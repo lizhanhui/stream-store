@@ -1,0 +1,12 @@
+[package]
+name = "client"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+common = { path = "../common" }
+rpc = { path = "../rpc" }

@@ -1,0 +1,17 @@
+[package]
+name = "stream-manager"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+sqlx = { workspace = true }
+refinery = { workspace = true }
+mysql_async = { workspace = true }
+futures-util = { workspace = true }
+common = { path = "../common" }
+rpc = { path = "../rpc" }
+server = { path = "../server" }
+client = { path = "../client" }

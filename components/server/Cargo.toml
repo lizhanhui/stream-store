@@ -1,0 +1,12 @@
+[package]
+name = "server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures-util = { workspace = true }
+tracing = { workspace = true }
+common = { path = "../common" }
+rpc = { path = "../rpc" }

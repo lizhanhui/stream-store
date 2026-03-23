@@ -1,0 +1,48 @@
+[workspace]
+resolver = "3"
+members = [
+    "components/common", 
+    "components/rpc", 
+    "components/client", 
+    "components/server", 
+    "components/extent-node", 
+    "components/stream-manager",
+]
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+bytes = "1"
+tokio-util = { version = "0.7", features = ["codec"] }
+futures-util = { version = "0.3", features = ["sink"] }
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sqlx = { version = "0.8", features = ["runtime-tokio", "mysql"] }
+refinery = { version = "0.8", features = ["mysql_async"] }
+mysql_async = "0.35"
+
+[package]
+name = "stream-store"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+common = { path = "components/common" }
+extent-node = { path = "components/extent-node" }
+stream-manager = { path = "components/stream-manager" }
+server = { path = "components/server" }
+client = { path = "components/client" }
+rpc = { path = "components/rpc" }
+
+[dev-dependencies]
+futures-util = { workspace = true }
+tokio-util = { workspace = true }
+sqlx = { workspace = true }
+
+[[bench]]
+name = "concurrent_multi_stream"
+harness = false
