@@ -87,24 +87,6 @@ impl StorageClient {
         Ok(())
     }
 
-    // ── Data path operations (ExtentNode) ──
-
-    /// Create a new stream on the ExtentNode. Returns the assigned StreamId.
-    pub async fn create_stream(&mut self) -> Result<StreamId, StorageError> {
-        let req = Frame {
-            opcode: Opcode::CreateStream,
-            flags: 0,
-            request_id: self.alloc_request_id(),
-            stream_id: StreamId(0),
-            extent_id: ExtentId(0),
-            offset: Offset(0),
-            payload: Bytes::new(),
-        };
-        let resp = self.send_recv(req).await?;
-        Self::check_error(&resp)?;
-        Ok(resp.stream_id)
-    }
-
     /// Create a new stream on the StreamManager.
     /// Payload carries stream name and per-stream replication factor.
     /// If replication_factor=0, the StreamManager uses its default.

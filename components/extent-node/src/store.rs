@@ -289,7 +289,6 @@ impl RequestHandler for ExtentNodeStore {
         response_tx: Option<&mpsc::Sender<Frame>>,
     ) -> Option<Frame> {
         match frame.opcode {
-            Opcode::CreateStream => Some(self.handle_create_stream(frame)),
             Opcode::Append => self.handle_append(frame, response_tx),
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
@@ -326,22 +325,6 @@ impl RequestHandler for ExtentNodeStore {
 }
 
 impl ExtentNodeStore {
-    fn handle_create_stream(&self, frame: Frame) -> Frame {
-        let stream_id = StreamId(self.next_stream_id.fetch_add(1, Ordering::Relaxed));
-        let stream = Stream::with_capacity(stream_id, self.arena_capacity);
-        self.streams.insert(stream_id, stream);
-
-        Frame {
-            opcode: Opcode::AppendAck, // reuse as generic ack
-            flags: 0,
-            request_id: frame.request_id,
-            stream_id,
-            extent_id: ExtentId(0),
-            offset: Offset(0),
-            payload: Bytes::new(),
-        }
-    }
-
     /// Handle RegisterExtent from StreamManager: assign this ExtentNode a role in broadcast replication.
     ///
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
@@ -727,25 +710,30 @@ impl ExtentNodeStore {
 mod tests {
     use super::*;
 
-    async fn create_stream(store: &ExtentNodeStore, req_id: u32) -> StreamId {
-        let frame = Frame {
-            opcode: Opcode::CreateStream,
+    /// Register a stream on the ExtentNode via RegisterExtent (RF=1, Primary, no secondaries).
+    /// This is the production path: StreamManager assigns a stream_id and sends RegisterExtent.
+    async fn register_stream(store: &ExtentNodeStore, stream_id: u64, req_id: u32) -> StreamId {
+        use rpc::payload::build_register_extent_payload;
+
+        let sid = StreamId(stream_id);
+        let payload = build_register_extent_payload(stream_id, 1, 0, 1, &[]);
+        let resp = store.handle_frame(Frame {
+            opcode: Opcode::RegisterExtent,
             flags: 0,
             request_id: req_id,
-            stream_id: StreamId(0),
+            stream_id: sid,
             extent_id: ExtentId(0),
             offset: Offset(0),
-            payload: Bytes::new(),
-        };
-        let resp = store.handle_frame(frame, None).await.unwrap();
-        assert_eq!(resp.opcode, Opcode::AppendAck);
-        resp.stream_id
+            payload,
+        }, None).await.unwrap();
+        assert_eq!(resp.opcode, Opcode::RegisterExtentAck);
+        sid
     }
 
     #[tokio::test]
     async fn create_and_append() {
         let store = ExtentNodeStore::new();
-        let sid = create_stream(&store, 1).await;
+        let sid = register_stream(&store, 1, 1).await;
 
         let resp = store.handle_frame(Frame {
             opcode: Opcode::Append,
@@ -783,7 +771,7 @@ mod tests {
     #[tokio::test]
     async fn append_read_query_offset() {
         let store = ExtentNodeStore::new();
-        let sid = create_stream(&store, 1).await;
+        let sid = register_stream(&store, 1, 1).await;
 
         let mut byte_positions = Vec::new();
         for i in 0u32..3 {
@@ -1136,7 +1124,7 @@ mod tests {
         // Pre-create all streams so IDs are deterministic.
         let mut stream_ids = Vec::new();
         for i in 0..NUM_STREAMS {
-            let sid = create_stream(&store, i as u32).await;
+            let sid = register_stream(&store, i + 1, i as u32).await;
             stream_ids.push(sid);
         }
 
@@ -1282,14 +1270,14 @@ mod tests {
         // Create writer streams (will be written to concurrently).
         let mut writer_sids = Vec::new();
         for i in 0..NUM_WRITER_STREAMS {
-            let sid = create_stream(&store, i as u32).await;
+            let sid = register_stream(&store, i + 1, i as u32).await;
             writer_sids.push(sid);
         }
 
         // Create reader streams and pre-populate them with data.
         let mut reader_sids = Vec::new();
         for i in 0..NUM_READER_STREAMS {
-            let sid = create_stream(&store, (100 + i) as u32).await;
+            let sid = register_stream(&store, 100 + i + 1, (100 + i) as u32).await;
             for j in 0..100u32 {
                 store.handle_frame(Frame {
                     opcode: Opcode::Append,
@@ -1402,7 +1390,7 @@ mod tests {
         const APPENDS_PER_TASK: u64 = 2_000;
 
         let store = Arc::new(ExtentNodeStore::new());
-        let sid = create_stream(&store, 1).await;
+        let sid = register_stream(&store, 1, 1).await;
 
         let start = Instant::now();
 
