@@ -127,18 +127,21 @@ RF=3 (optional, quorum = Primary + 1 Secondary):
                           +-----------+
               +=========> | ExtentNode|
               |           |(Secondary)|
-              |           +-----------+
-        +-----------+           ^
-        | ExtentNode|           | watermark ACK
-        | (Primary) |           |
-        +-----------+     +-----------+
-              |           | ExtentNode|
-              +=========> |(Secondary)|
-                          +-----------+
-              ^                 |
-              +--- watermark ---+
+              |           +-----+-----+
+              |                 |
+              | watermark ACK   | watermark ACK
+              |   (from S1)     |   (from S2)
+              |                 |
+        +-----+-----+    +-----+-----+
+        | ExtentNode| <= | ExtentNode|
+        | (Primary) |    |(Secondary)|
+        +-----------+    +-----------+
+              |                ^
+              +================+
+                broadcast append
 
         Primary broadcasts to BOTH secondaries in parallel.
+        BOTH secondaries send watermark ACKs back to Primary.
         Quorum ACK: Primary + 1 of 2 secondaries (RF/2 = 1).
 ```
 
