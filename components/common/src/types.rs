@@ -5,13 +5,18 @@ pub const MAGIC: u8 = 0xEF;
 pub const PROTOCOL_VERSION: u8 = 1;
 
 /// Fixed header length in bytes (Magic 1 + Version 1 + Opcode 1 + Flags 1
-/// + RequestId 4 + StreamId 8 + Offset 8 + ExtentId 4 + PayloadLen 4 = 32).
-pub const HEADER_LEN: usize = 32;
+/// + RemainingLength 4 = 8).
+pub const HEADER_LEN: usize = 8;
 
 /// Flag bit indicating a forwarded append (broadcast replication).
 /// When set on an Append frame, the receiving ExtentNode acts as a Secondary
 /// (writes locally and returns a Watermark).
 pub const FLAG_FORWARDED: u8 = 0x01;
+
+/// Flag bit on SEAL indicating the caller provides the resolved end offset.
+/// When clear (client seal): Stream Manager queries all EN replicas for offset.
+/// When set (extent-node seal): offset field is present and trusted by SM.
+pub const FLAG_OFFSET_PRESENT: u8 = 0x01;
 
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -43,6 +48,7 @@ pub enum Opcode {
     CreateStream = 0x07,
     QueryOffset = 0x08,
     QueryOffsetResp = 0x09,
+    CreateStreamResp = 0x0A,
 
     // -- Lifecycle (0x10-0x1F): ExtentNode <-> StreamManager --
     Connect = 0x10,
@@ -82,6 +88,7 @@ impl Opcode {
             0x07 => Some(Opcode::CreateStream),
             0x08 => Some(Opcode::QueryOffset),
             0x09 => Some(Opcode::QueryOffsetResp),
+            0x0A => Some(Opcode::CreateStreamResp),
             // Lifecycle
             0x10 => Some(Opcode::Connect),
             0x11 => Some(Opcode::ConnectAck),

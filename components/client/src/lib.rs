@@ -1,15 +1,16 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use bytes::{Buf, BufMut, Bytes, BytesMut};
+use bytes::{Buf, Bytes};
 use common::errors::StorageError;
-use common::types::{ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId};
+use common::types::{
+    ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId, FLAG_OFFSET_PRESENT,
+};
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
 use rpc::payload::{
-    build_client_seal_payload, build_connect_payload, build_create_stream_payload,
-    build_describe_extent_payload, build_describe_stream_payload, build_extent_node_seal_payload,
-    build_heartbeat_payload, build_string_payload, parse_extent_info_vec,
+    build_connect_payload, build_create_stream_payload, build_heartbeat_payload,
+    build_string_payload, parse_extent_info_vec,
 };
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
@@ -63,19 +64,14 @@ impl StorageClient {
 
     fn check_error(resp: &Frame) -> Result<(), StorageError> {
         if resp.opcode == Opcode::Error {
-            let payload = &resp.payload;
-            if payload.len() >= 2 {
-                let code = u16::from_be_bytes([payload[0], payload[1]]);
-                let msg = String::from_utf8_lossy(&payload[2..]).to_string();
-                let error_code = ErrorCode::from_u16(code);
-                return Err(match error_code {
-                    Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id),
-                    Some(ErrorCode::ExtentFull) => StorageError::ExtentFull(resp.extent_id),
-                    Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id),
-                    _ => StorageError::Internal(msg),
-                });
-            }
-            return Err(StorageError::Internal("unknown error".into()));
+            let error_code = ErrorCode::from_u16(resp.error_code);
+            let msg = String::from_utf8_lossy(&resp.payload).to_string();
+            return Err(match error_code {
+                Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id),
+                Some(ErrorCode::ExtentFull) => StorageError::ExtentFull(resp.extent_id),
+                Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id),
+                _ => StorageError::Internal(msg),
+            });
         }
         Ok(())
     }
@@ -91,32 +87,25 @@ impl StorageClient {
     ) -> Result<(StreamId, ExtentId, String), StorageError> {
         let req = Frame {
             opcode: Opcode::CreateStream,
-            flags: 0,
             request_id: self.alloc_request_id(),
-            stream_id: StreamId(0),
-            extent_id: ExtentId(0),
-            offset: Offset(0),
             payload: build_create_stream_payload(name, replication_factor),
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
-
-        // Parse response payload: [extent_id:u32][addr_len:u16][addr]
-        let payload = &resp.payload;
-        if payload.len() < 6 {
-            return Err(StorageError::Internal(
-                "CreateStream response payload too short".into(),
-            ));
+        if resp.opcode != Opcode::CreateStreamResp {
+            return Err(StorageError::Internal(format!(
+                "expected CreateStreamResp, got {:?}",
+                resp.opcode
+            )));
         }
-        let extent_id =
-            ExtentId(u32::from_be_bytes(payload[0..4].try_into().map_err(
-                |_| StorageError::Internal("invalid extent_id bytes".into()),
-            )?));
-        let addr = rpc::payload::parse_string_payload(&payload[4..]).ok_or_else(|| {
-            StorageError::Internal("invalid CreateStream StreamManager response".into())
+
+        // extent_id is in the frame field; payload carries [addr_len:u16][addr]
+        let addr = rpc::payload::parse_string_payload(&resp.payload).ok_or_else(|| {
+            StorageError::Internal("invalid CreateStreamResp primary_addr payload".into())
         })?;
 
-        Ok((resp.stream_id, extent_id, addr))
+        Ok((resp.stream_id, resp.extent_id, addr))
     }
 
     /// Append a message to a stream. Returns the assigned offset and byte position.
@@ -127,26 +116,17 @@ impl StorageClient {
     ) -> Result<AppendResult, StorageError> {
         let req = Frame {
             opcode: Opcode::Append,
-            flags: 0,
             request_id: self.alloc_request_id(),
             stream_id,
-            extent_id: ExtentId(0),
-            offset: Offset(0),
             payload,
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
 
-        // Parse byte_pos from AppendAck payload (u64 BE).
-        let byte_pos = if resp.payload.len() >= 8 {
-            u64::from_be_bytes(resp.payload[..8].try_into().unwrap())
-        } else {
-            0
-        };
-
         Ok(AppendResult {
             offset: resp.offset,
-            byte_pos,
+            byte_pos: resp.byte_pos,
         })
     }
 
@@ -161,25 +141,20 @@ impl StorageClient {
         byte_pos: u64,
         count: u16,
     ) -> Result<Vec<Bytes>, StorageError> {
-        let bp_payload = {
-            let mut buf = BytesMut::with_capacity(8);
-            buf.put_u64(byte_pos);
-            buf.freeze()
-        };
         let req = Frame {
             opcode: Opcode::Read,
-            flags: (count as u8),
             request_id: self.alloc_request_id(),
             stream_id,
-            extent_id: ExtentId(0),
             offset,
-            payload: bp_payload,
+            byte_pos,
+            count: count as u32,
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
 
         // Decode payload: [u32 len][bytes] repeated.
-        let msg_count = resp.flags as usize;
+        let msg_count = resp.count as usize;
         let mut messages = Vec::with_capacity(msg_count);
         let mut buf = &resp.payload[..];
 
@@ -202,12 +177,9 @@ impl StorageClient {
     pub async fn query_offset(&mut self, stream_id: StreamId) -> Result<Offset, StorageError> {
         let req = Frame {
             opcode: Opcode::QueryOffset,
-            flags: 0,
             request_id: self.alloc_request_id(),
             stream_id,
-            extent_id: ExtentId(0),
-            offset: Offset(0),
-            payload: Bytes::new(),
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
@@ -225,12 +197,9 @@ impl StorageClient {
     ) -> Result<(), StorageError> {
         let req = Frame {
             opcode: Opcode::Connect,
-            flags: 0,
             request_id: self.alloc_request_id(),
-            stream_id: StreamId(0),
-            extent_id: ExtentId(0),
-            offset: Offset(0),
             payload: build_connect_payload(node_id, addr, heartbeat_interval_ms),
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
@@ -251,12 +220,9 @@ impl StorageClient {
     ) -> Result<(), StorageError> {
         let req = Frame {
             opcode: Opcode::Heartbeat,
-            flags: 0,
             request_id: self.alloc_request_id(),
-            stream_id: StreamId(0),
-            extent_id: ExtentId(0),
-            offset: Offset(0),
             payload: build_heartbeat_payload(node_id, metrics),
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
@@ -267,12 +233,9 @@ impl StorageClient {
     pub async fn disconnect_extent_node(&mut self, node_id: &str) -> Result<(), StorageError> {
         let req = Frame {
             opcode: Opcode::Disconnect,
-            flags: 0,
             request_id: self.alloc_request_id(),
-            stream_id: StreamId(0),
-            extent_id: ExtentId(0),
-            offset: Offset(0),
             payload: build_string_payload(node_id),
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
@@ -293,8 +256,6 @@ impl StorageClient {
     /// StreamManager will query all EN replicas to determine the committed offset
     /// via quorum algorithm, then seal-and-allocate a new extent.
     ///
-    /// Payload: `[extent_id:u32]` (4 bytes).
-    ///
     /// Returns (new_extent_id, new_primary_addr).
     pub async fn seal(
         &mut self,
@@ -303,12 +264,11 @@ impl StorageClient {
     ) -> Result<(u64, String), StorageError> {
         let req = Frame {
             opcode: Opcode::Seal,
-            flags: 0,
+            flags: 0, // no FLAG_OFFSET_PRESENT -> client seal
             request_id: self.alloc_request_id(),
             stream_id,
-            extent_id: ExtentId(0),
-            offset: Offset(0),
-            payload: build_client_seal_payload(extent_id.0),
+            extent_id,
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
@@ -340,10 +300,6 @@ impl StorageClient {
     /// the extent locally. The `offset` is `base_offset + message_count` — the
     /// committed offset that StreamManager should trust without querying replicas.
     ///
-    /// StreamManager will also fire-and-forget seal RPCs to secondary ENs.
-    ///
-    /// Payload: `[extent_id:u32][offset:u64]` (12 bytes).
-    ///
     /// Returns (new_extent_id, new_primary_addr).
     pub async fn extent_node_seal(
         &mut self,
@@ -353,12 +309,12 @@ impl StorageClient {
     ) -> Result<(u64, String), StorageError> {
         let req = Frame {
             opcode: Opcode::Seal,
-            flags: 0,
+            flags: FLAG_OFFSET_PRESENT, // extent-node seal carries offset
             request_id: self.alloc_request_id(),
             stream_id,
-            extent_id: ExtentId(0),
-            offset: Offset(0),
-            payload: build_extent_node_seal_payload(extent_id.0, offset),
+            extent_id,
+            offset: Offset(offset),
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
@@ -398,12 +354,10 @@ impl StorageClient {
     ) -> Result<Vec<ExtentInfo>, StorageError> {
         let req = Frame {
             opcode: Opcode::DescribeStream,
-            flags: 0,
             request_id: self.alloc_request_id(),
             stream_id,
-            extent_id: ExtentId(0),
-            offset: Offset(0),
-            payload: build_describe_stream_payload(count),
+            count,
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
@@ -425,12 +379,10 @@ impl StorageClient {
     ) -> Result<ExtentInfo, StorageError> {
         let req = Frame {
             opcode: Opcode::DescribeExtent,
-            flags: 0,
             request_id: self.alloc_request_id(),
             stream_id,
-            extent_id: ExtentId(0),
-            offset: Offset(0),
-            payload: build_describe_extent_payload(extent_id.0),
+            extent_id,
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;
@@ -451,9 +403,6 @@ impl StorageClient {
     ///
     /// Returns the `ExtentInfo` for the extent covering `offset`, including replica
     /// addresses so the caller knows which extent node(s) to read from.
-    ///
-    /// - For sealed extents: `base_offset <= offset < base_offset + message_count`.
-    /// - For the active extent: `offset >= base_offset` (tail of the stream).
     pub async fn seek(
         &mut self,
         stream_id: StreamId,
@@ -461,12 +410,10 @@ impl StorageClient {
     ) -> Result<ExtentInfo, StorageError> {
         let req = Frame {
             opcode: Opcode::Seek,
-            flags: 0,
             request_id: self.alloc_request_id(),
             stream_id,
-            extent_id: ExtentId(0),
             offset,
-            payload: Bytes::new(),
+            ..Default::default()
         };
         let resp = self.send_recv(req).await?;
         Self::check_error(&resp)?;

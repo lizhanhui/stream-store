@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
-use common::types::{ExtentId, Offset, Opcode, FLAG_FORWARDED};
+use common::types::{Offset, Opcode, FLAG_FORWARDED};
 use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
 
@@ -71,11 +71,10 @@ pub async fn run_downstream_manager(
         let frame = Frame {
             opcode: Opcode::Append,
             flags: FLAG_FORWARDED,
-            request_id: 0, // not meaningful for forwarded frames
             stream_id: req.stream_id,
-            extent_id: ExtentId(0),
             offset: Offset(req.offset),
             payload: req.payload,
+            ..Default::default()
         };
 
         // Send to secondary.

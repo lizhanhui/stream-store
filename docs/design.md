@@ -27,9 +27,9 @@ The unit of replication and the unit of S3 flush. A stream is composed of an ord
 
 When a trigger fires (size threshold, time interval, node failure, or **extent full**):
 
-Two seal variants are supported, dispatched by payload length:
+A single `SEAL` opcode (0x05) covers all trigger sources. `Flags` bit 0 (`FLAG_OFFSET_PRESENT`) distinguishes whether the caller provides the resolved end offset:
 
-**Client Seal** (4-byte payload: `[extent_id:u32]`):
+**Client Seal** (`FLAG_OFFSET_PRESENT = 0`):
 1. Client sends `Seal(stream_id, extent_id)` to Stream Manager.
 2. Stream Manager sends `Seal` RPC to **each Extent Node holding a replica** (Primary and all Secondaries). Each Extent Node stops accepting appends and responds with its local commit length.
 3. Stream Manager determines the committed offset: if the Primary responded, its quorum offset is used (most accurate). Otherwise, SM computes the committed offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
@@ -37,17 +37,19 @@ Two seal variants are supported, dispatched by payload length:
 5. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to each new Extent Node.
 6. Stream Manager responds to client with the new extent info (Primary address). Writes resume immediately.
 
-**Extent-node seal** (12-byte payload: `[extent_id:u32][offset:u64]`):
-1. Primary ExtentNode proactively seals (e.g. arena full) and sends `Seal(stream_id, extent_id, offset)` to Stream Manager. The `offset = base_offset + message_count`.
+**Extent-node Seal** (`FLAG_OFFSET_PRESENT = 1`):
+1. Primary ExtentNode proactively seals (e.g. arena full) and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` set to Stream Manager. The `offset = base_offset + message_count`.
 2. Stream Manager trusts the reported offset. It derives `message_count = offset - base_offset` using the extent's base_offset from metadata.
 3. Stream Manager updates extent metadata to SEALED.
-4. Stream Manager **fire-and-forgets** Seal RPCs to all secondary extent nodes (`tokio::spawn` — does not block the response). This ensures secondaries learn about the seal asynchronously.
+4. Stream Manager **fire-and-forgets** Seal RPCs to secondary extent nodes only (`tokio::spawn` -- does not block the response), skipping the Primary (already sealed locally). This ensures secondaries learn about the seal asynchronously.
 5. Stream Manager allocates a new active extent and responds to the Extent Node with the new extent info.
+
+Both paths share the same downstream procedure in Stream Manager: seal in MySQL (transaction), allocate new extent, notify ExtentNodes via RegisterExtent.
 
 **ExtentFull handling**: When the Primary's arena is exhausted, it takes two actions:
 
 1. **Returns `ErrorCode::ExtentFull` (5)** to the client whose append triggered the overflow. This client knows to retry after obtaining the new extent from Stream Manager.
-2. **Proactively seals the extent and sends `Seal(stream_id, extent_id, offset)` to Stream Manager** in the background (12-byte extent-node seal variant). The `offset = base_offset + message_count` is the committed offset that Stream Manager trusts without querying replicas. Stream Manager updates metadata, fire-and-forgets Seal RPCs to secondary ExtentNodes, allocates a new extent, and responds — all before most clients even see the error.
+2. **Proactively seals the extent and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` to Stream Manager** in the background. The `offset = base_offset + message_count` is the committed offset that Stream Manager trusts without querying replicas. Stream Manager updates metadata, fire-and-forgets Seal RPCs to secondary ExtentNodes, allocates a new extent, and responds -- all before most clients even see the error.
 
 This avoids an error storm where every concurrent client independently discovers the extent is full and races to trigger seal-and-new. Only the Primary initiates the seal -- once. Subsequent clients that arrive after the local seal see `ExtentSealed` and call `DescribeStream(count=1)` to get the new extent, which is already being allocated.
 
@@ -162,40 +164,39 @@ All Extent Nodes, S3 Flusher, and S3 Reader run as Extent Node processes. Stream
 
 ### Custom TCP Wire Protocol
 
-Fixed-header + raw payload format for minimal overhead and zero-copy forwarding.
+MQTT-style **Fixed Header + Variable Header + Payload** format for minimal overhead and zero-copy forwarding. Each opcode defines its own variable header layout; only fields relevant to that operation are on the wire. The payload section carries arbitrary application data (e.g., message bytes for APPEND) and is always length-prefixed.
 
 #### Frame Format
 
-Byte-offset diagram. Each column = 1 byte, each row = 8 bytes.
-
 ```
-        0       1       2       3       4       5       6       7
-   +-------+-------+-------+-------+-------------------------------+
- 0 | Magic |Version|Opcode | Flags |          Request ID           |
-   +-------+-------+-------+-------+-------------------------------+
- 8 |                           Stream ID                           |
-   +---------------------------------------------------------------+
-16 |                            Offset                             |
-   +-------------------------------+-------------------------------+
-24 |          Extent ID            |        Payload Length          |
-   +-------------------------------+-------------------------------+
-32 |                        Payload (variable)                     |
-   +---------------------------------------------------------------+
++--Fixed Header (8 bytes, always present)-----------------------------+
+|       0       1       2       3       4       5       6       7     |
+|  +-------+-------+-------+-------+-------------------------------+  |
+|  | Magic |Version| Opcode| Flags |       Remaining Length        |  |
+|  +-------+-------+-------+-------+-------------------------------+  |
++---------------------------------------------------------------------+
++--Variable Header (opcode-specific, 0..N bytes)----------------------+
+|  Fields determined by the Opcode. See per-opcode layouts below.     |
++---------------------------------------------------------------------+
++--Payload (optional, length-prefixed)--------------------------------+
+|  [Payload Length : u32]  (present when opcode defines a payload)     |
+|  [Payload bytes  : ...]                                             |
++---------------------------------------------------------------------+
 ```
 
-Fixed header: 32 bytes. Fields:
+**Fixed Header** (8 bytes):
 
 | Field | Size | Description |
 |-------|------|-------------|
 | Magic | 1B | `0xEF` -- protocol identification |
-| Version | 1B | Protocol version |
+| Version | 1B | Protocol version (currently 1) |
 | Opcode | 1B | Operation type (see below) |
-| Flags | 1B | Per-opcode flags (e.g., FLAG_FORWARDED for replication, message count for reads) |
-| Request ID | 4B | Correlates request/response pairs |
-| Stream ID | 8B | Target stream |
-| Offset | 8B | Logical offset (for reads) or base offset returned (for writes) |
-| Extent ID | 4B | Target extent within stream (0 when not applicable) |
-| Payload Length | 4B | Length of variable payload section |
+| Flags | 1B | Per-opcode flags (e.g., `FLAG_FORWARDED = 0x01` for replication) |
+| Remaining Length | 4B | Total bytes of variable header + payload section that follow the fixed header |
+
+**Variable Header**: Determined entirely by the Opcode (and sometimes Flags). Each opcode section below specifies the exact fields and their order. Fields carry protocol-level metadata specific to the operation (stream IDs, offsets, extent IDs, counts, request IDs, etc.). Only the fields meaningful for that opcode appear on the wire. Request ID is a variable header field present in request-response opcodes, absent in fire-and-forget opcodes (e.g., WATERMARK, SM_MEMBERSHIP_CHANGE).
+
+**Payload**: Carries arbitrary application data from the ultimate user (e.g., message bytes for APPEND, error description for ERROR). When present, a 4-byte `Payload Length` prefix precedes the payload bytes. Opcodes that carry no application payload omit both the length prefix and the payload bytes entirely.
 
 #### Opcodes
 
@@ -203,49 +204,363 @@ Grouped by category with gaps for future growth.
 
 **Data path (0x01-0x0F) -- Client <-> Extent Node**
 
-| Opcode | Name | Direction | Description |
-|--------|------|-----------|-------------|
-| 0x01 | APPEND | Client->Primary; Primary->Secondary (forwarded) | Append message body to data stream. Header carries both Stream ID and Extent ID so the server can validate the target extent directly. Payload = message bytes. Flags bit 0 (FLAG_FORWARDED): 0 = client request, 1 = forwarded from Primary. Flags[1:7] = number of index targets (for multi-dispatch). |
-| 0x02 | APPEND_ACK | Primary->Client | Confirms append. Offset = assigned sequence number. Payload = `[byte_pos:u64]` (byte position within the extent arena, for building external index). Sent after quorum ACK is achieved. |
-| 0x03 | READ | Client->Extent Node | Read from stream. Offset = start offset. Flags[0:15] = count. |
-| 0x04 | READ_RESP | Extent Node->Client | Read response. Payload = message bytes. |
-| 0x05 | SEAL | Client->Stream Manager; Stream Manager->Extent Node | Seal an extent. Two payload variants dispatched by length: **Client seal** (4 bytes): `[extent_id:u32]`. Client doesn't know the committed offset; Stream Manager concurrently seals all Extent Node replicas and determines the committed offset via quorum (Primary's offset if available, otherwise k-th largest Secondary offset where `k = RF/2`). **Extent-node seal** (12 bytes): `[extent_id:u32][offset:u64]`. Primary ExtentNode proactively seals (e.g. ExtentFull) and reports its committed offset (`base_offset + message_count`). Stream Manager trusts the offset, derives `message_count = offset - base_offset`, updates metadata, and fire-and-forgets Seal RPCs to secondary ExtentNodes (non-blocking). Both variants end with Stream Manager allocating a new extent and responding with `SealAck`. |
-| 0x06 | SEAL_ACK | Extent Node->Stream Manager; Stream Manager->Client | Extent Node->Stream Manager: Seal confirmation. Offset = local message_count (commit length). Stream Manager->Client: returns new extent info after seal-and-new. |
-| 0x07 | CREATE_STREAM | Client->Stream Manager | Create a new stream. Payload = `[name_len:u16][stream_name][replication_factor:u16]`. If replication_factor=0, StreamManager uses its default. Response (via APPEND_ACK opcode): stream_id in header, payload = `[extent_id:u32][addr_len:u16][primary_addr]`. |
-| 0x08 | QUERY_OFFSET | Client->Extent Node/Stream Manager | Query max offset for a stream. |
-| 0x09 | QUERY_OFFSET_RESP | Extent Node/Stream Manager->Client | Returns current max offset. |
+##### 0x01 APPEND (Client -> Primary; Primary -> Secondary when forwarded)
+
+Append a message to a data stream. `Flags` bit 0 (`FLAG_FORWARDED`): 0 = client request, 1 = forwarded from Primary to Secondary for broadcast replication.
+
+```
+Fixed Header (8B)
+  Flags: bit 0 = FLAG_FORWARDED
+Variable Header:
+  [stream_id    : u64]    -- target stream
+  [extent_id    : u32]    -- target extent (for server-side validation)
+Payload:
+  [payload_len  : u32]    -- length of message bytes
+  [payload      : bytes]  -- message body (application data)
+```
+
+When forwarded (Primary -> Secondary), `request_id = 0` (not meaningful) and the Secondary derives the logical offset locally from its arena's `record_count`.
+
+##### 0x02 APPEND_ACK (Primary -> Client)
+
+Confirms a successful append after quorum ACK is achieved.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- stream that was appended to
+  [extent_id    : u32]    -- extent that was appended to
+  [offset       : u64]    -- assigned logical sequence number
+  [byte_pos     : u64]    -- byte position within the extent arena (for building external index)
+No Payload.
+```
+
+##### 0x03 READ (Client -> Extent Node)
+
+Read messages from a stream starting at a given offset and byte position.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- target stream
+  [offset       : u64]    -- start logical offset
+  [byte_pos     : u64]    -- byte position within the extent arena (0 = scan from start)
+  [count        : u32]    -- number of messages to read
+No Payload.
+```
+
+##### 0x04 READ_RESP (Extent Node -> Client)
+
+Read response carrying message data.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- stream that was read from
+  [offset       : u64]    -- starting offset of the returned batch
+  [count        : u32]    -- actual number of messages returned
+Payload:
+  [payload_len  : u32]    -- total length of all encoded messages
+  [payload      : bytes]  -- repeated [msg_len:u32][msg_bytes] per message
+```
+
+##### 0x05 SEAL (Client -> Stream Manager; Extent Node -> Stream Manager; Stream Manager -> Extent Node)
+
+Seal an extent. A single opcode covers all trigger sources; `Flags` bit 0 (`FLAG_OFFSET_PRESENT`) distinguishes whether the caller provides the resolved end offset:
+
+- **Client seal** (`FLAG_OFFSET_PRESENT = 0`): Client doesn't know the committed offset. Stream Manager concurrently seals all Extent Node replicas and determines the committed offset via quorum (Primary's offset if available, otherwise k-th largest Secondary offset where `k = RF/2`).
+- **Extent-node seal** (`FLAG_OFFSET_PRESENT = 1`): Primary ExtentNode proactively seals (e.g. ExtentFull) and reports its committed offset (`base_offset + message_count`). Stream Manager trusts the offset, derives `message_count = offset - base_offset`, skips sealing the Primary (already sealed locally), and fire-and-forgets Seal RPCs to secondary ExtentNodes only.
+- **Stream Manager -> Extent Node**: Stream Manager sends Seal to individual Extent Nodes during client-seal quorum collection. Variable header carries `stream_id` only; Extent Node seals locally and responds with SEAL_ACK.
+
+Both client-initiated and EN-initiated paths end with Stream Manager allocating a new extent and responding with SEAL_ACK.
+
+```
+FLAG_OFFSET_PRESENT = 0 (client seal, or SM -> EN):
+  Fixed Header (8B)
+    Flags: 0x00
+  Variable Header:
+    [stream_id    : u64]    -- stream to seal
+    [extent_id    : u32]    -- extent to seal
+  No Payload.
+
+FLAG_OFFSET_PRESENT = 1 (extent-node seal):
+  Fixed Header (8B)
+    Flags: 0x01
+  Variable Header:
+    [stream_id    : u64]    -- stream to seal
+    [extent_id    : u32]    -- extent to seal
+    [offset       : u64]    -- committed offset (base_offset + message_count), trusted by SM
+  No Payload.
+```
+
+##### 0x06 SEAL_ACK (Extent Node -> Stream Manager; Stream Manager -> Client)
+
+**Extent Node -> Stream Manager**: Seal confirmation from an individual EN. Carries the committed offset so Stream Manager can compute quorum.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- stream that was sealed
+  [extent_id    : u32]    -- extent that was sealed
+  [offset       : u64]    -- committed offset (base_offset + message_count)
+No Payload.
+```
+
+**Stream Manager -> Client**: Returns new extent info after seal-and-new allocation.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- stream that was sealed
+  [new_extent_id: u32]    -- newly allocated extent
+  [primary_addr_len : u16]
+  [primary_addr : bytes]  -- address of the new extent's Primary node
+No Payload.
+```
+
+##### 0x07 CREATE_STREAM (Client -> Stream Manager)
+
+Create a new stream. If `replication_factor = 0`, Stream Manager uses its default.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [name_len     : u16]
+  [stream_name  : bytes]  -- stream name (maps to MQTT queue name)
+  [replication_factor : u16]
+No Payload.
+```
+
+**Response** (via APPEND_ACK opcode): `stream_id` in variable header, plus initial extent info.
+
+##### 0x08 QUERY_OFFSET (Client -> Extent Node / Stream Manager)
+
+Query the max offset (exclusive) for a stream.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- target stream
+No Payload.
+```
+
+##### 0x09 QUERY_OFFSET_RESP (Extent Node / Stream Manager -> Client)
+
+Returns the current max offset.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- queried stream
+  [offset       : u64]    -- max offset (exclusive)
+No Payload.
+```
 
 **Lifecycle (0x10-0x1F) -- Extent Node <-> Stream Manager**
 
-| Opcode | Name | Direction | Description |
-|--------|------|-----------|-------------|
-| 0x10 | CONNECT | Extent Node->Stream Manager | First frame after Extent Node connects to Stream Manager. Payload = `[node_id_len:u16][node_id][addr_len:u16][addr][interval_ms:u32]`. Stream Manager uses 1.5x interval as dead-node timeout. |
-| 0x11 | CONNECT_ACK | Stream Manager->Extent Node | Acknowledges Extent Node registration. |
-| 0x12 | DISCONNECT | Extent Node->Stream Manager | Graceful shutdown. Extent Node notifies Stream Manager it is leaving; Stream Manager stops allocating new extents to this Extent Node. |
-| 0x13 | DISCONNECT_ACK | Stream Manager->Extent Node | Acknowledges disconnect. |
-| 0x14 | HEARTBEAT | Extent Node->Stream Manager | Connection keepalive within the interval declared in CONNECT. |
-| 0x15 | REGISTER_EXTENT | Stream Manager->Extent Node | Register an extent's replica membership on an Extent Node. Payload = `[stream_id:u64][extent_id:u32][role:u8][rf:u16][num_addrs:u16][addrs...]`. Role: 0=Primary, 1+=Secondary. Primary receives all secondary addresses for broadcast forwarding. Secondaries receive empty address list (they only ACK back to Primary). Extent Node creates local stream and prepares replication. |
-| 0x16 | REGISTER_EXTENT_ACK | Extent Node->Stream Manager | Acknowledges extent registration. |
-| 0x17 | WATERMARK | Secondary->Primary | Cumulative ACK from Secondary to Primary. Offset = highest committed offset (inclusive). Primary uses watermark ACKs from all secondaries to compute quorum offset and ACK clients. |
+##### 0x10 CONNECT (Extent Node -> Stream Manager)
+
+First frame after an Extent Node connects to Stream Manager. Stream Manager uses 1.5x `interval_ms` as the dead-node timeout.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [node_id_len  : u16]
+  [node_id      : bytes]  -- unique node identifier
+  [addr_len     : u16]
+  [addr         : bytes]  -- listen address (host:port)
+  [interval_ms  : u32]    -- heartbeat interval in milliseconds
+No Payload.
+```
+
+##### 0x11 CONNECT_ACK (Stream Manager -> Extent Node)
+
+Acknowledges Extent Node registration.
+
+```
+Fixed Header (8B)
+No Variable Header.
+No Payload.
+```
+
+##### 0x12 DISCONNECT (Extent Node -> Stream Manager)
+
+Graceful shutdown. Stream Manager stops allocating new extents to this node.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [node_id_len  : u16]
+  [node_id      : bytes]  -- node identifier
+No Payload.
+```
+
+##### 0x13 DISCONNECT_ACK (Stream Manager -> Extent Node)
+
+Acknowledges disconnect.
+
+```
+Fixed Header (8B)
+No Variable Header.
+No Payload.
+```
+
+##### 0x14 HEARTBEAT (Extent Node -> Stream Manager)
+
+Connection keepalive within the interval declared in CONNECT. Carries runtime metrics for load-aware extent placement.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [node_id_len  : u16]
+  [node_id      : bytes]  -- node identifier
+  [available_memory_bytes : u64]
+  [total_memory_bytes     : u64]
+  [appends_per_sec        : u32]
+  [active_extent_count    : u32]
+  [bytes_written_per_sec  : u64]
+No Payload.
+```
+
+Heartbeat response echoes the fixed header only (same opcode, same request_id, no variable header, no payload).
+
+##### 0x15 REGISTER_EXTENT (Stream Manager -> Extent Node)
+
+Register an extent's replica membership on an Extent Node. Primary receives all secondary addresses for broadcast forwarding; Secondaries receive an empty address list.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- stream this extent belongs to
+  [extent_id    : u32]    -- extent being registered
+  [role         : u8]     -- 0 = Primary, 1+ = Secondary
+  [replication_factor : u16]
+  [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
+  per address:
+    [addr_len   : u16]
+    [addr       : bytes]
+No Payload.
+```
+
+##### 0x16 REGISTER_EXTENT_ACK (Extent Node -> Stream Manager)
+
+Acknowledges extent registration.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- stream that was registered
+  [extent_id    : u32]    -- extent that was registered
+No Payload.
+```
+
+##### 0x17 WATERMARK (Secondary -> Primary)
+
+Cumulative ACK from Secondary to Primary. Primary uses watermark ACKs from all secondaries to compute quorum offset and ACK clients.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- stream the watermark applies to
+  [offset       : u64]    -- highest committed offset (inclusive, cumulative)
+No Payload.
+```
 
 **Cluster management (0x20-0x2F) -- Stream Manager -> Extent Node/Client**
 
-| Opcode | Name | Direction | Description |
-|--------|------|-----------|-------------|
-| 0x20 | STREAM_MANAGER_MEMBERSHIP_CHANGE | Stream Manager->Extent Node/Client | Stream Manager cluster membership update. Payload = list of active Stream Manager peer addresses. Extent Nodes and clients update their connection pools accordingly. |
+##### 0x20 STREAM_MANAGER_MEMBERSHIP_CHANGE (Stream Manager -> Extent Node/Client)
+
+Stream Manager cluster membership update. Extent Nodes and clients update their connection pools.
+
+```
+Fixed Header (8B)
+Payload:
+  [payload_len  : u32]
+  [payload      : bytes]  -- list of active SM peer addresses
+                             [num_addrs:u16][addr_len:u16][addr]...
+```
 
 **Management (0x30-0x3F) -- Client <-> Stream Manager**
 
-| Opcode | Name | Direction | Description |
-|--------|------|-----------|-------------|
-| 0x30 | DESCRIBE_STREAM | Client->Stream Manager | Describe a stream's extents with replica info and node liveness. Payload = `[count:u32]`. count=0: all extents (latest to earliest). count=1: active extent only. count=N: at most N extents from latest to earliest. Response carries `Vec<ExtentInfo>` (see below). |
-| 0x31 | DESCRIBE_STREAM_RESP | Stream Manager->Client | Response to DESCRIBE_STREAM. Payload = encoded `Vec<ExtentInfo>`. |
-| 0x32 | DESCRIBE_EXTENT | Client->Stream Manager | Describe a single extent. Header stream_id identifies the stream. Payload = `[extent_id:u32]`. Response carries single `ExtentInfo`. |
-| 0x33 | DESCRIBE_EXTENT_RESP | Stream Manager->Client | Response to DESCRIBE_EXTENT. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry. |
-| 0x34 | SEEK | Client->Stream Manager | Seek an extent for a given offset. Header stream_id identifies the stream, offset field carries the target offset (payload empty). Returns the extent containing or just before the offset. Response carries single `ExtentInfo`. |
-| 0x35 | SEEK_RESP | Stream Manager->Client | Response to SEEK. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry. For sealed/flushed extents, offset must satisfy `base_offset <= offset < base_offset + message_count`. For active extent, offset must satisfy `base_offset <= offset` (message_count is 0 in metadata). |
+##### 0x30 DESCRIBE_STREAM (Client -> Stream Manager)
 
-**ExtentInfo** response payload format (shared by 0x31 and 0x33):
+Describe a stream's extents with replica info and node liveness.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- target stream
+  [count        : u32]    -- 0 = all extents, 1 = active only, N = at most N from latest
+No Payload.
+```
+
+##### 0x31 DESCRIBE_STREAM_RESP (Stream Manager -> Client)
+
+Response to DESCRIBE_STREAM. Payload = encoded `Vec<ExtentInfo>`.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- queried stream
+Payload:
+  [payload_len  : u32]
+  [payload      : bytes]  -- encoded Vec<ExtentInfo> (see ExtentInfo format below)
+```
+
+##### 0x32 DESCRIBE_EXTENT (Client -> Stream Manager)
+
+Describe a single extent.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- target stream
+  [extent_id    : u32]    -- target extent
+No Payload.
+```
+
+##### 0x33 DESCRIBE_EXTENT_RESP (Stream Manager -> Client)
+
+Response to DESCRIBE_EXTENT. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- queried stream
+Payload:
+  [payload_len  : u32]
+  [payload      : bytes]  -- encoded Vec<ExtentInfo> (1 entry)
+```
+
+##### 0x34 SEEK (Client -> Stream Manager)
+
+Resolve a logical offset to the extent that contains it.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- target stream
+  [offset       : u64]    -- target logical offset
+No Payload.
+```
+
+##### 0x35 SEEK_RESP (Stream Manager -> Client)
+
+Response to SEEK. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [stream_id    : u64]    -- queried stream
+  [offset       : u64]    -- resolved offset
+Payload:
+  [payload_len  : u32]
+  [payload      : bytes]  -- encoded Vec<ExtentInfo> (1 entry)
+```
+
+For sealed/flushed extents: `base_offset <= offset < base_offset + message_count`. For the active extent: `offset >= base_offset` (message_count is 0 in metadata).
+
+**ExtentInfo** payload encoding (shared by 0x31, 0x33, 0x35):
 
 ```
 [num_extents:u32]
@@ -263,9 +578,20 @@ Fields:
 
 **Control (0xFE-0xFF)**
 
-| Opcode | Name | Direction | Description |
-|--------|------|-----------|-------------|
-| 0xFF | ERROR | Any->Any | Error response. Header Extent ID carries the relevant extent (e.g., the full/sealed extent for ExtentFull/ExtentSealed errors; 0 otherwise). Payload = error code (u16) + message. Error codes: 0=Ok, 1=UnknownStream, 2=InvalidOffset, 3=ExtentSealed, 4=InternalError, 5=ExtentFull. |
+##### 0xFF ERROR (Any -> Any)
+
+Error response. Variable header carries the error code and the relevant extent ID (for ExtentFull/ExtentSealed errors so the client can identify which extent triggered the error without a round-trip).
+
+```
+Fixed Header (8B)
+Variable Header:
+  [error_code   : u16]    -- 0=Ok, 1=UnknownStream, 2=InvalidOffset,
+                              3=ExtentSealed, 4=InternalError, 5=ExtentFull
+  [extent_id    : u32]    -- relevant extent (0 when not applicable)
+Payload:
+  [payload_len  : u32]
+  [payload      : bytes]  -- human-readable error message (UTF-8)
+```
 
 #### Connection Model
 
@@ -296,7 +622,7 @@ stream-store/                          (Workspace root)
     │
     ├── rpc/                           -- Custom TCP wire protocol (depends: common, tokio, bytes)
     │   └── src/lib.rs
-    │       ├── frame.rs               -- Wire format encode/decode (32-byte fixed header + payload)
+    │       ├── frame.rs               -- Wire format encode/decode (8-byte fixed header + variable header + payload)
     │       ├── codec.rs               -- Tokio Encoder/Decoder for frame framing
     │       └── payload.rs             -- Structured payload encode/decode helpers
     │
@@ -816,7 +1142,7 @@ mysql_url = "mysql://user:pass@db-host:3306/mqtt_storage"
 |---|---|---|
 | Process model | Dedicated Rust process | No GC pauses, zero-copy I/O, precise memory control, enforced architectural boundary |
 | Implementation language | Rust (Tokio async runtime) | Deterministic memory, zero-cost abstractions, mature async ecosystem (aws-sdk-s3, sqlx, moka) |
-| RPC protocol | Custom TCP with fixed header + raw payload | Minimal overhead, zero-copy broadcast forwarding, full control over batching and framing |
+| RPC protocol | Custom TCP with fixed header + variable header + payload (MQTT-style) | Minimal overhead, zero-copy broadcast forwarding, per-opcode wire layout, full control over batching and framing |
 | Object storage API | S3-compatible | Widest ecosystem (AWS, MinIO, Ceph, Alibaba OSS S3-compat) |
 | Replication protocol | Broadcast replication with quorum ACK | O(1) hop latency (vs O(N) for chain), tolerates minority failures, simple parallel fan-out |
 | Durability before S3 | Pure in-memory N-way (default 2-way) | Low latency; single-node failure tolerated; S3 flush bounds risk |

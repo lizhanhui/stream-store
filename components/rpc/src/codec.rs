@@ -30,7 +30,7 @@ impl Encoder<Frame> for FrameCodec {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use common::types::{ExtentId, Offset, Opcode, StreamId};
+    use common::types::{Opcode, StreamId, ExtentId};
 
     #[test]
     fn codec_round_trip() {
@@ -40,9 +40,9 @@ mod tests {
             flags: 0,
             request_id: 1,
             stream_id: StreamId(10),
-            extent_id: ExtentId(0),
-            offset: Offset(0),
+            extent_id: ExtentId(5),
             payload: Bytes::from_static(b"test payload"),
+            ..Default::default()
         };
 
         let mut buf = BytesMut::new();

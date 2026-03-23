@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::types::{ExtentId, Offset, Opcode, StreamId};
+use common::types::{Offset, Opcode, StreamId};
 use rpc::frame::Frame;
 use rpc::payload::build_register_extent_payload;
 use tokio::sync::{broadcast, mpsc};
@@ -100,12 +100,9 @@ async fn register_extent(
     framed
         .send(Frame {
             opcode: Opcode::RegisterExtent,
-            flags: 0,
-            request_id: 0,
             stream_id: StreamId(stream_id),
-            extent_id: ExtentId(0),
-            offset: Offset(0),
             payload,
+            ..Default::default()
         })
         .await
         .unwrap();

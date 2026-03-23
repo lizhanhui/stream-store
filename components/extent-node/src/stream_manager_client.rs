@@ -12,12 +12,13 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::errors::StorageError;
-use common::types::{ExtentId, NodeMetrics, Offset, Opcode, StreamId};
+use common::types::Opcode;
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
 use rpc::payload::{build_connect_payload, build_disconnect_payload, build_heartbeat_payload};
+use common::errors::StorageError;
+use common::types::NodeMetrics;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -158,12 +159,8 @@ impl StreamManagerClient {
         );
         let connect_frame = Frame {
             opcode: Opcode::Connect,
-            flags: 0,
-            request_id: 0,
-            stream_id: StreamId(0),
-            extent_id: ExtentId(0),
-            offset: Offset(0),
             payload: connect_payload,
+            ..Default::default()
         };
         framed.send(connect_frame).await?;
 
@@ -198,12 +195,9 @@ impl StreamManagerClient {
                     info!("shutdown signal received; sending Disconnect to StreamManager");
                     let disconnect_frame = Frame {
                         opcode: Opcode::Disconnect,
-                        flags: 0,
                         request_id,
-                        stream_id: StreamId(0),
-                        extent_id: ExtentId(0),
-                        offset: Offset(0),
                         payload: build_disconnect_payload(advertised_addr),
+                        ..Default::default()
                     };
                     if let Err(e) = framed.send(disconnect_frame).await {
                         warn!("failed to send Disconnect to StreamManager: {e}");
@@ -261,12 +255,9 @@ impl StreamManagerClient {
 
             let hb_frame = Frame {
                 opcode: Opcode::Heartbeat,
-                flags: 0,
                 request_id,
-                stream_id: StreamId(0),
-                extent_id: ExtentId(0),
-                offset: Offset(0),
                 payload: heartbeat_payload,
+                ..Default::default()
             };
             request_id = request_id.wrapping_add(1);
 
