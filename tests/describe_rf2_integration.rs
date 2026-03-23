@@ -19,8 +19,7 @@ use extent_node::store::{ExtentNodeStore, ForwardRequest};
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .try_init();
 }
@@ -70,9 +69,7 @@ async fn start_stream_manager_rf2() -> String {
         StreamManagerStore::new(store, allocator, config.default_replication_factor);
     let handler = Arc::new(stream_manager_store);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
     tokio::spawn(async move {
@@ -90,9 +87,7 @@ async fn start_stream_manager_rf2() -> String {
 /// Start a broadcast-replication-enabled ExtentNode server (with deferred ACK support).
 /// Returns the listen address.
 async fn start_broadcast_extent_node() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
     let (forward_tx, forward_rx) = mpsc::channel::<ForwardRequest>(4096);
@@ -106,14 +101,24 @@ async fn start_broadcast_extent_node() -> String {
     // Spawn DownstreamManager.
     let downstream_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        extent_node::downstream::run_downstream_manager(forward_rx, watermark_tx, downstream_shutdown).await;
+        extent_node::downstream::run_downstream_manager(
+            forward_rx,
+            watermark_tx,
+            downstream_shutdown,
+        )
+        .await;
     });
 
     // Spawn WatermarkHandler.
     let store_for_wm = Arc::clone(&store);
     let watermark_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        extent_node::watermark::run_watermark_handler(watermark_rx, store_for_wm, watermark_shutdown).await;
+        extent_node::watermark::run_watermark_handler(
+            watermark_rx,
+            store_for_wm,
+            watermark_shutdown,
+        )
+        .await;
     });
 
     // Keep shutdown_tx alive so receivers don't see Closed.
@@ -142,20 +147,26 @@ async fn describe_stream_rf2_integration() {
     let extent_node_2_addr = start_broadcast_extent_node().await;
     let stream_manager_addr = start_stream_manager_rf2().await;
 
-    let mut stream_manager = client::StorageClient::connect(&stream_manager_addr).await.unwrap();
+    let mut stream_manager = client::StorageClient::connect(&stream_manager_addr)
+        .await
+        .unwrap();
 
     // Register both ExtentNodes with the StreamManager.
-    stream_manager.connect_extent_node("extent-node-1", &extent_node_1_addr, 5000)
+    stream_manager
+        .connect_extent_node("extent-node-1", &extent_node_1_addr, 5000)
         .await
         .unwrap();
-    stream_manager.heartbeat("extent-node-1", &NodeMetrics::default())
+    stream_manager
+        .heartbeat("extent-node-1", &NodeMetrics::default())
         .await
         .unwrap();
 
-    stream_manager.connect_extent_node("extent-node-2", &extent_node_2_addr, 5000)
+    stream_manager
+        .connect_extent_node("extent-node-2", &extent_node_2_addr, 5000)
         .await
         .unwrap();
-    stream_manager.heartbeat("extent-node-2", &NodeMetrics::default())
+    stream_manager
+        .heartbeat("extent-node-2", &NodeMetrics::default())
         .await
         .unwrap();
 
@@ -168,10 +179,8 @@ async fn describe_stream_rf2_integration() {
             .as_millis()
     );
 
-    let (stream_id, first_extent_id, primary_addr) = stream_manager
-        .create_stream_on_stream_manager(&stream_name, 2)
-        .await
-        .unwrap();
+    let (stream_id, first_extent_id, primary_addr) =
+        stream_manager.create_stream(&stream_name, 2).await.unwrap();
 
     assert!(stream_id.0 > 0);
     // Primary should be one of the two registered ENs.
@@ -222,8 +231,10 @@ async fn describe_stream_rf2_integration() {
     assert_eq!(secondary_replica.node_addr, *expected_secondary);
 
     // ── Part 3: Seal and create new extent, then describe all ──
-    let (second_extent_id, new_primary_addr) =
-        stream_manager.client_seal(stream_id, first_extent_id).await.unwrap();
+    let (second_extent_id, new_primary_addr) = stream_manager
+        .seal(stream_id, first_extent_id)
+        .await
+        .unwrap();
 
     // Append to new extent.
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -248,7 +259,11 @@ async fn describe_stream_rf2_integration() {
     assert_eq!(new_ext.extent_id, (second_extent_id as u32));
     assert_eq!(new_ext.state, ExtentState::Active);
     assert_eq!(new_ext.base_offset, 5);
-    assert_eq!(new_ext.replicas.len(), 2, "new extent should also have RF=2");
+    assert_eq!(
+        new_ext.replicas.len(),
+        2,
+        "new extent should also have RF=2"
+    );
 
     assert_eq!(sealed_ext.extent_id, first_extent_id.0);
     assert_eq!(sealed_ext.state, ExtentState::Sealed);
@@ -293,11 +308,7 @@ async fn describe_stream_rf2_integration() {
     // ── Part 5: Disconnect one EN, verify is_alive goes false ──
     //
     // Determine which EN is Secondary on the sealed extent so we disconnect it.
-    let sealed_secondary = sealed_ext
-        .replicas
-        .iter()
-        .find(|r| r.role == 1)
-        .unwrap();
+    let sealed_secondary = sealed_ext.replicas.iter().find(|r| r.role == 1).unwrap();
     let dead_addr = &sealed_secondary.node_addr;
     let dead_node_id = if *dead_addr == extent_node_1_addr {
         "extent-node-1"
@@ -306,7 +317,10 @@ async fn describe_stream_rf2_integration() {
     };
 
     // Disconnect the node from SM (this marks it Dead in the node table).
-    stream_manager.disconnect_extent_node(dead_node_id).await.unwrap();
+    stream_manager
+        .disconnect_extent_node(dead_node_id)
+        .await
+        .unwrap();
 
     // Now describe again — the disconnected node should show is_alive=false.
     let after_disconnect = stream_manager.describe_stream(stream_id, 0).await.unwrap();
@@ -366,10 +380,20 @@ async fn describe_stream_rf2_integration() {
     assert_eq!(s.state, ExtentState::Sealed);
     assert_eq!(s.base_offset, 0);
     assert_eq!(s.message_count, 5);
-    assert_eq!(s.replicas.len(), 2, "RF=2 seek result should have 2 replicas");
+    assert_eq!(
+        s.replicas.len(),
+        2,
+        "RF=2 seek result should have 2 replicas"
+    );
     // Verify roles.
-    assert!(s.replicas.iter().any(|r| r.role == 0), "should have Primary");
-    assert!(s.replicas.iter().any(|r| r.role == 1), "should have Secondary");
+    assert!(
+        s.replicas.iter().any(|r| r.role == 0),
+        "should have Primary"
+    );
+    assert!(
+        s.replicas.iter().any(|r| r.role == 1),
+        "should have Secondary"
+    );
 
     // 6b. Seek offset=3 -> still first sealed extent (mid-range).
     let s = stream_manager.seek(stream_id, Offset(3)).await.unwrap();
@@ -389,12 +413,20 @@ async fn describe_stream_rf2_integration() {
 
     // 6e. Seek reflects node liveness: the dead node should show is_alive=false.
     let s = stream_manager.seek(stream_id, Offset(0)).await.unwrap();
-    let dead_in_seek = s.replicas.iter().find(|r| r.node_addr == *dead_addr).unwrap();
+    let dead_in_seek = s
+        .replicas
+        .iter()
+        .find(|r| r.node_addr == *dead_addr)
+        .unwrap();
     assert!(
         !dead_in_seek.is_alive,
         "dead node should be is_alive=false in seek result"
     );
-    let alive_in_seek = s.replicas.iter().find(|r| r.node_addr != *dead_addr).unwrap();
+    let alive_in_seek = s
+        .replicas
+        .iter()
+        .find(|r| r.node_addr != *dead_addr)
+        .unwrap();
     assert!(
         alive_in_seek.is_alive,
         "surviving node should be is_alive=true in seek result"

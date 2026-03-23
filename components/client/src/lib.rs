@@ -8,9 +8,8 @@ use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
 use rpc::payload::{
     build_client_seal_payload, build_connect_payload, build_create_stream_payload,
-    build_describe_extent_payload, build_describe_stream_payload,
-    build_extent_node_seal_payload, build_heartbeat_payload, build_string_payload,
-    parse_extent_info_vec,
+    build_describe_extent_payload, build_describe_stream_payload, build_extent_node_seal_payload,
+    build_heartbeat_payload, build_string_payload, parse_extent_info_vec,
 };
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
@@ -70,15 +69,9 @@ impl StorageClient {
                 let msg = String::from_utf8_lossy(&payload[2..]).to_string();
                 let error_code = ErrorCode::from_u16(code);
                 return Err(match error_code {
-                    Some(ErrorCode::UnknownStream) => {
-                        StorageError::UnknownStream(resp.stream_id)
-                    }
-                    Some(ErrorCode::ExtentFull) => {
-                        StorageError::ExtentFull(resp.extent_id)
-                    }
-                    Some(ErrorCode::ExtentSealed) => {
-                        StorageError::ExtentSealed(resp.extent_id)
-                    }
+                    Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id),
+                    Some(ErrorCode::ExtentFull) => StorageError::ExtentFull(resp.extent_id),
+                    Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id),
                     _ => StorageError::Internal(msg),
                 });
             }
@@ -91,7 +84,7 @@ impl StorageClient {
     /// Payload carries stream name and per-stream replication factor.
     /// If replication_factor=0, the StreamManager uses its default.
     /// Returns (StreamId, ExtentId, ExtentNode address for the first extent).
-    pub async fn create_stream_on_stream_manager(
+    pub async fn create_stream(
         &mut self,
         name: &str,
         replication_factor: u16,
@@ -111,15 +104,17 @@ impl StorageClient {
         // Parse response payload: [extent_id:u32][addr_len:u16][addr]
         let payload = &resp.payload;
         if payload.len() < 6 {
-            return Err(StorageError::Internal("CreateStream response payload too short".into()));
+            return Err(StorageError::Internal(
+                "CreateStream response payload too short".into(),
+            ));
         }
-        let extent_id = ExtentId(u32::from_be_bytes(
-            payload[0..4].try_into().map_err(|_| {
-                StorageError::Internal("invalid extent_id bytes".into())
-            })?,
-        ));
-        let addr = rpc::payload::parse_string_payload(&payload[4..])
-            .ok_or_else(|| StorageError::Internal("invalid CreateStream StreamManager response".into()))?;
+        let extent_id =
+            ExtentId(u32::from_be_bytes(payload[0..4].try_into().map_err(
+                |_| StorageError::Internal("invalid extent_id bytes".into()),
+            )?));
+        let addr = rpc::payload::parse_string_payload(&payload[4..]).ok_or_else(|| {
+            StorageError::Internal("invalid CreateStream StreamManager response".into())
+        })?;
 
         Ok((resp.stream_id, extent_id, addr))
     }
@@ -204,10 +199,7 @@ impl StorageClient {
     }
 
     /// Query the max offset (exclusive) for a stream.
-    pub async fn query_offset(
-        &mut self,
-        stream_id: StreamId,
-    ) -> Result<Offset, StorageError> {
+    pub async fn query_offset(&mut self, stream_id: StreamId) -> Result<Offset, StorageError> {
         let req = Frame {
             opcode: Opcode::QueryOffset,
             flags: 0,
@@ -252,7 +244,11 @@ impl StorageClient {
     }
 
     /// Send Heartbeat to StreamManager with runtime metrics.
-    pub async fn heartbeat(&mut self, node_id: &str, metrics: &NodeMetrics) -> Result<(), StorageError> {
+    pub async fn heartbeat(
+        &mut self,
+        node_id: &str,
+        metrics: &NodeMetrics,
+    ) -> Result<(), StorageError> {
         let req = Frame {
             opcode: Opcode::Heartbeat,
             flags: 0,
@@ -300,7 +296,7 @@ impl StorageClient {
     /// Payload: `[extent_id:u32]` (4 bytes).
     ///
     /// Returns (new_extent_id, new_primary_addr).
-    pub async fn client_seal(
+    pub async fn seal(
         &mut self,
         stream_id: StreamId,
         extent_id: ExtentId,
@@ -329,8 +325,8 @@ impl StorageClient {
             return Err(StorageError::Internal("SealAck payload too short".into()));
         }
         let extent_id = u64::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3],
-            payload[4], payload[5], payload[6], payload[7],
+            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+            payload[7],
         ]);
         let addr = rpc::payload::parse_string_payload(&payload[8..])
             .ok_or_else(|| StorageError::Internal("invalid SealAck addr".into()))?;
@@ -379,8 +375,8 @@ impl StorageClient {
             return Err(StorageError::Internal("SealAck payload too short".into()));
         }
         let extent_id = u64::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3],
-            payload[4], payload[5], payload[6], payload[7],
+            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
+            payload[7],
         ]);
         let addr = rpc::payload::parse_string_payload(&payload[8..])
             .ok_or_else(|| StorageError::Internal("invalid SealAck addr".into()))?;
@@ -417,9 +413,8 @@ impl StorageClient {
                 resp.opcode
             )));
         }
-        parse_extent_info_vec(&resp.payload).ok_or_else(|| {
-            StorageError::Internal("invalid DescribeStreamResp payload".into())
-        })
+        parse_extent_info_vec(&resp.payload)
+            .ok_or_else(|| StorageError::Internal("invalid DescribeStreamResp payload".into()))
     }
 
     /// Describe a single extent with replica info and node liveness.
@@ -445,9 +440,8 @@ impl StorageClient {
                 resp.opcode
             )));
         }
-        let extents = parse_extent_info_vec(&resp.payload).ok_or_else(|| {
-            StorageError::Internal("invalid DescribeExtentResp payload".into())
-        })?;
+        let extents = parse_extent_info_vec(&resp.payload)
+            .ok_or_else(|| StorageError::Internal("invalid DescribeExtentResp payload".into()))?;
         extents.into_iter().next().ok_or_else(|| {
             StorageError::Internal("DescribeExtentResp returned empty result".into())
         })
@@ -482,11 +476,11 @@ impl StorageClient {
                 resp.opcode
             )));
         }
-        let extents = parse_extent_info_vec(&resp.payload).ok_or_else(|| {
-            StorageError::Internal("invalid SeekResp payload".into())
-        })?;
-        extents.into_iter().next().ok_or_else(|| {
-            StorageError::Internal("SeekResp returned empty result".into())
-        })
+        let extents = parse_extent_info_vec(&resp.payload)
+            .ok_or_else(|| StorageError::Internal("invalid SeekResp payload".into()))?;
+        extents
+            .into_iter()
+            .next()
+            .ok_or_else(|| StorageError::Internal("SeekResp returned empty result".into()))
     }
 }

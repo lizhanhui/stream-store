@@ -55,8 +55,7 @@ async fn main() {
     // Override via RUST_LOG env var, e.g. RUST_LOG=debug or RUST_LOG=stream_manager=debug,extent_node=trace.
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
 
@@ -102,7 +101,7 @@ async fn main() {
             .expect("failed to connect to StreamManager");
 
     let (stream_id, extent_id, primary_addr) = stream_manager_client
-        .create_stream_on_stream_manager("example-stream", 2)
+        .create_stream("example-stream", 2)
         .await
         .expect("failed to create stream");
 
@@ -126,7 +125,10 @@ async fn main() {
             .append(stream_id, Bytes::from(msg.clone()))
             .await
             .expect("append failed");
-        info!("    Appended \"{}\" at offset {}, byte_pos={}", msg, offset.offset.0, offset.byte_pos);
+        info!(
+            "    Appended \"{}\" at offset {}, byte_pos={}",
+            msg, offset.offset.0, offset.byte_pos
+        );
     }
 
     // ── 7. Query max offset ──
@@ -156,7 +158,7 @@ async fn main() {
 
     // ── 9. Seal extent via StreamManager (client seal — StreamManager queries ExtentNodes for offset) ──
     let (new_extent_id_raw, new_primary_addr) = stream_manager_client
-        .client_seal(stream_id, extent_id)
+        .seal(stream_id, extent_id)
         .await
         .expect("seal failed");
     let message_count = messages.len() as u32;
@@ -165,18 +167,14 @@ async fn main() {
         "[8] Sealed extent {:?} (message_count={message_count})",
         extent_id
     );
-    info!(
-        "    New extent_id={new_extent_id_raw}, primary={new_primary_addr}"
-    );
+    info!("    New extent_id={new_extent_id_raw}, primary={new_primary_addr}");
 
     // ── 10. Append more records to the new extent ──
     let mut extent_node_client_2 = client::StorageClient::connect(&new_primary_addr)
         .await
         .expect("failed to connect to ExtentNode for new extent");
 
-    let new_messages: Vec<String> = (0..3)
-        .map(|i| format!("After seal #{i}"))
-        .collect();
+    let new_messages: Vec<String> = (0..3).map(|i| format!("After seal #{i}")).collect();
 
     info!(
         "[9] Appending {} messages to new extent...",
@@ -187,7 +185,10 @@ async fn main() {
             .append(stream_id, Bytes::from(msg.clone()))
             .await
             .expect("append after seal failed");
-        info!("    Appended \"{}\" at offset {}, byte_pos={}", msg, offset.offset.0, offset.byte_pos);
+        info!(
+            "    Appended \"{}\" at offset {}, byte_pos={}",
+            msg, offset.offset.0, offset.byte_pos
+        );
     }
 
     // ── 11. Read from new extent ──
@@ -219,7 +220,7 @@ async fn main() {
     // ── 12. Seal the second extent ──
     let new_extent_id = ExtentId(new_extent_id_raw as u32);
     let (final_extent_id, final_addr) = stream_manager_client
-        .client_seal(stream_id, new_extent_id)
+        .seal(stream_id, new_extent_id)
         .await
         .expect("second seal failed");
 

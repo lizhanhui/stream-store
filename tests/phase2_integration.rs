@@ -14,8 +14,7 @@ use common::types::{ExtentId, ExtentState, NodeMetrics, Offset};
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .try_init();
 }
@@ -23,10 +22,10 @@ fn init_tracing() {
 /// Start a StreamManager server on a random port with real MySQL.
 /// Drops and recreates tables via Refinery for a clean slate.
 async fn start_stream_manager_server() -> String {
+    use std::sync::Arc;
     use stream_manager::allocator::Allocator;
     use stream_manager::metadata::MetadataStore;
     use stream_manager::store::StreamManagerStore;
-    use std::sync::Arc;
 
     let config = StreamManagerConfig {
         default_replication_factor: 1, // single ExtentNode for this test
@@ -39,7 +38,14 @@ async fn start_stream_manager_server() -> String {
         .connect(&config.mysql_url)
         .await
         .expect("failed to connect for cleanup");
-    for table in &["extent_replica", "extent", "stream_sequence", "stream", "node", "refinery_schema_history"] {
+    for table in &[
+        "extent_replica",
+        "extent",
+        "stream_sequence",
+        "stream",
+        "node",
+        "refinery_schema_history",
+    ] {
         sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
             .execute(&pool)
             .await
@@ -54,12 +60,11 @@ async fn start_stream_manager_server() -> String {
     store.migrate().await.expect("failed to migrate");
 
     let allocator = Arc::new(tokio::sync::Mutex::new(Allocator::new()));
-    let stream_manager_store = StreamManagerStore::new(store, allocator, config.default_replication_factor);
+    let stream_manager_store =
+        StreamManagerStore::new(store, allocator, config.default_replication_factor);
     let handler = Arc::new(stream_manager_store);
 
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
     tokio::spawn(async move {
@@ -76,14 +81,10 @@ async fn start_stream_manager_server() -> String {
 
 /// Start an ExtentNode server on a random port.
 async fn start_extent_node_server() -> String {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
-    let store = std::sync::Arc::new(
-        extent_node::store::ExtentNodeStore::new(),
-    );
+    let store = std::sync::Arc::new(extent_node::store::ExtentNodeStore::new());
 
     tokio::spawn(async move {
         server::Server::builder("ExtentNode-test")
@@ -108,7 +109,9 @@ async fn stream_manager_integration() {
 
     // ── Part 1: Connect, heartbeat, disconnect (node lifecycle) ──
     {
-        let mut c = client::StorageClient::connect(&stream_manager_addr).await.unwrap();
+        let mut c = client::StorageClient::connect(&stream_manager_addr)
+            .await
+            .unwrap();
 
         // Register an ExtentNode node.
         c.connect_extent_node("extent-node-test-1", "127.0.0.1:9801", 5000)
@@ -116,15 +119,21 @@ async fn stream_manager_integration() {
             .unwrap();
 
         // Send heartbeat.
-        c.heartbeat("extent-node-test-1", &NodeMetrics::default()).await.unwrap();
+        c.heartbeat("extent-node-test-1", &NodeMetrics::default())
+            .await
+            .unwrap();
 
         // Disconnect.
-        c.disconnect_extent_node("extent-node-test-1").await.unwrap();
+        c.disconnect_extent_node("extent-node-test-1")
+            .await
+            .unwrap();
     }
 
     // ── Part 2: Create stream, append, seal, query offset ──
     {
-        let mut stream_manager_client = client::StorageClient::connect(&stream_manager_addr).await.unwrap();
+        let mut stream_manager_client = client::StorageClient::connect(&stream_manager_addr)
+            .await
+            .unwrap();
 
         // Register the ExtentNode with StreamManager.
         stream_manager_client
@@ -142,7 +151,7 @@ async fn stream_manager_integration() {
         );
 
         let (stream_id, extent_id, returned_addr) = stream_manager_client
-            .create_stream_on_stream_manager(&stream_name, 1)
+            .create_stream(&stream_name, 1)
             .await
             .unwrap();
 
@@ -151,7 +160,9 @@ async fn stream_manager_integration() {
 
         // Append to ExtentNode directly using the SM-assigned stream_id.
         // The EN knows about this stream_id because SM sent RegisterExtent.
-        let mut en_client = client::StorageClient::connect(&extent_node_addr).await.unwrap();
+        let mut en_client = client::StorageClient::connect(&extent_node_addr)
+            .await
+            .unwrap();
 
         for i in 0u64..5 {
             en_client
@@ -165,7 +176,10 @@ async fn stream_manager_integration() {
         assert_eq!(offset, Offset(0)); // active extent has 0 in metadata
 
         // Seal via StreamManager with explicit extent_id.
-        let (new_extent_id, new_addr) = stream_manager_client.client_seal(stream_id, extent_id).await.unwrap();
+        let (new_extent_id, new_addr) = stream_manager_client
+            .seal(stream_id, extent_id)
+            .await
+            .unwrap();
         assert!(new_extent_id > 0);
         assert_eq!(new_addr, extent_node_addr); // only one ExtentNode, seal-and-new goes to same node
 
@@ -175,7 +189,9 @@ async fn stream_manager_integration() {
 
         // Append more to the new extent, then seal again.
         // Need a fresh EN client since the stream was sealed and new extent registered.
-        let mut en_client2 = client::StorageClient::connect(&extent_node_addr).await.unwrap();
+        let mut en_client2 = client::StorageClient::connect(&extent_node_addr)
+            .await
+            .unwrap();
         for i in 0u64..10 {
             en_client2
                 .append(stream_id, Bytes::from(format!("msg2-{i}")))
@@ -184,7 +200,10 @@ async fn stream_manager_integration() {
         }
 
         let new_eid = ExtentId(new_extent_id as u32);
-        let (third_extent_id, _) = stream_manager_client.client_seal(stream_id, new_eid).await.unwrap();
+        let (third_extent_id, _) = stream_manager_client
+            .seal(stream_id, new_eid)
+            .await
+            .unwrap();
         let offset = stream_manager_client.query_offset(stream_id).await.unwrap();
         assert_eq!(offset, Offset(15)); // 5 + 10 = 15
 
@@ -196,7 +215,10 @@ async fn stream_manager_integration() {
         //   extent_id=3  base_offset=15  message_count=0   state=Active
 
         // 3a. describe_stream(count=0) — all extents, latest first.
-        let all_extents = stream_manager_client.describe_stream(stream_id, 0).await.unwrap();
+        let all_extents = stream_manager_client
+            .describe_stream(stream_id, 0)
+            .await
+            .unwrap();
         assert_eq!(all_extents.len(), 3);
         // Ordered by extent_id descending: 3, 2, 1.
         assert_eq!(all_extents[0].extent_id, (third_extent_id as u32));
@@ -216,20 +238,30 @@ async fn stream_manager_integration() {
 
         // 3b. Each extent should have exactly 1 replica (RF=1) — the registered ExtentNode.
         for ext in &all_extents {
-            assert_eq!(ext.replicas.len(), 1, "RF=1 should have 1 replica per extent");
+            assert_eq!(
+                ext.replicas.len(),
+                1,
+                "RF=1 should have 1 replica per extent"
+            );
             assert_eq!(ext.replicas[0].node_addr, extent_node_addr);
             assert_eq!(ext.replicas[0].role, 0); // Primary
             assert!(ext.replicas[0].is_alive, "node should be alive");
         }
 
         // 3c. describe_stream(count=1) — latest (active) extent only.
-        let latest = stream_manager_client.describe_stream(stream_id, 1).await.unwrap();
+        let latest = stream_manager_client
+            .describe_stream(stream_id, 1)
+            .await
+            .unwrap();
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].extent_id, (third_extent_id as u32));
         assert_eq!(latest[0].state, ExtentState::Active);
 
         // 3d. describe_stream(count=2) — latest 2 extents.
-        let top2 = stream_manager_client.describe_stream(stream_id, 2).await.unwrap();
+        let top2 = stream_manager_client
+            .describe_stream(stream_id, 2)
+            .await
+            .unwrap();
         assert_eq!(top2.len(), 2);
         assert_eq!(top2[0].extent_id, (third_extent_id as u32));
         assert_eq!(top2[1].extent_id, (new_extent_id as u32));
@@ -282,7 +314,10 @@ async fn stream_manager_integration() {
         let third_eid = third_extent_id;
 
         // 4a. Seek offset=0 -> first sealed extent (start of first extent).
-        let s = stream_manager_client.seek(stream_id, Offset(0)).await.unwrap();
+        let s = stream_manager_client
+            .seek(stream_id, Offset(0))
+            .await
+            .unwrap();
         assert_eq!(s.extent_id, first_eid);
         assert_eq!(s.state, ExtentState::Sealed);
         assert_eq!(s.base_offset, 0);
@@ -291,36 +326,57 @@ async fn stream_manager_integration() {
         assert_eq!(s.replicas[0].node_addr, extent_node_addr);
 
         // 4b. Seek offset=3 -> first sealed extent (mid-range).
-        let s = stream_manager_client.seek(stream_id, Offset(3)).await.unwrap();
+        let s = stream_manager_client
+            .seek(stream_id, Offset(3))
+            .await
+            .unwrap();
         assert_eq!(s.extent_id, first_eid);
 
         // 4c. Seek offset=4 -> first sealed extent (last message).
-        let s = stream_manager_client.seek(stream_id, Offset(4)).await.unwrap();
+        let s = stream_manager_client
+            .seek(stream_id, Offset(4))
+            .await
+            .unwrap();
         assert_eq!(s.extent_id, first_eid);
 
         // 4d. Seek offset=5 -> second sealed extent (boundary = start of second).
-        let s = stream_manager_client.seek(stream_id, Offset(5)).await.unwrap();
+        let s = stream_manager_client
+            .seek(stream_id, Offset(5))
+            .await
+            .unwrap();
         assert_eq!(s.extent_id, (second_eid as u32));
         assert_eq!(s.state, ExtentState::Sealed);
         assert_eq!(s.base_offset, 5);
         assert_eq!(s.message_count, 10);
 
         // 4e. Seek offset=12 -> second sealed extent (mid-range).
-        let s = stream_manager_client.seek(stream_id, Offset(12)).await.unwrap();
+        let s = stream_manager_client
+            .seek(stream_id, Offset(12))
+            .await
+            .unwrap();
         assert_eq!(s.extent_id, (second_eid as u32));
 
         // 4f. Seek offset=14 -> second sealed extent (last message).
-        let s = stream_manager_client.seek(stream_id, Offset(14)).await.unwrap();
+        let s = stream_manager_client
+            .seek(stream_id, Offset(14))
+            .await
+            .unwrap();
         assert_eq!(s.extent_id, (second_eid as u32));
 
         // 4g. Seek offset=15 -> active (mutable) extent (boundary = start of active).
-        let s = stream_manager_client.seek(stream_id, Offset(15)).await.unwrap();
+        let s = stream_manager_client
+            .seek(stream_id, Offset(15))
+            .await
+            .unwrap();
         assert_eq!(s.extent_id, (third_eid as u32));
         assert_eq!(s.state, ExtentState::Active);
         assert_eq!(s.base_offset, 15);
 
         // 4h. Seek offset=999 -> active extent (far beyond committed data, still the tail).
-        let s = stream_manager_client.seek(stream_id, Offset(999)).await.unwrap();
+        let s = stream_manager_client
+            .seek(stream_id, Offset(999))
+            .await
+            .unwrap();
         assert_eq!(s.extent_id, (third_eid as u32));
         assert_eq!(s.state, ExtentState::Active);
     }

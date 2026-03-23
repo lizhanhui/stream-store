@@ -1,9 +1,10 @@
 use std::sync::Arc;
 
+use crate::metadata::{MetadataStore, SealResult};
 use bytes::{BufMut, Bytes, BytesMut};
-use futures_util::future;
 use common::errors::StorageError;
 use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId};
+use futures_util::future;
 use rpc::frame::Frame;
 use rpc::payload::{
     build_register_extent_payload, encode_extent_info_vec, parse_client_seal_payload,
@@ -12,7 +13,6 @@ use rpc::payload::{
     parse_string_payload,
 };
 use server::handler::RequestHandler;
-use crate::metadata::{MetadataStore, SealResult};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -22,10 +22,7 @@ use crate::allocator::Allocator;
 ///
 /// This is a free function (not a method) so that it can be called from async tasks
 /// spawned for concurrent sealing without borrowing `self`.
-async fn seal_extent_node_static(
-    addr: &str,
-    stream_id: StreamId,
-) -> Result<u64, StorageError> {
+async fn seal_extent_node_static(addr: &str, stream_id: StreamId) -> Result<u64, StorageError> {
     let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
         StorageError::Internal(format!("connect to ExtentNode {addr} for Seal: {e}"))
     })?;
@@ -41,9 +38,7 @@ async fn seal_extent_node_static(
             payload: Bytes::new(),
         })
         .await
-        .map_err(|e| {
-            StorageError::Internal(format!("Seal to ExtentNode {addr}: {e}"))
-        })?;
+        .map_err(|e| StorageError::Internal(format!("Seal to ExtentNode {addr}: {e}")))?;
 
     if resp.opcode == Opcode::Error {
         let msg = String::from_utf8_lossy(&resp.payload).to_string();
@@ -71,7 +66,10 @@ impl StreamManagerStore {
         allocator: Arc<Mutex<Allocator>>,
         default_replication_factor: usize,
     ) -> Self {
-        assert!(default_replication_factor >= 1, "default_replication_factor must be >= 1");
+        assert!(
+            default_replication_factor >= 1,
+            "default_replication_factor must be >= 1"
+        );
         Self {
             store,
             allocator,
@@ -87,14 +85,11 @@ impl StreamManagerStore {
     async fn notify_replica_set(
         &self,
         stream_id: StreamId,
-        extent_id: common::types::ExtentId,
+        extent_id: ExtentId,
         replica_addrs: &[String],
     ) -> Result<(), StorageError> {
         // Collect secondary addresses (all addresses after the first).
-        let secondary_addrs: Vec<&str> = replica_addrs[1..]
-            .iter()
-            .map(|s| s.as_str())
-            .collect();
+        let secondary_addrs: Vec<&str> = replica_addrs[1..].iter().map(|s| s.as_str()).collect();
 
         for (i, addr) in replica_addrs.iter().enumerate() {
             let role = i as u8;
@@ -107,16 +102,13 @@ impl StreamManagerStore {
                 vec![]
             };
 
-            let payload = build_register_extent_payload(
-                stream_id.0,
-                extent_id.0,
-                role,
-                rf,
-                &addrs_for_node,
-            );
+            let payload =
+                build_register_extent_payload(stream_id.0, extent_id.0, role, rf, &addrs_for_node);
 
             let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
-                StorageError::Internal(format!("connect to ExtentNode {addr} for RegisterExtent: {e}"))
+                StorageError::Internal(format!(
+                    "connect to ExtentNode {addr} for RegisterExtent: {e}"
+                ))
             })?;
 
             let resp = client
@@ -144,7 +136,9 @@ impl StreamManagerStore {
             let role_name = if role == 0 { "Primary" } else { "Secondary" };
             info!(
                 "RegisterExtent sent to ExtentNode {addr}: stream={:?}, extent={:?}, role={role_name}, rf={rf}, secondaries={}",
-                stream_id, extent_id, addrs_for_node.join(", ")
+                stream_id,
+                extent_id,
+                addrs_for_node.join(", ")
             );
         }
         Ok(())
@@ -161,7 +155,7 @@ impl StreamManagerStore {
         stream_id: StreamId,
         base_offset: u64,
         replication_factor: usize,
-    ) -> Result<(common::types::ExtentId, String), StorageError> {
+    ) -> Result<(ExtentId, String), StorageError> {
         let mut alloc = self.allocator.lock().await;
         let nodes = alloc.pick_nodes(&self.store, replication_factor).await?;
         drop(alloc);
@@ -175,7 +169,10 @@ impl StreamManagerStore {
 
         let node_addrs: Vec<String> = replicas.iter().map(|(addr, _)| addr.clone()).collect();
 
-        let extent_id = self.store.allocate_extent(stream_id, base_offset, &replicas).await?;
+        let extent_id = self
+            .store
+            .allocate_extent(stream_id, base_offset, &replicas)
+            .await?;
 
         info!(
             "extent {:?} allocated for stream {:?}: replicas={:?}",
@@ -185,7 +182,8 @@ impl StreamManagerStore {
         // Notify each ExtentNode of its replication role.
         // Always send RegisterExtent, even for replication_factor=1, so the ExtentNode knows
         // the StreamManager-assigned stream_id and extent_id (required for seal coordination).
-        self.notify_replica_set(stream_id, extent_id, &node_addrs).await?;
+        self.notify_replica_set(stream_id, extent_id, &node_addrs)
+            .await?;
 
         Ok((extent_id, node_addrs[0].clone()))
     }
@@ -226,7 +224,9 @@ impl StreamManagerStore {
             Some((node_id, addr, interval_ms)) => {
                 match self.store.register_node(&node_id, &addr, interval_ms).await {
                     Ok(()) => {
-                        info!("ExtentNode registered: node_id={node_id}, addr={addr}, interval={interval_ms}ms");
+                        info!(
+                            "ExtentNode registered: node_id={node_id}, addr={addr}, interval={interval_ms}ms"
+                        );
                         Frame {
                             opcode: Opcode::ConnectAck,
                             flags: 0,
@@ -239,7 +239,12 @@ impl StreamManagerStore {
                     }
                     Err(e) => {
                         error!("register_node failed: {e}");
-                        Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                        Frame::error_response(
+                            frame.request_id,
+                            ErrorCode::InternalError,
+                            &e.to_string(),
+                            ExtentId(0),
+                        )
                     }
                 }
             }
@@ -275,7 +280,12 @@ impl StreamManagerStore {
                     }
                     Err(e) => {
                         error!("update_heartbeat failed: {e}");
-                        Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                        Frame::error_response(
+                            frame.request_id,
+                            ErrorCode::InternalError,
+                            &e.to_string(),
+                            ExtentId(0),
+                        )
                     }
                 }
             }
@@ -312,7 +322,12 @@ impl StreamManagerStore {
                     }
                     Err(e) => {
                         error!("mark_node_dead on disconnect failed: {e}");
-                        Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                        Frame::error_response(
+                            frame.request_id,
+                            ErrorCode::InternalError,
+                            &e.to_string(),
+                            ExtentId(0),
+                        )
                     }
                 }
             }
@@ -388,7 +403,12 @@ impl StreamManagerStore {
             },
             Err(e) => {
                 error!("create_stream failed: {e}");
-                Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                Frame::error_response(
+                    frame.request_id,
+                    ErrorCode::InternalError,
+                    &e.to_string(),
+                    ExtentId(0),
+                )
             }
         }
     }
@@ -431,7 +451,8 @@ impl StreamManagerStore {
                     );
                 }
             };
-            self.extent_node_seal(stream_id, ExtentId(extent_id_raw), offset).await
+            self.extent_node_seal(stream_id, ExtentId(extent_id_raw), offset)
+                .await
         } else {
             Err(StorageError::Internal(format!(
                 "invalid Seal payload length: expected 4 (client_seal) or 12 (extent_node_seal), got {payload_len}"
@@ -450,7 +471,12 @@ impl StreamManagerStore {
             },
             Err(e) => {
                 error!("seal failed: {e}");
-                Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                Frame::error_response(
+                    frame.request_id,
+                    ErrorCode::InternalError,
+                    &e.to_string(),
+                    ExtentId(0),
+                )
             }
         }
     }
@@ -501,10 +527,16 @@ impl StreamManagerStore {
             match result {
                 Ok(offset) => {
                     if *role == 0 {
-                        info!("Primary {addr} reports committed offset {offset} for stream {:?}", stream_id);
+                        info!(
+                            "Primary {addr} reports committed offset {offset} for stream {:?}",
+                            stream_id
+                        );
                         primary_offset = Some(*offset);
                     } else {
-                        info!("Secondary {addr} reports offset {offset} for stream {:?}", stream_id);
+                        info!(
+                            "Secondary {addr} reports offset {offset} for stream {:?}",
+                            stream_id
+                        );
                         secondary_offsets.push(*offset);
                     }
                 }
@@ -522,13 +554,14 @@ impl StreamManagerStore {
             if (secondary_offsets.len() as u32) < required_secondary_acks {
                 return Err(StorageError::Internal(format!(
                     "insufficient replicas for seal: need {} secondary ACKs, got {}",
-                    required_secondary_acks, secondary_offsets.len()
+                    required_secondary_acks,
+                    secondary_offsets.len()
                 )));
             }
             // For RF=1 (no secondaries, no primary): this is a failure.
             if secondary_offsets.is_empty() {
                 return Err(StorageError::Internal(
-                    "no ExtentNodes responded to seal".into()
+                    "no ExtentNodes responded to seal".into(),
                 ));
             }
             // Take kth largest, where k = required_secondary_acks.
@@ -553,16 +586,21 @@ impl StreamManagerStore {
         );
 
         // 4. Derive message_count from committed offset.
-        let extent_row = self.store.get_active_extent(stream_id).await?.ok_or_else(|| {
-            StorageError::Internal(format!(
-                "no active extent found for stream {:?} during client_seal",
-                stream_id
-            ))
-        })?;
+        let extent_row = self
+            .store
+            .get_active_extent(stream_id)
+            .await?
+            .ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "no active extent found for stream {:?} during client_seal",
+                    stream_id
+                ))
+            })?;
         let message_count = (committed - extent_row.base_offset) as u32;
 
         // 5. Pick nodes for new extent replica set.
-        self.seal_allocate_notify(stream_id, extent_id, message_count).await
+        self.seal_allocate_notify(stream_id, extent_id, message_count)
+            .await
     }
 
     /// Extent-node-initiated (proactive) seal: the primary EN provides the committed
@@ -586,19 +624,29 @@ impl StreamManagerStore {
         );
 
         // 1. Derive message_count from the provided offset.
-        let extent_row = self.store.get_active_extent(stream_id).await?.ok_or_else(|| {
-            StorageError::Internal(format!(
-                "no active extent found for stream {:?} during extent_node_seal",
-                stream_id
-            ))
-        })?;
+        let extent_row = self
+            .store
+            .get_active_extent(stream_id)
+            .await?
+            .ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "no active extent found for stream {:?} during extent_node_seal",
+                    stream_id
+                ))
+            })?;
         let message_count = (offset - extent_row.base_offset) as u32;
 
         // 2-3. Seal + allocate + notify new replica set.
-        let resp_payload = self.seal_allocate_notify(stream_id, extent_id, message_count).await?;
+        let resp_payload = self
+            .seal_allocate_notify(stream_id, extent_id, message_count)
+            .await?;
 
         // 4. Fire-and-forget: seal all secondary ENs of the old extent.
-        let replicas = self.store.get_replicas(stream_id, extent_id).await.unwrap_or_default();
+        let replicas = self
+            .store
+            .get_replicas(stream_id, extent_id)
+            .await
+            .unwrap_or_default();
         let secondary_addrs: Vec<String> = replicas
             .into_iter()
             .filter(|r| r.role != 0)
@@ -633,7 +681,8 @@ impl StreamManagerStore {
         message_count: u32,
     ) -> Result<Bytes, StorageError> {
         // Pick nodes for new extent replica set using per-stream replication factor.
-        let replication_factor = self.store.get_stream_replication_factor(stream_id).await? as usize;
+        let replication_factor =
+            self.store.get_stream_replication_factor(stream_id).await? as usize;
         let mut alloc = self.allocator.lock().await;
         let nodes = alloc.pick_nodes(&self.store, replication_factor).await?;
         drop(alloc);
@@ -647,12 +696,7 @@ impl StreamManagerStore {
         // Transactional seal + allocate (idempotent for already-sealed extents).
         let seal_result = self
             .store
-            .seal_and_allocate_transaction(
-                stream_id,
-                extent_id,
-                message_count,
-                &new_replicas,
-            )
+            .seal_and_allocate_transaction(stream_id, extent_id, message_count, &new_replicas)
             .await?;
 
         let (new_extent_id, primary_addr) = match seal_result {
@@ -666,7 +710,8 @@ impl StreamManagerStore {
                 );
 
                 // Register new extent on ExtentNodes.
-                self.notify_replica_set(stream_id, new_extent_id, &node_addrs).await?;
+                self.notify_replica_set(stream_id, new_extent_id, &node_addrs)
+                    .await?;
 
                 (new_extent_id, primary_addr)
             }
@@ -704,9 +749,7 @@ impl StreamManagerStore {
                 return Ok(Offset(0));
             }
             let last = &extents[extents.len() - 1];
-            Ok::<Offset, StorageError>(Offset(
-                last.base_offset + last.message_count as u64,
-            ))
+            Ok::<Offset, StorageError>(Offset(last.base_offset + last.message_count as u64))
         }
         .await;
 
@@ -722,7 +765,12 @@ impl StreamManagerStore {
             },
             Err(e) => {
                 error!("query_offset failed: {e}");
-                Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                Frame::error_response(
+                    frame.request_id,
+                    ErrorCode::InternalError,
+                    &e.to_string(),
+                    ExtentId(0),
+                )
             }
         }
     }
@@ -763,7 +811,12 @@ impl StreamManagerStore {
             }
             Err(e) => {
                 error!("describe_stream failed: {e}");
-                Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                Frame::error_response(
+                    frame.request_id,
+                    ErrorCode::InternalError,
+                    &e.to_string(),
+                    ExtentId(0),
+                )
             }
         }
     }
@@ -805,12 +858,20 @@ impl StreamManagerStore {
             Ok(None) => Frame::error_response(
                 frame.request_id,
                 ErrorCode::UnknownStream,
-                &format!("extent not found: stream={:?}, extent={:?}", stream_id, extent_id),
+                &format!(
+                    "extent not found: stream={:?}, extent={:?}",
+                    stream_id, extent_id
+                ),
                 ExtentId(0),
             ),
             Err(e) => {
                 error!("describe_extent failed: {e}");
-                Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                Frame::error_response(
+                    frame.request_id,
+                    ErrorCode::InternalError,
+                    &e.to_string(),
+                    ExtentId(0),
+                )
             }
         }
     }
@@ -847,7 +908,12 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("seek failed: {e}");
-                Frame::error_response(frame.request_id, ErrorCode::InternalError, &e.to_string(), ExtentId(0))
+                Frame::error_response(
+                    frame.request_id,
+                    ErrorCode::InternalError,
+                    &e.to_string(),
+                    ExtentId(0),
+                )
             }
         }
     }

@@ -75,7 +75,7 @@ async fn client_task(
         .unwrap_or_else(|e| panic!("client {client_id}: StreamManager connect failed: {e}"));
 
     let (stream_id, initial_extent_id, initial_primary_addr) = stream_manager_client
-        .create_stream_on_stream_manager(&format!("bench-stream-{client_id}"), REPLICATION_FACTOR)
+        .create_stream(&format!("bench-stream-{client_id}"), REPLICATION_FACTOR)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: create_stream failed: {e}"));
 
@@ -97,7 +97,7 @@ async fn client_task(
             Err(StorageError::ExtentFull(_)) | Err(StorageError::ExtentSealed(_)) => {
                 // Seal the current extent via StreamManager and get a new one.
                 let (new_extent_id_raw, new_primary_addr) = stream_manager_client
-                    .client_seal(stream_id, extent_id)
+                    .seal(stream_id, extent_id)
                     .await
                     .unwrap_or_else(|e| panic!("client {client_id}: seal failed: {e}"));
 
@@ -130,8 +130,7 @@ async fn client_task(
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
 
@@ -157,7 +156,10 @@ async fn main() {
             ..Default::default()
         };
         let extent_node_addr = extent_node::ExtentNode::start(extent_node_config).await;
-        info!("[setup] ExtentNode {i} started on {}", extent_node_addr.addr());
+        info!(
+            "[setup] ExtentNode {i} started on {}",
+            extent_node_addr.addr()
+        );
     }
 
     // ── 4. Wait for heartbeat registration ──
