@@ -524,4 +524,95 @@ mod tests {
         let all_msgs = ext.read(0, total as u32).unwrap();
         assert_eq!(all_msgs.len(), total);
     }
+
+    #[test]
+    fn state_transitions() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        assert_eq!(ext.state(), ExtentState::Active);
+        assert!(!ext.is_sealed());
+
+        ext.seal();
+        assert_eq!(ext.state(), ExtentState::Sealed);
+        assert!(ext.is_sealed());
+    }
+
+    #[test]
+    fn last_offset_empty_extent() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        assert_eq!(ext.last_offset(), None);
+    }
+
+    #[test]
+    fn last_offset_with_records() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(10), 4096);
+        ext.append(Bytes::from_static(b"a")).unwrap();
+        assert_eq!(ext.last_offset(), Some(Offset(10)));
+        ext.append(Bytes::from_static(b"b")).unwrap();
+        assert_eq!(ext.last_offset(), Some(Offset(11)));
+    }
+
+    #[test]
+    fn bytes_written_tracks_cursor() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        assert_eq!(ext.bytes_written(), 0);
+
+        ext.append(Bytes::from_static(b"abc")).unwrap(); // 4 + 3 = 7 bytes
+        assert_eq!(ext.bytes_written(), 7);
+
+        ext.append(Bytes::from_static(b"de")).unwrap(); // 4 + 2 = 6 bytes
+        assert_eq!(ext.bytes_written(), 13);
+    }
+
+    #[test]
+    fn capacity_returns_arena_size() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 8192);
+        assert_eq!(ext.capacity(), 8192);
+    }
+
+    #[test]
+    fn committed_data_empty() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let data = ext.committed_data();
+        assert!(data.is_empty());
+    }
+
+    #[test]
+    fn committed_data_matches_arena_content() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        ext.append(Bytes::from_static(b"hello")).unwrap();
+        ext.append(Bytes::from_static(b"world")).unwrap();
+
+        let data = ext.committed_data();
+        // 2 records, each 4 + 5 = 9 bytes = 18 total
+        assert_eq!(data.len(), 18);
+
+        // First record: len=5, "hello"
+        let len0 = u32::from_be_bytes([data[0], data[1], data[2], data[3]]);
+        assert_eq!(len0, 5);
+        assert_eq!(&data[4..9], b"hello");
+
+        // Second record: len=5, "world"
+        let len1 = u32::from_be_bytes([data[9], data[10], data[11], data[12]]);
+        assert_eq!(len1, 5);
+        assert_eq!(&data[13..18], b"world");
+    }
+
+    #[test]
+    fn debug_format_does_not_panic() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        ext.append(Bytes::from_static(b"test")).unwrap();
+        let debug_str = format!("{:?}", ext);
+        assert!(debug_str.contains("Extent"));
+        assert!(debug_str.contains("id"));
+    }
+
+    #[test]
+    fn seal_is_idempotent() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        ext.append(Bytes::from_static(b"msg")).unwrap();
+        ext.seal();
+        ext.seal(); // should not panic
+        assert!(ext.is_sealed());
+        assert_eq!(ext.message_count(), 1);
+    }
 }

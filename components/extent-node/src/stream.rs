@@ -244,4 +244,87 @@ mod tests {
         assert_eq!(r.offset, Offset(1));
         assert_eq!(stream.max_offset(), Offset(2));
     }
+
+    #[test]
+    fn is_mutable_new_stream() {
+        let stream = Stream::new(StreamId(1));
+        assert!(stream.is_mutable());
+    }
+
+    #[test]
+    fn is_mutable_after_seal_and_new() {
+        let mut stream = Stream::new(StreamId(1));
+        stream.append(Bytes::from_static(b"msg")).unwrap();
+        stream.seal_active();
+        // After seal_active, a new active extent is created, so still mutable.
+        assert!(stream.is_mutable());
+    }
+
+    #[test]
+    fn active_extent_id_changes_after_seal() {
+        let mut stream = Stream::new(StreamId(1));
+        assert_eq!(stream.active_extent_id(), ExtentId(0));
+
+        stream.seal_active();
+        assert_eq!(stream.active_extent_id(), ExtentId(1));
+
+        stream.seal_active();
+        assert_eq!(stream.active_extent_id(), ExtentId(2));
+    }
+
+    #[test]
+    fn with_capacity_uses_custom_arena_size() {
+        let stream = Stream::with_capacity(StreamId(1), 1024);
+        // Should be able to append, but with smaller arena.
+        stream.append(Bytes::from_static(b"test")).unwrap();
+        assert_eq!(stream.max_offset(), Offset(1));
+    }
+
+    #[test]
+    fn multiple_seal_and_new_cycles() {
+        let mut stream = Stream::with_capacity(StreamId(1), 4096);
+
+        // Cycle 1: append 5 messages, seal.
+        for i in 0..5 {
+            let r = stream.append(Bytes::from(format!("c1-{i}"))).unwrap();
+            assert_eq!(r.offset, Offset(i as u64));
+        }
+        let (base, count) = stream.seal_active().unwrap();
+        assert_eq!(base, 0);
+        assert_eq!(count, 5);
+
+        // Cycle 2: append 3 messages, seal.
+        for i in 0..3 {
+            let r = stream.append(Bytes::from(format!("c2-{i}"))).unwrap();
+            assert_eq!(r.offset, Offset(5 + i as u64));
+        }
+        let (base, count) = stream.seal_active().unwrap();
+        assert_eq!(base, 5);
+        assert_eq!(count, 3);
+
+        // Cycle 3: verify new extent starts at offset 8.
+        let r = stream.append(Bytes::from_static(b"c3")).unwrap();
+        assert_eq!(r.offset, Offset(8));
+        assert_eq!(stream.max_offset(), Offset(9));
+    }
+
+    #[test]
+    fn read_across_extent_boundary_returns_from_correct_extent() {
+        let mut stream = Stream::with_capacity(StreamId(1), 4096);
+
+        // First extent: offsets 0, 1.
+        stream.append(Bytes::from_static(b"first-0")).unwrap();
+        stream.append(Bytes::from_static(b"first-1")).unwrap();
+        stream.seal_active();
+
+        // Second extent: offset 2 starts at byte_pos 0.
+        let r = stream.append(Bytes::from_static(b"second-0")).unwrap();
+        assert_eq!(r.offset, Offset(2));
+        assert_eq!(r.byte_pos, 0);
+
+        // Reading offset 2 from the second extent should work.
+        let msgs = stream.read(Offset(2), 0, 1).unwrap();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0], Bytes::from_static(b"second-0"));
+    }
 }

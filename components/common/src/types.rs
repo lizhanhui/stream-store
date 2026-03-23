@@ -235,3 +235,223 @@ impl ErrorCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── Opcode ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn opcode_from_u8_all_valid() {
+        let cases: &[(u8, Opcode)] = &[
+            (0x01, Opcode::Append),
+            (0x02, Opcode::AppendAck),
+            (0x03, Opcode::Read),
+            (0x04, Opcode::ReadResp),
+            (0x05, Opcode::Seal),
+            (0x06, Opcode::SealAck),
+            (0x07, Opcode::CreateStream),
+            (0x08, Opcode::QueryOffset),
+            (0x09, Opcode::QueryOffsetResp),
+            (0x10, Opcode::Connect),
+            (0x11, Opcode::ConnectAck),
+            (0x12, Opcode::Disconnect),
+            (0x13, Opcode::DisconnectAck),
+            (0x14, Opcode::Heartbeat),
+            (0x15, Opcode::RegisterExtent),
+            (0x16, Opcode::RegisterExtentAck),
+            (0x17, Opcode::Watermark),
+            (0x20, Opcode::StreamManagerMembershipChange),
+            (0x30, Opcode::DescribeStream),
+            (0x31, Opcode::DescribeStreamResp),
+            (0x32, Opcode::DescribeExtent),
+            (0x33, Opcode::DescribeExtentResp),
+            (0x34, Opcode::Seek),
+            (0x35, Opcode::SeekResp),
+            (0xFF, Opcode::Error),
+        ];
+        for &(byte, expected) in cases {
+            assert_eq!(
+                Opcode::from_u8(byte),
+                Some(expected),
+                "Opcode::from_u8(0x{byte:02X}) failed"
+            );
+        }
+    }
+
+    #[test]
+    fn opcode_from_u8_invalid_returns_none() {
+        let invalid: &[u8] = &[0x00, 0x0A, 0x0F, 0x18, 0x1F, 0x21, 0x2F, 0x36, 0xFE];
+        for &byte in invalid {
+            assert_eq!(
+                Opcode::from_u8(byte),
+                None,
+                "Opcode::from_u8(0x{byte:02X}) should be None"
+            );
+        }
+    }
+
+    // ── ExtentState ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn extent_state_round_trip() {
+        let states = [
+            (0u8, ExtentState::Unspecified),
+            (1, ExtentState::Active),
+            (2, ExtentState::Sealed),
+            (3, ExtentState::Flushed),
+        ];
+        for (byte, state) in states {
+            assert_eq!(ExtentState::from_u8(byte), Some(state));
+            assert_eq!(state.as_u8(), byte);
+        }
+    }
+
+    #[test]
+    fn extent_state_from_u8_invalid() {
+        for v in [4u8, 10, 128, 255] {
+            assert_eq!(ExtentState::from_u8(v), None);
+        }
+    }
+
+    // ── NodeState ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn node_state_round_trip() {
+        let states = [
+            (0u8, NodeState::Unspecified),
+            (1, NodeState::Alive),
+            (2, NodeState::Dead),
+        ];
+        for (byte, state) in states {
+            assert_eq!(NodeState::from_u8(byte), Some(state));
+            assert_eq!(state.as_u8(), byte);
+        }
+    }
+
+    #[test]
+    fn node_state_from_u8_invalid() {
+        for v in [3u8, 10, 128, 255] {
+            assert_eq!(NodeState::from_u8(v), None);
+        }
+    }
+
+    // ── ErrorCode ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn error_code_from_u16_all_valid() {
+        let cases: &[(u16, ErrorCode)] = &[
+            (0, ErrorCode::Ok),
+            (1, ErrorCode::UnknownStream),
+            (2, ErrorCode::InvalidOffset),
+            (3, ErrorCode::ExtentSealed),
+            (4, ErrorCode::InternalError),
+            (5, ErrorCode::ExtentFull),
+        ];
+        for &(val, expected) in cases {
+            assert_eq!(
+                ErrorCode::from_u16(val),
+                Some(expected),
+                "ErrorCode::from_u16({val}) failed"
+            );
+        }
+    }
+
+    #[test]
+    fn error_code_from_u16_invalid() {
+        for v in [6u16, 100, 1000, u16::MAX] {
+            assert_eq!(ErrorCode::from_u16(v), None);
+        }
+    }
+
+    // ── Offset ordering ──────────────────────────────────────────────────────
+
+    #[test]
+    fn offset_ordering() {
+        assert!(Offset(0) < Offset(1));
+        assert!(Offset(1) < Offset(u64::MAX));
+        assert_eq!(Offset(42), Offset(42));
+
+        let mut offsets = vec![Offset(5), Offset(1), Offset(3), Offset(0), Offset(2)];
+        offsets.sort();
+        assert_eq!(offsets, vec![Offset(0), Offset(1), Offset(2), Offset(3), Offset(5)]);
+    }
+
+    // ── NodeMetrics default ──────────────────────────────────────────────────
+
+    #[test]
+    fn node_metrics_default_is_zero() {
+        let m = NodeMetrics::default();
+        assert_eq!(m.available_memory_bytes, 0);
+        assert_eq!(m.total_memory_bytes, 0);
+        assert_eq!(m.appends_per_sec, 0);
+        assert_eq!(m.active_extent_count, 0);
+        assert_eq!(m.bytes_written_per_sec, 0);
+    }
+
+    // ── StreamId / ExtentId / NodeId equality & hashing ──────────────────────
+
+    #[test]
+    fn stream_id_equality_and_copy() {
+        let a = StreamId(42);
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(StreamId(1), StreamId(2));
+    }
+
+    #[test]
+    fn extent_id_equality_and_copy() {
+        let a = ExtentId(100);
+        let b = a; // Copy
+        assert_eq!(a, b);
+        assert_ne!(ExtentId(0), ExtentId(1));
+    }
+
+    #[test]
+    fn node_id_equality_and_clone() {
+        let a = NodeId("node-1".to_string());
+        let b = a.clone();
+        assert_eq!(a, b);
+        assert_ne!(NodeId("x".to_string()), NodeId("y".to_string()));
+    }
+
+    // ── Constants ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn protocol_constants() {
+        assert_eq!(MAGIC, 0xEF);
+        assert_eq!(PROTOCOL_VERSION, 1);
+        assert_eq!(HEADER_LEN, 32);
+        assert_eq!(FLAG_FORWARDED, 0x01);
+    }
+
+    // ── ExtentInfo / ReplicaDetail construction ──────────────────────────────
+
+    #[test]
+    fn extent_info_construction() {
+        let info = ExtentInfo {
+            extent_id: 1,
+            base_offset: 100,
+            message_count: 50,
+            state: ExtentState::Active,
+            replicas: vec![
+                ReplicaDetail {
+                    node_addr: "10.0.0.1:9801".to_string(),
+                    role: 0,
+                    is_alive: true,
+                },
+                ReplicaDetail {
+                    node_addr: "10.0.0.2:9801".to_string(),
+                    role: 1,
+                    is_alive: false,
+                },
+            ],
+        };
+        assert_eq!(info.extent_id, 1);
+        assert_eq!(info.state, ExtentState::Active);
+        assert_eq!(info.replicas.len(), 2);
+        assert!(info.replicas[0].is_alive);
+        assert!(!info.replicas[1].is_alive);
+    }
+}

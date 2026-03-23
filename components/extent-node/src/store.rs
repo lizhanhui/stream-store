@@ -1469,4 +1469,226 @@ mod tests {
             elapsed.as_secs_f64() * 1000.0,
         );
     }
+
+    // ── ReplicaInfo unit tests ───────────────────────────────────────────────
+
+    #[test]
+    fn replica_info_is_primary() {
+        let ri = ReplicaInfo {
+            stream_id: StreamId(1),
+            extent_id: ExtentId(10),
+            role: ROLE_PRIMARY,
+            replication_factor: 3,
+            replica_addrs: vec!["a:1".into(), "b:2".into()],
+        };
+        assert!(ri.is_primary());
+        assert!(!ri.is_standalone());
+    }
+
+    #[test]
+    fn replica_info_is_secondary() {
+        let ri = ReplicaInfo {
+            stream_id: StreamId(1),
+            extent_id: ExtentId(10),
+            role: 1,
+            replication_factor: 2,
+            replica_addrs: vec![],
+        };
+        assert!(!ri.is_primary());
+    }
+
+    #[test]
+    fn replica_info_is_standalone_rf1() {
+        let ri = ReplicaInfo {
+            stream_id: StreamId(1),
+            extent_id: ExtentId(10),
+            role: ROLE_PRIMARY,
+            replication_factor: 1,
+            replica_addrs: vec![],
+        };
+        assert!(ri.is_primary());
+        assert!(ri.is_standalone());
+    }
+
+    #[test]
+    fn replica_info_is_standalone_no_replicas() {
+        // Even with RF > 1, if replica_addrs is empty, it's standalone.
+        let ri = ReplicaInfo {
+            stream_id: StreamId(1),
+            extent_id: ExtentId(10),
+            role: ROLE_PRIMARY,
+            replication_factor: 3,
+            replica_addrs: vec![],
+        };
+        assert!(ri.is_standalone());
+    }
+
+    #[test]
+    fn replica_info_required_secondary_acks() {
+        // RF=1 -> 0, RF=2 -> 1, RF=3 -> 1, RF=4 -> 2, RF=5 -> 2
+        let cases: &[(u16, u32)] = &[(1, 0), (2, 1), (3, 1), (4, 2), (5, 2)];
+        for &(rf, expected) in cases {
+            let ri = ReplicaInfo {
+                stream_id: StreamId(1),
+                extent_id: ExtentId(1),
+                role: ROLE_PRIMARY,
+                replication_factor: rf,
+                replica_addrs: vec![],
+            };
+            assert_eq!(
+                ri.required_secondary_acks(),
+                expected,
+                "RF={rf}: expected {expected}"
+            );
+        }
+    }
+
+    // ── AckQueue additional edge cases ───────────────────────────────────────
+
+    #[test]
+    fn ack_queue_quorum_offset_rf1_returns_none() {
+        let aq = AckQueue::new(0);
+        assert_eq!(aq.quorum_offset(), None);
+    }
+
+    #[test]
+    fn ack_queue_quorum_offset_no_secondaries_reported() {
+        let aq = AckQueue::new(2);
+        assert_eq!(aq.quorum_offset(), None);
+    }
+
+    #[test]
+    fn ack_queue_ack_from_secondary_idempotent_lower_offset() {
+        let mut aq = AckQueue::new(1);
+        aq.ack_from_secondary("sec-1", 10);
+        // Lower offset should not decrease the recorded value.
+        aq.ack_from_secondary("sec-1", 5);
+        assert_eq!(aq.quorum_offset(), Some(10));
+    }
+
+    #[test]
+    fn ack_queue_ack_from_secondary_updates_higher_offset() {
+        let mut aq = AckQueue::new(1);
+        aq.ack_from_secondary("sec-1", 5);
+        assert_eq!(aq.quorum_offset(), Some(5));
+        aq.ack_from_secondary("sec-1", 10);
+        assert_eq!(aq.quorum_offset(), Some(10));
+    }
+
+    #[tokio::test]
+    async fn ack_queue_drain_quorum_with_no_pending() {
+        let mut aq = AckQueue::new(1);
+        aq.ack_from_secondary("sec-1", 5);
+        // drain_quorum should be a no-op when no pending ACKs exist.
+        aq.drain_quorum();
+        assert!(aq.pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn ack_queue_drain_quorum_partial() {
+        // Only some pending ACKs should be drained when quorum_offset < max pending.
+        let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(100);
+
+        let mut aq = AckQueue::new(1);
+        for i in 0u64..5 {
+            aq.pending.push_back(PendingAck {
+                request_id: i as u32,
+                stream_id: StreamId(1),
+                response_tx: resp_tx.clone(),
+                assigned_offset: i,
+                ack_payload: Bytes::new(),
+            });
+        }
+
+        // Only ACK up to offset 2.
+        aq.ack_from_secondary("sec-1", 2);
+        aq.drain_quorum();
+
+        // Offsets 0, 1, 2 should be drained; 3, 4 should remain.
+        assert_eq!(aq.pending.len(), 2);
+        assert_eq!(aq.pending[0].assigned_offset, 3);
+        assert_eq!(aq.pending[1].assigned_offset, 4);
+
+        // 3 ACKs should have been sent.
+        for expected_offset in 0u64..3 {
+            let ack = resp_rx.try_recv().unwrap();
+            assert_eq!(ack.offset, Offset(expected_offset));
+        }
+        assert!(resp_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn read_from_unknown_stream() {
+        let store = ExtentNodeStore::new();
+        let resp = store.handle_frame(Frame {
+            opcode: Opcode::Read,
+            flags: 1,
+            request_id: 1,
+            stream_id: StreamId(999),
+            extent_id: ExtentId(0),
+            offset: Offset(0),
+            payload: Bytes::new(),
+        }, None).await.unwrap();
+        assert_eq!(resp.opcode, Opcode::Error);
+    }
+
+    #[tokio::test]
+    async fn query_offset_unknown_stream() {
+        let store = ExtentNodeStore::new();
+        let resp = store.handle_frame(Frame {
+            opcode: Opcode::QueryOffset,
+            flags: 0,
+            request_id: 1,
+            stream_id: StreamId(999),
+            extent_id: ExtentId(0),
+            offset: Offset(0),
+            payload: Bytes::new(),
+        }, None).await.unwrap();
+        assert_eq!(resp.opcode, Opcode::Error);
+    }
+
+    #[tokio::test]
+    async fn seal_unknown_stream() {
+        let store = ExtentNodeStore::new();
+        let resp = store.handle_frame(Frame {
+            opcode: Opcode::Seal,
+            flags: 0,
+            request_id: 1,
+            stream_id: StreamId(999),
+            extent_id: ExtentId(0),
+            offset: Offset(0),
+            payload: Bytes::new(),
+        }, None).await.unwrap();
+        assert_eq!(resp.opcode, Opcode::Error);
+    }
+
+    #[tokio::test]
+    async fn create_multiple_streams_get_unique_ids() {
+        let store = ExtentNodeStore::new();
+        let sid1 = create_stream(&store, 1).await;
+        let sid2 = create_stream(&store, 2).await;
+        let sid3 = create_stream(&store, 3).await;
+        assert_ne!(sid1, sid2);
+        assert_ne!(sid2, sid3);
+        assert_ne!(sid1, sid3);
+    }
+
+    #[tokio::test]
+    async fn append_empty_payload() {
+        let store = ExtentNodeStore::new();
+        let sid = create_stream(&store, 1).await;
+
+        let resp = store.handle_frame(Frame {
+            opcode: Opcode::Append,
+            flags: 0,
+            request_id: 2,
+            stream_id: sid,
+            extent_id: ExtentId(0),
+            offset: Offset(0),
+            payload: Bytes::new(),
+        }, None).await.unwrap();
+
+        assert_eq!(resp.opcode, Opcode::AppendAck);
+        assert_eq!(resp.offset, Offset(0));
+    }
 }

@@ -67,3 +67,51 @@ impl Default for StreamManagerConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn server_config_default() {
+        let cfg = ServerConfig::default();
+        assert_eq!(cfg.listen_addr, "0.0.0.0:9801");
+    }
+
+    #[test]
+    fn extent_node_config_default() {
+        let cfg = ExtentNodeConfig::default();
+        assert_eq!(cfg.listen_addr, "0.0.0.0:9801");
+        assert_eq!(cfg.stream_manager_addr, "127.0.0.1:9800");
+        assert_eq!(cfg.heartbeat_interval_ms, 5000);
+        assert_eq!(cfg.extent_arena_capacity, 64 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stream_manager_config_default() {
+        let cfg = StreamManagerConfig::default();
+        assert_eq!(cfg.listen_addr, "0.0.0.0:9800");
+        assert_eq!(cfg.mysql_url, "mysql://root:password@tx.dev:3306/metadata");
+        assert_eq!(cfg.default_replication_factor, 2);
+        assert_eq!(cfg.heartbeat_check_interval_ms, 3000);
+    }
+
+    #[test]
+    fn configs_are_clone_and_debug() {
+        let sc = ServerConfig::default();
+        let sc2 = sc.clone();
+        assert_eq!(sc.listen_addr, sc2.listen_addr);
+        // Debug formatting should not panic.
+        let _ = format!("{:?}", sc);
+
+        let enc = ExtentNodeConfig::default();
+        let enc2 = enc.clone();
+        assert_eq!(enc.extent_arena_capacity, enc2.extent_arena_capacity);
+        let _ = format!("{:?}", enc);
+
+        let smc = StreamManagerConfig::default();
+        let smc2 = smc.clone();
+        assert_eq!(smc.default_replication_factor, smc2.default_replication_factor);
+        let _ = format!("{:?}", smc);
+    }
+}

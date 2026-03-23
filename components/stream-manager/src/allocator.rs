@@ -227,4 +227,72 @@ mod tests {
             "light node ({light_score}) should score lower than heavy node ({heavy_score})"
         );
     }
+
+    #[test]
+    fn allocator_default_trait() {
+        let alloc = Allocator::default();
+        // Default allocator has no metrics.
+        assert!(alloc.get_metrics("any-node").is_none());
+    }
+
+    #[test]
+    fn score_node_zero_total_memory() {
+        let mut alloc = Allocator::new();
+        alloc.update_metrics("node", NodeMetrics {
+            available_memory_bytes: 0,
+            total_memory_bytes: 0,
+            appends_per_sec: 0,
+            active_extent_count: 0,
+            bytes_written_per_sec: 0,
+        });
+        let score = alloc.score_node("node");
+        // total_memory_bytes = 0 means mem_pressure = 0.5, everything else = 0
+        // => 0.25 * 0.5 = 0.125
+        assert!((score - 0.125).abs() < 0.001, "got: {score}");
+    }
+
+    #[test]
+    fn update_metrics_overwrites_previous() {
+        let mut alloc = Allocator::new();
+        alloc.update_metrics("node-1", NodeMetrics {
+            available_memory_bytes: 1000,
+            total_memory_bytes: 2000,
+            appends_per_sec: 10,
+            active_extent_count: 5,
+            bytes_written_per_sec: 100,
+        });
+        alloc.update_metrics("node-1", NodeMetrics {
+            available_memory_bytes: 9999,
+            total_memory_bytes: 10000,
+            appends_per_sec: 0,
+            active_extent_count: 0,
+            bytes_written_per_sec: 0,
+        });
+        let m = alloc.get_metrics("node-1").unwrap();
+        assert_eq!(m.available_memory_bytes, 9999);
+        assert_eq!(m.total_memory_bytes, 10000);
+    }
+
+    #[test]
+    fn remove_metrics_nonexistent_is_noop() {
+        let mut alloc = Allocator::new();
+        alloc.remove_metrics("nonexistent"); // should not panic
+        assert!(alloc.get_metrics("nonexistent").is_none());
+    }
+
+    #[test]
+    fn score_clamped_above_maximums() {
+        let mut alloc = Allocator::new();
+        // All metrics way above normalization caps.
+        alloc.update_metrics("node", NodeMetrics {
+            available_memory_bytes: 0,
+            total_memory_bytes: 1,
+            appends_per_sec: 500_000,
+            active_extent_count: 1000,
+            bytes_written_per_sec: 10_000_000_000,
+        });
+        let score = alloc.score_node("node");
+        // All components clamped to 1.0 => score = 0.25 + 0.35 + 0.25 + 0.15 = 1.0
+        assert!((score - 1.0).abs() < 0.001, "score should be ~1.0, got {score}");
+    }
 }
