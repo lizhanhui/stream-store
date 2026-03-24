@@ -30,7 +30,7 @@ impl Encoder<Frame> for FrameCodec {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use common::types::{Opcode, StreamId, ExtentId};
+    use common::types::{ExtentId, Opcode, StreamId};
 
     #[test]
     fn codec_round_trip() {

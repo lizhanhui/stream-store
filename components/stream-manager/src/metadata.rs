@@ -95,7 +95,8 @@ impl MetadataStore {
             .run_async(&mut pool)
             .await
             .map_err(|e| StorageError::Internal(format!("migration: {e}")))?;
-        pool.disconnect().await
+        pool.disconnect()
+            .await
             .map_err(|e| StorageError::Internal(format!("disconnect migration pool: {e}")))?;
         info!("database migrations applied");
         Ok(())
@@ -124,13 +125,11 @@ impl MetadataStore {
         let stream_id = StreamId(result.last_insert_id());
 
         // Initialize stream_sequence for per-stream extent_id generation.
-        sqlx::query(
-            "INSERT INTO stream_sequence (stream_id, next_extent_id) VALUES (?, 0)",
-        )
-        .bind(stream_id.0 as i64)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("init stream_sequence: {e}")))?;
+        sqlx::query("INSERT INTO stream_sequence (stream_id, next_extent_id) VALUES (?, 0)")
+            .bind(stream_id.0 as i64)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("init stream_sequence: {e}")))?;
 
         Ok(stream_id)
     }
@@ -158,13 +157,11 @@ impl MetadataStore {
         &self,
         stream_id: StreamId,
     ) -> Result<u16, StorageError> {
-        let row = sqlx::query(
-            "SELECT replication_factor FROM stream WHERE stream_id = ?",
-        )
-        .bind(stream_id.0 as i64)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("get_stream_replication_factor: {e}")))?;
+        let row = sqlx::query("SELECT replication_factor FROM stream WHERE stream_id = ?")
+            .bind(stream_id.0 as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("get_stream_replication_factor: {e}")))?;
 
         Ok(row.get::<i16, _>("replication_factor") as u16)
     }
@@ -185,7 +182,9 @@ impl MetadataStore {
         nodes: &[(String, u8)],
     ) -> Result<ExtentId, StorageError> {
         if nodes.is_empty() {
-            return Err(StorageError::Internal("allocate_extent: empty node list".into()));
+            return Err(StorageError::Internal(
+                "allocate_extent: empty node list".into(),
+            ));
         }
 
         // Step 1: Atomically get next extent_id for this stream.
@@ -197,13 +196,11 @@ impl MetadataStore {
         .await
         .map_err(|e| StorageError::Internal(format!("increment stream_sequence: {e}")))?;
 
-        let row = sqlx::query(
-            "SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?",
-        )
-        .bind(stream_id.0 as i64)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
+        let row = sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?")
+            .bind(stream_id.0 as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
 
         // next_extent_id was already incremented, so the allocated ID is next_extent_id (post-increment value).
         let extent_id = ExtentId(row.get::<i64, _>("next_extent_id") as u32);
@@ -270,9 +267,14 @@ impl MetadataStore {
         message_count: u32,
         nodes: &[(String, u8)],
     ) -> Result<SealResult, StorageError> {
-        let mut conn = self.pool.acquire().await
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
             .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
-        let mut tx = conn.begin().await
+        let mut tx = conn
+            .begin()
+            .await
             .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
 
         // Step 1: Lock the target extent row and check state.
@@ -334,7 +336,8 @@ impl MetadataStore {
                 .map(|r| r.get::<String, _>("node_addr"))
                 .unwrap_or_default();
 
-            tx.commit().await
+            tx.commit()
+                .await
                 .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
 
             return Ok(SealResult::AlreadySealed {
@@ -367,13 +370,11 @@ impl MetadataStore {
         .await
         .map_err(|e| StorageError::Internal(format!("increment stream_sequence: {e}")))?;
 
-        let seq_row = sqlx::query(
-            "SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?",
-        )
-        .bind(stream_id.0 as i64)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
+        let seq_row = sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?")
+            .bind(stream_id.0 as i64)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
 
         let new_extent_id = ExtentId(seq_row.get::<i64, _>("next_extent_id") as u32);
         let new_base_offset = row.get::<i64, _>("base_offset") as u64 + message_count as u64;
@@ -404,7 +405,8 @@ impl MetadataStore {
             .map_err(|e| StorageError::Internal(format!("insert extent_replica: {e}")))?;
         }
 
-        tx.commit().await
+        tx.commit()
+            .await
             .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
 
         Ok(SealResult::Sealed { new_extent_id })
@@ -429,10 +431,7 @@ impl MetadataStore {
     }
 
     /// Get all extents for a stream, ordered by extent_id.
-    pub async fn get_extents(
-        &self,
-        stream_id: StreamId,
-    ) -> Result<Vec<ExtentRow>, StorageError> {
+    pub async fn get_extents(&self, stream_id: StreamId) -> Result<Vec<ExtentRow>, StorageError> {
         let rows = sqlx::query(
             "SELECT extent_id, stream_id, base_offset, message_count, state \
              FROM extent WHERE stream_id = ? ORDER BY extent_id",

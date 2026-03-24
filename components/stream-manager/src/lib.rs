@@ -7,10 +7,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::config::StreamManagerConfig;
 use crate::metadata::MetadataStore;
+use common::config::StreamManagerConfig;
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, Mutex};
+use tokio::sync::{Mutex, broadcast};
 use tokio::task::JoinHandle;
 use tracing::info;
 

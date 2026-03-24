@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
-use common::types::{Offset, Opcode, FLAG_FORWARDED};
+use common::types::{FLAG_FORWARDED, Offset, Opcode};
 use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
 
@@ -137,10 +137,7 @@ async fn downstream_reader(
                         return;
                     }
                 } else {
-                    warn!(
-                        "unexpected opcode {:?} from secondary {addr}",
-                        frame.opcode
-                    );
+                    warn!("unexpected opcode {:?} from secondary {addr}", frame.opcode);
                 }
             }
             Err(e) => {

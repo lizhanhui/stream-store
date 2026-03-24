@@ -2,7 +2,7 @@ use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{ExtentId, ExtentState, Offset, StreamId};
 
-use crate::extent::{AppendResult, Extent, DEFAULT_ARENA_CAPACITY};
+use crate::extent::{AppendResult, DEFAULT_ARENA_CAPACITY, Extent};
 
 /// A stream: an ordered, append-only sequence of messages backed by a list of extents.
 ///
@@ -68,7 +68,12 @@ impl Stream {
     /// This enables O(1) random access when the caller has an external index.
     ///
     /// If `byte_pos` is 0, this reads from the beginning of the extent.
-    pub fn read(&self, offset: Offset, byte_pos: u64, count: u32) -> Result<Vec<Bytes>, StorageError> {
+    pub fn read(
+        &self,
+        offset: Offset,
+        byte_pos: u64,
+        count: u32,
+    ) -> Result<Vec<Bytes>, StorageError> {
         for extent in &self.extents {
             // Skip extents entirely before our read range.
             if extent.next_offset().0 <= offset.0 {
@@ -89,7 +94,8 @@ impl Stream {
 
     /// Whether this stream can accept appends (its last extent is active/unsealed).
     pub fn is_mutable(&self) -> bool {
-        self.extents.last()
+        self.extents
+            .last()
             .map(|e| e.state() == ExtentState::Active)
             .unwrap_or(false)
     }
@@ -129,7 +135,8 @@ impl Stream {
         let new_base = Offset(base_offset + message_count);
         let new_id = ExtentId(self.next_extent_id);
         self.next_extent_id += 1;
-        self.extents.push(Extent::with_capacity(new_id, new_base, self.arena_capacity));
+        self.extents
+            .push(Extent::with_capacity(new_id, new_base, self.arena_capacity));
 
         Some((base_offset, message_count))
     }
@@ -168,11 +175,7 @@ mod tests {
         let stream = Stream::new(StreamId(1));
         let mut results = Vec::new();
         for i in 0..10 {
-            results.push(
-                stream
-                    .append(Bytes::from(format!("msg{i}")))
-                    .unwrap(),
-            );
+            results.push(stream.append(Bytes::from(format!("msg{i}"))).unwrap());
         }
 
         // Read 3 messages starting at record 5's byte_pos.

@@ -113,8 +113,7 @@ impl Extent {
 
     /// Create a new active extent with the specified capacity in bytes.
     pub fn with_capacity(id: ExtentId, base_offset: Offset, capacity: usize) -> Self {
-        let layout = Layout::from_size_align(capacity, 8)
-            .expect("invalid layout");
+        let layout = Layout::from_size_align(capacity, 8).expect("invalid layout");
         // SAFETY: layout is valid, nonzero size.
         let buf = unsafe { alloc(layout) };
         if buf.is_null() {
@@ -155,7 +154,9 @@ impl Extent {
         let record_len = 4 + payload_len;
 
         // 1. Reserve byte slot (atomic fetch_add, lock-free).
-        let byte_pos = self.write_cursor.fetch_add(record_len as u64, Ordering::Relaxed);
+        let byte_pos = self
+            .write_cursor
+            .fetch_add(record_len as u64, Ordering::Relaxed);
         if byte_pos + record_len as u64 > self.capacity as u64 {
             // Extent full. The cursor may overshoot capacity -- that's fine because
             // seal will stop further appends and committed_bytes won't advance past
@@ -170,18 +171,10 @@ impl Extent {
         unsafe {
             let dst = self.buf.add(byte_pos as usize);
             // Write length prefix (big-endian u32).
-            std::ptr::copy_nonoverlapping(
-                (payload_len as u32).to_be_bytes().as_ptr(),
-                dst,
-                4,
-            );
+            std::ptr::copy_nonoverlapping((payload_len as u32).to_be_bytes().as_ptr(), dst, 4);
             // Write payload bytes.
             if payload_len > 0 {
-                std::ptr::copy_nonoverlapping(
-                    payload.as_ref().as_ptr(),
-                    dst.add(4),
-                    payload_len,
-                );
+                std::ptr::copy_nonoverlapping(payload.as_ref().as_ptr(), dst.add(4), payload_len);
             }
         }
 
@@ -197,7 +190,8 @@ impl Extent {
                 Ordering::Relaxed,
             ) {
                 Ok(_) => {
-                    self.committed_bytes.store(new_committed_bytes, Ordering::Release);
+                    self.committed_bytes
+                        .store(new_committed_bytes, Ordering::Release);
                     break;
                 }
                 Err(_) => std::hint::spin_loop(),
@@ -234,12 +228,9 @@ impl Extent {
                 break;
             }
 
-            let len = u32::from_be_bytes([
-                arena[pos],
-                arena[pos + 1],
-                arena[pos + 2],
-                arena[pos + 3],
-            ]) as usize;
+            let len =
+                u32::from_be_bytes([arena[pos], arena[pos + 1], arena[pos + 2], arena[pos + 3]])
+                    as usize;
 
             let payload_start = pos + 4;
             let payload_end = payload_start + len;
@@ -358,7 +349,10 @@ impl std::fmt::Debug for Extent {
             .field("write_cursor", &self.write_cursor.load(Ordering::Relaxed))
             .field("record_count", &self.record_count.load(Ordering::Relaxed))
             .field("committed_seq", &self.committed_seq.load(Ordering::Relaxed))
-            .field("committed_bytes", &self.committed_bytes.load(Ordering::Relaxed))
+            .field(
+                "committed_bytes",
+                &self.committed_bytes.load(Ordering::Relaxed),
+            )
             .field("sealed", &self.sealed.load(Ordering::Relaxed))
             .finish()
     }

@@ -125,13 +125,16 @@ pub fn parse_heartbeat_payload(payload: &[u8]) -> Option<(String, NodeMetrics)> 
     pos += 4;
     let bytes_written_per_sec = u64::from_be_bytes(payload[pos..pos + 8].try_into().ok()?);
 
-    Some((node_id, NodeMetrics {
-        available_memory_bytes,
-        total_memory_bytes,
-        appends_per_sec,
-        active_extent_count,
-        bytes_written_per_sec,
-    }))
+    Some((
+        node_id,
+        NodeMetrics {
+            available_memory_bytes,
+            total_memory_bytes,
+            appends_per_sec,
+            active_extent_count,
+            bytes_written_per_sec,
+        },
+    ))
 }
 
 /// Replication role constants.
@@ -369,15 +372,17 @@ mod tests {
     #[test]
     fn register_extent_payload_primary_with_secondaries() {
         // Primary with 2 secondary addresses (RF=3).
-        let payload = build_register_extent_payload(
-            42, 100, 0, 3, &["127.0.0.1:9802", "127.0.0.1:9803"],
-        );
+        let payload =
+            build_register_extent_payload(42, 100, 0, 3, &["127.0.0.1:9802", "127.0.0.1:9803"]);
         let parsed = parse_register_extent_payload(&payload).unwrap();
         assert_eq!(parsed.stream_id, 42);
         assert_eq!(parsed.extent_id, 100);
         assert_eq!(parsed.role, ROLE_PRIMARY);
         assert_eq!(parsed.replication_factor, 3);
-        assert_eq!(parsed.replica_addrs, vec!["127.0.0.1:9802", "127.0.0.1:9803"]);
+        assert_eq!(
+            parsed.replica_addrs,
+            vec!["127.0.0.1:9802", "127.0.0.1:9803"]
+        );
     }
 
     #[test]
@@ -410,12 +415,12 @@ mod tests {
         assert!(parse_register_extent_payload(&[0u8; 16]).is_none());
         // 21 bytes but claims num_addrs=1 with addr_len=5 but no addr data
         let mut buf = BytesMut::new();
-        buf.put_u64(1);  // stream_id
-        buf.put_u64(1);  // extent_id
-        buf.put_u8(0);   // role
-        buf.put_u16(2);  // replication_factor
-        buf.put_u16(1);  // num_addrs = 1
-        buf.put_u16(5);  // addr_len = 5 but nothing follows
+        buf.put_u64(1); // stream_id
+        buf.put_u64(1); // extent_id
+        buf.put_u8(0); // role
+        buf.put_u16(2); // replication_factor
+        buf.put_u16(1); // num_addrs = 1
+        buf.put_u16(5); // addr_len = 5 but nothing follows
         assert!(parse_register_extent_payload(&buf).is_none());
     }
 
@@ -498,13 +503,11 @@ mod tests {
                 base_offset: 300,
                 message_count: 0,
                 state: ExtentState::Active,
-                replicas: vec![
-                    ReplicaDetail {
-                        node_addr: "127.0.0.1:9803".to_string(),
-                        role: 0,
-                        is_alive: true,
-                    },
-                ],
+                replicas: vec![ReplicaDetail {
+                    node_addr: "127.0.0.1:9803".to_string(),
+                    role: 0,
+                    is_alive: true,
+                }],
             },
         ];
 

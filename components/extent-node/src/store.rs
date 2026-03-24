@@ -2,10 +2,10 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId, FLAG_FORWARDED};
+use common::types::{ErrorCode, ExtentId, FLAG_FORWARDED, Offset, Opcode, StreamId};
 use dashmap::DashMap;
 use rpc::frame::Frame;
-use rpc::payload::{parse_register_extent_payload, ROLE_PRIMARY};
+use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -66,7 +66,9 @@ impl AckQueue {
             return None; // Not enough secondaries have reported yet
         }
         offsets.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        offsets.get(self.required_secondary_acks as usize - 1).copied()
+        offsets
+            .get(self.required_secondary_acks as usize - 1)
+            .copied()
     }
 
     /// Record a cumulative ACK from a secondary at a given offset.
@@ -267,7 +269,9 @@ impl ExtentNodeStore {
         let bytes = self.bytes_written.swap(0, Ordering::Relaxed);
 
         // Count active extents: streams whose last extent is active (mutable).
-        let active_count = self.streams.iter()
+        let active_count = self
+            .streams
+            .iter()
             .filter(|entry| entry.value().is_mutable())
             .count() as u32;
 
@@ -293,13 +297,11 @@ impl RequestHandler for ExtentNodeStore {
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
             Opcode::Seal => Some(self.handle_seal(frame)),
             Opcode::RegisterExtent => Some(self.handle_register_extent(frame)),
-            Opcode::Connect => {
-            Some(Frame {
+            Opcode::Connect => Some(Frame {
                 opcode: Opcode::ConnectAck,
                 request_id: frame.request_id,
                 ..Default::default()
-            })
-            }
+            }),
             Opcode::Heartbeat => Some(Frame {
                 opcode: Opcode::Heartbeat,
                 request_id: frame.request_id,
@@ -343,7 +345,8 @@ impl ExtentNodeStore {
 
         // Update next_stream_id to avoid collision with StreamManager-assigned IDs.
         // Use fetch_max to atomically ensure we stay above the assigned ID.
-        self.next_stream_id.fetch_max(parsed.stream_id + 1, Ordering::Relaxed);
+        self.next_stream_id
+            .fetch_max(parsed.stream_id + 1, Ordering::Relaxed);
 
         let role_name = if parsed.role == ROLE_PRIMARY {
             "Primary"
@@ -434,7 +437,9 @@ impl ExtentNodeStore {
 
                 // Proactively seal the extent so subsequent appends get
                 // ExtentSealed (fast path) instead of racing on the full arena.
-                let (extent_id, offset) = if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+                let (extent_id, offset) = if let Some(mut stream_mut) =
+                    self.streams.get_mut(&stream_id)
+                {
                     let eid = stream_mut.active_extent_id();
                     match stream_mut.seal_active() {
                         Some((base_offset, message_count)) => (eid, base_offset + message_count),
@@ -447,7 +452,11 @@ impl ExtentNodeStore {
                 // Notify background task to send Seal to Stream Manager,
                 // triggering new extent allocation before clients retry.
                 if let Some(ref tx) = self.seal_tx {
-                    let _ = tx.try_send(SealRequest { stream_id, extent_id, offset });
+                    let _ = tx.try_send(SealRequest {
+                        stream_id,
+                        extent_id,
+                        offset,
+                    });
                 }
 
                 return Some(Frame::error_response(
@@ -475,7 +484,8 @@ impl ExtentNodeStore {
 
         // Update metrics counters (atomic, no lock needed).
         self.append_count.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written.fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(frame.payload.len() as u64, Ordering::Relaxed);
 
         // Build AppendAck payload with byte_pos so the caller can build an index.
         let ack_byte_pos = byte_pos;
@@ -649,7 +659,10 @@ impl ExtentNodeStore {
         match stream_ref.seal_active() {
             Some((base_offset, message_count)) => {
                 let offset = base_offset + message_count;
-                info!("sealed active extent for stream {:?}, base_offset={base_offset}, message_count={message_count}, offset={offset}", stream_id);
+                info!(
+                    "sealed active extent for stream {:?}, base_offset={base_offset}, message_count={message_count}, offset={offset}",
+                    stream_id
+                );
                 Frame {
                     opcode: Opcode::SealAck,
                     request_id: frame.request_id,
@@ -679,13 +692,19 @@ mod tests {
 
         let sid = StreamId(stream_id);
         let payload = build_register_extent_payload(stream_id, 1, 0, 1, &[]);
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::RegisterExtent,
-            request_id: req_id,
-            stream_id: sid,
-            payload,
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::RegisterExtent,
+                    request_id: req_id,
+                    stream_id: sid,
+                    payload,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.opcode, Opcode::RegisterExtentAck);
         sid
     }
@@ -695,13 +714,19 @@ mod tests {
         let store = ExtentNodeStore::new();
         let sid = register_stream(&store, 1, 1).await;
 
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::Append,
-            request_id: 2,
-            stream_id: sid,
-            payload: Bytes::from_static(b"hello"),
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::Append,
+                    request_id: 2,
+                    stream_id: sid,
+                    payload: Bytes::from_static(b"hello"),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(resp.opcode, Opcode::AppendAck);
         assert_eq!(resp.offset, Offset(0));
@@ -712,13 +737,19 @@ mod tests {
     #[tokio::test]
     async fn append_to_unknown_stream() {
         let store = ExtentNodeStore::new();
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::Append,
-            request_id: 1,
-            stream_id: StreamId(999),
-            payload: Bytes::from_static(b"fail"),
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::Append,
+                    request_id: 1,
+                    stream_id: StreamId(999),
+                    payload: Bytes::from_static(b"fail"),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.opcode, Opcode::Error);
     }
 
@@ -729,36 +760,54 @@ mod tests {
 
         let mut byte_positions = Vec::new();
         for i in 0u32..3 {
-            let resp = store.handle_frame(Frame {
-                opcode: Opcode::Append,
-                request_id: 10 + i,
-                stream_id: sid,
-                payload: Bytes::from(format!("msg{i}")),
-                ..Default::default()
-            }, None).await.unwrap();
+            let resp = store
+                .handle_frame(
+                    Frame {
+                        opcode: Opcode::Append,
+                        request_id: 10 + i,
+                        stream_id: sid,
+                        payload: Bytes::from(format!("msg{i}")),
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
             assert_eq!(resp.opcode, Opcode::AppendAck);
             assert_eq!(resp.offset, Offset(i as u64));
             byte_positions.push(resp.byte_pos);
         }
 
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::QueryOffset,
-            request_id: 20,
-            stream_id: sid,
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::QueryOffset,
+                    request_id: 20,
+                    stream_id: sid,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.opcode, Opcode::QueryOffsetResp);
         assert_eq!(resp.offset, Offset(3));
 
         // Read all 3 from byte_pos=0.
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::Read,
-            request_id: 30,
-            stream_id: sid,
-            offset: Offset(0),
-            count: 3,
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::Read,
+                    request_id: 30,
+                    stream_id: sid,
+                    offset: Offset(0),
+                    count: 3,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.opcode, Opcode::ReadResp);
         assert_eq!(resp.count, 3);
 
@@ -773,20 +822,28 @@ mod tests {
         assert!(payload.is_empty());
 
         // Read msg1 directly via its byte_pos.
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::Read,
-            request_id: 31,
-            stream_id: sid,
-            offset: Offset(1),
-            byte_pos: byte_positions[1],
-            count: 1,
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::Read,
+                    request_id: 31,
+                    stream_id: sid,
+                    offset: Offset(1),
+                    byte_pos: byte_positions[1],
+                    count: 1,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.opcode, Opcode::ReadResp);
         assert_eq!(resp.count, 1);
         let len = u32::from_be_bytes([
-            resp.payload[0], resp.payload[1],
-            resp.payload[2], resp.payload[3],
+            resp.payload[0],
+            resp.payload[1],
+            resp.payload[2],
+            resp.payload[3],
         ]) as usize;
         assert_eq!(&resp.payload[4..4 + len], b"msg1");
     }
@@ -799,13 +856,19 @@ mod tests {
 
         // RegisterExtent as Primary with 1 secondary (RF=2).
         let payload = build_register_extent_payload(42, 100, 0, 2, &["127.0.0.1:9802"]);
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::RegisterExtent,
-            request_id: 1,
-            stream_id: StreamId(42),
-            payload,
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::RegisterExtent,
+                    request_id: 1,
+                    stream_id: StreamId(42),
+                    payload,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(resp.opcode, Opcode::RegisterExtentAck);
         assert_eq!(resp.stream_id, StreamId(42));
@@ -832,13 +895,19 @@ mod tests {
 
         // RegisterExtent as Secondary (RF=2, no replica addrs).
         let payload = build_register_extent_payload(42, 100, 1, 2, &[]);
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::RegisterExtent,
-            request_id: 1,
-            stream_id: StreamId(42),
-            payload,
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::RegisterExtent,
+                    request_id: 1,
+                    stream_id: StreamId(42),
+                    payload,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(resp.opcode, Opcode::RegisterExtentAck);
 
@@ -860,22 +929,34 @@ mod tests {
 
         // Register as Primary, RF=1 (standalone).
         let payload = build_register_extent_payload(10, 50, 0, 1, &[]);
-        store.handle_frame(Frame {
-            opcode: Opcode::RegisterExtent,
-            request_id: 1,
-            stream_id: StreamId(10),
-            payload,
-            ..Default::default()
-        }, None).await.unwrap();
+        store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::RegisterExtent,
+                    request_id: 1,
+                    stream_id: StreamId(10),
+                    payload,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         // Append — standalone should ACK immediately.
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::Append,
-            request_id: 2,
-            stream_id: StreamId(10),
-            payload: Bytes::from_static(b"hello standalone"),
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::Append,
+                    request_id: 2,
+                    stream_id: StreamId(10),
+                    payload: Bytes::from_static(b"hello standalone"),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(resp.opcode, Opcode::AppendAck);
         assert_eq!(resp.offset, Offset(0));
@@ -891,28 +972,40 @@ mod tests {
         let store = ExtentNodeStore::with_forward_tx(forward_tx);
 
         // Register as Primary with 2 secondaries (RF=3).
-        let payload = build_register_extent_payload(
-            10, 50, 0, 3,
-            &["127.0.0.1:9802", "127.0.0.1:9803"],
-        );
-        store.handle_frame(Frame {
-            opcode: Opcode::RegisterExtent,
-            request_id: 1,
-            stream_id: StreamId(10),
-            payload,
-            ..Default::default()
-        }, None).await.unwrap();
+        let payload =
+            build_register_extent_payload(10, 50, 0, 3, &["127.0.0.1:9802", "127.0.0.1:9803"]);
+        store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::RegisterExtent,
+                    request_id: 1,
+                    stream_id: StreamId(10),
+                    payload,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         // Append — should return None (deferred), send 2 ForwardRequests.
-        let result = store.handle_frame(Frame {
-            opcode: Opcode::Append,
-            request_id: 2,
-            stream_id: StreamId(10),
-            payload: Bytes::from_static(b"broadcast msg"),
-            ..Default::default()
-        }, Some(&resp_tx)).await;
+        let result = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::Append,
+                    request_id: 2,
+                    stream_id: StreamId(10),
+                    payload: Bytes::from_static(b"broadcast msg"),
+                    ..Default::default()
+                },
+                Some(&resp_tx),
+            )
+            .await;
 
-        assert!(result.is_none(), "Primary with secondaries should defer ACK");
+        assert!(
+            result.is_none(),
+            "Primary with secondaries should defer ACK"
+        );
 
         // Should have 2 ForwardRequests (one per secondary).
         let fwd1 = forward_rx.try_recv().unwrap();
@@ -955,23 +1048,35 @@ mod tests {
 
         // Register as Secondary (RF=2).
         let payload = build_register_extent_payload(10, 50, 1, 2, &[]);
-        store.handle_frame(Frame {
-            opcode: Opcode::RegisterExtent,
-            request_id: 1,
-            stream_id: StreamId(10),
-            payload,
-            ..Default::default()
-        }, None).await.unwrap();
+        store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::RegisterExtent,
+                    request_id: 1,
+                    stream_id: StreamId(10),
+                    payload,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         // Forwarded append.
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::Append,
-            flags: FLAG_FORWARDED,
-            request_id: 2,
-            stream_id: StreamId(10),
-            payload: Bytes::from_static(b"forwarded msg"),
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::Append,
+                    flags: FLAG_FORWARDED,
+                    request_id: 2,
+                    stream_id: StreamId(10),
+                    payload: Bytes::from_static(b"forwarded msg"),
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
 
         assert_eq!(resp.opcode, Opcode::Watermark);
         assert_eq!(resp.stream_id, StreamId(10));
@@ -1069,16 +1174,25 @@ mod tests {
                 let mut offsets = Vec::with_capacity(APPENDS_PER_STREAM as usize);
 
                 for seq in 0..APPENDS_PER_STREAM {
-                    let resp = store.handle_frame(Frame {
-                        opcode: Opcode::Append,
-                        request_id: seq as u32,
-                        stream_id: sid,
-                        payload: Bytes::from(payload_data.clone()),
-                        ..Default::default()
-                    }, None).await.unwrap();
+                    let resp = store
+                        .handle_frame(
+                            Frame {
+                                opcode: Opcode::Append,
+                                request_id: seq as u32,
+                                stream_id: sid,
+                                payload: Bytes::from(payload_data.clone()),
+                                ..Default::default()
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
 
-                    assert_eq!(resp.opcode, Opcode::AppendAck,
-                        "task {task_idx} seq {seq}: expected AppendAck");
+                    assert_eq!(
+                        resp.opcode,
+                        Opcode::AppendAck,
+                        "task {task_idx} seq {seq}: expected AppendAck"
+                    );
                     offsets.push(resp.offset.0);
                 }
                 offsets
@@ -1097,67 +1211,102 @@ mod tests {
 
         // 1. Each stream's offsets should be a contiguous range [0..APPENDS_PER_STREAM).
         for (task_idx, offsets) in all_offsets.iter().enumerate() {
-            assert_eq!(offsets.len(), APPENDS_PER_STREAM as usize,
-                "task {task_idx}: wrong number of offsets");
+            assert_eq!(
+                offsets.len(),
+                APPENDS_PER_STREAM as usize,
+                "task {task_idx}: wrong number of offsets"
+            );
 
             let mut sorted = offsets.clone();
             sorted.sort_unstable();
             sorted.dedup();
-            assert_eq!(sorted.len(), APPENDS_PER_STREAM as usize,
-                "task {task_idx}: duplicate offsets detected");
-            assert_eq!(*sorted.first().unwrap(), 0,
-                "task {task_idx}: first offset should be 0");
-            assert_eq!(*sorted.last().unwrap(), APPENDS_PER_STREAM - 1,
-                "task {task_idx}: last offset should be {}", APPENDS_PER_STREAM - 1);
+            assert_eq!(
+                sorted.len(),
+                APPENDS_PER_STREAM as usize,
+                "task {task_idx}: duplicate offsets detected"
+            );
+            assert_eq!(
+                *sorted.first().unwrap(),
+                0,
+                "task {task_idx}: first offset should be 0"
+            );
+            assert_eq!(
+                *sorted.last().unwrap(),
+                APPENDS_PER_STREAM - 1,
+                "task {task_idx}: last offset should be {}",
+                APPENDS_PER_STREAM - 1
+            );
         }
 
         // 2. Each stream should have correct max_offset.
         for (task_idx, &sid) in stream_ids.iter().enumerate() {
-            let resp = store.handle_frame(Frame {
-                opcode: Opcode::QueryOffset,
-                request_id: 0,
-                stream_id: sid,
-                ..Default::default()
-            }, None).await.unwrap();
-            assert_eq!(resp.offset, Offset(APPENDS_PER_STREAM),
-                "task {task_idx}: stream max_offset mismatch");
+            let resp = store
+                .handle_frame(
+                    Frame {
+                        opcode: Opcode::QueryOffset,
+                        request_id: 0,
+                        stream_id: sid,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.offset,
+                Offset(APPENDS_PER_STREAM),
+                "task {task_idx}: stream max_offset mismatch"
+            );
         }
 
         // 3. Read all records from each stream and verify payload content.
         for (task_idx, &sid) in stream_ids.iter().enumerate() {
             let expected_byte = b'A' + (task_idx as u8 % 26);
-            let resp = store.handle_frame(Frame {
-                opcode: Opcode::Read,
-                request_id: 0,
-                stream_id: sid,
-                offset: Offset(0),
-                count: 100,
-                ..Default::default()
-            }, None).await.unwrap();
+            let resp = store
+                .handle_frame(
+                    Frame {
+                        opcode: Opcode::Read,
+                        request_id: 0,
+                        stream_id: sid,
+                        offset: Offset(0),
+                        count: 100,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
             assert_eq!(resp.opcode, Opcode::ReadResp);
             let count = resp.count as usize;
             assert!(count > 0, "task {task_idx}: expected at least 1 message");
 
             // Verify first record's payload.
             let len = u32::from_be_bytes([
-                resp.payload[0], resp.payload[1],
-                resp.payload[2], resp.payload[3],
+                resp.payload[0],
+                resp.payload[1],
+                resp.payload[2],
+                resp.payload[3],
             ]) as usize;
-            assert_eq!(len, PAYLOAD_SIZE,
-                "task {task_idx}: payload size mismatch");
-            assert_eq!(resp.payload[4], expected_byte,
-                "task {task_idx}: payload content mismatch");
+            assert_eq!(len, PAYLOAD_SIZE, "task {task_idx}: payload size mismatch");
+            assert_eq!(
+                resp.payload[4], expected_byte,
+                "task {task_idx}: payload content mismatch"
+            );
         }
 
         // 4. Verify metrics counters.
         let total_expected = NUM_STREAMS * APPENDS_PER_STREAM;
         let (appends, bytes, active_count) = store.snapshot_metrics();
-        assert_eq!(appends, total_expected,
-            "metrics: append count mismatch");
-        assert_eq!(bytes, total_expected * PAYLOAD_SIZE as u64,
-            "metrics: bytes_written mismatch");
-        assert_eq!(active_count, NUM_STREAMS as u32,
-            "metrics: active extent count mismatch");
+        assert_eq!(appends, total_expected, "metrics: append count mismatch");
+        assert_eq!(
+            bytes,
+            total_expected * PAYLOAD_SIZE as u64,
+            "metrics: bytes_written mismatch"
+        );
+        assert_eq!(
+            active_count, NUM_STREAMS as u32,
+            "metrics: active extent count mismatch"
+        );
 
         // Print throughput info (visible with `cargo test -- --nocapture`).
         let total_ops = total_expected;
@@ -1203,13 +1352,19 @@ mod tests {
         for i in 0..NUM_READER_STREAMS {
             let sid = register_stream(&store, 100 + i + 1, (100 + i) as u32).await;
             for j in 0..100u32 {
-                store.handle_frame(Frame {
-                    opcode: Opcode::Append,
-                    request_id: j,
-                    stream_id: sid,
-                    payload: Bytes::from(format!("pre-{j}")),
-                    ..Default::default()
-                }, None).await.unwrap();
+                store
+                    .handle_frame(
+                        Frame {
+                            opcode: Opcode::Append,
+                            request_id: j,
+                            stream_id: sid,
+                            payload: Bytes::from(format!("pre-{j}")),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
             }
             reader_sids.push(sid);
         }
@@ -1224,13 +1379,19 @@ mod tests {
             let store = Arc::clone(&store);
             handles.push(tokio::spawn(async move {
                 for seq in 0..APPENDS_PER_STREAM {
-                    let resp = store.handle_frame(Frame {
-                        opcode: Opcode::Append,
-                        request_id: seq as u32,
-                        stream_id: sid,
-                        payload: Bytes::from_static(b"write-payload"),
-                        ..Default::default()
-                    }, None).await.unwrap();
+                    let resp = store
+                        .handle_frame(
+                            Frame {
+                                opcode: Opcode::Append,
+                                request_id: seq as u32,
+                                stream_id: sid,
+                                payload: Bytes::from_static(b"write-payload"),
+                                ..Default::default()
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
                     assert_eq!(resp.opcode, Opcode::AppendAck);
                 }
                 "writer_done"
@@ -1242,14 +1403,20 @@ mod tests {
             let store = Arc::clone(&store);
             handles.push(tokio::spawn(async move {
                 for _ in 0..READS_PER_STREAM {
-                    let resp = store.handle_frame(Frame {
-                        opcode: Opcode::Read,
-                        request_id: 0,
-                        stream_id: sid,
-                        offset: Offset(0),
-                        count: 10,
-                        ..Default::default()
-                    }, None).await.unwrap();
+                    let resp = store
+                        .handle_frame(
+                            Frame {
+                                opcode: Opcode::Read,
+                                request_id: 0,
+                                stream_id: sid,
+                                offset: Offset(0),
+                                count: 10,
+                                ..Default::default()
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
                     assert_eq!(resp.opcode, Opcode::ReadResp);
                     assert!(resp.count > 0, "reader should get at least 1 message");
                 }
@@ -1265,26 +1432,46 @@ mod tests {
 
         // Verify writer streams have correct data.
         for &sid in &writer_sids {
-            let resp = store.handle_frame(Frame {
-                opcode: Opcode::QueryOffset,
-                request_id: 0,
-                stream_id: sid,
-                ..Default::default()
-            }, None).await.unwrap();
-            assert_eq!(resp.offset, Offset(APPENDS_PER_STREAM),
-                "writer stream {:?} should have {APPENDS_PER_STREAM} messages", sid);
+            let resp = store
+                .handle_frame(
+                    Frame {
+                        opcode: Opcode::QueryOffset,
+                        request_id: 0,
+                        stream_id: sid,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.offset,
+                Offset(APPENDS_PER_STREAM),
+                "writer stream {:?} should have {APPENDS_PER_STREAM} messages",
+                sid
+            );
         }
 
         // Verify reader streams are untouched (still 100 messages each).
         for &sid in &reader_sids {
-            let resp = store.handle_frame(Frame {
-                opcode: Opcode::QueryOffset,
-                request_id: 0,
-                stream_id: sid,
-                ..Default::default()
-            }, None).await.unwrap();
-            assert_eq!(resp.offset, Offset(100),
-                "reader stream {:?} should still have 100 messages", sid);
+            let resp = store
+                .handle_frame(
+                    Frame {
+                        opcode: Opcode::QueryOffset,
+                        request_id: 0,
+                        stream_id: sid,
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.offset,
+                Offset(100),
+                "reader stream {:?} should still have 100 messages",
+                sid
+            );
         }
     }
 
@@ -1313,13 +1500,19 @@ mod tests {
             handles.push(tokio::spawn(async move {
                 let mut offsets = Vec::with_capacity(APPENDS_PER_TASK as usize);
                 for seq in 0..APPENDS_PER_TASK {
-                    let resp = store.handle_frame(Frame {
-                        opcode: Opcode::Append,
-                        request_id: seq as u32,
-                        stream_id: sid,
-                        payload: Bytes::from(format!("t{task_idx}-m{seq}")),
-                        ..Default::default()
-                    }, None).await.unwrap();
+                    let resp = store
+                        .handle_frame(
+                            Frame {
+                                opcode: Opcode::Append,
+                                request_id: seq as u32,
+                                stream_id: sid,
+                                payload: Bytes::from(format!("t{task_idx}-m{seq}")),
+                                ..Default::default()
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
                     assert_eq!(resp.opcode, Opcode::AppendAck);
                     offsets.push(resp.offset.0);
                 }
@@ -1340,18 +1533,27 @@ mod tests {
 
         all_offsets.sort_unstable();
         all_offsets.dedup();
-        assert_eq!(all_offsets.len(), total,
-            "duplicate offsets detected across tasks");
+        assert_eq!(
+            all_offsets.len(),
+            total,
+            "duplicate offsets detected across tasks"
+        );
         assert_eq!(*all_offsets.first().unwrap(), 0);
         assert_eq!(*all_offsets.last().unwrap(), (total - 1) as u64);
 
         // Verify max_offset.
-        let resp = store.handle_frame(Frame {
-            opcode: Opcode::QueryOffset,
-            request_id: 0,
-            stream_id: sid,
-            ..Default::default()
-        }, None).await.unwrap();
+        let resp = store
+            .handle_frame(
+                Frame {
+                    opcode: Opcode::QueryOffset,
+                    request_id: 0,
+                    stream_id: sid,
+                    ..Default::default()
+                },
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(resp.offset, Offset(total as u64));
 
         let throughput = total as f64 / elapsed.as_secs_f64();

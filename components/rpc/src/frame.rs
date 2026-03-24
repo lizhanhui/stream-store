@@ -1,8 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    ErrorCode, ExtentId, Offset, Opcode, StreamId, FLAG_OFFSET_PRESENT, HEADER_LEN, MAGIC,
-    PROTOCOL_VERSION,
+    ErrorCode, ExtentId, FLAG_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
+    StreamId,
 };
 
 /// A wire protocol frame.
@@ -292,8 +292,7 @@ impl Frame {
         }
 
         // Peek at remaining_length without advancing.
-        let remaining_len =
-            u32::from_be_bytes([src[4], src[5], src[6], src[7]]) as usize;
+        let remaining_len = u32::from_be_bytes([src[4], src[5], src[6], src[7]]) as usize;
         let total_len = HEADER_LEN + remaining_len;
 
         if src.len() < total_len {
@@ -317,8 +316,8 @@ impl Frame {
         }
 
         let opcode_byte = src.get_u8();
-        let opcode = Opcode::from_u8(opcode_byte)
-            .ok_or(StorageError::UnknownOpcode(opcode_byte))?;
+        let opcode =
+            Opcode::from_u8(opcode_byte).ok_or(StorageError::UnknownOpcode(opcode_byte))?;
 
         let flags = src.get_u8();
         let _remaining_len = src.get_u32(); // already peeked above
@@ -739,12 +738,7 @@ mod tests {
 
     #[test]
     fn error_response_frame() {
-        let frame = Frame::error_response(
-            42,
-            ErrorCode::ExtentFull,
-            "arena full",
-            ExtentId(7),
-        );
+        let frame = Frame::error_response(42, ErrorCode::ExtentFull, "arena full", ExtentId(7));
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);

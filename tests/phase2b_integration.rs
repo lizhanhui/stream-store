@@ -19,21 +19,15 @@ use extent_node::store::{ExtentNodeStore, ForwardRequest};
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .try_init();
 }
 
 /// Start a broadcast-replication-enabled ExtentNode server.
 /// Returns (addr, store handle).
-async fn start_extent_node() -> (
-    String,
-    Arc<ExtentNodeStore>,
-) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .unwrap();
+async fn start_extent_node() -> (String, Arc<ExtentNodeStore>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
     // Create channels for broadcast replication.
@@ -48,14 +42,24 @@ async fn start_extent_node() -> (
     // Spawn DownstreamManager.
     let downstream_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        extent_node::downstream::run_downstream_manager(forward_rx, watermark_tx, downstream_shutdown).await;
+        extent_node::downstream::run_downstream_manager(
+            forward_rx,
+            watermark_tx,
+            downstream_shutdown,
+        )
+        .await;
     });
 
     // Spawn WatermarkHandler.
     let store_for_wm = Arc::clone(&store);
     let watermark_shutdown = shutdown_tx.subscribe();
     tokio::spawn(async move {
-        extent_node::watermark::run_watermark_handler(watermark_rx, store_for_wm, watermark_shutdown).await;
+        extent_node::watermark::run_watermark_handler(
+            watermark_rx,
+            store_for_wm,
+            watermark_shutdown,
+        )
+        .await;
     });
 
     // Keep shutdown_tx alive so receivers don't see Closed.
@@ -96,7 +100,13 @@ async fn register_extent(
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
 
-    let payload = build_register_extent_payload(stream_id, extent_id, role, replication_factor, replica_addrs);
+    let payload = build_register_extent_payload(
+        stream_id,
+        extent_id,
+        role,
+        replication_factor,
+        replica_addrs,
+    );
     framed
         .send(Frame {
             opcode: Opcode::RegisterExtent,
@@ -133,7 +143,15 @@ async fn broadcast_replication_rf2() {
     // Register broadcast replication.
     // Secondary must be registered first so it's ready to accept forwarded appends.
     register_extent(&secondary_addr, stream_id, extent_id, 1, 2, &[]).await;
-    register_extent(&primary_addr, stream_id, extent_id, 0, 2, &[&secondary_addr]).await;
+    register_extent(
+        &primary_addr,
+        stream_id,
+        extent_id,
+        0,
+        2,
+        &[&secondary_addr],
+    )
+    .await;
 
     // Give a moment for connections to settle.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -155,7 +173,10 @@ async fn broadcast_replication_rf2() {
     assert_eq!(max, Offset(5));
 
     // Read messages from Primary (byte_pos=0, read from beginning).
-    let msgs = client.read(StreamId(stream_id), Offset(0), 0, 10).await.unwrap();
+    let msgs = client
+        .read(StreamId(stream_id), Offset(0), 0, 10)
+        .await
+        .unwrap();
     assert_eq!(msgs.len(), 5);
     for i in 0..5 {
         assert_eq!(msgs[i], Bytes::from(format!("msg-{i}")));

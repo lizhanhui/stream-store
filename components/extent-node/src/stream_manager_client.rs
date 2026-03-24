@@ -12,21 +12,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::errors::StorageError;
+use common::types::NodeMetrics;
 use common::types::Opcode;
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
 use rpc::payload::{build_connect_payload, build_disconnect_payload, build_heartbeat_payload};
-use common::errors::StorageError;
-use common::types::NodeMetrics;
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
 
-use crate::store::ExtentNodeStore;
 use crate::ExtentNode;
+use crate::store::ExtentNodeStore;
 
 /// Manages the full lifecycle of the connection to StreamManager:
 /// TCP connect, Connect handshake, periodic Heartbeat, reconnection on failure,
@@ -152,11 +152,8 @@ impl StreamManagerClient {
         info!("connected to StreamManager at {stream_manager_addr}");
 
         // Send Connect.
-        let connect_payload = build_connect_payload(
-            advertised_addr,
-            advertised_addr,
-            heartbeat_interval_ms,
-        );
+        let connect_payload =
+            build_connect_payload(advertised_addr, advertised_addr, heartbeat_interval_ms);
         let connect_frame = Frame {
             opcode: Opcode::Connect,
             payload: connect_payload,
@@ -170,9 +167,7 @@ impl StreamManagerClient {
             }
             Some(Ok(resp)) => {
                 error!("unexpected Connect response: {:?}", resp.opcode);
-                return Err(StorageError::Internal(
-                    "unexpected Connect response".into(),
-                ));
+                return Err(StorageError::Internal("unexpected Connect response".into()));
             }
             Some(Err(e)) => return Err(e),
             None => {

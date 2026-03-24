@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bytes::{Buf, Bytes};
 use common::errors::StorageError;
 use common::types::{
-    ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId, FLAG_OFFSET_PRESENT,
+    ErrorCode, ExtentId, ExtentInfo, FLAG_OFFSET_PRESENT, NodeMetrics, Offset, Opcode, StreamId,
 };
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;

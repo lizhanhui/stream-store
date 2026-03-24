@@ -4,7 +4,7 @@ use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::Framed;
-use tracing::{error, info, info_span, Instrument};
+use tracing::{Instrument, error, info, info_span};
 
 use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
@@ -201,10 +201,7 @@ async fn serve_connection<H: RequestHandler>(stream: TcpStream, handler: Arc<H>)
 /// a per-connection mpsc channel. This enables deferred responses: the handler
 /// can return `None` for an Append, and later the WatermarkHandler sends the
 /// AppendAck through the channel.
-async fn serve_connection_with_deferred<H: RequestHandler>(
-    stream: TcpStream,
-    handler: Arc<H>,
-) {
+async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, handler: Arc<H>) {
     let peer = stream
         .peer_addr()
         .map(|a| a.to_string())
@@ -221,8 +218,7 @@ async fn serve_connection_with_deferred<H: RequestHandler>(
         let write_span = info_span!("writer");
         let write_task = tokio::spawn(
             async move {
-                let mut framed_write =
-                    tokio_util::codec::FramedWrite::new(write_half, FrameCodec);
+                let mut framed_write = tokio_util::codec::FramedWrite::new(write_half, FrameCodec);
                 while let Some(frame) = response_rx.recv().await {
                     if let Err(e) = framed_write.send(frame).await {
                         error!("failed to send response: {e}");
@@ -235,8 +231,7 @@ async fn serve_connection_with_deferred<H: RequestHandler>(
         );
 
         // Read task: read client frames, dispatch to handler.
-        let mut framed_read =
-            tokio_util::codec::FramedRead::new(read_half, FrameCodec);
+        let mut framed_read = tokio_util::codec::FramedRead::new(read_half, FrameCodec);
 
         while let Some(result) = framed_read.next().await {
             match result {

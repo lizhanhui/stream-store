@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::{BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
-use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId, FLAG_OFFSET_PRESENT};
+use common::types::{ErrorCode, ExtentId, FLAG_OFFSET_PRESENT, Offset, Opcode, StreamId};
 use futures_util::future;
 use rpc::frame::Frame;
 use rpc::payload::{

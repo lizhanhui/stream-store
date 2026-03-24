@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::metadata::MetadataStore;
-use tokio::sync::{broadcast, Mutex};
-use tracing::{info, warn, error};
+use tokio::sync::{Mutex, broadcast};
+use tracing::{error, info, warn};
 
 use crate::allocator::Allocator;
 
@@ -75,7 +75,9 @@ async fn check_expired_nodes(
             );
             // Seal with current message_count (we can't know the exact count
             // from ExtentNode since it's dead; record what metadata has).
-            store.seal_extent(extent.stream_id, extent.extent_id, extent.message_count).await?;
+            store
+                .seal_extent(extent.stream_id, extent.extent_id, extent.message_count)
+                .await?;
 
             // 3. Allocate a replacement extent on a healthy node.
             let new_base_offset = extent.base_offset + extent.message_count as u64;

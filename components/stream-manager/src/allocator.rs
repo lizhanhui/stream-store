@@ -108,7 +108,9 @@ impl Allocator {
         count: usize,
     ) -> Result<Vec<NodeRow>, StorageError> {
         if count == 0 {
-            return Err(StorageError::Internal("replication_factor must be >= 1".into()));
+            return Err(StorageError::Internal(
+                "replication_factor must be >= 1".into(),
+            ));
         }
         let alive = store.get_alive_nodes().await?;
         if alive.len() < count {
@@ -158,32 +160,44 @@ mod tests {
     fn score_node_idle() {
         let mut alloc = Allocator::new();
         // Idle node: plenty of memory, no load.
-        alloc.update_metrics("node-1", NodeMetrics {
-            available_memory_bytes: 16_000_000_000,
-            total_memory_bytes: 16_000_000_000,
-            appends_per_sec: 0,
-            active_extent_count: 0,
-            bytes_written_per_sec: 0,
-        });
+        alloc.update_metrics(
+            "node-1",
+            NodeMetrics {
+                available_memory_bytes: 16_000_000_000,
+                total_memory_bytes: 16_000_000_000,
+                appends_per_sec: 0,
+                active_extent_count: 0,
+                bytes_written_per_sec: 0,
+            },
+        );
         let score = alloc.score_node("node-1");
         // mem_pressure = 0.0, all others = 0.0 => score ~ 0.0
-        assert!(score < 0.01, "idle node score should be near 0, got {score}");
+        assert!(
+            score < 0.01,
+            "idle node score should be near 0, got {score}"
+        );
     }
 
     #[test]
     fn score_node_loaded() {
         let mut alloc = Allocator::new();
         // Heavily loaded node: low memory, high throughput, many extents.
-        alloc.update_metrics("node-1", NodeMetrics {
-            available_memory_bytes: 1_000_000_000,
-            total_memory_bytes: 16_000_000_000,
-            appends_per_sec: 50_000,
-            active_extent_count: 100,
-            bytes_written_per_sec: 100 * 1024 * 1024,
-        });
+        alloc.update_metrics(
+            "node-1",
+            NodeMetrics {
+                available_memory_bytes: 1_000_000_000,
+                total_memory_bytes: 16_000_000_000,
+                appends_per_sec: 50_000,
+                active_extent_count: 100,
+                bytes_written_per_sec: 100 * 1024 * 1024,
+            },
+        );
         let score = alloc.score_node("node-1");
         // All components at or near max => score near 1.0
-        assert!(score > 0.8, "loaded node score should be near 1.0, got {score}");
+        assert!(
+            score > 0.8,
+            "loaded node score should be near 1.0, got {score}"
+        );
     }
 
     #[test]
@@ -203,22 +217,28 @@ mod tests {
         let mut alloc = Allocator::new();
 
         // Light node.
-        alloc.update_metrics("light", NodeMetrics {
-            available_memory_bytes: 14_000_000_000,
-            total_memory_bytes: 16_000_000_000,
-            appends_per_sec: 100,
-            active_extent_count: 5,
-            bytes_written_per_sec: 1_000_000,
-        });
+        alloc.update_metrics(
+            "light",
+            NodeMetrics {
+                available_memory_bytes: 14_000_000_000,
+                total_memory_bytes: 16_000_000_000,
+                appends_per_sec: 100,
+                active_extent_count: 5,
+                bytes_written_per_sec: 1_000_000,
+            },
+        );
 
         // Heavy node.
-        alloc.update_metrics("heavy", NodeMetrics {
-            available_memory_bytes: 2_000_000_000,
-            total_memory_bytes: 16_000_000_000,
-            appends_per_sec: 40_000,
-            active_extent_count: 80,
-            bytes_written_per_sec: 80 * 1024 * 1024,
-        });
+        alloc.update_metrics(
+            "heavy",
+            NodeMetrics {
+                available_memory_bytes: 2_000_000_000,
+                total_memory_bytes: 16_000_000_000,
+                appends_per_sec: 40_000,
+                active_extent_count: 80,
+                bytes_written_per_sec: 80 * 1024 * 1024,
+            },
+        );
 
         let light_score = alloc.score_node("light");
         let heavy_score = alloc.score_node("heavy");
