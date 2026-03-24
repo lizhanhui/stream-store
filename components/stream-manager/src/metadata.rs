@@ -171,10 +171,11 @@ impl MetadataStore {
     /// Allocate a new extent for a stream on a replica set. Returns ExtentId.
     ///
     /// `nodes` is ordered: [(primary_addr, 0), (secondary_1_addr, 1), ...].
-    /// This method:
-    /// 1. Atomically increments stream_sequence to get the next extent_id.
-    /// 2. Inserts the extent row.
-    /// 3. Inserts extent_replica rows for each node.
+    /// This method runs in a single MySQL transaction to prevent race conditions:
+    /// 1. Locks the stream_sequence row with SELECT ... FOR UPDATE.
+    /// 2. Increments next_extent_id and reads the new value atomically.
+    /// 3. Inserts the extent row.
+    /// 4. Inserts extent_replica rows for each node.
     pub async fn allocate_extent(
         &self,
         stream_id: StreamId,
@@ -187,18 +188,36 @@ impl MetadataStore {
             ));
         }
 
-        // Step 1: Atomically get next extent_id for this stream.
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+
+        // Step 1: Lock and increment stream_sequence atomically within the transaction.
+        sqlx::query(
+            "SELECT next_extent_id FROM stream_sequence WHERE stream_id = ? FOR UPDATE",
+        )
+        .bind(stream_id.0 as i64)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Internal(format!("lock stream_sequence: {e}")))?;
+
         sqlx::query(
             "UPDATE stream_sequence SET next_extent_id = next_extent_id + 1 WHERE stream_id = ?",
         )
         .bind(stream_id.0 as i64)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("increment stream_sequence: {e}")))?;
 
         let row = sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?")
             .bind(stream_id.0 as i64)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
 
@@ -213,7 +232,7 @@ impl MetadataStore {
         .bind(extent_id.0 as i64)
         .bind(base_offset as i64)
         .bind(ExtentState::Active.as_u8())
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("insert extent: {e}")))?;
 
@@ -226,10 +245,14 @@ impl MetadataStore {
             .bind(extent_id.0 as i64)
             .bind(addr)
             .bind(*role)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("insert extent_replica: {e}")))?;
         }
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
 
         Ok(extent_id)
     }
