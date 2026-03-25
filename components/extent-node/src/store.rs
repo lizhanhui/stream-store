@@ -627,7 +627,8 @@ impl ExtentNodeStore {
 
         match stream_ref.read(frame.offset(), byte_pos, count) {
             Ok(messages) => {
-                let mut payload = BytesMut::new();
+                let total_size: usize = messages.iter().map(|m| 4 + m.len()).sum();
+                let mut payload = BytesMut::with_capacity(total_size);
                 for msg in &messages {
                     payload.put_u32(msg.len() as u32);
                     payload.extend_from_slice(msg);

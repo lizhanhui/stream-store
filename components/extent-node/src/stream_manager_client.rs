@@ -12,6 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use common::config::{RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
 use common::errors::StorageError;
 use common::types::NodeMetrics;
 use common::types::Opcode;
@@ -147,7 +148,13 @@ impl StreamManagerClient {
         heartbeat_interval_ms: u32,
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Result<bool, StorageError> {
-        let stream = TcpStream::connect(stream_manager_addr).await?;
+        let stream = tokio::time::timeout(
+            RPC_CONNECT_TIMEOUT,
+            TcpStream::connect(stream_manager_addr),
+        )
+        .await
+        .map_err(|_| StorageError::Internal(format!("connect timeout to {stream_manager_addr}")))?
+        ?;
         let mut framed = Framed::new(stream, FrameCodec);
         info!("connected to StreamManager at {stream_manager_addr}");
 
@@ -155,20 +162,28 @@ impl StreamManagerClient {
         let connect_payload =
             build_connect_payload(advertised_addr, advertised_addr, heartbeat_interval_ms);
         let connect_frame = Frame::new(VariableHeader::Connect { request_id: 0 }, Some(connect_payload));
-        framed.send(connect_frame).await?;
+        tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.send(connect_frame))
+            .await
+            .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))?
+            ?;
 
-        match framed.next().await {
-            Some(Ok(resp)) if resp.opcode() == Opcode::ConnectAck => {
+        match tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.next()).await {
+            Ok(Some(Ok(resp))) if resp.opcode() == Opcode::ConnectAck => {
                 info!("registered with StreamManager");
             }
-            Some(Ok(resp)) => {
+            Ok(Some(Ok(resp))) => {
                 error!("unexpected Connect response: {:?}", resp.opcode());
                 return Err(StorageError::Internal("unexpected Connect response".into()));
             }
-            Some(Err(e)) => return Err(e),
-            None => {
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(None) => {
                 return Err(StorageError::Internal(
                     "StreamManager connection closed after Connect".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(StorageError::Internal(
+                    "timeout waiting for ConnectAck from StreamManager".into(),
                 ));
             }
         }
@@ -242,19 +257,27 @@ impl StreamManagerClient {
             let hb_frame = Frame::new(VariableHeader::Heartbeat { request_id }, Some(heartbeat_payload));
             request_id = request_id.wrapping_add(1);
 
-            framed.send(hb_frame).await?;
+            tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.send(hb_frame))
+                .await
+                .map_err(|_| StorageError::Internal("timeout sending Heartbeat".into()))?
+                ?;
 
-            match framed.next().await {
-                Some(Ok(resp)) if resp.opcode() == Opcode::Heartbeat => {
+            match tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.next()).await {
+                Ok(Some(Ok(resp))) if resp.opcode() == Opcode::Heartbeat => {
                     // Heartbeat acknowledged.
                 }
-                Some(Ok(resp)) => {
+                Ok(Some(Ok(resp))) => {
                     warn!("unexpected heartbeat response: {:?}", resp.opcode());
                 }
-                Some(Err(e)) => return Err(e),
-                None => {
+                Ok(Some(Err(e))) => return Err(e),
+                Ok(None) => {
                     return Err(StorageError::Internal(
                         "StreamManager connection closed".into(),
+                    ));
+                }
+                Err(_) => {
+                    return Err(StorageError::Internal(
+                        "timeout waiting for Heartbeat response".into(),
                     ));
                 }
             }

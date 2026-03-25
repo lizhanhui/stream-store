@@ -5,7 +5,7 @@ use common::types::{ExtentInfo, ExtentState, NodeMetrics, ReplicaDetail};
 
 /// Build a Connect payload: [node_id_len:u16][node_id][addr_len:u16][addr][interval_ms:u32]
 pub fn build_connect_payload(node_id: &str, addr: &str, interval_ms: u32) -> Bytes {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(2 + node_id.len() + 2 + addr.len() + 4);
     buf.put_u16(node_id.len() as u16);
     buf.extend_from_slice(node_id.as_bytes());
     buf.put_u16(addr.len() as u16);
@@ -63,7 +63,7 @@ pub fn build_disconnect_payload(node_id: &str) -> Bytes {
 
 /// Build a simple string payload: [len:u16][string]
 pub fn build_string_payload(s: &str) -> Bytes {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(2 + s.len());
     buf.put_u16(s.len() as u16);
     buf.extend_from_slice(s.as_bytes());
     buf.freeze()
@@ -86,7 +86,7 @@ pub fn parse_string_payload(payload: &[u8]) -> Option<String> {
 /// Wire format:
 /// `[node_id_len:u16][node_id][available_memory_bytes:u64][total_memory_bytes:u64][appends_per_sec:u32][active_extent_count:u32][bytes_written_per_sec:u64]`
 pub fn build_heartbeat_payload(node_id: &str, metrics: &NodeMetrics) -> Bytes {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(2 + node_id.len() + 8 + 8 + 4 + 4 + 8);
     buf.put_u16(node_id.len() as u16);
     buf.extend_from_slice(node_id.as_bytes());
     buf.put_u64(metrics.available_memory_bytes);
@@ -152,7 +152,8 @@ pub const ROLE_PRIMARY: u8 = 0;
 pub fn build_register_extent_payload(
     replica_addrs: &[&str],
 ) -> Bytes {
-    let mut buf = BytesMut::new();
+    let addrs_size: usize = replica_addrs.iter().map(|a| 2 + a.len()).sum();
+    let mut buf = BytesMut::with_capacity(2 + addrs_size);
     buf.put_u16(replica_addrs.len() as u16);
     for addr in replica_addrs {
         buf.put_u16(addr.len() as u16);
@@ -193,7 +194,7 @@ pub fn parse_register_extent_payload(payload: &[u8]) -> Option<Vec<String>> {
 
 /// Build a CreateStream payload: [name_len:u16][stream_name][replication_factor:u16]
 pub fn build_create_stream_payload(name: &str, replication_factor: u16) -> Bytes {
-    let mut buf = BytesMut::new();
+    let mut buf = BytesMut::with_capacity(2 + name.len() + 2);
     buf.put_u16(name.len() as u16);
     buf.extend_from_slice(name.as_bytes());
     buf.put_u16(replication_factor);
@@ -230,7 +231,11 @@ pub fn parse_create_stream_payload(payload: &[u8]) -> Option<(String, u16)> {
 ///         [addr_len:u16][addr_bytes][role:u8][is_alive:u8]
 /// ```
 pub fn encode_extent_info_vec(extents: &[ExtentInfo]) -> Bytes {
-    let mut buf = BytesMut::new();
+    // Pre-compute capacity: 4 (num_extents) + per extent: 4+8+8+1+2 = 23 + replica data
+    let extent_size: usize = extents.iter().map(|ext| {
+        23 + ext.replicas.iter().map(|r| 2 + r.node_addr.len() + 1 + 1).sum::<usize>()
+    }).sum();
+    let mut buf = BytesMut::with_capacity(4 + extent_size);
     buf.put_u32(extents.len() as u32);
     for ext in extents {
         buf.put_u32(ext.extent_id);

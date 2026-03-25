@@ -1,4 +1,7 @@
 use std::alloc::{Layout, alloc, dealloc};
+use std::ops::Deref;
+use std::ptr::NonNull;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -7,6 +10,58 @@ use common::types::{ExtentId, ExtentState, Offset};
 
 /// Default arena capacity: 64 MB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
+
+/// Owns the raw heap allocation for an extent's arena buffer.
+/// Wrapped in `Arc` so that `Bytes` slices keep the buffer alive
+/// even after the `Extent` is dropped.
+struct ArenaBuffer {
+    ptr: NonNull<u8>,
+    capacity: usize,
+    layout: Layout,
+}
+
+// SAFETY: The raw allocation is exclusively managed by ArenaBuffer via Arc.
+// No aliased mutable access is possible once shared.
+unsafe impl Send for ArenaBuffer {}
+unsafe impl Sync for ArenaBuffer {}
+
+impl Drop for ArenaBuffer {
+    fn drop(&mut self) {
+        // SAFETY: ptr and layout were produced by alloc() in ArenaBuffer::new().
+        unsafe {
+            dealloc(self.ptr.as_ptr(), self.layout);
+        }
+    }
+}
+
+/// A reference-counted slice into an `ArenaBuffer`.
+/// Implements `Deref<Target=[u8]>` so it can be passed to `Bytes::from_owner()`.
+struct OwnedArenaSlice {
+    _arena: Arc<ArenaBuffer>,
+    ptr: *const u8,
+    len: usize,
+}
+
+// SAFETY: The underlying memory is owned by Arc<ArenaBuffer> which is Send+Sync.
+// The ptr/len describe an immutable view into that allocation.
+unsafe impl Send for OwnedArenaSlice {}
+unsafe impl Sync for OwnedArenaSlice {}
+
+impl Deref for OwnedArenaSlice {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        // SAFETY: ptr is valid for len bytes as long as _arena is alive,
+        // and _arena is kept alive by the Arc clone in this struct.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+impl AsRef<[u8]> for OwnedArenaSlice {
+    fn as_ref(&self) -> &[u8] {
+        self.deref()
+    }
+}
 
 /// Result of a successful append: the logical offset and the byte position
 /// within the arena where the record was written. The caller can use the
@@ -73,12 +128,13 @@ pub struct Extent {
     pub id: ExtentId,
     pub start_offset: Offset,
 
-    /// Pre-allocated contiguous buffer. Owned by this Extent; freed on drop.
+    /// Reference-counted arena buffer. Shared with any outstanding `Bytes`
+    /// slices, so the memory is not freed until all readers are done.
+    arena: Arc<ArenaBuffer>,
+    /// Derived write pointer into the arena (for append writes).
     buf: *mut u8,
     /// Total capacity of the arena in bytes.
     capacity: usize,
-    /// Layout used for allocation (needed for dealloc).
-    layout: Layout,
 
     /// Byte position of the next free slot. Writers `fetch_add` to reserve space.
     write_cursor: AtomicU64,
@@ -99,9 +155,9 @@ pub struct Extent {
     sealed: AtomicBool,
 }
 
-// SAFETY: The raw pointer `buf` is exclusively owned by this Extent.
-// All concurrent access to the arena is mediated by atomic cursors that
-// guarantee non-overlapping writes and committed-seq-bounded reads.
+// SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
+// used for non-overlapping writes mediated by atomic cursors. The ArenaBuffer
+// itself is Send+Sync, and all concurrent access is bounded by atomic cursors.
 unsafe impl Send for Extent {}
 unsafe impl Sync for Extent {}
 
@@ -115,17 +171,24 @@ impl Extent {
     pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: usize) -> Self {
         let layout = Layout::from_size_align(capacity, 8).expect("invalid layout");
         // SAFETY: layout is valid, nonzero size.
-        let buf = unsafe { alloc(layout) };
-        if buf.is_null() {
+        let ptr = unsafe { alloc(layout) };
+        if ptr.is_null() {
             std::alloc::handle_alloc_error(layout);
         }
+
+        let arena = Arc::new(ArenaBuffer {
+            ptr: NonNull::new(ptr).unwrap(),
+            capacity,
+            layout,
+        });
+        let buf = arena.ptr.as_ptr();
 
         Self {
             id,
             start_offset,
+            arena,
             buf,
             capacity,
-            layout,
             write_cursor: AtomicU64::new(0),
             record_count: AtomicU64::new(0),
             committed_seq: AtomicU64::new(0),
@@ -181,8 +244,9 @@ impl Extent {
         // 4. Advance committed_seq and committed_bytes in-order (spin-wait CAS).
         //    Each writer spins until committed_seq == their seq, then advances to seq+1.
         //    The spin waits only for the immediately preceding writer's memcpy to finish.
+        //    Uses exponential backoff: up to 63 spin iterations (sub-µs), then yield to OS.
         let new_committed_bytes = byte_pos + record_len as u64;
-        loop {
+        for spin_count in 0u32.. {
             match self.committed_seq.compare_exchange_weak(
                 seq,
                 seq + 1,
@@ -194,7 +258,15 @@ impl Extent {
                         .store(new_committed_bytes, Ordering::Release);
                     break;
                 }
-                Err(_) => std::hint::spin_loop(),
+                Err(_) => {
+                    if spin_count < 6 {
+                        for _ in 0..(1 << spin_count) {
+                            std::hint::spin_loop();
+                        }
+                    } else {
+                        std::thread::yield_now();
+                    }
+                }
             }
         }
 
@@ -248,21 +320,17 @@ impl Extent {
 
     /// Create a `Bytes` view of the entire arena buffer.
     ///
-    /// The returned `Bytes` is reference-counted, so the arena memory stays alive
-    /// as long as any derived slice is held by a reader.
+    /// The returned `Bytes` holds an `Arc` clone of the arena buffer,
+    /// so the memory stays alive as long as any derived slice is held by a reader.
     fn arena_as_bytes(&self) -> Bytes {
-        let ptr = self.buf;
-        let cap = self.capacity;
-        // SAFETY: `ptr` is valid for `cap` bytes and remains valid as long as this
-        // Extent lives. We extend the lifetime to 'static -- this is sound because
-        // the Extent guarantees the buffer lives as long as any Bytes derived from it
-        // (sealed extents are kept alive until evicted, active extents are never
-        // dropped while serving reads).
-        //
-        // NOTE: In production we should use a proper Arc<[u8]> wrapper.
-        let slice = unsafe { std::slice::from_raw_parts(ptr, cap) };
-        let static_slice: &'static [u8] = unsafe { std::mem::transmute(slice) };
-        Bytes::from_static(static_slice)
+        let arena = Arc::clone(&self.arena);
+        let ptr = arena.ptr.as_ptr() as *const u8;
+        let len = arena.capacity;
+        Bytes::from_owner(OwnedArenaSlice {
+            _arena: arena,
+            ptr,
+            len,
+        })
     }
 
     /// Seal this extent. No more appends will be accepted.
@@ -327,15 +395,6 @@ impl Extent {
         }
         let arena = self.arena_as_bytes();
         arena.slice(0..cb)
-    }
-}
-
-impl Drop for Extent {
-    fn drop(&mut self) {
-        // SAFETY: buf was allocated with this layout in new()/with_capacity().
-        unsafe {
-            dealloc(self.buf, self.layout);
-        }
     }
 }
 

@@ -214,6 +214,7 @@ Append a message to a data stream. `Flags` bit 0 (`FLAG_FORWARDED`): 0 = client 
 Fixed Header (8B)
   Flags: bit 0 = FLAG_FORWARDED
 Variable Header:
+  [request_id   : u32]    -- correlates request/response (0 when forwarded)
   [stream_id    : u64]    -- target stream
   [extent_id    : u32]    -- target extent (for server-side validation)
 Payload:
@@ -230,6 +231,7 @@ Confirms a successful append after quorum ACK is achieved.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates with original APPEND request
   [stream_id    : u64]    -- stream that was appended to
   [extent_id    : u32]    -- extent that was appended to
   [offset       : u64]    -- assigned logical sequence number
@@ -244,6 +246,7 @@ Read messages from a stream starting at a given offset and byte position.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
   [offset       : u64]    -- start logical offset
   [byte_pos     : u64]    -- byte position within the extent arena (0 = scan from start)
@@ -258,6 +261,7 @@ Read response carrying message data.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates with original READ request
   [stream_id    : u64]    -- stream that was read from
   [offset       : u64]    -- starting offset of the returned batch
   [count        : u32]    -- actual number of messages returned
@@ -281,6 +285,7 @@ FLAG_OFFSET_PRESENT = 0 (client seal, or SM -> EN):
   Fixed Header (8B)
     Flags: 0x00
   Variable Header:
+    [request_id   : u32]    -- correlates request/response
     [stream_id    : u64]    -- stream to seal
     [extent_id    : u32]    -- extent to seal
   No Payload.
@@ -289,6 +294,7 @@ FLAG_OFFSET_PRESENT = 1 (extent-node seal):
   Fixed Header (8B)
     Flags: 0x01
   Variable Header:
+    [request_id   : u32]    -- correlates request/response
     [stream_id    : u64]    -- stream to seal
     [extent_id    : u32]    -- extent to seal
     [offset       : u64]    -- committed end_offset, trusted by SM
@@ -333,13 +339,27 @@ Create a new stream. If `replication_factor = 0`, Stream Manager uses its defaul
 ```
 Fixed Header (8B)
 Variable Header:
-  [name_len     : u16]
-  [stream_name  : bytes]  -- stream name (maps to MQTT queue name)
+  [request_id         : u32]
+Payload:
+  [name_len           : u16]
+  [stream_name        : bytes]  -- stream name (maps to MQTT queue name)
   [replication_factor : u16]
-No Payload.
 ```
 
-**Response** (via APPEND_ACK opcode): `stream_id` in variable header, plus initial extent info.
+##### 0x0A CREATE_STREAM_RESP (Stream Manager -> Client)
+
+Response to CREATE_STREAM. Returns the newly created stream ID, initial extent ID, and the Primary Extent Node address.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [request_id  : u32]
+  [stream_id   : u64]
+  [extent_id   : u32]
+Payload:
+  [addr_len      : u16]
+  [primary_addr  : bytes]  -- address of the initial extent's Primary node
+```
 
 ##### 0x08 QUERY_OFFSET (Client -> Extent Node / Stream Manager)
 
@@ -348,6 +368,7 @@ Query the max offset (exclusive) for a stream.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
 No Payload.
 ```
@@ -359,6 +380,7 @@ Returns the current max offset.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates with original QUERY_OFFSET request
   [stream_id    : u64]    -- queried stream
   [offset       : u64]    -- max offset (exclusive)
 No Payload.
@@ -511,6 +533,7 @@ Describe a stream's extents with replica info and node liveness.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
   [count        : u32]    -- 0 = all extents, 1 = active only, N = at most N from latest
 No Payload.
@@ -523,6 +546,7 @@ Response to DESCRIBE_STREAM. Payload = encoded `Vec<ExtentInfo>`, ordered by ext
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates with original DESCRIBE_STREAM request
   [stream_id    : u64]    -- queried stream
 Payload:
   [payload_len  : u32]
@@ -536,6 +560,7 @@ Describe a single extent.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
   [extent_id    : u32]    -- target extent
 No Payload.
@@ -548,6 +573,7 @@ Response to DESCRIBE_EXTENT. Payload = encoded `Vec<ExtentInfo>` with exactly 1 
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates with original DESCRIBE_EXTENT request
   [stream_id    : u64]    -- queried stream
 Payload:
   [payload_len  : u32]
@@ -561,6 +587,7 @@ Resolve a logical offset to the extent that contains it.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
   [offset       : u64]    -- target logical offset
 No Payload.
@@ -573,6 +600,7 @@ Response to SEEK. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates with original SEEK request
   [stream_id    : u64]    -- queried stream
   [offset       : u64]    -- resolved offset
 Payload:
@@ -607,6 +635,7 @@ Error response. Variable header carries the error code and the relevant extent I
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id   : u32]    -- correlates with the request that caused the error
   [error_code   : u16]    -- 0=Ok, 1=UnknownStream, 2=InvalidOffset,
                               3=ExtentSealed, 4=InternalError, 5=ExtentFull
   [extent_id    : u32]    -- relevant extent (0 when not applicable)
@@ -662,6 +691,7 @@ stream-store/                          (Workspace root)
     │       ├── extent.rs              -- Extent: in-memory buffer + state machine (Active/Sealed/Flushed)
     │       ├── stream.rs              -- Stream: ordered extent list, active extent tracking, seal-and-new
     │       ├── store.rs               -- ExtentNodeStore: request handler, ReplicaInfo, PendingAck, AckQueue
+    │       ├── stream_manager_client.rs -- StreamManagerClient: RAII connection + heartbeat lifecycle
     │       ├── downstream.rs          -- DownstreamManager: per-node-addr TCP for broadcast forwarding
     │       └── watermark.rs           -- WatermarkHandler: cumulative ACK + quorum drain, deferred client ACK
     │

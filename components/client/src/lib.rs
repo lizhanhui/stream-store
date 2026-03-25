@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::{Buf, Bytes};
+use common::config::{RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
 use common::errors::StorageError;
 use common::types::{
     ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId,
@@ -37,7 +38,10 @@ pub struct StorageClient {
 impl StorageClient {
     /// Connect to a storage service endpoint.
     pub async fn connect(addr: &str) -> Result<Self, StorageError> {
-        let stream = TcpStream::connect(addr).await?;
+        let stream = tokio::time::timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(addr))
+            .await
+            .map_err(|_| StorageError::Internal(format!("connect timeout to {addr}")))?
+            ?;
         Ok(Self {
             framed: Framed::new(stream, FrameCodec),
             next_request_id: AtomicU32::new(1),
@@ -49,12 +53,17 @@ impl StorageClient {
     }
 
     async fn send_recv(&mut self, frame: Frame) -> Result<Frame, StorageError> {
-        self.framed.send(frame).await?;
-        match self.framed.next().await {
-            Some(Ok(resp)) => Ok(resp),
-            Some(Err(e)) => Err(e),
-            None => Err(StorageError::Internal("connection closed".into())),
-        }
+        let result = tokio::time::timeout(RPC_REQUEST_TIMEOUT, async {
+            self.framed.send(frame).await?;
+            match self.framed.next().await {
+                Some(Ok(resp)) => Ok(resp),
+                Some(Err(e)) => Err(e),
+                None => Err(StorageError::Internal("connection closed".into())),
+            }
+        })
+        .await
+        .map_err(|_| StorageError::Internal("RPC request timeout".into()))?;
+        result
     }
 
     /// Send a raw frame and return the response. Used by StreamManager to communicate with ExtentNodes.
