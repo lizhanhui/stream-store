@@ -7,8 +7,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::types::{Offset, Opcode, StreamId};
-use rpc::frame::Frame;
+use common::types::{ExtentId, Offset, Opcode, StreamId};
+use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::build_register_extent_payload;
 use tokio::sync::{broadcast, mpsc};
 
@@ -100,25 +100,23 @@ async fn register_extent(
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let mut framed = Framed::new(stream, FrameCodec);
 
-    let payload = build_register_extent_payload(
-        stream_id,
-        extent_id,
-        role,
-        replication_factor,
-        replica_addrs,
-    );
+    let payload = build_register_extent_payload(replica_addrs);
     framed
-        .send(Frame {
-            opcode: Opcode::RegisterExtent,
-            stream_id: StreamId(stream_id),
-            payload,
-            ..Default::default()
-        })
+        .send(Frame::new(
+            VariableHeader::RegisterExtent {
+                request_id: 0,
+                stream_id: StreamId(stream_id),
+                extent_id: ExtentId(extent_id),
+                role,
+                replication_factor,
+            },
+            Some(payload),
+        ))
         .await
         .unwrap();
 
     let resp = framed.next().await.unwrap().unwrap();
-    assert_eq!(resp.opcode, Opcode::RegisterExtentAck);
+    assert_eq!(resp.opcode(), Opcode::RegisterExtentAck);
 }
 
 /// Test RF=2: Primary broadcasts to 1 Secondary.

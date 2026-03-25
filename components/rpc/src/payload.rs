@@ -142,24 +142,17 @@ pub const ROLE_PRIMARY: u8 = 0;
 
 /// Build a RegisterExtent payload for broadcast replication.
 ///
-/// Wire format:
-/// `[stream_id:u64][extent_id:u32][role:u8][replication_factor:u16][num_addrs:u16][addr1_len:u16][addr1]...[addrN_len:u16][addrN]`
+/// Build a RegisterExtent payload containing the replica addresses.
 ///
-/// `role`: 0 = Primary, 1+ = Secondary.
-/// `replication_factor`: total RF (1 = no replicas, 2 = 1 secondary, etc.).
+/// Wire format (payload only — stream_id, extent_id, role, replication_factor
+/// are now in the variable header):
+/// `[num_addrs:u16][addr1_len:u16][addr1]...[addrN_len:u16][addrN]`
+///
 /// `replica_addrs`: all secondary addresses (for Primary); empty for Secondaries.
 pub fn build_register_extent_payload(
-    stream_id: u64,
-    extent_id: u32,
-    role: u8,
-    replication_factor: u16,
     replica_addrs: &[&str],
 ) -> Bytes {
     let mut buf = BytesMut::new();
-    buf.put_u64(stream_id);
-    buf.put_u32(extent_id);
-    buf.put_u8(role);
-    buf.put_u16(replication_factor);
     buf.put_u16(replica_addrs.len() as u16);
     for addr in replica_addrs {
         buf.put_u16(addr.len() as u16);
@@ -168,32 +161,18 @@ pub fn build_register_extent_payload(
     buf.freeze()
 }
 
-/// Parsed RegisterExtent payload.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct RegisterExtentPayload {
-    pub stream_id: u64,
-    pub extent_id: u32,
-    pub role: u8,
-    pub replication_factor: u16,
-    pub replica_addrs: Vec<String>,
-}
-
-/// Parse a RegisterExtent payload for broadcast replication.
+/// Parse a RegisterExtent payload (replica addresses only).
 ///
-/// Wire format:
-/// `[stream_id:u64][extent_id:u32][role:u8][replication_factor:u16][num_addrs:u16][addr1_len:u16][addr1]...`
-pub fn parse_register_extent_payload(payload: &[u8]) -> Option<RegisterExtentPayload> {
-    // Minimum: 8 + 4 + 1 + 2 + 2 = 17 bytes
-    if payload.len() < 17 {
+/// Wire format: `[num_addrs:u16][addr1_len:u16][addr1]...`
+///
+/// Returns the list of replica addresses.
+pub fn parse_register_extent_payload(payload: &[u8]) -> Option<Vec<String>> {
+    if payload.len() < 2 {
         return None;
     }
-    let stream_id = u64::from_be_bytes(payload[0..8].try_into().ok()?);
-    let extent_id = u32::from_be_bytes(payload[8..12].try_into().ok()?);
-    let role = payload[12];
-    let replication_factor = u16::from_be_bytes([payload[13], payload[14]]);
-    let num_addrs = u16::from_be_bytes([payload[15], payload[16]]) as usize;
+    let num_addrs = u16::from_be_bytes([payload[0], payload[1]]) as usize;
 
-    let mut pos = 17;
+    let mut pos = 2;
     let mut replica_addrs = Vec::with_capacity(num_addrs);
     for _ in 0..num_addrs {
         if payload.len() < pos + 2 {
@@ -209,13 +188,7 @@ pub fn parse_register_extent_payload(payload: &[u8]) -> Option<RegisterExtentPay
         replica_addrs.push(addr);
     }
 
-    Some(RegisterExtentPayload {
-        stream_id,
-        extent_id,
-        role,
-        replication_factor,
-        replica_addrs,
-    })
+    Some(replica_addrs)
 }
 
 /// Build a CreateStream payload: [name_len:u16][stream_name][replication_factor:u16]
@@ -373,14 +346,10 @@ mod tests {
     fn register_extent_payload_primary_with_secondaries() {
         // Primary with 2 secondary addresses (RF=3).
         let payload =
-            build_register_extent_payload(42, 100, 0, 3, &["127.0.0.1:9802", "127.0.0.1:9803"]);
+            build_register_extent_payload(&["127.0.0.1:9802", "127.0.0.1:9803"]);
         let parsed = parse_register_extent_payload(&payload).unwrap();
-        assert_eq!(parsed.stream_id, 42);
-        assert_eq!(parsed.extent_id, 100);
-        assert_eq!(parsed.role, ROLE_PRIMARY);
-        assert_eq!(parsed.replication_factor, 3);
         assert_eq!(
-            parsed.replica_addrs,
+            parsed,
             vec!["127.0.0.1:9802", "127.0.0.1:9803"]
         );
     }
@@ -388,37 +357,24 @@ mod tests {
     #[test]
     fn register_extent_payload_secondary() {
         // Secondary receives no replica addresses.
-        let payload = build_register_extent_payload(7, 200, 1, 2, &[]);
+        let payload = build_register_extent_payload(&[]);
         let parsed = parse_register_extent_payload(&payload).unwrap();
-        assert_eq!(parsed.stream_id, 7);
-        assert_eq!(parsed.extent_id, 200);
-        assert_eq!(parsed.role, 1);
-        assert_eq!(parsed.replication_factor, 2);
-        assert!(parsed.replica_addrs.is_empty());
+        assert!(parsed.is_empty());
     }
 
     #[test]
     fn register_extent_payload_rf1() {
         // RF=1: Primary only, no secondaries.
-        let payload = build_register_extent_payload(10, 50, 0, 1, &[]);
+        let payload = build_register_extent_payload(&[]);
         let parsed = parse_register_extent_payload(&payload).unwrap();
-        assert_eq!(parsed.stream_id, 10);
-        assert_eq!(parsed.extent_id, 50);
-        assert_eq!(parsed.role, ROLE_PRIMARY);
-        assert_eq!(parsed.replication_factor, 1);
-        assert!(parsed.replica_addrs.is_empty());
+        assert!(parsed.is_empty());
     }
 
     #[test]
     fn register_extent_payload_too_short() {
         assert!(parse_register_extent_payload(&[]).is_none());
-        assert!(parse_register_extent_payload(&[0u8; 16]).is_none());
-        // 21 bytes but claims num_addrs=1 with addr_len=5 but no addr data
+        // claims num_addrs=1 with addr_len=5 but no addr data
         let mut buf = BytesMut::new();
-        buf.put_u64(1); // stream_id
-        buf.put_u32(1); // extent_id
-        buf.put_u8(0); // role
-        buf.put_u16(2); // replication_factor
         buf.put_u16(1); // num_addrs = 1
         buf.put_u16(5); // addr_len = 5 but nothing follows
         assert!(parse_register_extent_payload(&buf).is_none());

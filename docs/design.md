@@ -198,6 +198,8 @@ MQTT-style **Fixed Header + Variable Header + Payload** format for minimal overh
 
 **Payload**: Carries arbitrary application data from the ultimate user (e.g., message bytes for APPEND, error description for ERROR). When present, a 4-byte `Payload Length` prefix precedes the payload bytes. Opcodes that carry no application payload omit both the length prefix and the payload bytes entirely.
 
+**Rust Representation**: The `Frame` type uses a `FixedHeader` + `VariableHeader` enum + `Option<Bytes>` payload design. Each opcode is a distinct `VariableHeader` variant containing only the fields valid for that opcode — invalid field combinations are rejected at compile time. Flag-dependent fields (e.g., `Seal.offset`, `SealAck.new_extent_id`) use `Option<T>`; the flags byte is computed during encode from the `Option` state, eliminating stale-flag bugs.
+
 #### Opcodes
 
 Grouped by category with gaps for future growth.
@@ -449,15 +451,16 @@ Register an extent's replica membership on an Extent Node. Primary receives all 
 ```
 Fixed Header (8B)
 Variable Header:
-  [stream_id    : u64]    -- stream this extent belongs to
-  [extent_id    : u32]    -- extent being registered
-  [role         : u8]     -- 0 = Primary, 1+ = Secondary
-  [replication_factor : u16]
+  [request_id          : u32]
+  [stream_id           : u64]    -- stream this extent belongs to
+  [extent_id           : u32]    -- extent being registered
+  [role                : u8]     -- 0 = Primary, 1+ = Secondary
+  [replication_factor  : u16]
+Payload:
   [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
   per address:
     [addr_len   : u16]
     [addr       : bytes]
-No Payload.
 ```
 
 ##### 0x16 REGISTER_EXTENT_ACK (Extent Node -> Stream Manager)
@@ -467,8 +470,9 @@ Acknowledges extent registration.
 ```
 Fixed Header (8B)
 Variable Header:
-  [stream_id    : u64]    -- stream that was registered
-  [extent_id    : u32]    -- extent that was registered
+  [request_id  : u32]
+  [stream_id   : u64]    -- stream that was registered
+  [extent_id   : u32]    -- extent that was registered
 No Payload.
 ```
 
@@ -640,7 +644,7 @@ stream-store/                          (Workspace root)
     │
     ├── rpc/                           -- Custom TCP wire protocol (depends: common, tokio, bytes)
     │   └── src/lib.rs
-    │       ├── frame.rs               -- Wire format encode/decode (8-byte fixed header + variable header + payload)
+    │       ├── frame.rs               -- Wire format encode/decode: FixedHeader + VariableHeader enum + payload
     │       ├── codec.rs               -- Tokio Encoder/Decoder for frame framing
     │       └── payload.rs             -- Structured payload encode/decode helpers
     │

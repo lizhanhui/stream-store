@@ -13,9 +13,9 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
-use common::types::{FLAG_FORWARDED, Offset, Opcode};
+use common::types::{ExtentId, FLAG_FORWARDED, Opcode};
 use rpc::codec::FrameCodec;
-use rpc::frame::Frame;
+use rpc::frame::{Frame, VariableHeader};
 
 use crate::store::{ForwardRequest, WatermarkEvent};
 
@@ -68,14 +68,15 @@ pub async fn run_downstream_manager(
         }
 
         // Build the forwarded Append frame.
-        let frame = Frame {
-            opcode: Opcode::Append,
-            flags: FLAG_FORWARDED,
-            stream_id: req.stream_id,
-            offset: Offset(req.offset),
-            payload: req.payload,
-            ..Default::default()
-        };
+        let mut frame = Frame::new(
+            VariableHeader::Append {
+                request_id: 0,
+                stream_id: req.stream_id,
+                extent_id: ExtentId(0),
+            },
+            Some(req.payload),
+        );
+        frame.header.flags = FLAG_FORWARDED;
 
         // Send to secondary.
         let write_half = connections.get_mut(addr).unwrap();
@@ -126,10 +127,10 @@ async fn downstream_reader(
     while let Some(result) = framed_read.next().await {
         match result {
             Ok(frame) => {
-                if frame.opcode == Opcode::Watermark {
+                if frame.opcode() == Opcode::Watermark {
                     let event = WatermarkEvent {
-                        stream_id: frame.stream_id,
-                        acked_offset: frame.offset.0,
+                        stream_id: frame.stream_id(),
+                        acked_offset: frame.offset().0,
                         source_addr: addr.clone(),
                     };
                     if let Err(e) = watermark_tx.send(event).await {
@@ -137,7 +138,7 @@ async fn downstream_reader(
                         return;
                     }
                 } else {
-                    warn!("unexpected opcode {:?} from secondary {addr}", frame.opcode);
+                    warn!("unexpected opcode {:?} from secondary {addr}", frame.opcode());
                 }
             }
             Err(e) => {

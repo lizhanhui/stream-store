@@ -30,20 +30,20 @@ impl Encoder<Frame> for FrameCodec {
 mod tests {
     use super::*;
     use bytes::Bytes;
-    use common::types::{ExtentId, Opcode, StreamId};
+    use common::types::{ExtentId, StreamId};
+    use crate::frame::VariableHeader;
 
     #[test]
     fn codec_round_trip() {
         let mut codec = FrameCodec;
-        let frame = Frame {
-            opcode: Opcode::Append,
-            flags: 0,
-            request_id: 1,
-            stream_id: StreamId(10),
-            extent_id: ExtentId(5),
-            payload: Bytes::from_static(b"test payload"),
-            ..Default::default()
-        };
+        let frame = Frame::new(
+            VariableHeader::Append {
+                request_id: 1,
+                stream_id: StreamId(10),
+                extent_id: ExtentId(5),
+            },
+            Some(Bytes::from_static(b"test payload")),
+        );
 
         let mut buf = BytesMut::new();
         Encoder::encode(&mut codec, frame.clone(), &mut buf).unwrap();

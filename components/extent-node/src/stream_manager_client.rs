@@ -17,7 +17,7 @@ use common::types::NodeMetrics;
 use common::types::Opcode;
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
-use rpc::frame::Frame;
+use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{build_connect_payload, build_disconnect_payload, build_heartbeat_payload};
 use tokio::net::TcpStream;
 use tokio::sync::oneshot;
@@ -154,19 +154,15 @@ impl StreamManagerClient {
         // Send Connect.
         let connect_payload =
             build_connect_payload(advertised_addr, advertised_addr, heartbeat_interval_ms);
-        let connect_frame = Frame {
-            opcode: Opcode::Connect,
-            payload: connect_payload,
-            ..Default::default()
-        };
+        let connect_frame = Frame::new(VariableHeader::Connect { request_id: 0 }, Some(connect_payload));
         framed.send(connect_frame).await?;
 
         match framed.next().await {
-            Some(Ok(resp)) if resp.opcode == Opcode::ConnectAck => {
+            Some(Ok(resp)) if resp.opcode() == Opcode::ConnectAck => {
                 info!("registered with StreamManager");
             }
             Some(Ok(resp)) => {
-                error!("unexpected Connect response: {:?}", resp.opcode);
+                error!("unexpected Connect response: {:?}", resp.opcode());
                 return Err(StorageError::Internal("unexpected Connect response".into()));
             }
             Some(Err(e)) => return Err(e),
@@ -188,23 +184,18 @@ impl StreamManagerClient {
                 _ = &mut *shutdown_rx => {
                     // Graceful shutdown: send Disconnect before closing.
                     info!("shutdown signal received; sending Disconnect to StreamManager");
-                    let disconnect_frame = Frame {
-                        opcode: Opcode::Disconnect,
-                        request_id,
-                        payload: build_disconnect_payload(advertised_addr),
-                        ..Default::default()
-                    };
+                    let disconnect_frame = Frame::new(VariableHeader::Disconnect { request_id }, Some(build_disconnect_payload(advertised_addr)));
                     if let Err(e) = framed.send(disconnect_frame).await {
                         warn!("failed to send Disconnect to StreamManager: {e}");
                         return Ok(true);
                     }
                     // Wait for DisconnectAck (best-effort, with a short timeout).
                     match tokio::time::timeout(Duration::from_secs(2), framed.next()).await {
-                        Ok(Some(Ok(resp))) if resp.opcode == Opcode::DisconnectAck => {
+                        Ok(Some(Ok(resp))) if resp.opcode() == Opcode::DisconnectAck => {
                             info!("received DisconnectAck from StreamManager");
                         }
                         Ok(Some(Ok(resp))) => {
-                            warn!("unexpected response to Disconnect: {:?}", resp.opcode);
+                            warn!("unexpected response to Disconnect: {:?}", resp.opcode());
                         }
                         Ok(Some(Err(e))) => {
                             warn!("error reading DisconnectAck: {e}");
@@ -248,22 +239,17 @@ impl StreamManagerClient {
 
             let heartbeat_payload = build_heartbeat_payload(advertised_addr, &metrics);
 
-            let hb_frame = Frame {
-                opcode: Opcode::Heartbeat,
-                request_id,
-                payload: heartbeat_payload,
-                ..Default::default()
-            };
+            let hb_frame = Frame::new(VariableHeader::Heartbeat { request_id }, Some(heartbeat_payload));
             request_id = request_id.wrapping_add(1);
 
             framed.send(hb_frame).await?;
 
             match framed.next().await {
-                Some(Ok(resp)) if resp.opcode == Opcode::Heartbeat => {
+                Some(Ok(resp)) if resp.opcode() == Opcode::Heartbeat => {
                     // Heartbeat acknowledged.
                 }
                 Some(Ok(resp)) => {
-                    warn!("unexpected heartbeat response: {:?}", resp.opcode);
+                    warn!("unexpected heartbeat response: {:?}", resp.opcode());
                 }
                 Some(Err(e)) => return Err(e),
                 None => {

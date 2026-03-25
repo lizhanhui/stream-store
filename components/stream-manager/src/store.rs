@@ -3,11 +3,9 @@ use std::sync::Arc;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
 use common::errors::StorageError;
-use common::types::{
-    ErrorCode, ExtentId, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, Offset, Opcode, StreamId,
-};
+use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use futures_util::future;
-use rpc::frame::Frame;
+use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{
     build_register_extent_payload, build_string_payload, encode_extent_info_vec,
     parse_connect_payload, parse_create_stream_payload, parse_heartbeat_payload,
@@ -29,23 +27,28 @@ async fn seal_extent_node_static(addr: &str, stream_id: StreamId) -> Result<u64,
     })?;
 
     let resp = client
-        .send_frame(Frame {
-            opcode: Opcode::Seal,
-            stream_id,
-            ..Default::default()
-        })
+        .send_frame(Frame::new(
+            VariableHeader::Seal {
+                request_id: 0,
+                stream_id,
+                extent_id: ExtentId(0),
+                offset: None,
+            },
+            None,
+        ))
         .await
         .map_err(|e| StorageError::Internal(format!("Seal to ExtentNode {addr}: {e}")))?;
 
-    if resp.opcode == Opcode::Error {
-        let msg = String::from_utf8_lossy(&resp.payload).to_string();
+    if resp.opcode() == Opcode::Error {
+        let msg =
+            String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
         return Err(StorageError::Internal(format!(
             "ExtentNode {addr} rejected Seal: {msg}"
         )));
     }
 
     // SealAck carries committed end_offset in the offset field.
-    Ok(resp.offset.0)
+    Ok(resp.offset().0)
 }
 
 /// The Stream Manager's request handler.
@@ -100,7 +103,7 @@ impl StreamManagerStore {
             };
 
             let payload =
-                build_register_extent_payload(stream_id.0, extent_id.0, role, rf, &addrs_for_node);
+                build_register_extent_payload(&addrs_for_node);
 
             let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
                 StorageError::Internal(format!(
@@ -109,19 +112,24 @@ impl StreamManagerStore {
             })?;
 
             let resp = client
-                .send_frame(Frame {
-                    opcode: Opcode::RegisterExtent,
-                    stream_id,
-                    payload,
-                    ..Default::default()
-                })
+                .send_frame(Frame::new(
+                    VariableHeader::RegisterExtent {
+                        request_id: 0,
+                        stream_id,
+                        extent_id,
+                        role,
+                        replication_factor: rf,
+                    },
+                    Some(payload),
+                ))
                 .await
                 .map_err(|e| {
                     StorageError::Internal(format!("RegisterExtent to ExtentNode {addr}: {e}"))
                 })?;
 
-            if resp.opcode == Opcode::Error {
-                let msg = String::from_utf8_lossy(&resp.payload).to_string();
+            if resp.opcode() == Opcode::Error {
+                let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default())
+                    .to_string();
                 return Err(StorageError::Internal(format!(
                     "ExtentNode {addr} rejected RegisterExtent: {msg}"
                 )));
@@ -189,7 +197,7 @@ impl RequestHandler for StreamManagerStore {
         frame: Frame,
         _response_tx: Option<&tokio::sync::mpsc::Sender<Frame>>,
     ) -> Option<Frame> {
-        let response = match frame.opcode {
+        let response = match frame.opcode() {
             Opcode::Connect => self.handle_connect(frame).await,
             Opcode::Heartbeat => self.handle_heartbeat(frame).await,
             Opcode::Disconnect => self.handle_disconnect(frame).await,
@@ -200,9 +208,9 @@ impl RequestHandler for StreamManagerStore {
             Opcode::DescribeExtent => self.handle_describe_extent(frame).await,
             Opcode::Seek => self.handle_seek(frame).await,
             _ => Frame::error_response(
-                frame.request_id,
+                frame.request_id(),
                 ErrorCode::InternalError,
-                &format!("StreamManager: unsupported opcode {:?}", frame.opcode),
+                &format!("StreamManager: unsupported opcode {:?}", frame.opcode()),
                 ExtentId(0),
             ),
         };
@@ -213,7 +221,7 @@ impl RequestHandler for StreamManagerStore {
 impl StreamManagerStore {
     /// ExtentNode Connect: register node. Payload = [node_id_len:u16][node_id][addr_len:u16][addr][interval_ms:u32]
     async fn handle_connect(&self, frame: Frame) -> Frame {
-        let payload = &frame.payload;
+        let payload = frame.payload.as_deref().unwrap_or_default();
         match parse_connect_payload(payload) {
             Some((node_id, addr, interval_ms)) => {
                 match self.store.register_node(&node_id, &addr, interval_ms).await {
@@ -221,16 +229,17 @@ impl StreamManagerStore {
                         info!(
                             "ExtentNode registered: node_id={node_id}, addr={addr}, interval={interval_ms}ms"
                         );
-                        Frame {
-                            opcode: Opcode::ConnectAck,
-                            request_id: frame.request_id,
-                            ..Default::default()
-                        }
+                        Frame::new(
+                            VariableHeader::ConnectAck {
+                                request_id: frame.request_id(),
+                            },
+                            None,
+                        )
                     }
                     Err(e) => {
                         error!("register_node failed: {e}");
                         Frame::error_response(
-                            frame.request_id,
+                            frame.request_id(),
                             ErrorCode::InternalError,
                             &e.to_string(),
                             ExtentId(0),
@@ -239,7 +248,7 @@ impl StreamManagerStore {
                 }
             }
             None => Frame::error_response(
-                frame.request_id,
+                frame.request_id(),
                 ErrorCode::InternalError,
                 "invalid Connect payload",
                 ExtentId(0),
@@ -250,7 +259,7 @@ impl StreamManagerStore {
     /// ExtentNode Heartbeat: update heartbeat timestamp and cache runtime metrics.
     /// Payload = [node_id_len:u16][node_id][metrics:32 bytes]
     async fn handle_heartbeat(&self, frame: Frame) -> Frame {
-        let payload = &frame.payload;
+        let payload = frame.payload.as_deref().unwrap_or_default();
         match parse_heartbeat_payload(payload) {
             Some((node_id, metrics)) => {
                 match self.store.update_heartbeat(&node_id).await {
@@ -258,16 +267,17 @@ impl StreamManagerStore {
                         // Update in-memory metrics on the allocator for load-aware placement.
                         let mut alloc = self.allocator.lock().await;
                         alloc.update_metrics(&node_id, metrics);
-                        Frame {
-                            opcode: Opcode::Heartbeat,
-                            request_id: frame.request_id,
-                            ..Default::default()
-                        }
+                        Frame::new(
+                            VariableHeader::Heartbeat {
+                                request_id: frame.request_id(),
+                            },
+                            None,
+                        )
                     }
                     Err(e) => {
                         error!("update_heartbeat failed: {e}");
                         Frame::error_response(
-                            frame.request_id,
+                            frame.request_id(),
                             ErrorCode::InternalError,
                             &e.to_string(),
                             ExtentId(0),
@@ -276,7 +286,7 @@ impl StreamManagerStore {
                 }
             }
             None => Frame::error_response(
-                frame.request_id,
+                frame.request_id(),
                 ErrorCode::InternalError,
                 "invalid Heartbeat payload",
                 ExtentId(0),
@@ -287,7 +297,7 @@ impl StreamManagerStore {
     /// ExtentNode Disconnect: mark node as dead, clean up metrics, stop allocating.
     /// Payload = [node_id_len:u16][node_id]
     async fn handle_disconnect(&self, frame: Frame) -> Frame {
-        let payload = &frame.payload;
+        let payload = frame.payload.as_deref().unwrap_or_default();
         match parse_string_payload(payload) {
             Some(node_id) => {
                 match self.store.mark_node_dead(&node_id).await {
@@ -296,16 +306,17 @@ impl StreamManagerStore {
                         let mut alloc = self.allocator.lock().await;
                         alloc.remove_metrics(&node_id);
                         info!("ExtentNode disconnected: node_id={node_id}");
-                        Frame {
-                            opcode: Opcode::DisconnectAck,
-                            request_id: frame.request_id,
-                            ..Default::default()
-                        }
+                        Frame::new(
+                            VariableHeader::DisconnectAck {
+                                request_id: frame.request_id(),
+                            },
+                            None,
+                        )
                     }
                     Err(e) => {
                         error!("mark_node_dead on disconnect failed: {e}");
                         Frame::error_response(
-                            frame.request_id,
+                            frame.request_id(),
                             ErrorCode::InternalError,
                             &e.to_string(),
                             ExtentId(0),
@@ -314,7 +325,7 @@ impl StreamManagerStore {
                 }
             }
             None => Frame::error_response(
-                frame.request_id,
+                frame.request_id(),
                 ErrorCode::InternalError,
                 "invalid Disconnect payload",
                 ExtentId(0),
@@ -329,12 +340,12 @@ impl StreamManagerStore {
     ///
     /// Response payload: [addr_len:u16][primary_addr]
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
-        let payload = &frame.payload;
+        let payload = frame.payload.as_deref().unwrap_or_default();
         let (stream_name, replication_factor) = match parse_create_stream_payload(payload) {
             Some((name, rf)) => (name, rf),
             None => {
                 return Frame::error_response(
-                    frame.request_id,
+                    frame.request_id(),
                     ErrorCode::InternalError,
                     "invalid CreateStream payload: expected [name_len:u16][name][replication_factor:u16]",
                     ExtentId(0),
@@ -367,18 +378,18 @@ impl StreamManagerStore {
         .await;
 
         match result {
-            Ok((stream_id, extent_id, primary_addr)) => Frame {
-                opcode: Opcode::CreateStreamResp,
-                request_id: frame.request_id,
-                stream_id,
-                extent_id,
-                payload: build_string_payload(&primary_addr),
-                ..Default::default()
-            },
+            Ok((stream_id, extent_id, primary_addr)) => Frame::new(
+                VariableHeader::CreateStreamResp {
+                    request_id: frame.request_id(),
+                    stream_id,
+                    extent_id,
+                },
+                Some(build_string_payload(&primary_addr)),
+            ),
             Err(e) => {
                 error!("create_stream failed: {e}");
                 Frame::error_response(
-                    frame.request_id,
+                    frame.request_id(),
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -390,17 +401,16 @@ impl StreamManagerStore {
     /// Seal an extent for a stream and allocate a new replica set.
     ///
     /// Dispatches based on whether the caller provides a committed offset:
-    /// - `FLAG_OFFSET_PRESENT` clear: SM queries all EN replicas for offset via quorum.
-    /// - `FLAG_OFFSET_PRESENT` set: SM trusts offset from the caller (in frame.offset).
+    /// - Seal variant's `offset` is `None`: SM queries all EN replicas for offset via quorum.
+    /// - Seal variant's `offset` is `Some`: SM trusts offset from the caller.
     ///
     /// Both paths seal in MySQL (transaction) + allocate new extent and notify ExtentNodes.
     async fn handle_seal(&self, frame: Frame) -> Frame {
-        let stream_id = frame.stream_id;
-        let extent_id = frame.extent_id;
-        let committed_offset = if frame.flags & FLAG_OFFSET_PRESENT != 0 {
-            Some(frame.offset.0)
-        } else {
-            None
+        let stream_id = frame.stream_id();
+        let extent_id = frame.extent_id();
+        let committed_offset = match &frame.variable_header {
+            VariableHeader::Seal { offset, .. } => offset.map(|o| o.0),
+            _ => None,
         };
 
         let result = self
@@ -408,20 +418,21 @@ impl StreamManagerStore {
             .await;
 
         match result {
-            Ok((new_extent_id, primary_addr)) => Frame {
-                opcode: Opcode::SealAck,
-                flags: FLAG_NEW_EXTENT_PRESENT,
-                request_id: frame.request_id,
-                stream_id,
-                extent_id,
-                count: new_extent_id.0, // new_extent_id encoded as u32 in count field
-                payload: Bytes::copy_from_slice(primary_addr.as_bytes()), // primary_addr
-                ..Default::default()
-            },
+            Ok((new_extent_id, primary_addr)) => Frame::new(
+                VariableHeader::SealAck {
+                    request_id: frame.request_id(),
+                    stream_id,
+                    extent_id,
+                    offset: Offset(0),
+                    new_extent_id: Some(new_extent_id),
+                    primary_addr: Some(Bytes::copy_from_slice(primary_addr.as_bytes())),
+                },
+                None,
+            ),
             Err(e) => {
                 error!("seal failed: {e}");
                 Frame::error_response(
-                    frame.request_id,
+                    frame.request_id(),
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -667,7 +678,7 @@ impl StreamManagerStore {
 
     /// QueryOffset on StreamManager: return the total logical end offset for a stream.
     async fn handle_query_offset(&self, frame: Frame) -> Frame {
-        let stream_id = frame.stream_id;
+        let stream_id = frame.stream_id();
 
         let result = async {
             let extents = self.store.get_extents(stream_id).await?;
@@ -680,17 +691,18 @@ impl StreamManagerStore {
         .await;
 
         match result {
-            Ok(offset) => Frame {
-                opcode: Opcode::QueryOffsetResp,
-                request_id: frame.request_id,
-                stream_id,
-                offset,
-                ..Default::default()
-            },
+            Ok(offset) => Frame::new(
+                VariableHeader::QueryOffsetResp {
+                    request_id: frame.request_id(),
+                    stream_id,
+                    offset,
+                },
+                None,
+            ),
             Err(e) => {
                 error!("query_offset failed: {e}");
                 Frame::error_response(
-                    frame.request_id,
+                    frame.request_id(),
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -706,24 +718,24 @@ impl StreamManagerStore {
     /// Payload: [count:u32]  (0 = all extents, N = at most N from latest to earliest)
     /// Response: DescribeStreamResp with encoded Vec<ExtentInfo>
     async fn handle_describe_stream(&self, frame: Frame) -> Frame {
-        let stream_id = frame.stream_id;
-        let count = frame.count;
+        let stream_id = frame.stream_id();
+        let count = frame.count();
 
         match self.store.describe_stream_extents(stream_id, count).await {
             Ok(extents) => {
                 let payload = encode_extent_info_vec(&extents);
-                Frame {
-                    opcode: Opcode::DescribeStreamResp,
-                    request_id: frame.request_id,
-                    stream_id,
-                    payload,
-                    ..Default::default()
-                }
+                Frame::new(
+                    VariableHeader::DescribeStreamResp {
+                        request_id: frame.request_id(),
+                        stream_id,
+                    },
+                    Some(payload),
+                )
             }
             Err(e) => {
                 error!("describe_stream failed: {e}");
                 Frame::error_response(
-                    frame.request_id,
+                    frame.request_id(),
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -737,22 +749,22 @@ impl StreamManagerStore {
     /// Payload: [extent_id:u32]
     /// Response: DescribeExtentResp with encoded Vec<ExtentInfo> (length 1)
     async fn handle_describe_extent(&self, frame: Frame) -> Frame {
-        let stream_id = frame.stream_id;
-        let extent_id = frame.extent_id;
+        let stream_id = frame.stream_id();
+        let extent_id = frame.extent_id();
 
         match self.store.describe_extent(stream_id, extent_id).await {
             Ok(Some(info)) => {
                 let payload = encode_extent_info_vec(&[info]);
-                Frame {
-                    opcode: Opcode::DescribeExtentResp,
-                    request_id: frame.request_id,
-                    stream_id,
-                    payload,
-                    ..Default::default()
-                }
+                Frame::new(
+                    VariableHeader::DescribeExtentResp {
+                        request_id: frame.request_id(),
+                        stream_id,
+                    },
+                    Some(payload),
+                )
             }
             Ok(None) => Frame::error_response(
-                frame.request_id,
+                frame.request_id(),
                 ErrorCode::UnknownStream,
                 &format!(
                     "extent not found: stream={:?}, extent={:?}",
@@ -763,7 +775,7 @@ impl StreamManagerStore {
             Err(e) => {
                 error!("describe_extent failed: {e}");
                 Frame::error_response(
-                    frame.request_id,
+                    frame.request_id(),
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -777,23 +789,23 @@ impl StreamManagerStore {
     /// Uses the frame header's offset field as the target offset (no payload needed).
     /// Response: SeekResp with encoded Vec<ExtentInfo> (length 1).
     async fn handle_seek(&self, frame: Frame) -> Frame {
-        let stream_id = frame.stream_id;
-        let offset = frame.offset.0;
+        let stream_id = frame.stream_id();
+        let offset = frame.offset().0;
 
         match self.store.seek_extent(stream_id, offset).await {
             Ok(Some(info)) => {
                 let payload = encode_extent_info_vec(&[info]);
-                Frame {
-                    opcode: Opcode::SeekResp,
-                    request_id: frame.request_id,
-                    stream_id,
-                    offset: Offset(offset),
-                    payload,
-                    ..Default::default()
-                }
+                Frame::new(
+                    VariableHeader::SeekResp {
+                        request_id: frame.request_id(),
+                        stream_id,
+                        offset: Offset(offset),
+                    },
+                    Some(payload),
+                )
             }
             Ok(None) => Frame::error_response(
-                frame.request_id,
+                frame.request_id(),
                 ErrorCode::InvalidOffset,
                 &format!(
                     "no extent contains offset {} for stream {:?}",
@@ -804,7 +816,7 @@ impl StreamManagerStore {
             Err(e) => {
                 error!("seek failed: {e}");
                 Frame::error_response(
-                    frame.request_id,
+                    frame.request_id(),
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
