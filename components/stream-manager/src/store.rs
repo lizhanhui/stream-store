@@ -327,7 +327,7 @@ impl StreamManagerStore {
     ///
     /// If replication_factor=0 in the payload, the server's default_replication_factor is used.
     ///
-    /// Response payload: [extent_id:u64][addr_len:u16][primary_addr]
+    /// Response payload: [addr_len:u16][primary_addr]
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
         let payload = &frame.payload;
         let (stream_name, replication_factor) = match parse_create_stream_payload(payload) {
@@ -749,7 +749,7 @@ impl StreamManagerStore {
 
     /// DescribeExtent: return a single extent's metadata with replica info and node liveness.
     ///
-    /// Payload: [extent_id:u64]
+    /// Payload: [extent_id:u32]
     /// Response: DescribeExtentResp with encoded Vec<ExtentInfo> (length 1)
     async fn handle_describe_extent(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id;

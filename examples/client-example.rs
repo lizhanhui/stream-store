@@ -218,7 +218,7 @@ async fn main() {
     info!("    (verified: all messages match)");
 
     // ── 12. Seal the second extent ──
-    let new_extent_id = ExtentId(new_extent_id_raw as u32);
+    let new_extent_id = ExtentId(new_extent_id_raw);
     let (final_extent_id, final_addr) = stream_manager_client
         .seal(stream_id, new_extent_id)
         .await

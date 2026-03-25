@@ -261,7 +261,7 @@ impl StorageClient {
         &mut self,
         stream_id: StreamId,
         extent_id: ExtentId,
-    ) -> Result<(u64, String), StorageError> {
+    ) -> Result<(u32, String), StorageError> {
         let req = Frame {
             opcode: Opcode::Seal,
             flags: 0, // no FLAG_OFFSET_PRESENT -> client seal
@@ -280,7 +280,7 @@ impl StorageClient {
         }
 
         // SealAck with FLAG_NEW_EXTENT_PRESENT: new_extent_id in count field, primary_addr in payload
-        let new_extent_id = resp.count as u64;
+        let new_extent_id = resp.count;
         let addr = String::from_utf8_lossy(&resp.payload).to_string();
 
         Ok((new_extent_id, addr))
@@ -298,7 +298,7 @@ impl StorageClient {
         stream_id: StreamId,
         extent_id: ExtentId,
         offset: u64,
-    ) -> Result<(u64, String), StorageError> {
+    ) -> Result<(u32, String), StorageError> {
         let req = Frame {
             opcode: Opcode::Seal,
             flags: FLAG_OFFSET_PRESENT, // extent-node seal carries offset
@@ -318,7 +318,7 @@ impl StorageClient {
         }
 
         // SealAck with FLAG_NEW_EXTENT_PRESENT: new_extent_id in count field, primary_addr in payload
-        let new_extent_id = resp.count as u64;
+        let new_extent_id = resp.count;
         let addr = String::from_utf8_lossy(&resp.payload).to_string();
 
         Ok((new_extent_id, addr))

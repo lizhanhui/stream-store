@@ -371,12 +371,13 @@ First frame after an Extent Node connects to Stream Manager. Stream Manager uses
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id    : u32]
+Payload:
   [node_id_len  : u16]
   [node_id      : bytes]  -- unique node identifier
   [addr_len     : u16]
   [addr         : bytes]  -- listen address (host:port)
   [interval_ms  : u32]    -- heartbeat interval in milliseconds
-No Payload.
 ```
 
 ##### 0x11 CONNECT_ACK (Stream Manager -> Extent Node)
@@ -385,7 +386,8 @@ Acknowledges Extent Node registration.
 
 ```
 Fixed Header (8B)
-No Variable Header.
+Variable Header:
+  [request_id    : u32]
 No Payload.
 ```
 
@@ -396,9 +398,10 @@ Graceful shutdown. Stream Manager stops allocating new extents to this node.
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id    : u32]
+Payload:
   [node_id_len  : u16]
   [node_id      : bytes]  -- node identifier
-No Payload.
 ```
 
 ##### 0x13 DISCONNECT_ACK (Stream Manager -> Extent Node)
@@ -407,7 +410,8 @@ Acknowledges disconnect.
 
 ```
 Fixed Header (8B)
-No Variable Header.
+Variable Header:
+  [request_id    : u32]
 No Payload.
 ```
 
@@ -418,6 +422,8 @@ Connection keepalive within the interval declared in CONNECT. Carries runtime me
 ```
 Fixed Header (8B)
 Variable Header:
+  [request_id    : u32]
+Payload:
   [node_id_len  : u16]
   [node_id      : bytes]  -- node identifier
   [available_memory_bytes : u64]
@@ -425,10 +431,16 @@ Variable Header:
   [appends_per_sec        : u32]
   [active_extent_count    : u32]
   [bytes_written_per_sec  : u64]
-No Payload.
 ```
 
-Heartbeat response echoes the fixed header only (same opcode, same request_id, no variable header, no payload).
+**Heartbeat response** (Stream Manager -> Extent Node): echoes request_id, no payload.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [request_id    : u32]
+No Payload.
+```
 
 ##### 0x15 REGISTER_EXTENT (Stream Manager -> Extent Node)
 
@@ -502,7 +514,7 @@ No Payload.
 
 ##### 0x31 DESCRIBE_STREAM_RESP (Stream Manager -> Client)
 
-Response to DESCRIBE_STREAM. Payload = encoded `Vec<ExtentInfo>`.
+Response to DESCRIBE_STREAM. Payload = encoded `Vec<ExtentInfo>`, ordered by extent_id **descending** (latest first). When `count > 0`, at most `count` extents are returned starting from the latest.
 
 ```
 Fixed Header (8B)
@@ -824,7 +836,7 @@ After appending to a data stream, the application receives `AppendResult { offse
 
 ```
 Index record (32 bytes, fixed width):
-  [stream_id: u64][extent_id: u64][offset: u64][byte_pos: u64]
+  [stream_id: u64][extent_id: u32][offset: u64][byte_pos: u64]
 ```
 
 **Read flow**:

@@ -11,7 +11,7 @@ pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
 /// Result of a successful append: the logical offset and the byte position
 /// within the arena where the record was written. The caller can use the
 /// byte position to build an external index (e.g., fixed-width index stream
-/// records: `[stream_id:u64][extent_id:u64][offset:u64][byte_pos:u64]`).
+/// records: `[stream_id:u64][extent_id:u32][offset:u64][byte_pos:u64]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
     /// Logical offset assigned to this record (start_offset + sequence number).

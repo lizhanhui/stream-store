@@ -256,7 +256,7 @@ async fn describe_stream_rf2_integration() {
     let new_ext = &all[0];
     let sealed_ext = &all[1];
 
-    assert_eq!(new_ext.extent_id, (second_extent_id as u32));
+    assert_eq!(new_ext.extent_id, (second_extent_id));
     assert_eq!(new_ext.state, ExtentState::Active);
     assert_eq!(new_ext.start_offset, 5);
     assert_eq!(
@@ -401,14 +401,14 @@ async fn describe_stream_rf2_integration() {
 
     // 6c. Seek offset=5 -> active extent (at boundary).
     let s = stream_manager.seek(stream_id, Offset(5)).await.unwrap();
-    assert_eq!(s.extent_id, (second_extent_id as u32));
+    assert_eq!(s.extent_id, (second_extent_id));
     assert_eq!(s.state, ExtentState::Active);
     assert_eq!(s.start_offset, 5);
     assert_eq!(s.replicas.len(), 2);
 
     // 6d. Seek offset=100 -> active extent (far beyond committed).
     let s = stream_manager.seek(stream_id, Offset(100)).await.unwrap();
-    assert_eq!(s.extent_id, (second_extent_id as u32));
+    assert_eq!(s.extent_id, (second_extent_id));
     assert_eq!(s.state, ExtentState::Active);
 
     // 6e. Seek reflects node liveness: the dead node should show is_alive=false.

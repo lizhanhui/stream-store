@@ -101,7 +101,7 @@ async fn client_task(
                     .await
                     .unwrap_or_else(|e| panic!("client {client_id}: seal failed: {e}"));
 
-                extent_id = ExtentId(new_extent_id_raw as u32);
+                extent_id = ExtentId(new_extent_id_raw);
                 primary_addr = new_primary_addr;
                 seal_count += 1;
 

@@ -416,7 +416,7 @@ mod tests {
         // 21 bytes but claims num_addrs=1 with addr_len=5 but no addr data
         let mut buf = BytesMut::new();
         buf.put_u64(1); // stream_id
-        buf.put_u64(1); // extent_id
+        buf.put_u32(1); // extent_id
         buf.put_u8(0); // role
         buf.put_u16(2); // replication_factor
         buf.put_u16(1); // num_addrs = 1
