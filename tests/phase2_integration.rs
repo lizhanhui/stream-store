@@ -177,7 +177,7 @@ async fn stream_manager_integration() {
 
         // Seal via StreamManager with explicit extent_id.
         let (new_extent_id, new_addr) = stream_manager_client
-            .seal(stream_id, extent_id)
+            .seal(stream_id, extent_id, None)
             .await
             .unwrap();
         assert!(new_extent_id > 0);
@@ -201,7 +201,7 @@ async fn stream_manager_integration() {
 
         let new_eid = ExtentId(new_extent_id);
         let (third_extent_id, _) = stream_manager_client
-            .seal(stream_id, new_eid)
+            .seal(stream_id, new_eid, None)
             .await
             .unwrap();
         let offset = stream_manager_client.query_offset(stream_id).await.unwrap();

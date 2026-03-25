@@ -232,7 +232,7 @@ async fn describe_stream_rf2_integration() {
 
     // ── Part 3: Seal and create new extent, then describe all ──
     let (second_extent_id, new_primary_addr) = stream_manager
-        .seal(stream_id, first_extent_id)
+        .seal(stream_id, first_extent_id, None)
         .await
         .unwrap();
 

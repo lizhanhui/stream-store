@@ -97,7 +97,7 @@ async fn client_task(
             Err(StorageError::ExtentFull(_)) | Err(StorageError::ExtentSealed(_)) => {
                 // Seal the current extent via StreamManager and get a new one.
                 let (new_extent_id_raw, new_primary_addr) = stream_manager_client
-                    .seal(stream_id, extent_id)
+                    .seal(stream_id, extent_id, None)
                     .await
                     .unwrap_or_else(|e| panic!("client {client_id}: seal failed: {e}"));
 

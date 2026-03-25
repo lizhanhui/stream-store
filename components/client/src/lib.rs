@@ -250,62 +250,32 @@ impl StorageClient {
 
     // ── Control operations (StreamManager) ──
 
-    /// Send Seal to StreamManager for client-initiated seal: seal a specific extent
-    /// without knowing the committed offset.
+    /// Seal an extent on the StreamManager and allocate a new one.
     ///
-    /// StreamManager will query all EN replicas to determine the committed offset
-    /// via quorum algorithm, then seal-and-allocate a new extent.
+    /// - `committed_offset = None` (client seal): StreamManager queries all EN replicas
+    ///   to determine the committed offset via quorum algorithm.
+    /// - `committed_offset = Some(offset)` (extent-node seal): StreamManager trusts the
+    ///   provided offset without querying replicas. Used when the primary ExtentNode has
+    ///   already sealed the extent locally (e.g. arena full).
     ///
     /// Returns (new_extent_id, new_primary_addr).
     pub async fn seal(
         &mut self,
         stream_id: StreamId,
         extent_id: ExtentId,
+        committed_offset: Option<u64>,
     ) -> Result<(u32, String), StorageError> {
-        let req = Frame {
-            opcode: Opcode::Seal,
-            flags: 0, // no FLAG_OFFSET_PRESENT -> client seal
-            request_id: self.alloc_request_id(),
-            stream_id,
-            extent_id,
-            ..Default::default()
+        let (flags, offset) = match committed_offset {
+            Some(off) => (FLAG_OFFSET_PRESENT, Offset(off)),
+            None => (0, Offset(0)),
         };
-        let resp = self.send_recv(req).await?;
-        Self::check_error(&resp)?;
-        if resp.opcode != Opcode::SealAck {
-            return Err(StorageError::Internal(format!(
-                "expected SealAck, got {:?}",
-                resp.opcode
-            )));
-        }
-
-        // SealAck with FLAG_NEW_EXTENT_PRESENT: new_extent_id in count field, primary_addr in payload
-        let new_extent_id = resp.count;
-        let addr = String::from_utf8_lossy(&resp.payload).to_string();
-
-        Ok((new_extent_id, addr))
-    }
-
-    /// Send Seal to StreamManager for extent-node-initiated (proactive) seal.
-    ///
-    /// Used when the primary ExtentNode detects ExtentFull and has already sealed
-    /// the extent locally. The `offset` is the committed end_offset — the
-    /// committed offset that StreamManager should trust without querying replicas.
-    ///
-    /// Returns (new_extent_id, new_primary_addr).
-    pub async fn extent_node_seal(
-        &mut self,
-        stream_id: StreamId,
-        extent_id: ExtentId,
-        offset: u64,
-    ) -> Result<(u32, String), StorageError> {
         let req = Frame {
             opcode: Opcode::Seal,
-            flags: FLAG_OFFSET_PRESENT, // extent-node seal carries offset
+            flags,
             request_id: self.alloc_request_id(),
             stream_id,
             extent_id,
-            offset: Offset(offset),
+            offset,
             ..Default::default()
         };
         let resp = self.send_recv(req).await?;

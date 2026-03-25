@@ -389,23 +389,23 @@ impl StreamManagerStore {
 
     /// Seal an extent for a stream and allocate a new replica set.
     ///
-    /// Dispatches to one of two paths based on FLAG_OFFSET_PRESENT flag:
-    /// - Flag clear → `client_seal`: SM queries all EN replicas for offset via quorum.
-    /// - Flag set → `extent_node_seal`: SM trusts offset from primary EN (in frame.offset).
+    /// Dispatches based on whether the caller provides a committed offset:
+    /// - `FLAG_OFFSET_PRESENT` clear: SM queries all EN replicas for offset via quorum.
+    /// - `FLAG_OFFSET_PRESENT` set: SM trusts offset from the caller (in frame.offset).
     ///
     /// Both paths seal in MySQL (transaction) + allocate new extent and notify ExtentNodes.
     async fn handle_seal(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id;
         let extent_id = frame.extent_id;
-
-        let result = if frame.flags & FLAG_OFFSET_PRESENT != 0 {
-            // extent_node_seal: primary EN provides committed offset.
-            self.extent_node_seal(stream_id, extent_id, frame.offset.0)
-                .await
+        let committed_offset = if frame.flags & FLAG_OFFSET_PRESENT != 0 {
+            Some(frame.offset.0)
         } else {
-            // client_seal: client doesn't know offset, SM queries all EN replicas.
-            self.client_seal(stream_id, extent_id).await
+            None
         };
+
+        let result = self
+            .seal_extent(stream_id, extent_id, committed_offset)
+            .await;
 
         match result {
             Ok((new_extent_id, primary_addr)) => Frame {
@@ -430,21 +430,94 @@ impl StreamManagerStore {
         }
     }
 
-    /// Client-initiated seal: query all EN replicas for committed offset via quorum,
-    /// then seal-and-allocate a new extent.
+    /// Seal an extent and allocate a new replica set.
     ///
-    /// Flow:
-    /// 1. Get replicas for the extent.
-    /// 2. Concurrently seal ALL replicas on ExtentNodes (reject further appends).
-    /// 3. Determine committed offset from Primary or Secondary quorum.
-    /// 4. Seal in MySQL (transaction) + allocate new extent.
-    /// 5. Register new extent on ExtentNodes.
-    async fn client_seal(
+    /// - `committed_offset = None`: SM queries all EN replicas for the committed offset
+    ///   via quorum, then seals-and-allocates.
+    /// - `committed_offset = Some(offset)`: SM trusts the provided offset, seals-and-allocates,
+    ///   then fire-and-forgets seal RPCs to secondary ENs.
+    async fn seal_extent(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
+        committed_offset: Option<u64>,
     ) -> Result<(ExtentId, String), StorageError> {
-        // 1. Get replicas for the extent, ordered by role (Primary first).
+        let end_offset = match committed_offset {
+            Some(offset) => {
+                info!(
+                    "seal_extent: offset provided for extent {:?} stream {:?}: offset={offset}",
+                    extent_id, stream_id
+                );
+                offset
+            }
+            None => {
+                // Query all EN replicas to determine committed offset via quorum.
+                self.resolve_committed_offset(stream_id, extent_id).await?
+            }
+        };
+
+        // Verify active extent exists.
+        let _extent_row = self
+            .store
+            .get_active_extent(stream_id)
+            .await?
+            .ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "no active extent found for stream {:?} during seal_extent",
+                    stream_id
+                ))
+            })?;
+
+        // Seal + allocate + notify new replica set.
+        let result = self
+            .seal_allocate_notify(stream_id, extent_id, end_offset)
+            .await?;
+
+        // When offset was provided (EN-initiated seal), fire-and-forget seal to secondaries.
+        // The caller (EN Primary) has already sealed locally, so we only need to seal secondaries.
+        if committed_offset.is_some() {
+            let replicas = self
+                .store
+                .get_replicas(stream_id, extent_id)
+                .await
+                .unwrap_or_default();
+            let secondary_addrs: Vec<String> = replicas
+                .into_iter()
+                .filter(|r| r.role != 0)
+                .map(|r| r.node_addr)
+                .collect();
+
+            if !secondary_addrs.is_empty() {
+                let sid = stream_id;
+                tokio::spawn(async move {
+                    for addr in secondary_addrs {
+                        match seal_extent_node_static(&addr, sid).await {
+                            Ok(offset) => {
+                                info!(
+                                    "fire-and-forget seal to secondary {addr}: offset={offset}"
+                                );
+                            }
+                            Err(e) => {
+                                warn!("fire-and-forget seal to secondary {addr} failed: {e}");
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// Query all EN replicas for the committed offset via quorum algorithm.
+    ///
+    /// Concurrently seals ALL replicas on ExtentNodes (stopping further appends),
+    /// then determines the committed offset from the responses.
+    async fn resolve_committed_offset(
+        &self,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+    ) -> Result<u64, StorageError> {
         let replicas = self.store.get_replicas(stream_id, extent_id).await?;
         if replicas.is_empty() {
             return Err(StorageError::Internal(format!(
@@ -453,7 +526,7 @@ impl StreamManagerStore {
             )));
         }
 
-        // 2. Concurrently seal ALL replicas on ExtentNodes.
+        // Concurrently seal ALL replicas on ExtentNodes.
         let mut seal_futures = Vec::new();
         for replica in &replicas {
             let addr = replica.node_addr.clone();
@@ -466,7 +539,7 @@ impl StreamManagerStore {
         }
         let seal_results = future::join_all(seal_futures).await;
 
-        // 3. Determine committed offset from responses.
+        // Determine committed offset from responses.
         let mut primary_offset: Option<u64> = None;
         let mut secondary_offsets: Vec<u64> = Vec::new();
         let rf = replicas.len() as u16;
@@ -496,7 +569,6 @@ impl StreamManagerStore {
         }
 
         let committed = if let Some(offset) = primary_offset {
-            // Primary responded: use its quorum_offset (most accurate).
             offset
         } else {
             // Primary failed: compute from Secondary responses using quorum math.
@@ -507,17 +579,15 @@ impl StreamManagerStore {
                     secondary_offsets.len()
                 )));
             }
-            // For RF=1 (no secondaries, no primary): this is a failure.
             if secondary_offsets.is_empty() {
                 return Err(StorageError::Internal(
                     "no ExtentNodes responded to seal".into(),
                 ));
             }
             // Take kth largest, where k = required_secondary_acks.
-            secondary_offsets.sort_unstable_by(|a, b| b.cmp(a)); // descending
+            secondary_offsets.sort_unstable_by(|a, b| b.cmp(a));
             let k = required_secondary_acks as usize;
             if k == 0 {
-                // RF=2, Primary down, 1 Secondary: take its offset.
                 secondary_offsets[0]
             } else if k <= secondary_offsets.len() {
                 secondary_offsets[k - 1]
@@ -530,95 +600,10 @@ impl StreamManagerStore {
         };
 
         info!(
-            "client_seal: sealing extent {:?} for stream {:?}: committed={committed}",
+            "seal_extent: resolved committed offset for extent {:?} stream {:?}: committed={committed}",
             extent_id, stream_id
         );
-
-        // 4. Verify active extent exists.
-        let _extent_row = self
-            .store
-            .get_active_extent(stream_id)
-            .await?
-            .ok_or_else(|| {
-                StorageError::Internal(format!(
-                    "no active extent found for stream {:?} during client_seal",
-                    stream_id
-                ))
-            })?;
-        let end_offset = committed;
-
-        // 5. Pick nodes for new extent replica set.
-        self.seal_allocate_notify(stream_id, extent_id, end_offset)
-            .await
-    }
-
-    /// Extent-node-initiated (proactive) seal: the primary EN provides the committed
-    /// offset directly. SM trusts it, seals-and-allocates, then fires-and-forgets
-    /// seal RPCs to all secondary ENs.
-    ///
-    /// Flow:
-    /// 1. Verify active extent exists.
-    /// 2. Seal in MySQL + allocate new extent.
-    /// 3. Register new extent on ExtentNodes.
-    /// 4. Fire-and-forget: seal secondary ENs asynchronously.
-    async fn extent_node_seal(
-        &self,
-        stream_id: StreamId,
-        extent_id: ExtentId,
-        offset: u64,
-    ) -> Result<(ExtentId, String), StorageError> {
-        info!(
-            "extent_node_seal: sealing extent {:?} for stream {:?}: offset={offset}",
-            extent_id, stream_id
-        );
-
-        // 1. Verify active extent exists. The provided offset IS the end_offset.
-        let _extent_row = self
-            .store
-            .get_active_extent(stream_id)
-            .await?
-            .ok_or_else(|| {
-                StorageError::Internal(format!(
-                    "no active extent found for stream {:?} during extent_node_seal",
-                    stream_id
-                ))
-            })?;
-        let end_offset = offset;
-
-        // 2-3. Seal + allocate + notify new replica set.
-        let result = self
-            .seal_allocate_notify(stream_id, extent_id, end_offset)
-            .await?;
-
-        // 4. Fire-and-forget: seal all secondary ENs of the old extent.
-        let replicas = self
-            .store
-            .get_replicas(stream_id, extent_id)
-            .await
-            .unwrap_or_default();
-        let secondary_addrs: Vec<String> = replicas
-            .into_iter()
-            .filter(|r| r.role != 0)
-            .map(|r| r.node_addr)
-            .collect();
-
-        if !secondary_addrs.is_empty() {
-            let sid = stream_id;
-            tokio::spawn(async move {
-                for addr in secondary_addrs {
-                    match seal_extent_node_static(&addr, sid).await {
-                        Ok(offset) => {
-                            info!("fire-and-forget seal to secondary {addr}: offset={offset}");
-                        }
-                        Err(e) => {
-                            warn!("fire-and-forget seal to secondary {addr} failed: {e}");
-                        }
-                    }
-                }
-            });
-        }
-
-        Ok(result)
+        Ok(committed)
     }
 
     /// Shared logic for both seal paths: pick new nodes, seal-and-allocate in DB,

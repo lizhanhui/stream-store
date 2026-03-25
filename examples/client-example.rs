@@ -158,7 +158,7 @@ async fn main() {
 
     // ── 9. Seal extent via StreamManager (client seal — StreamManager queries ExtentNodes for offset) ──
     let (new_extent_id_raw, new_primary_addr) = stream_manager_client
-        .seal(stream_id, extent_id)
+        .seal(stream_id, extent_id, None)
         .await
         .expect("seal failed");
     let sealed_count = messages.len() as u32;
@@ -220,7 +220,7 @@ async fn main() {
     // ── 12. Seal the second extent ──
     let new_extent_id = ExtentId(new_extent_id_raw);
     let (final_extent_id, final_addr) = stream_manager_client
-        .seal(stream_id, new_extent_id)
+        .seal(stream_id, new_extent_id, None)
         .await
         .expect("second seal failed");
 
