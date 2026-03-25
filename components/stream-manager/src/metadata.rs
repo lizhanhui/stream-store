@@ -23,8 +23,8 @@ pub struct StreamRow {
 pub struct ExtentRow {
     pub extent_id: ExtentId,
     pub stream_id: StreamId,
-    pub base_offset: u64,
-    pub message_count: u32,
+    pub start_offset: u64,
+    pub end_offset: u64,
     pub state: ExtentState,
 }
 
@@ -46,7 +46,7 @@ pub enum SealResult {
     /// that was already allocated (the next Active extent after the sealed one).
     AlreadySealed {
         new_extent_id: ExtentId,
-        new_base_offset: u64,
+        new_start_offset: u64,
         primary_addr: String,
     },
 }
@@ -179,7 +179,7 @@ impl MetadataStore {
     pub async fn allocate_extent(
         &self,
         stream_id: StreamId,
-        base_offset: u64,
+        start_offset: u64,
         nodes: &[(String, u8)],
     ) -> Result<ExtentId, StorageError> {
         if nodes.is_empty() {
@@ -226,11 +226,12 @@ impl MetadataStore {
 
         // Step 2: Insert extent row.
         sqlx::query(
-            "INSERT INTO extent (stream_id, extent_id, base_offset, state) VALUES (?, ?, ?, ?)",
+            "INSERT INTO extent (stream_id, extent_id, start_offset, end_offset, state) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(stream_id.0 as i64)
         .bind(extent_id.0 as i64)
-        .bind(base_offset as i64)
+        .bind(start_offset as i64)
+        .bind(start_offset as i64) // end_offset = start_offset for new active extent
         .bind(ExtentState::Active.as_u8())
         .execute(&mut *tx)
         .await
@@ -257,19 +258,19 @@ impl MetadataStore {
         Ok(extent_id)
     }
 
-    /// Seal an extent: update state to SEALED and record message_count.
+    /// Seal an extent: update state to SEALED and record end_offset.
     pub async fn seal_extent(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
-        message_count: u32,
+        end_offset: u64,
     ) -> Result<(), StorageError> {
         sqlx::query(
-            "UPDATE extent SET state = ?, message_count = ?, sealed_at = NOW() \
+            "UPDATE extent SET state = ?, end_offset = ?, sealed_at = NOW() \
              WHERE stream_id = ? AND extent_id = ?",
         )
         .bind(ExtentState::Sealed.as_u8())
-        .bind(message_count as i64)
+        .bind(end_offset as i64)
         .bind(stream_id.0 as i64)
         .bind(extent_id.0 as i64)
         .execute(&self.pool)
@@ -287,7 +288,7 @@ impl MetadataStore {
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
-        message_count: u32,
+        end_offset: u64,
         nodes: &[(String, u8)],
     ) -> Result<SealResult, StorageError> {
         let mut conn = self
@@ -302,7 +303,7 @@ impl MetadataStore {
 
         // Step 1: Lock the target extent row and check state.
         let row = sqlx::query(
-            "SELECT state, message_count, base_offset \
+            "SELECT state, start_offset \
              FROM extent WHERE stream_id = ? AND extent_id = ? FOR UPDATE",
         )
         .bind(stream_id.0 as i64)
@@ -324,7 +325,7 @@ impl MetadataStore {
         if state == ExtentState::Sealed {
             // Already sealed — find the successor (next extent with higher extent_id).
             let successor = sqlx::query(
-                "SELECT extent_id, base_offset FROM extent \
+                "SELECT extent_id, start_offset FROM extent \
                  WHERE stream_id = ? AND extent_id > ? \
                  ORDER BY extent_id ASC LIMIT 1",
             )
@@ -342,7 +343,7 @@ impl MetadataStore {
             })?;
 
             let new_extent_id = ExtentId(successor.get::<i64, _>("extent_id") as u32);
-            let new_base_offset = successor.get::<i64, _>("base_offset") as u64;
+            let new_start_offset = successor.get::<i64, _>("start_offset") as u64;
 
             // Get primary replica address for the successor extent.
             let replica = sqlx::query(
@@ -365,18 +366,18 @@ impl MetadataStore {
 
             return Ok(SealResult::AlreadySealed {
                 new_extent_id,
-                new_base_offset,
+                new_start_offset,
                 primary_addr,
             });
         }
 
         // Step 2: Seal the active extent.
         sqlx::query(
-            "UPDATE extent SET state = ?, message_count = ?, sealed_at = NOW() \
+            "UPDATE extent SET state = ?, end_offset = ?, sealed_at = NOW() \
              WHERE stream_id = ? AND extent_id = ? AND state = ?",
         )
         .bind(ExtentState::Sealed.as_u8())
-        .bind(message_count as i64)
+        .bind(end_offset as i64)
         .bind(stream_id.0 as i64)
         .bind(extent_id.0 as i64)
         .bind(ExtentState::Active.as_u8())
@@ -400,15 +401,16 @@ impl MetadataStore {
             .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
 
         let new_extent_id = ExtentId(seq_row.get::<i64, _>("next_extent_id") as u32);
-        let new_base_offset = row.get::<i64, _>("base_offset") as u64 + message_count as u64;
+        let new_start_offset = end_offset;
 
         // Step 4: Insert new extent row.
         sqlx::query(
-            "INSERT INTO extent (stream_id, extent_id, base_offset, state) VALUES (?, ?, ?, ?)",
+            "INSERT INTO extent (stream_id, extent_id, start_offset, end_offset, state) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(stream_id.0 as i64)
         .bind(new_extent_id.0 as i64)
-        .bind(new_base_offset as i64)
+        .bind(new_start_offset as i64)
+        .bind(new_start_offset as i64) // end_offset = start_offset for new active extent
         .bind(ExtentState::Active.as_u8())
         .execute(&mut *tx)
         .await
@@ -441,7 +443,7 @@ impl MetadataStore {
         stream_id: StreamId,
     ) -> Result<Option<ExtentRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT extent_id, stream_id, base_offset, message_count, state \
+            "SELECT extent_id, stream_id, start_offset, end_offset, state \
              FROM extent WHERE stream_id = ? AND state = ? LIMIT 1",
         )
         .bind(stream_id.0 as i64)
@@ -456,7 +458,7 @@ impl MetadataStore {
     /// Get all extents for a stream, ordered by extent_id.
     pub async fn get_extents(&self, stream_id: StreamId) -> Result<Vec<ExtentRow>, StorageError> {
         let rows = sqlx::query(
-            "SELECT extent_id, stream_id, base_offset, message_count, state \
+            "SELECT extent_id, stream_id, start_offset, end_offset, state \
              FROM extent WHERE stream_id = ? ORDER BY extent_id",
         )
         .bind(stream_id.0 as i64)
@@ -473,7 +475,7 @@ impl MetadataStore {
         node_addr: &str,
     ) -> Result<Vec<ExtentRow>, StorageError> {
         let rows = sqlx::query(
-            "SELECT e.extent_id, e.stream_id, e.base_offset, e.message_count, e.state \
+            "SELECT e.extent_id, e.stream_id, e.start_offset, e.end_offset, e.state \
              FROM extent e \
              INNER JOIN extent_replica r ON e.stream_id = r.stream_id AND e.extent_id = r.extent_id \
              WHERE r.node_addr = ? AND e.state = ?",
@@ -521,8 +523,8 @@ impl MetadataStore {
         ExtentRow {
             extent_id: ExtentId(r.get::<i64, _>("extent_id") as u32),
             stream_id: StreamId(r.get::<i64, _>("stream_id") as u64),
-            base_offset: r.get::<i64, _>("base_offset") as u64,
-            message_count: r.get::<i64, _>("message_count") as u32,
+            start_offset: r.get::<i64, _>("start_offset") as u64,
+            end_offset: r.get::<i64, _>("end_offset") as u64,
             state: ExtentState::from_u8(state_val).unwrap_or(ExtentState::Unspecified),
         }
     }
@@ -574,7 +576,7 @@ impl MetadataStore {
     ) -> Result<Vec<ExtentInfo>, StorageError> {
         let extent_rows = if count == 0 {
             sqlx::query(
-                "SELECT extent_id, stream_id, base_offset, message_count, state \
+                "SELECT extent_id, stream_id, start_offset, end_offset, state \
                  FROM extent WHERE stream_id = ? ORDER BY extent_id DESC",
             )
             .bind(stream_id.0 as i64)
@@ -582,7 +584,7 @@ impl MetadataStore {
             .await
         } else {
             sqlx::query(
-                "SELECT extent_id, stream_id, base_offset, message_count, state \
+                "SELECT extent_id, stream_id, start_offset, end_offset, state \
                  FROM extent WHERE stream_id = ? ORDER BY extent_id DESC LIMIT ?",
             )
             .bind(stream_id.0 as i64)
@@ -600,8 +602,8 @@ impl MetadataStore {
                 .await?;
             result.push(ExtentInfo {
                 extent_id: ext.extent_id.0,
-                base_offset: ext.base_offset,
-                message_count: ext.message_count,
+                start_offset: ext.start_offset,
+                end_offset: ext.end_offset,
                 state: ext.state,
                 replicas,
             });
@@ -618,7 +620,7 @@ impl MetadataStore {
         extent_id: ExtentId,
     ) -> Result<Option<ExtentInfo>, StorageError> {
         let row = sqlx::query(
-            "SELECT extent_id, stream_id, base_offset, message_count, state \
+            "SELECT extent_id, stream_id, start_offset, end_offset, state \
              FROM extent WHERE stream_id = ? AND extent_id = ?",
         )
         .bind(stream_id.0 as i64)
@@ -636,8 +638,8 @@ impl MetadataStore {
                     .await?;
                 Ok(Some(ExtentInfo {
                     extent_id: ext.extent_id.0,
-                    base_offset: ext.base_offset,
-                    message_count: ext.message_count,
+                    start_offset: ext.start_offset,
+                    end_offset: ext.end_offset,
                     state: ext.state,
                     replicas,
                 }))
@@ -648,9 +650,9 @@ impl MetadataStore {
     /// Seek: find the extent containing the given logical offset.
     ///
     /// Resolution order:
-    /// 1. Sealed/Flushed extent where `base_offset <= offset < base_offset + message_count`.
-    /// 2. Active extent where `base_offset <= offset` (active extent's `message_count` in
-    ///    metadata is 0 until sealed, but it may contain data beyond `base_offset`).
+    /// 1. Sealed/Flushed extent where `start_offset <= offset < end_offset`.
+    /// 2. Active extent where `start_offset <= offset` (active extent's `end_offset` in
+    ///    metadata equals `start_offset` until sealed, but it may contain data beyond that).
     ///
     /// Returns `None` if no extent can serve the offset (e.g., stream has no extents, or
     /// offset is negative/invalid).
@@ -659,12 +661,12 @@ impl MetadataStore {
         stream_id: StreamId,
         offset: u64,
     ) -> Result<Option<ExtentInfo>, StorageError> {
-        // Try sealed/flushed extents first: base_offset <= offset < base_offset + message_count.
+        // Try sealed/flushed extents first: start_offset <= offset < end_offset.
         let row = sqlx::query(
-            "SELECT extent_id, stream_id, base_offset, message_count, state \
+            "SELECT extent_id, stream_id, start_offset, end_offset, state \
              FROM extent \
              WHERE stream_id = ? AND state IN (?, ?) \
-               AND base_offset <= ? AND ? < base_offset + message_count \
+               AND start_offset <= ? AND ? < end_offset \
              ORDER BY extent_id ASC LIMIT 1",
         )
         .bind(stream_id.0 as i64)
@@ -683,18 +685,18 @@ impl MetadataStore {
                 .await?;
             return Ok(Some(ExtentInfo {
                 extent_id: ext.extent_id.0,
-                base_offset: ext.base_offset,
-                message_count: ext.message_count,
+                start_offset: ext.start_offset,
+                end_offset: ext.end_offset,
                 state: ext.state,
                 replicas,
             }));
         }
 
-        // Fall back to the Active extent where base_offset <= offset.
+        // Fall back to the Active extent where start_offset <= offset.
         let row = sqlx::query(
-            "SELECT extent_id, stream_id, base_offset, message_count, state \
+            "SELECT extent_id, stream_id, start_offset, end_offset, state \
              FROM extent \
-             WHERE stream_id = ? AND state = ? AND base_offset <= ? \
+             WHERE stream_id = ? AND state = ? AND start_offset <= ? \
              ORDER BY extent_id DESC LIMIT 1",
         )
         .bind(stream_id.0 as i64)
@@ -713,8 +715,8 @@ impl MetadataStore {
                     .await?;
                 Ok(Some(ExtentInfo {
                     extent_id: ext.extent_id.0,
-                    base_offset: ext.base_offset,
-                    message_count: ext.message_count,
+                    start_offset: ext.start_offset,
+                    end_offset: ext.end_offset,
                     state: ext.state,
                     replicas,
                 }))

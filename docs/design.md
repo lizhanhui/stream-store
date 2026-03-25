@@ -33,13 +33,13 @@ A single `SEAL` opcode (0x05) covers all trigger sources. `Flags` bit 0 (`FLAG_O
 1. Client sends `Seal(stream_id, extent_id)` to Stream Manager.
 2. Stream Manager sends `Seal` RPC to **each Extent Node holding a replica** (Primary and all Secondaries). Each Extent Node stops accepting appends and responds with its local commit length.
 3. Stream Manager determines the committed offset: if the Primary responded, its quorum offset is used (most accurate). Otherwise, SM computes the committed offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
-4. Stream Manager updates extent metadata to SEALED with the derived message_count.
+4. Stream Manager updates extent metadata to SEALED with the committed end_offset.
 5. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to each new Extent Node.
 6. Stream Manager responds to client with the new extent info (Primary address). Writes resume immediately.
 
 **Extent-node Seal** (`FLAG_OFFSET_PRESENT = 1`):
-1. Primary ExtentNode proactively seals (e.g. arena full) and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` set to Stream Manager. The `offset = base_offset + message_count`.
-2. Stream Manager trusts the reported offset. It derives `message_count = offset - base_offset` using the extent's base_offset from metadata.
+1. Primary ExtentNode proactively seals (e.g. arena full) and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` set to Stream Manager. The `offset` is the committed end_offset.
+2. Stream Manager trusts the reported offset and records it as the extent's `end_offset` in metadata.
 3. Stream Manager updates extent metadata to SEALED.
 4. Stream Manager **fire-and-forgets** Seal RPCs to secondary extent nodes only (`tokio::spawn` -- does not block the response), skipping the Primary (already sealed locally). This ensures secondaries learn about the seal asynchronously.
 5. Stream Manager allocates a new active extent and responds to the Extent Node with the new extent info.
@@ -49,7 +49,7 @@ Both paths share the same downstream procedure in Stream Manager: seal in MySQL 
 **ExtentFull handling**: When the Primary's arena is exhausted, it takes two actions:
 
 1. **Returns `ErrorCode::ExtentFull` (5)** to the client whose append triggered the overflow. This client knows to retry after obtaining the new extent from Stream Manager.
-2. **Proactively seals the extent and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` to Stream Manager** in the background. The `offset = base_offset + message_count` is the committed offset that Stream Manager trusts without querying replicas. Stream Manager updates metadata, fire-and-forgets Seal RPCs to secondary ExtentNodes, allocates a new extent, and responds -- all before most clients even see the error.
+2. **Proactively seals the extent and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` to Stream Manager** in the background. The `offset` is the committed end_offset that Stream Manager trusts without querying replicas. Stream Manager updates metadata, fire-and-forgets Seal RPCs to secondary ExtentNodes, allocates a new extent, and responds -- all before most clients even see the error.
 
 This avoids an error storm where every concurrent client independently discovers the extent is full and races to trigger seal-and-new. Only the Primary initiates the seal -- once. Subsequent clients that arrive after the local seal see `ExtentSealed` and call `DescribeStream(count=1)` to get the new extent, which is already being allocated.
 
@@ -269,7 +269,7 @@ Payload:
 Seal an extent. A single opcode covers all trigger sources; `Flags` bit 0 (`FLAG_OFFSET_PRESENT`) distinguishes whether the caller provides the resolved end offset:
 
 - **Client seal** (`FLAG_OFFSET_PRESENT = 0`): Client doesn't know the committed offset. Stream Manager concurrently seals all Extent Node replicas and determines the committed offset via quorum (Primary's offset if available, otherwise k-th largest Secondary offset where `k = RF/2`).
-- **Extent-node seal** (`FLAG_OFFSET_PRESENT = 1`): Primary ExtentNode proactively seals (e.g. ExtentFull) and reports its committed offset (`base_offset + message_count`). Stream Manager trusts the offset, derives `message_count = offset - base_offset`, skips sealing the Primary (already sealed locally), and fire-and-forgets Seal RPCs to secondary ExtentNodes only.
+- **Extent-node seal** (`FLAG_OFFSET_PRESENT = 1`): Primary ExtentNode proactively seals (e.g. ExtentFull) and reports its committed end_offset. Stream Manager trusts the offset, skips sealing the Primary (already sealed locally), and fire-and-forgets Seal RPCs to secondary ExtentNodes only.
 - **Stream Manager -> Extent Node**: Stream Manager sends Seal to individual Extent Nodes during client-seal quorum collection. Variable header carries `stream_id` only; Extent Node seals locally and responds with SEAL_ACK.
 
 Both client-initiated and EN-initiated paths end with Stream Manager allocating a new extent and responding with SEAL_ACK.
@@ -289,7 +289,7 @@ FLAG_OFFSET_PRESENT = 1 (extent-node seal):
   Variable Header:
     [stream_id    : u64]    -- stream to seal
     [extent_id    : u32]    -- extent to seal
-    [offset       : u64]    -- committed offset (base_offset + message_count), trusted by SM
+    [offset       : u64]    -- committed end_offset, trusted by SM
   No Payload.
 ```
 
@@ -299,20 +299,26 @@ FLAG_OFFSET_PRESENT = 1 (extent-node seal):
 
 ```
 Fixed Header (8B)
+  Flags: 0x00
 Variable Header:
+  [request_id   : u32]    -- request id
   [stream_id    : u64]    -- stream that was sealed
   [extent_id    : u32]    -- extent that was sealed
-  [offset       : u64]    -- committed offset (base_offset + message_count)
+  [offset       : u64]    -- committed end_offset
 No Payload.
 ```
 
-**Stream Manager -> Client**: Returns new extent info after seal-and-new allocation.
+**Stream Manager -> Client**: Returns new extent info after seal-and-new allocation. Uses `FLAG_NEW_EXTENT_PRESENT` (0x01) to carry the new extent info in the variable header.
 
 ```
 Fixed Header (8B)
+  Flags: 0x01 (FLAG_NEW_EXTENT_PRESENT)
 Variable Header:
+  [request_id   : u32]    -- request id
   [stream_id    : u64]    -- stream that was sealed
-  [new_extent_id: u32]    -- newly allocated extent
+  [extent_id    : u32]    -- extent that was sealed
+  [offset       : u64]    -- committed end_offset
+  [new_extent_id: u32]    -- newly allocated extent (in count field)
   [primary_addr_len : u16]
   [primary_addr : bytes]  -- address of the new extent's Primary node
 No Payload.
@@ -558,14 +564,14 @@ Payload:
   [payload      : bytes]  -- encoded Vec<ExtentInfo> (1 entry)
 ```
 
-For sealed/flushed extents: `base_offset <= offset < base_offset + message_count`. For the active extent: `offset >= base_offset` (message_count is 0 in metadata).
+For sealed/flushed extents: `start_offset <= offset < end_offset`. For the active extent: `offset >= start_offset` (end_offset equals start_offset in metadata until sealed).
 
 **ExtentInfo** payload encoding (shared by 0x31, 0x33, 0x35):
 
 ```
 [num_extents:u32]
   per extent:
-    [extent_id:u32][base_offset:u64][message_count:u32][state:u8]
+    [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
     [num_replicas:u16]
       per replica:
         [addr_len:u16][addr_bytes][role:u8][is_alive:u8]
@@ -862,7 +868,7 @@ Sealing sets `sealed.store(true, Release)`. Subsequent appends see the flag and 
 ### Failure Handling
 
 1. Stream Manager detects node failure (heartbeat timeout = 1.5x declared interval).
-2. Stream Manager seals the current extent with the message_count from metadata (the dead node cannot report).
+2. Stream Manager seals the current extent with the end_offset from metadata (the dead node cannot report).
 3. Stream Manager allocates new extent with new replica set on healthy nodes.
 4. Writes resume immediately. Failed replica is lazily re-replicated.
 
@@ -916,7 +922,8 @@ Each extent object is self-contained:
 ```
 +-----------------------------------+
 | Extent Header (magic, version,    |
-|   stream_id, base_offset, count)  |
+|   stream_id, start_offset,        |
+|   end_offset)                     |
 | Message 0: [len][headers][body]   |
 | Message 1: [len][headers][body]   |
 | ...                               |
@@ -955,8 +962,8 @@ CREATE TABLE stream (
 CREATE TABLE extent (
     stream_id     BIGINT NOT NULL,
     extent_id     INT NOT NULL,                    -- per-stream monotonic via stream_sequence table (u32: 4.3B IDs)
-    base_offset   BIGINT NOT NULL DEFAULT 0,    -- first logical offset in this extent
-    message_count INT DEFAULT 0,                 -- number of messages (updated on seal, u32)
+    start_offset  BIGINT NOT NULL DEFAULT 0,    -- first logical offset in this extent
+    end_offset    BIGINT NOT NULL DEFAULT 0,   -- exclusive upper bound (updated on seal; equals start_offset while active)
     state         TINYINT NOT NULL DEFAULT 1,   -- ExtentState: 0=Unspecified, 1=Active, 2=Sealed, 3=Flushed
     s3_key        VARCHAR(1024),                -- set after flush
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1000,8 +1007,8 @@ CREATE TABLE stream_offset (
 ```
 pullMessage(queue, group, offset=1050, count=10)
   -> Stream Manager lookup: stream for queue
-  -> Find extent where base_offset <= 1050 < base_offset + message_count
-  -> local_offset = 1050 - base_offset
+  -> Find extent where start_offset <= 1050 < end_offset
+  -> local_offset = 1050 - start_offset
   -> Read from extent (memory or S3)
 ```
 

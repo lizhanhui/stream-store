@@ -18,6 +18,11 @@ pub const FLAG_FORWARDED: u8 = 0x01;
 /// When set (extent-node seal): offset field is present and trusted by SM.
 pub const FLAG_OFFSET_PRESENT: u8 = 0x01;
 
+/// Flag bit on SEAL_ACK indicating the response carries new extent info.
+/// When clear (EN→SM): only base variable header (no new extent info).
+/// When set (SM→Client): variable header includes new_extent_id + primary_addr.
+pub const FLAG_NEW_EXTENT_PRESENT: u8 = 0x01;
+
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);
@@ -198,8 +203,8 @@ impl Default for NodeMetrics {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtentInfo {
     pub extent_id: u32,
-    pub base_offset: u64,
-    pub message_count: u32,
+    pub start_offset: u64,
+    pub end_offset: u64,
     pub state: ExtentState,
     pub replicas: Vec<ReplicaDetail>,
 }

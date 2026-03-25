@@ -279,25 +279,17 @@ impl StorageClient {
             )));
         }
 
-        // Parse response payload: [extent_id:u64][addr_len:u16][addr]
-        let payload = &resp.payload;
-        if payload.len() < 8 {
-            return Err(StorageError::Internal("SealAck payload too short".into()));
-        }
-        let extent_id = u64::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-            payload[7],
-        ]);
-        let addr = rpc::payload::parse_string_payload(&payload[8..])
-            .ok_or_else(|| StorageError::Internal("invalid SealAck addr".into()))?;
+        // SealAck with FLAG_NEW_EXTENT_PRESENT: new_extent_id in count field, primary_addr in payload
+        let new_extent_id = resp.count as u64;
+        let addr = String::from_utf8_lossy(&resp.payload).to_string();
 
-        Ok((extent_id, addr))
+        Ok((new_extent_id, addr))
     }
 
     /// Send Seal to StreamManager for extent-node-initiated (proactive) seal.
     ///
     /// Used when the primary ExtentNode detects ExtentFull and has already sealed
-    /// the extent locally. The `offset` is `base_offset + message_count` — the
+    /// the extent locally. The `offset` is the committed end_offset — the
     /// committed offset that StreamManager should trust without querying replicas.
     ///
     /// Returns (new_extent_id, new_primary_addr).
@@ -325,19 +317,11 @@ impl StorageClient {
             )));
         }
 
-        // Parse response payload: [extent_id:u64][addr_len:u16][addr]
-        let payload = &resp.payload;
-        if payload.len() < 8 {
-            return Err(StorageError::Internal("SealAck payload too short".into()));
-        }
-        let extent_id = u64::from_be_bytes([
-            payload[0], payload[1], payload[2], payload[3], payload[4], payload[5], payload[6],
-            payload[7],
-        ]);
-        let addr = rpc::payload::parse_string_payload(&payload[8..])
-            .ok_or_else(|| StorageError::Internal("invalid SealAck addr".into()))?;
+        // SealAck with FLAG_NEW_EXTENT_PRESENT: new_extent_id in count field, primary_addr in payload
+        let new_extent_id = resp.count as u64;
+        let addr = String::from_utf8_lossy(&resp.payload).to_string();
 
-        Ok((extent_id, addr))
+        Ok((new_extent_id, addr))
     }
 
     // ── Management operations (StreamManager) ──

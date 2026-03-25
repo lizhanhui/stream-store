@@ -1,9 +1,11 @@
 use std::sync::Arc;
 
 use crate::metadata::{MetadataStore, SealResult};
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::Bytes;
 use common::errors::StorageError;
-use common::types::{ErrorCode, ExtentId, FLAG_OFFSET_PRESENT, Offset, Opcode, StreamId};
+use common::types::{
+    ErrorCode, ExtentId, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, Offset, Opcode, StreamId,
+};
 use futures_util::future;
 use rpc::frame::Frame;
 use rpc::payload::{
@@ -17,7 +19,7 @@ use tracing::{error, info, warn};
 
 use crate::allocator::Allocator;
 
-/// Seal an ExtentNode's extent and return the committed offset (base_offset + message_count).
+/// Seal an ExtentNode's extent and return the committed end_offset.
 ///
 /// This is a free function (not a method) so that it can be called from async tasks
 /// spawned for concurrent sealing without borrowing `self`.
@@ -42,7 +44,7 @@ async fn seal_extent_node_static(addr: &str, stream_id: StreamId) -> Result<u64,
         )));
     }
 
-    // SealAck carries committed offset (base_offset + message_count) in the offset field.
+    // SealAck carries committed end_offset in the offset field.
     Ok(resp.offset.0)
 }
 
@@ -145,7 +147,7 @@ impl StreamManagerStore {
     async fn allocate_and_notify_replica_set(
         &self,
         stream_id: StreamId,
-        base_offset: u64,
+        start_offset: u64,
         replication_factor: usize,
     ) -> Result<(ExtentId, String), StorageError> {
         let mut alloc = self.allocator.lock().await;
@@ -163,7 +165,7 @@ impl StreamManagerStore {
 
         let extent_id = self
             .store
-            .allocate_extent(stream_id, base_offset, &replicas)
+            .allocate_extent(stream_id, start_offset, &replicas)
             .await?;
 
         info!(
@@ -406,12 +408,14 @@ impl StreamManagerStore {
         };
 
         match result {
-            Ok(resp_payload) => Frame {
+            Ok((new_extent_id, primary_addr)) => Frame {
                 opcode: Opcode::SealAck,
+                flags: FLAG_NEW_EXTENT_PRESENT,
                 request_id: frame.request_id,
                 stream_id,
                 extent_id,
-                payload: resp_payload,
+                count: new_extent_id.0, // new_extent_id encoded as u32 in count field
+                payload: Bytes::copy_from_slice(primary_addr.as_bytes()), // primary_addr
                 ..Default::default()
             },
             Err(e) => {
@@ -439,7 +443,7 @@ impl StreamManagerStore {
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
-    ) -> Result<Bytes, StorageError> {
+    ) -> Result<(ExtentId, String), StorageError> {
         // 1. Get replicas for the extent, ordered by role (Primary first).
         let replicas = self.store.get_replicas(stream_id, extent_id).await?;
         if replicas.is_empty() {
@@ -530,8 +534,8 @@ impl StreamManagerStore {
             extent_id, stream_id
         );
 
-        // 4. Derive message_count from committed offset.
-        let extent_row = self
+        // 4. Verify active extent exists.
+        let _extent_row = self
             .store
             .get_active_extent(stream_id)
             .await?
@@ -541,10 +545,10 @@ impl StreamManagerStore {
                     stream_id
                 ))
             })?;
-        let message_count = (committed - extent_row.base_offset) as u32;
+        let end_offset = committed;
 
         // 5. Pick nodes for new extent replica set.
-        self.seal_allocate_notify(stream_id, extent_id, message_count)
+        self.seal_allocate_notify(stream_id, extent_id, end_offset)
             .await
     }
 
@@ -553,7 +557,7 @@ impl StreamManagerStore {
     /// seal RPCs to all secondary ENs.
     ///
     /// Flow:
-    /// 1. Derive message_count from offset.
+    /// 1. Verify active extent exists.
     /// 2. Seal in MySQL + allocate new extent.
     /// 3. Register new extent on ExtentNodes.
     /// 4. Fire-and-forget: seal secondary ENs asynchronously.
@@ -562,14 +566,14 @@ impl StreamManagerStore {
         stream_id: StreamId,
         extent_id: ExtentId,
         offset: u64,
-    ) -> Result<Bytes, StorageError> {
+    ) -> Result<(ExtentId, String), StorageError> {
         info!(
             "extent_node_seal: sealing extent {:?} for stream {:?}: offset={offset}",
             extent_id, stream_id
         );
 
-        // 1. Derive message_count from the provided offset.
-        let extent_row = self
+        // 1. Verify active extent exists. The provided offset IS the end_offset.
+        let _extent_row = self
             .store
             .get_active_extent(stream_id)
             .await?
@@ -579,11 +583,11 @@ impl StreamManagerStore {
                     stream_id
                 ))
             })?;
-        let message_count = (offset - extent_row.base_offset) as u32;
+        let end_offset = offset;
 
         // 2-3. Seal + allocate + notify new replica set.
-        let resp_payload = self
-            .seal_allocate_notify(stream_id, extent_id, message_count)
+        let result = self
+            .seal_allocate_notify(stream_id, extent_id, end_offset)
             .await?;
 
         // 4. Fire-and-forget: seal all secondary ENs of the old extent.
@@ -614,17 +618,17 @@ impl StreamManagerStore {
             });
         }
 
-        Ok(resp_payload)
+        Ok(result)
     }
 
     /// Shared logic for both seal paths: pick new nodes, seal-and-allocate in DB,
-    /// notify new replica set, and build SealAck response payload.
+    /// notify new replica set, and return (new_extent_id, primary_addr).
     async fn seal_allocate_notify(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
-        message_count: u32,
-    ) -> Result<Bytes, StorageError> {
+        end_offset: u64,
+    ) -> Result<(ExtentId, String), StorageError> {
         // Pick nodes for new extent replica set using per-stream replication factor.
         let replication_factor =
             self.store.get_stream_replication_factor(stream_id).await? as usize;
@@ -641,7 +645,7 @@ impl StreamManagerStore {
         // Transactional seal + allocate (idempotent for already-sealed extents).
         let seal_result = self
             .store
-            .seal_and_allocate_transaction(stream_id, extent_id, message_count, &new_replicas)
+            .seal_and_allocate_transaction(stream_id, extent_id, end_offset, &new_replicas)
             .await?;
 
         let (new_extent_id, primary_addr) = match seal_result {
@@ -662,7 +666,7 @@ impl StreamManagerStore {
             }
             SealResult::AlreadySealed {
                 new_extent_id,
-                new_base_offset: _,
+                new_start_offset: _,
                 primary_addr,
             } => {
                 info!(
@@ -673,18 +677,10 @@ impl StreamManagerStore {
             }
         };
 
-        // Build SealAck response payload: [extent_id:u64][addr_len:u16][addr]
-        let mut resp_payload = BytesMut::new();
-        resp_payload.put_u64(new_extent_id.0 as u64);
-        let addr_bytes = primary_addr.as_bytes();
-        resp_payload.put_u16(addr_bytes.len() as u16);
-        resp_payload.extend_from_slice(addr_bytes);
-
-        Ok(resp_payload.freeze())
+        Ok((new_extent_id, primary_addr))
     }
 
-    /// QueryOffset on StreamManager: return the total logical end offset for a stream
-    /// (sum of all extents' base_offset + message_count for the last extent).
+    /// QueryOffset on StreamManager: return the total logical end offset for a stream.
     async fn handle_query_offset(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id;
 
@@ -694,7 +690,7 @@ impl StreamManagerStore {
                 return Ok(Offset(0));
             }
             let last = &extents[extents.len() - 1];
-            Ok::<Offset, StorageError>(Offset(last.base_offset + last.message_count as u64))
+            Ok::<Offset, StorageError>(Offset(last.end_offset))
         }
         .await;
 

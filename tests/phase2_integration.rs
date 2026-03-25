@@ -210,9 +210,9 @@ async fn stream_manager_integration() {
         // ── Part 3: describe_stream and describe_extent ──
         //
         // At this point the stream has 3 extents:
-        //   extent_id=1  base_offset=0   message_count=5   state=Sealed
-        //   extent_id=2  base_offset=5   message_count=10  state=Sealed
-        //   extent_id=3  base_offset=15  message_count=0   state=Active
+        //   extent_id=1  start_offset=0   end_offset=5    state=Sealed
+        //   extent_id=2  start_offset=5   end_offset=15   state=Sealed
+        //   extent_id=3  start_offset=15  end_offset=15   state=Active
 
         // 3a. describe_stream(count=0) — all extents, latest first.
         let all_extents = stream_manager_client
@@ -223,18 +223,18 @@ async fn stream_manager_integration() {
         // Ordered by extent_id descending: 3, 2, 1.
         assert_eq!(all_extents[0].extent_id, (third_extent_id as u32));
         assert_eq!(all_extents[0].state, ExtentState::Active);
-        assert_eq!(all_extents[0].base_offset, 15);
-        assert_eq!(all_extents[0].message_count, 0);
+        assert_eq!(all_extents[0].start_offset, 15);
+        assert_eq!(all_extents[0].end_offset, 15);
 
         assert_eq!(all_extents[1].extent_id, (new_extent_id as u32));
         assert_eq!(all_extents[1].state, ExtentState::Sealed);
-        assert_eq!(all_extents[1].base_offset, 5);
-        assert_eq!(all_extents[1].message_count, 10);
+        assert_eq!(all_extents[1].start_offset, 5);
+        assert_eq!(all_extents[1].end_offset, 15);
 
         assert_eq!(all_extents[2].extent_id, extent_id.0);
         assert_eq!(all_extents[2].state, ExtentState::Sealed);
-        assert_eq!(all_extents[2].base_offset, 0);
-        assert_eq!(all_extents[2].message_count, 5);
+        assert_eq!(all_extents[2].start_offset, 0);
+        assert_eq!(all_extents[2].end_offset, 5);
 
         // 3b. Each extent should have exactly 1 replica (RF=1) — the registered ExtentNode.
         for ext in &all_extents {
@@ -273,8 +273,8 @@ async fn stream_manager_integration() {
             .unwrap();
         assert_eq!(ext1.extent_id, extent_id.0);
         assert_eq!(ext1.state, ExtentState::Sealed);
-        assert_eq!(ext1.base_offset, 0);
-        assert_eq!(ext1.message_count, 5);
+        assert_eq!(ext1.start_offset, 0);
+        assert_eq!(ext1.end_offset, 5);
         assert_eq!(ext1.replicas.len(), 1);
         assert_eq!(ext1.replicas[0].node_addr, extent_node_addr);
         assert!(ext1.replicas[0].is_alive);
@@ -286,8 +286,8 @@ async fn stream_manager_integration() {
             .unwrap();
         assert_eq!(ext3.extent_id, (third_extent_id as u32));
         assert_eq!(ext3.state, ExtentState::Active);
-        assert_eq!(ext3.base_offset, 15);
-        assert_eq!(ext3.message_count, 0);
+        assert_eq!(ext3.start_offset, 15);
+        assert_eq!(ext3.end_offset, 15);
 
         // 3g. describe_extent for non-existent extent returns error.
         let bad = stream_manager_client
@@ -306,9 +306,9 @@ async fn stream_manager_integration() {
         // ── Part 4: seek ──
         //
         // Stream layout (3 extents):
-        //   extent_id=first   base_offset=0   message_count=5   Sealed   [offsets 0..4]
-        //   extent_id=second  base_offset=5   message_count=10  Sealed   [offsets 5..14]
-        //   extent_id=third   base_offset=15  message_count=0   Active   [offsets 15..)
+        //   extent_id=first   start_offset=0   end_offset=5    Sealed   [offsets 0..4]
+        //   extent_id=second  start_offset=5   end_offset=15   Sealed   [offsets 5..14]
+        //   extent_id=third   start_offset=15  end_offset=15   Active   [offsets 15..)
         let first_eid = extent_id.0;
         let second_eid = new_extent_id;
         let third_eid = third_extent_id;
@@ -320,8 +320,8 @@ async fn stream_manager_integration() {
             .unwrap();
         assert_eq!(s.extent_id, first_eid);
         assert_eq!(s.state, ExtentState::Sealed);
-        assert_eq!(s.base_offset, 0);
-        assert_eq!(s.message_count, 5);
+        assert_eq!(s.start_offset, 0);
+        assert_eq!(s.end_offset, 5);
         assert_eq!(s.replicas.len(), 1);
         assert_eq!(s.replicas[0].node_addr, extent_node_addr);
 
@@ -346,8 +346,8 @@ async fn stream_manager_integration() {
             .unwrap();
         assert_eq!(s.extent_id, (second_eid as u32));
         assert_eq!(s.state, ExtentState::Sealed);
-        assert_eq!(s.base_offset, 5);
-        assert_eq!(s.message_count, 10);
+        assert_eq!(s.start_offset, 5);
+        assert_eq!(s.end_offset, 15);
 
         // 4e. Seek offset=12 -> second sealed extent (mid-range).
         let s = stream_manager_client
@@ -370,7 +370,7 @@ async fn stream_manager_integration() {
             .unwrap();
         assert_eq!(s.extent_id, (third_eid as u32));
         assert_eq!(s.state, ExtentState::Active);
-        assert_eq!(s.base_offset, 15);
+        assert_eq!(s.start_offset, 15);
 
         // 4h. Seek offset=999 -> active extent (far beyond committed data, still the tail).
         let s = stream_manager_client

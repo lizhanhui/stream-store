@@ -73,20 +73,20 @@ async fn check_expired_nodes(
                 "sealing extent {:?} on dead node {} (stream {:?})",
                 extent.extent_id, node.node_id, extent.stream_id
             );
-            // Seal with current message_count (we can't know the exact count
+            // Seal with current end_offset (we can't know the exact count
             // from ExtentNode since it's dead; record what metadata has).
             store
-                .seal_extent(extent.stream_id, extent.extent_id, extent.message_count)
+                .seal_extent(extent.stream_id, extent.extent_id, extent.end_offset)
                 .await?;
 
             // 3. Allocate a replacement extent on a healthy node.
-            let new_base_offset = extent.base_offset + extent.message_count as u64;
+            let new_start_offset = extent.end_offset;
             let mut alloc = allocator.lock().await;
             match alloc.pick_node(store).await {
                 Ok(target) => {
                     let replicas = vec![(target.addr.clone(), 0u8)];
                     let new_extent = store
-                        .allocate_extent(extent.stream_id, new_base_offset, &replicas)
+                        .allocate_extent(extent.stream_id, new_start_offset, &replicas)
                         .await?;
                     info!(
                         "replacement extent {:?} allocated on {} for stream {:?}",

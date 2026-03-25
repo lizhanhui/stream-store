@@ -161,10 +161,10 @@ async fn main() {
         .seal(stream_id, extent_id)
         .await
         .expect("seal failed");
-    let message_count = messages.len() as u32;
+    let sealed_count = messages.len() as u32;
 
     info!(
-        "[8] Sealed extent {:?} (message_count={message_count})",
+        "[8] Sealed extent {:?} (messages={sealed_count})",
         extent_id
     );
     info!("    New extent_id={new_extent_id_raw}, primary={new_primary_addr}");
@@ -192,20 +192,20 @@ async fn main() {
     }
 
     // ── 11. Read from new extent ──
-    let base_offset = message_count as u64; // new extent starts after sealed messages
+    let start_offset = sealed_count as u64; // new extent starts after sealed messages
     let read_new = extent_node_client_2
-        .read(stream_id, Offset(base_offset), 0, new_messages.len() as u16)
+        .read(stream_id, Offset(start_offset), 0, new_messages.len() as u16)
         .await
         .expect("read after seal failed");
 
     info!(
-        "[10] Read {} messages from Offset({base_offset}):",
+        "[10] Read {} messages from Offset({start_offset}):",
         read_new.len()
     );
     for (i, msg) in read_new.iter().enumerate() {
         info!(
             "    [{}] {}",
-            base_offset as usize + i,
+            start_offset as usize + i,
             String::from_utf8_lossy(msg)
         );
     }
@@ -241,12 +241,12 @@ async fn main() {
 
     assert_eq!(
         total_offset,
-        Offset(message_count as u64 + new_messages.len() as u64)
+        Offset(sealed_count as u64 + new_messages.len() as u64)
     );
 
     info!(
         "=== Success: created stream (replication_factor=2), appended {}, sealed twice, verified reads ===",
-        message_count as u64 + new_messages.len() as u64
+        sealed_count as u64 + new_messages.len() as u64
     );
 
     // ── 13. Graceful shutdown ──

@@ -207,9 +207,9 @@ async fn describe_stream_rf2_integration() {
     let ext = &active[0];
     assert_eq!(ext.extent_id, first_extent_id.0);
     assert_eq!(ext.state, ExtentState::Active);
-    assert_eq!(ext.base_offset, 0);
-    // Active extent message_count is 0 in metadata (only updated on seal).
-    assert_eq!(ext.message_count, 0);
+    assert_eq!(ext.start_offset, 0);
+    // Active extent end_offset equals start_offset in metadata (only updated on seal).
+    assert_eq!(ext.end_offset, 0);
 
     // RF=2: should have exactly 2 replicas.
     assert_eq!(ext.replicas.len(), 2, "RF=2 should have 2 replicas");
@@ -258,7 +258,7 @@ async fn describe_stream_rf2_integration() {
 
     assert_eq!(new_ext.extent_id, (second_extent_id as u32));
     assert_eq!(new_ext.state, ExtentState::Active);
-    assert_eq!(new_ext.base_offset, 5);
+    assert_eq!(new_ext.start_offset, 5);
     assert_eq!(
         new_ext.replicas.len(),
         2,
@@ -267,8 +267,8 @@ async fn describe_stream_rf2_integration() {
 
     assert_eq!(sealed_ext.extent_id, first_extent_id.0);
     assert_eq!(sealed_ext.state, ExtentState::Sealed);
-    assert_eq!(sealed_ext.base_offset, 0);
-    assert_eq!(sealed_ext.message_count, 5);
+    assert_eq!(sealed_ext.start_offset, 0);
+    assert_eq!(sealed_ext.end_offset, 5);
     assert_eq!(
         sealed_ext.replicas.len(),
         2,
@@ -302,7 +302,7 @@ async fn describe_stream_rf2_integration() {
         .unwrap();
     assert_eq!(detail.extent_id, first_extent_id.0);
     assert_eq!(detail.state, ExtentState::Sealed);
-    assert_eq!(detail.message_count, 5);
+    assert_eq!(detail.end_offset, 5);
     assert_eq!(detail.replicas.len(), 2);
 
     // ── Part 5: Disconnect one EN, verify is_alive goes false ──
@@ -378,8 +378,8 @@ async fn describe_stream_rf2_integration() {
     let s = stream_manager.seek(stream_id, Offset(0)).await.unwrap();
     assert_eq!(s.extent_id, first_extent_id.0);
     assert_eq!(s.state, ExtentState::Sealed);
-    assert_eq!(s.base_offset, 0);
-    assert_eq!(s.message_count, 5);
+    assert_eq!(s.start_offset, 0);
+    assert_eq!(s.end_offset, 5);
     assert_eq!(
         s.replicas.len(),
         2,
@@ -403,7 +403,7 @@ async fn describe_stream_rf2_integration() {
     let s = stream_manager.seek(stream_id, Offset(5)).await.unwrap();
     assert_eq!(s.extent_id, (second_extent_id as u32));
     assert_eq!(s.state, ExtentState::Active);
-    assert_eq!(s.base_offset, 5);
+    assert_eq!(s.start_offset, 5);
     assert_eq!(s.replicas.len(), 2);
 
     // 6d. Seek offset=100 -> active extent (far beyond committed).

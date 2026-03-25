@@ -1,8 +1,8 @@
 CREATE TABLE extent (
     stream_id     BIGINT NOT NULL,
     extent_id     INT NOT NULL,
-    base_offset   BIGINT NOT NULL,
-    message_count INT NOT NULL DEFAULT 0,
+    start_offset  BIGINT NOT NULL,
+    end_offset    BIGINT NOT NULL DEFAULT 0,
     state         TINYINT NOT NULL DEFAULT 1,
     s3_key        VARCHAR(1024),
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

@@ -81,7 +81,7 @@ impl Stream {
             }
 
             // Skip extents entirely after our read range (shouldn't happen with ordered extents).
-            if offset.0 < extent.base_offset.0 {
+            if offset.0 < extent.start_offset.0 {
                 break;
             }
 
@@ -117,9 +117,9 @@ impl Stream {
     }
 
     /// Seal the active (last) extent and create a new one.
-    /// Returns `(base_offset, message_count)` of the sealed extent, or None if no active extent.
+    /// Returns `(start_offset, end_offset)` of the sealed extent, or None if no active extent.
     ///
-    /// The committed offset for the sealed extent is `base_offset + message_count`.
+    /// `end_offset` = `start_offset + message_count` (exclusive upper bound).
     ///
     /// Requires `&mut self` because it modifies the extent list.
     pub fn seal_active(&mut self) -> Option<(u64, u64)> {
@@ -127,18 +127,18 @@ impl Stream {
         if last.state() == ExtentState::Sealed {
             return None;
         }
-        let base_offset = last.base_offset.0;
+        let start_offset = last.start_offset.0;
         let message_count = last.message_count();
+        let end_offset = start_offset + message_count;
         last.seal();
 
-        // Create a new active extent starting at the next offset.
-        let new_base = Offset(base_offset + message_count);
+        // Create a new active extent starting at the end offset.
         let new_id = ExtentId(self.next_extent_id);
         self.next_extent_id += 1;
         self.extents
-            .push(Extent::with_capacity(new_id, new_base, self.arena_capacity));
+            .push(Extent::with_capacity(new_id, Offset(end_offset), self.arena_capacity));
 
-        Some((base_offset, message_count))
+        Some((start_offset, end_offset))
     }
 }
 
@@ -216,11 +216,11 @@ mod tests {
         assert_eq!(stream.max_offset(), Offset(3));
 
         // Seal active extent.
-        let (base_offset, count) = stream.seal_active().unwrap();
-        assert_eq!(base_offset, 0);
-        assert_eq!(count, 3);
+        let (start_offset, end_offset) = stream.seal_active().unwrap();
+        assert_eq!(start_offset, 0);
+        assert_eq!(end_offset, 3);
 
-        // A new extent should exist with base_offset = 3.
+        // A new extent should exist with start_offset = 3.
         assert_eq!(stream.max_offset(), Offset(3)); // new extent is empty
 
         // Append to the new extent.

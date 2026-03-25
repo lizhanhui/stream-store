@@ -1,8 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    ErrorCode, ExtentId, FLAG_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
-    StreamId,
+    ErrorCode, ExtentId, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset,
+    Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 /// A wire protocol frame.
@@ -88,7 +88,15 @@ impl Frame {
                 }
             }
             // request_id(4) + stream_id(8) + extent_id(4) + offset(8)
-            Opcode::SealAck => 4 + 8 + 4 + 8,
+            // [+ count/new_extent_id(4) + addr_len(2) + addr_bytes if FLAG_NEW_EXTENT_PRESENT]
+            Opcode::SealAck => {
+                let base = 4 + 8 + 4 + 8;
+                if self.flags & FLAG_NEW_EXTENT_PRESENT != 0 {
+                    base + 4 + 2 + self.payload.len()
+                } else {
+                    base
+                }
+            }
             // request_id(4)
             Opcode::CreateStream => 4,
             // request_id(4) + stream_id(8) + extent_id(4)
@@ -139,7 +147,6 @@ impl Frame {
             | Opcode::ReadResp
             | Opcode::CreateStream
             | Opcode::CreateStreamResp
-            | Opcode::SealAck
             | Opcode::Connect
             | Opcode::Disconnect
             | Opcode::Heartbeat
@@ -215,6 +222,11 @@ impl Frame {
                 dst.put_u64(self.stream_id.0);
                 dst.put_u32(self.extent_id.0);
                 dst.put_u64(self.offset.0);
+                if self.flags & FLAG_NEW_EXTENT_PRESENT != 0 {
+                    dst.put_u32(self.count); // new_extent_id
+                    dst.put_u16(self.payload.len() as u16); // primary_addr length
+                    dst.extend_from_slice(&self.payload); // primary_addr bytes
+                }
             }
             Opcode::CreateStream => {
                 dst.put_u32(self.request_id);
@@ -379,7 +391,13 @@ impl Frame {
                 self.stream_id = StreamId(body.get_u64());
                 self.extent_id = ExtentId(body.get_u32());
                 self.offset = Offset(body.get_u64());
-                self.read_payload(body);
+                if self.flags & FLAG_NEW_EXTENT_PRESENT != 0 {
+                    self.count = body.get_u32(); // new_extent_id
+                    let addr_len = body.get_u16() as usize;
+                    if body.remaining() >= addr_len {
+                        self.payload = body.split_to(addr_len).freeze();
+                    }
+                }
             }
             Opcode::CreateStream => {
                 self.request_id = body.get_u32();
@@ -812,6 +830,69 @@ mod tests {
             decoded.payload,
             Bytes::from_static(b"\x00\x0e127.0.0.1:9000")
         );
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn seal_ack_without_new_extent() {
+        // EN→SM: no FLAG_NEW_EXTENT_PRESENT, just base variable header
+        let frame = Frame {
+            opcode: Opcode::SealAck,
+            flags: 0,
+            request_id: 1,
+            stream_id: StreamId(10),
+            extent_id: ExtentId(5),
+            offset: Offset(42),
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf);
+        // 8 (fixed) + 4 (req) + 8 (stream) + 4 (extent) + 8 (offset) = 32 bytes
+        assert_eq!(buf.len(), 32);
+
+        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.opcode, Opcode::SealAck);
+        assert_eq!(decoded.flags, 0);
+        assert_eq!(decoded.request_id, 1);
+        assert_eq!(decoded.stream_id, StreamId(10));
+        assert_eq!(decoded.extent_id, ExtentId(5));
+        assert_eq!(decoded.offset, Offset(42));
+        assert_eq!(decoded.count, 0); // no new_extent_id
+        assert!(decoded.payload.is_empty()); // no primary_addr
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn seal_ack_with_new_extent() {
+        // SM→Client: FLAG_NEW_EXTENT_PRESENT set, carries new_extent_id + primary_addr
+        let addr = b"127.0.0.1:9001";
+        let frame = Frame {
+            opcode: Opcode::SealAck,
+            flags: FLAG_NEW_EXTENT_PRESENT,
+            request_id: 2,
+            stream_id: StreamId(10),
+            extent_id: ExtentId(5),
+            offset: Offset(42),
+            count: 6, // new_extent_id
+            payload: Bytes::from_static(addr),
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf);
+        // 8 (fixed) + 24 (base) + 4 (new_extent_id) + 2 (addr_len) + 14 (addr) = 52 bytes
+        assert_eq!(buf.len(), 52);
+
+        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.opcode, Opcode::SealAck);
+        assert_eq!(decoded.flags, FLAG_NEW_EXTENT_PRESENT);
+        assert_eq!(decoded.request_id, 2);
+        assert_eq!(decoded.stream_id, StreamId(10));
+        assert_eq!(decoded.extent_id, ExtentId(5));
+        assert_eq!(decoded.offset, Offset(42));
+        assert_eq!(decoded.count, 6); // new_extent_id
+        assert_eq!(decoded.payload, Bytes::from_static(addr));
         assert!(buf.is_empty());
     }
 }

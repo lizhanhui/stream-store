@@ -14,7 +14,7 @@ pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
 /// records: `[stream_id:u64][extent_id:u64][offset:u64][byte_pos:u64]`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
-    /// Logical offset assigned to this record (base_offset + sequence number).
+    /// Logical offset assigned to this record (start_offset + sequence number).
     pub offset: Offset,
     /// Byte position from the beginning of the arena where this record starts.
     /// The record is stored as `[payload_len: u32 BE][payload: bytes]` at this position.
@@ -71,7 +71,7 @@ pub struct AppendResult {
 /// sealed extents.
 pub struct Extent {
     pub id: ExtentId,
-    pub base_offset: Offset,
+    pub start_offset: Offset,
 
     /// Pre-allocated contiguous buffer. Owned by this Extent; freed on drop.
     buf: *mut u8,
@@ -107,12 +107,12 @@ unsafe impl Sync for Extent {}
 
 impl Extent {
     /// Create a new active extent with default capacity (64 MB).
-    pub fn new(id: ExtentId, base_offset: Offset) -> Self {
-        Self::with_capacity(id, base_offset, DEFAULT_ARENA_CAPACITY)
+    pub fn new(id: ExtentId, start_offset: Offset) -> Self {
+        Self::with_capacity(id, start_offset, DEFAULT_ARENA_CAPACITY)
     }
 
     /// Create a new active extent with the specified capacity in bytes.
-    pub fn with_capacity(id: ExtentId, base_offset: Offset, capacity: usize) -> Self {
+    pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: usize) -> Self {
         let layout = Layout::from_size_align(capacity, 8).expect("invalid layout");
         // SAFETY: layout is valid, nonzero size.
         let buf = unsafe { alloc(layout) };
@@ -122,7 +122,7 @@ impl Extent {
 
         Self {
             id,
-            base_offset,
+            start_offset,
             buf,
             capacity,
             layout,
@@ -199,7 +199,7 @@ impl Extent {
         }
 
         Ok(AppendResult {
-            offset: Offset(self.base_offset.0 + seq),
+            offset: Offset(self.start_offset.0 + seq),
             byte_pos,
         })
     }
@@ -293,7 +293,7 @@ impl Extent {
 
     /// The next logical offset that would be assigned by an append.
     pub fn next_offset(&self) -> Offset {
-        Offset(self.base_offset.0 + self.committed_seq.load(Ordering::Acquire))
+        Offset(self.start_offset.0 + self.committed_seq.load(Ordering::Acquire))
     }
 
     /// The last valid offset in this extent (inclusive), or None if empty.
@@ -302,7 +302,7 @@ impl Extent {
         if count == 0 {
             None
         } else {
-            Some(Offset(self.base_offset.0 + count - 1))
+            Some(Offset(self.start_offset.0 + count - 1))
         }
     }
 
@@ -344,7 +344,7 @@ impl std::fmt::Debug for Extent {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Extent")
             .field("id", &self.id)
-            .field("base_offset", &self.base_offset)
+            .field("start_offset", &self.start_offset)
             .field("capacity", &self.capacity)
             .field("write_cursor", &self.write_cursor.load(Ordering::Relaxed))
             .field("record_count", &self.record_count.load(Ordering::Relaxed))
@@ -429,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn base_offset_nonzero() {
+    fn start_offset_nonzero() {
         let ext = Extent::with_capacity(ExtentId(2), Offset(100), 4096);
         let r = ext.append(Bytes::from_static(b"hello")).unwrap();
         assert_eq!(r.offset, Offset(100));

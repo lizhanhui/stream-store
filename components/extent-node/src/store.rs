@@ -137,7 +137,7 @@ pub struct WatermarkEvent {
 pub struct SealRequest {
     pub stream_id: StreamId,
     pub extent_id: ExtentId,
-    /// Committed offset = base_offset + message_count (the next writable offset).
+    /// Committed offset = end_offset (the next writable offset).
     /// Stream Manager trusts this value from the primary EN.
     pub offset: u64,
 }
@@ -442,7 +442,7 @@ impl ExtentNodeStore {
                 {
                     let eid = stream_mut.active_extent_id();
                     match stream_mut.seal_active() {
-                        Some((base_offset, message_count)) => (eid, base_offset + message_count),
+                        Some((_start_offset, end_offset)) => (eid, end_offset),
                         None => (eid, 0),
                     }
                 } else {
@@ -657,17 +657,16 @@ impl ExtentNodeStore {
         };
 
         match stream_ref.seal_active() {
-            Some((base_offset, message_count)) => {
-                let offset = base_offset + message_count;
+            Some((start_offset, end_offset)) => {
                 info!(
-                    "sealed active extent for stream {:?}, base_offset={base_offset}, message_count={message_count}, offset={offset}",
+                    "sealed active extent for stream {:?}, start_offset={start_offset}, end_offset={end_offset}",
                     stream_id
                 );
                 Frame {
                     opcode: Opcode::SealAck,
                     request_id: frame.request_id,
                     stream_id,
-                    offset: Offset(offset),
+                    offset: Offset(end_offset),
                     ..Default::default()
                 }
             }
