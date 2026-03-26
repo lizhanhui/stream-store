@@ -2,7 +2,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
@@ -10,6 +10,12 @@ use common::types::{ExtentId, ExtentState, Offset};
 
 /// Default arena capacity: 64 MB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
+
+/// Sentinel for unwritten index entries.
+const INDEX_UNSET: u32 = u32::MAX;
+
+/// Minimum record size: 4-byte length prefix + 1-byte payload.
+const MIN_RECORD_SIZE: usize = 5;
 
 /// Owns the raw heap allocation for an extent's arena buffer.
 /// Wrapped in `Arc` so that `Bytes` slices keep the buffer alive
@@ -153,6 +159,11 @@ pub struct Extent {
 
     /// Whether this extent has been sealed.
     sealed: AtomicBool,
+
+    /// Internal index mapping sequence number → byte position (compressed u32).
+    /// Entry i holds the byte_pos for the i-th record appended to this extent.
+    /// Capacity = arena_capacity / MIN_RECORD_SIZE.
+    index: Box<[AtomicU32]>,
 }
 
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
@@ -183,6 +194,13 @@ impl Extent {
         });
         let buf = arena.ptr.as_ptr();
 
+        let index_capacity = capacity / MIN_RECORD_SIZE;
+        let mut index_entries = Vec::with_capacity(index_capacity);
+        for _ in 0..index_capacity {
+            index_entries.push(AtomicU32::new(INDEX_UNSET));
+        }
+        let index = index_entries.into_boxed_slice();
+
         Self {
             id,
             start_offset,
@@ -194,6 +212,7 @@ impl Extent {
             committed_seq: AtomicU64::new(0),
             committed_bytes: AtomicU64::new(0),
             sealed: AtomicBool::new(false),
+            index,
         }
     }
 
@@ -256,6 +275,7 @@ impl Extent {
                 Ok(_) => {
                     self.committed_bytes
                         .store(new_committed_bytes, Ordering::Release);
+                    self.index_record(seq, byte_pos);
                     break;
                 }
                 Err(_) => {
@@ -316,6 +336,31 @@ impl Extent {
         }
 
         Ok(result)
+    }
+
+    /// Record byte_pos in the internal index. Called after successful commit.
+    fn index_record(&self, seq: u64, byte_pos: u64) {
+        let idx = seq as usize;
+        if idx < self.index.len() {
+            self.index[idx].store(byte_pos as u32, Ordering::Release);
+        }
+    }
+
+    /// Lookup byte_pos from the internal index.
+    ///
+    /// Returns `None` if `seq` is out of bounds or the entry has not been
+    /// committed yet (still holds the sentinel value).
+    pub fn index_lookup(&self, seq: u64) -> Option<u64> {
+        let idx = seq as usize;
+        if idx >= self.index.len() {
+            return None;
+        }
+        let val = self.index[idx].load(Ordering::Acquire);
+        if val == INDEX_UNSET {
+            None
+        } else {
+            Some(val as u64)
+        }
     }
 
     /// Create a `Bytes` view of the entire arena buffer.
@@ -576,5 +621,79 @@ mod tests {
         // Also verify sequential read from byte 0 returns all records.
         let all_msgs = ext.read(0, total as u32).unwrap();
         assert_eq!(all_msgs.len(), total);
+    }
+
+    #[test]
+    fn index_lookup_basic() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+
+        // Before any append, all index entries are None.
+        assert_eq!(ext.index_lookup(0), None);
+        assert_eq!(ext.index_lookup(1), None);
+
+        let r0 = ext.append(Bytes::from_static(b"msg0")).unwrap();
+        let r1 = ext.append(Bytes::from_static(b"msg1")).unwrap();
+        let r2 = ext.append(Bytes::from_static(b"msg2")).unwrap();
+
+        // After append, index entries should match byte_pos.
+        assert_eq!(ext.index_lookup(0), Some(r0.byte_pos));
+        assert_eq!(ext.index_lookup(1), Some(r1.byte_pos));
+        assert_eq!(ext.index_lookup(2), Some(r2.byte_pos));
+
+        // Uncommitted entries are still None.
+        assert_eq!(ext.index_lookup(3), None);
+
+        // Out-of-bounds returns None.
+        assert_eq!(ext.index_lookup(999_999), None);
+    }
+
+    #[test]
+    fn index_lookup_with_nonzero_start_offset() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(100), 4096);
+        let r0 = ext.append(Bytes::from_static(b"hello")).unwrap();
+        assert_eq!(r0.offset, Offset(100));
+
+        // Internal index uses seq (0-based within extent), not global offset.
+        assert_eq!(ext.index_lookup(0), Some(r0.byte_pos));
+    }
+
+    #[test]
+    fn concurrent_appends_index_consistent() {
+        use std::sync::Arc;
+        use std::thread;
+
+        let ext = Arc::new(Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024));
+        let num_threads = 8;
+        let appends_per_thread = 1000;
+
+        let handles: Vec<_> = (0..num_threads)
+            .map(|t| {
+                let ext = Arc::clone(&ext);
+                thread::spawn(move || {
+                    let mut results = Vec::new();
+                    for i in 0..appends_per_thread {
+                        let msg = format!("t{t}-m{i}");
+                        let r = ext.append(Bytes::from(msg)).unwrap();
+                        results.push(r);
+                    }
+                    results
+                })
+            })
+            .collect();
+
+        let mut all_results: Vec<AppendResult> = Vec::new();
+        for h in handles {
+            all_results.extend(h.join().unwrap());
+        }
+
+        // Verify every appended record has a consistent index entry.
+        all_results.sort_by_key(|r| r.offset.0);
+        let total = num_threads * appends_per_thread;
+        for i in 0..total {
+            let seq = all_results[i].offset.0;
+            let expected_byte_pos = all_results[i].byte_pos;
+            let actual = ext.index_lookup(seq).expect(&format!("seq {} should be set", seq));
+            assert_eq!(actual, expected_byte_pos, "index mismatch at seq {}", seq);
+        }
     }
 }

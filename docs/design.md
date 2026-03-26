@@ -12,8 +12,8 @@ An ordered, append-only sequence of messages/records.
 
 Stream has two types:
 
-- **Data Stream**: Stores sequence of messages/records data.
-- **Index Stream**: Stores lightweight pointers into data streams.
+- **Data Stream**: Stores sequence of messages/records data. Each extent maintains an internal index (compressed `AtomicU32` pointers) mapping sequence numbers to byte positions.
+- **Index Stream**: Stores lightweight pointers into data streams (used for multi-dispatch fan-out).
 
 ### Extent
 
@@ -840,7 +840,7 @@ Detailed steps:
 3. **Reserve logical sequence**: `record_count.fetch_add(1)` -- atomically assigns a monotonic sequence number.
 4. **Copy payload**: Write `[len][payload]` into the reserved region. No lock needed -- each writer owns its region exclusively.
 5. **Advance committed_seq and committed_bytes** (spin-wait CAS, Approach A): The writer spins on `committed_seq.compare_exchange_weak(seq, seq+1)` until it succeeds, then stores the new `committed_bytes`. This ensures both cursors advance **in-order** -- a reader seeing `committed_bytes=N` is guaranteed that all bytes in `0..N` are fully written.
-6. **Return `AppendResult { offset, byte_pos }`**: The caller receives both the logical offset and the byte position within the arena. The byte position is recorded in the server-side `IndexExtent` for O(1) offset→byte_pos resolution during reads.
+6. **Return `AppendResult { offset, byte_pos }`**: The caller receives both the logical offset and the byte position within the arena. The byte position is recorded in the extent's internal compressed index (`AtomicU32`) for O(1) offset→byte_pos resolution during reads.
 
 #### Commit Cursor: Spin-Wait CAS (Approach A)
 
@@ -860,22 +860,25 @@ Thread B (seq=1): memcpy done → CAS(1→2) succeeds
 Thread C (seq=2): CAS(2→3) succeeds  ← waited only for Thread B's memcpy
 ```
 
-#### Server-Side Index Stream
+#### Internal Extent Index (Compressed u32 Pointers)
 
-Each data extent has a corresponding **`IndexExtent`** — a lock-free, server-side index that maps sequence numbers to byte positions within the data extent's arena. The index is populated atomically during each append and used during reads to resolve logical offsets to physical byte positions.
+Each extent maintains an **internal index** — a lock-free array mapping sequence numbers to byte positions within the arena. The index is populated atomically inside `Extent::append()` after the commit CAS succeeds, and used during reads to resolve logical offsets to physical byte positions. There is no separate `IndexExtent` struct; the index is absorbed directly into `Extent`.
 
 **Index structure:**
-- `Box<[AtomicU64]>` — one entry per possible record in the extent.
+- `Box<[AtomicU32]>` — one entry per possible record in the extent, using compressed 32-bit pointers (sufficient for 64 MiB arenas, max byte_pos < 2^32).
 - Entry `i` stores the byte_pos for the `i`-th record (where `i = offset - extent.start_offset`).
 - Capacity = `arena_capacity / 5` (minimum record = 4 byte header + 1 byte payload).
-- Sentinel value `u64::MAX` distinguishes unwritten entries from byte_pos=0.
+- Sentinel value `u32::MAX` distinguishes unwritten entries from byte_pos=0.
+- Memory savings: 4 bytes per entry vs 8 bytes with `AtomicU64` — halves index memory overhead.
 
-**Write path:** After each successful `Extent::append()`, the `Stream` records `index_extent.record(seq, byte_pos)` with a single atomic store (Release ordering). This is lock-free and runs in the same thread as the append.
+**Write path:** Inside `Extent::append()`, after the committed_seq CAS succeeds and committed_bytes is stored, the writer records `index[seq].store(byte_pos as u32, Release)`. This is lock-free and happens in the same thread as the commit — no external coordination needed.
+
+**Ordering analysis:** The reader's Acquire load on `index[seq]` synchronizes-with the writer's Release store. Since the index store happens after `committed_bytes.store(Release)`, which happens after the payload memcpy, the reader is guaranteed to see the fully written payload. On x86-64, `AtomicU32` with Release/Acquire compiles to plain `mov` instructions (TSO provides the ordering for free) — zero runtime cost.
 
 **Read path:** When a client sends `READ(stream_id, offset, count)`:
 1. The server locates the extent containing the requested offset.
 2. Computes `seq = offset - extent.start_offset`.
-3. Looks up `byte_pos = index_extent.lookup(seq)` with a single atomic load (Acquire ordering).
+3. Looks up `byte_pos = extent.index_lookup(seq)` with a single atomic load (Acquire ordering).
 4. Reads `count` records forward from `byte_pos` in the data arena.
 5. Returns zero-copy `Bytes` slices referencing the arena buffer.
 
@@ -885,6 +888,7 @@ Each data extent has a corresponding **`IndexExtent`** — a lock-free, server-s
 - **No additional I/O** — the index lives in-memory alongside the data extent.
 - **Lock-free** — both record and lookup use atomic operations with no mutex contention.
 - **Readers never block writers.** The only synchronization is atomic loads on `committed_bytes` and index entries.
+- **Single-struct ownership** — one `Extent` owns both data and index, simplifying lifecycle management and eliminating parallel-vector bookkeeping.
 
 #### Configurable Arena Capacity
 
@@ -909,7 +913,7 @@ Sealing sets `sealed.store(true, Release)`. Subsequent appends see the flag and 
 | Zero-copy reads | `Bytes::slice` into the arena buffer; no allocation or copy |
 | Zero-copy S3 flush | Arena bytes are in wire format; sealed extent uploads the buffer directly |
 | No mutex on hot path | Append and read use only atomic operations and brief spin-wait |
-| O(1) random read | Server-side IndexExtent resolves offset→byte_pos; no sequential walk needed |
+| O(1) random read | Internal extent index resolves offset→byte_pos; no sequential walk needed |
 
 ### Failure Handling
 

@@ -3,11 +3,6 @@ use common::errors::StorageError;
 use common::types::{ExtentId, ExtentState, Offset, StreamId};
 
 use crate::extent::{AppendResult, DEFAULT_ARENA_CAPACITY, Extent};
-use crate::index_stream::IndexExtent;
-
-/// Minimum record size in the arena: 4-byte length prefix + 1-byte payload.
-/// Used to compute the maximum number of records an extent can hold.
-const MIN_RECORD_SIZE: usize = 5;
 
 /// A stream: an ordered, append-only sequence of messages backed by a list of extents.
 ///
@@ -15,8 +10,8 @@ const MIN_RECORD_SIZE: usize = 5;
 /// can write to it without any external mutex -- offset assignment, payload copy,
 /// and commit advancement are all handled by the Extent's internal atomics.
 ///
-/// Each data extent has a corresponding `IndexExtent` that maps sequence numbers
-/// to byte positions within the arena. The index is populated atomically during
+/// Each extent maintains an internal index mapping sequence numbers to byte
+/// positions (compressed u32 pointers). The index is populated atomically during
 /// append and used during read to resolve offsets without client-side byte_pos.
 ///
 /// Stream-level mutation (`seal_active`, adding new extents) still requires `&mut self`
@@ -26,8 +21,6 @@ const MIN_RECORD_SIZE: usize = 5;
 pub struct Stream {
     pub id: StreamId,
     extents: Vec<Extent>,
-    /// Parallel index extents (1:1 with data extents).
-    index_extents: Vec<IndexExtent>,
     /// Next extent ID to allocate (local counter for seal-and-new).
     next_extent_id: u32,
     /// Arena capacity for new extents created during seal-and-new.
@@ -39,11 +32,9 @@ impl Stream {
     /// and the default arena capacity (64 MiB).
     pub fn new(id: StreamId) -> Self {
         let extent = Extent::new(ExtentId(0), Offset(0));
-        let index = IndexExtent::new(DEFAULT_ARENA_CAPACITY / MIN_RECORD_SIZE);
         Self {
             id,
             extents: vec![extent],
-            index_extents: vec![index],
             next_extent_id: 1,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
         }
@@ -53,11 +44,9 @@ impl Stream {
     /// and the specified arena capacity in bytes.
     pub fn with_capacity(id: StreamId, arena_capacity: usize) -> Self {
         let extent = Extent::with_capacity(ExtentId(0), Offset(0), arena_capacity);
-        let index = IndexExtent::new(arena_capacity / MIN_RECORD_SIZE);
         Self {
             id,
             extents: vec![extent],
-            index_extents: vec![index],
             next_extent_id: 1,
             arena_capacity,
         }
@@ -67,24 +56,13 @@ impl Stream {
     /// offset and byte position within the extent arena.
     ///
     /// Only requires `&self` -- the Extent is internally synchronized (lock-free).
-    /// After a successful append, the byte_pos is recorded in the corresponding
-    /// IndexExtent for server-side offset→byte_pos resolution.
+    /// The byte_pos is recorded in the extent's internal index automatically.
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
         let active = self
             .extents
             .last()
             .expect("stream always has at least one extent");
-        let result = active.append(payload)?;
-
-        // Record byte_pos in the index extent (lock-free atomic store).
-        let index = self
-            .index_extents
-            .last()
-            .expect("index_extents parallel to extents");
-        let seq = result.offset.0 - active.start_offset.0;
-        index.record(seq, result.byte_pos);
-
-        Ok(result)
+        active.append(payload)
     }
 
     /// Read `count` messages starting from the given logical `offset`.
@@ -97,7 +75,7 @@ impl Stream {
         offset: Offset,
         count: u32,
     ) -> Result<Vec<Bytes>, StorageError> {
-        for (i, extent) in self.extents.iter().enumerate() {
+        for extent in &self.extents {
             // Skip extents entirely before our read range.
             if extent.next_offset().0 <= offset.0 {
                 continue;
@@ -108,10 +86,10 @@ impl Stream {
                 break;
             }
 
-            // Found the extent — resolve byte_pos via index lookup.
+            // Found the extent — resolve byte_pos via internal index lookup.
             let seq = offset.0 - extent.start_offset.0;
-            let byte_pos = self.index_extents[i]
-                .lookup(seq)
+            let byte_pos = extent
+                .index_lookup(seq)
                 .ok_or_else(|| StorageError::Internal(
                     format!("index lookup failed for offset {}", offset.0)
                 ))?;
@@ -166,8 +144,6 @@ impl Stream {
         self.next_extent_id += 1;
         self.extents
             .push(Extent::with_capacity(new_id, Offset(end_offset), self.arena_capacity));
-        self.index_extents
-            .push(IndexExtent::new(self.arena_capacity / MIN_RECORD_SIZE));
 
         Some((start_offset, end_offset))
     }
