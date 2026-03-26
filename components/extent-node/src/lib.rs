@@ -1,5 +1,6 @@
 pub mod downstream;
 pub mod extent;
+pub mod index_stream;
 pub mod store;
 pub mod stream;
 pub mod stream_manager_client;

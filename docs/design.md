@@ -235,13 +235,12 @@ Variable Header:
   [stream_id    : u64]    -- stream that was appended to
   [extent_id    : u32]    -- extent that was appended to
   [offset       : u64]    -- assigned logical sequence number
-  [byte_pos     : u64]    -- byte position within the extent arena (for building external index)
 No Payload.
 ```
 
 ##### 0x03 READ (Client -> Extent Node)
 
-Read messages from a stream starting at a given offset and byte position.
+Read messages from a stream starting at a given logical offset. The server resolves the byte position internally via its index stream, so clients only need to provide the logical offset.
 
 ```
 Fixed Header (8B)
@@ -249,7 +248,6 @@ Variable Header:
   [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
   [offset       : u64]    -- start logical offset
-  [byte_pos     : u64]    -- byte position within the extent arena (0 = scan from start)
   [count        : u32]    -- number of messages to read
 No Payload.
 ```
@@ -842,7 +840,7 @@ Detailed steps:
 3. **Reserve logical sequence**: `record_count.fetch_add(1)` -- atomically assigns a monotonic sequence number.
 4. **Copy payload**: Write `[len][payload]` into the reserved region. No lock needed -- each writer owns its region exclusively.
 5. **Advance committed_seq and committed_bytes** (spin-wait CAS, Approach A): The writer spins on `committed_seq.compare_exchange_weak(seq, seq+1)` until it succeeds, then stores the new `committed_bytes`. This ensures both cursors advance **in-order** -- a reader seeing `committed_bytes=N` is guaranteed that all bytes in `0..N` are fully written.
-6. **Return `AppendResult { offset, byte_pos }`**: The caller receives both the logical offset and the byte position within the arena. The byte position enables the caller to build an external offset-to-position index for O(1) random reads (see below).
+6. **Return `AppendResult { offset, byte_pos }`**: The caller receives both the logical offset and the byte position within the arena. The byte position is recorded in the server-side `IndexExtent` for O(1) offset→byte_pos resolution during reads.
 
 #### Commit Cursor: Spin-Wait CAS (Approach A)
 
@@ -862,29 +860,31 @@ Thread B (seq=1): memcpy done → CAS(1→2) succeeds
 Thread C (seq=2): CAS(2→3) succeeds  ← waited only for Thread B's memcpy
 ```
 
-#### Index-Based Read Path
+#### Server-Side Index Stream
 
-The data stream arena has **no internal index**. Instead, the application layer maintains a separate **index stream** with fixed-width records that map logical offsets to byte positions within data extent arenas.
+Each data extent has a corresponding **`IndexExtent`** — a lock-free, server-side index that maps sequence numbers to byte positions within the data extent's arena. The index is populated atomically during each append and used during reads to resolve logical offsets to physical byte positions.
 
-After appending to a data stream, the application receives `AppendResult { offset, byte_pos }` and writes a fixed-width index record (32 bytes) to the index stream:
+**Index structure:**
+- `Box<[AtomicU64]>` — one entry per possible record in the extent.
+- Entry `i` stores the byte_pos for the `i`-th record (where `i = offset - extent.start_offset`).
+- Capacity = `arena_capacity / 5` (minimum record = 4 byte header + 1 byte payload).
+- Sentinel value `u64::MAX` distinguishes unwritten entries from byte_pos=0.
 
-```
-Index record (32 bytes, fixed width):
-  [stream_id: u64][extent_id: u32][offset: u64][byte_pos: u64]
-```
+**Write path:** After each successful `Extent::append()`, the `Stream` records `index_extent.record(seq, byte_pos)` with a single atomic store (Release ordering). This is lock-free and runs in the same thread as the append.
 
-**Read flow**:
+**Read path:** When a client sends `READ(stream_id, offset, count)`:
+1. The server locates the extent containing the requested offset.
+2. Computes `seq = offset - extent.start_offset`.
+3. Looks up `byte_pos = index_extent.lookup(seq)` with a single atomic load (Acquire ordering).
+4. Reads `count` records forward from `byte_pos` in the data arena.
+5. Returns zero-copy `Bytes` slices referencing the arena buffer.
 
-1. Read the index stream at the desired logical offset (fixed-width records, so the byte position is `offset * 32`).
-2. Parse `(stream_id, extent_id, byte_pos)` from the index record.
-3. Send `READ(stream_id, offset, byte_pos, count)` to the Extent Node holding the data extent.
-4. The Extent Node seeks directly to `byte_pos` in the arena and reads `count` records forward.
-5. Return zero-copy `Bytes` slices referencing the arena buffer.
-
-This two-stream design (data + index) means:
-- **Data stream reads** are O(1) random access -- no sequential walk from byte 0.
-- **Index stream reads** are also O(1) -- fixed-width records enable direct offset calculation.
-- **Readers never block writers**. The only synchronization is atomic loads on `committed_bytes`.
+**Key benefits:**
+- **Clients only need logical offsets.** The `byte_pos` concept is invisible to the external API (wire protocol, client library, AppendResult).
+- **O(1) random reads** — no sequential walk from byte 0. Index lookup is a direct array access.
+- **No additional I/O** — the index lives in-memory alongside the data extent.
+- **Lock-free** — both record and lookup use atomic operations with no mutex contention.
+- **Readers never block writers.** The only synchronization is atomic loads on `committed_bytes` and index entries.
 
 #### Configurable Arena Capacity
 
@@ -909,7 +909,7 @@ Sealing sets `sealed.store(true, Release)`. Subsequent appends see the flag and 
 | Zero-copy reads | `Bytes::slice` into the arena buffer; no allocation or copy |
 | Zero-copy S3 flush | Arena bytes are in wire format; sealed extent uploads the buffer directly |
 | No mutex on hot path | Append and read use only atomic operations and brief spin-wait |
-| O(1) random read | External index provides byte_pos; no sequential walk needed |
+| O(1) random read | Server-side IndexExtent resolves offset→byte_pos; no sequential walk needed |
 
 ### Failure Handling
 

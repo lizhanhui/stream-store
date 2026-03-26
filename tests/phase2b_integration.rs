@@ -170,9 +170,9 @@ async fn broadcast_replication_rf2() {
     let max = client.query_offset(StreamId(stream_id)).await.unwrap();
     assert_eq!(max, Offset(5));
 
-    // Read messages from Primary (byte_pos=0, read from beginning).
+    // Read messages from Primary (byte_pos removed, offset-only API).
     let msgs = client
-        .read(StreamId(stream_id), Offset(0), 0, 10)
+        .read(StreamId(stream_id), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs.len(), 5);
@@ -191,7 +191,7 @@ async fn broadcast_replication_rf2() {
     assert_eq!(secondary_max, Offset(5));
 
     let secondary_msgs = secondary_client
-        .read(StreamId(stream_id), Offset(0), 0, 10)
+        .read(StreamId(stream_id), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(secondary_msgs.len(), 5);
@@ -252,7 +252,7 @@ async fn broadcast_replication_rf3() {
         let max = c.query_offset(StreamId(stream_id)).await.unwrap();
         assert_eq!(max, Offset(3), "{label} should have offset 3");
 
-        let msgs = c.read(StreamId(stream_id), Offset(0), 0, 10).await.unwrap();
+        let msgs = c.read(StreamId(stream_id), Offset(0), 10).await.unwrap();
         assert_eq!(msgs.len(), 3, "{label} should have 3 messages");
         for i in 0..3 {
             assert_eq!(
@@ -306,14 +306,14 @@ async fn multi_stream_shared_downstream() {
 
     // Verify stream A.
     let msgs_a = client
-        .read(StreamId(stream_a), Offset(0), 0, 10)
+        .read(StreamId(stream_a), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs_a.len(), 3);
 
     // Verify stream B.
     let msgs_b = client
-        .read(StreamId(stream_b), Offset(0), 0, 10)
+        .read(StreamId(stream_b), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs_b.len(), 2);
@@ -323,13 +323,13 @@ async fn multi_stream_shared_downstream() {
         .await
         .unwrap();
     let sec_a = sec_client
-        .read(StreamId(stream_a), Offset(0), 0, 10)
+        .read(StreamId(stream_a), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(sec_a.len(), 3);
 
     let sec_b = sec_client
-        .read(StreamId(stream_b), Offset(0), 0, 10)
+        .read(StreamId(stream_b), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(sec_b.len(), 2);

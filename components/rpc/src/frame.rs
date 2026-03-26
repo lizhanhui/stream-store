@@ -35,13 +35,11 @@ pub enum VariableHeader {
         stream_id: StreamId,
         extent_id: ExtentId,
         offset: Offset,
-        byte_pos: u64,
     },
     Read {
         request_id: u32,
         stream_id: StreamId,
         offset: Offset,
-        byte_pos: u64,
         count: u32,
     },
     ReadResp {
@@ -297,15 +295,6 @@ impl Frame {
         }
     }
 
-    /// Get the byte_pos for this frame (0 for opcodes without byte_pos).
-    pub fn byte_pos(&self) -> u64 {
-        match &self.variable_header {
-            VariableHeader::AppendAck { byte_pos, .. }
-            | VariableHeader::Read { byte_pos, .. } => *byte_pos,
-            _ => 0,
-        }
-    }
-
     /// Get the count for this frame (0 for opcodes without count).
     pub fn count(&self) -> u32 {
         match &self.variable_header {
@@ -387,10 +376,10 @@ impl Frame {
         match &self.variable_header {
             // request_id(4) + stream_id(8) + extent_id(4)
             VariableHeader::Append { .. } => 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + extent_id(4) + offset(8) + byte_pos(8)
-            VariableHeader::AppendAck { .. } => 4 + 8 + 4 + 8 + 8,
-            // request_id(4) + stream_id(8) + offset(8) + byte_pos(8) + count(4)
-            VariableHeader::Read { .. } => 4 + 8 + 8 + 8 + 4,
+            // request_id(4) + stream_id(8) + extent_id(4) + offset(8)
+            VariableHeader::AppendAck { .. } => 4 + 8 + 4 + 8,
+            // request_id(4) + stream_id(8) + offset(8) + count(4)
+            VariableHeader::Read { .. } => 4 + 8 + 8 + 4,
             // request_id(4) + stream_id(8) + offset(8) + count(4)
             VariableHeader::ReadResp { .. } => 4 + 8 + 8 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) [+ offset(8) if present]
@@ -511,25 +500,21 @@ impl Frame {
                 stream_id,
                 extent_id,
                 offset,
-                byte_pos,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
-                dst.put_u64(*byte_pos);
             }
             VariableHeader::Read {
                 request_id,
                 stream_id,
                 offset,
-                byte_pos,
                 count,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
                 dst.put_u64(offset.0);
-                dst.put_u64(*byte_pos);
                 dst.put_u32(*count);
             }
             VariableHeader::ReadResp {
@@ -776,14 +761,12 @@ impl Frame {
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
                 let offset = Offset(body.get_u64());
-                let byte_pos = body.get_u64();
                 Ok((
                     VariableHeader::AppendAck {
                         request_id,
                         stream_id,
                         extent_id,
                         offset,
-                        byte_pos,
                     },
                     None,
                 ))
@@ -792,14 +775,12 @@ impl Frame {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let offset = Offset(body.get_u64());
-                let byte_pos = body.get_u64();
                 let count = body.get_u32();
                 Ok((
                     VariableHeader::Read {
                         request_id,
                         stream_id,
                         offset,
-                        byte_pos,
                         count,
                     },
                     None,
@@ -1274,14 +1255,13 @@ mod tests {
     }
 
     #[test]
-    fn append_ack_with_byte_pos() {
+    fn append_ack_round_trip() {
         let frame = Frame::new(
             VariableHeader::AppendAck {
                 request_id: 10,
                 stream_id: StreamId(1),
                 extent_id: ExtentId(2),
                 offset: Offset(42),
-                byte_pos: 12345,
             },
             None,
         );
@@ -1290,20 +1270,18 @@ mod tests {
         frame.encode(&mut buf);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.byte_pos(), 12345);
         assert_eq!(decoded.offset(), Offset(42));
         assert_eq!(decoded.stream_id(), StreamId(1));
         assert_eq!(decoded.extent_id(), ExtentId(2));
     }
 
     #[test]
-    fn read_with_count_and_byte_pos() {
+    fn read_with_count() {
         let frame = Frame::new(
             VariableHeader::Read {
                 request_id: 5,
                 stream_id: StreamId(10),
                 offset: Offset(50),
-                byte_pos: 999,
                 count: 20,
             },
             None,
@@ -1314,7 +1292,6 @@ mod tests {
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.count(), 20);
-        assert_eq!(decoded.byte_pos(), 999);
         assert_eq!(decoded.offset(), Offset(50));
     }
 

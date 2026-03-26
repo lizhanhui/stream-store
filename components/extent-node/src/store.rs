@@ -26,8 +26,6 @@ pub struct PendingAck {
     pub response_tx: mpsc::Sender<Frame>,
     /// The offset assigned to this append.
     pub assigned_offset: u64,
-    /// Byte position within the extent arena (for index building).
-    pub byte_pos: u64,
 }
 
 /// Per-stream ACK queue on the Primary with cumulative quorum tracking.
@@ -95,7 +93,6 @@ impl AckQueue {
                         stream_id: ack.stream_id,
                         extent_id: ExtentId(0),
                         offset: Offset(ack.assigned_offset),
-                        byte_pos: ack.byte_pos,
                     },
                     None,
                 );
@@ -504,29 +501,24 @@ impl ExtentNodeStore {
         drop(stream_ref);
 
         let offset = append_result.offset;
-        let byte_pos = append_result.byte_pos;
 
         // Update metrics counters (atomic, no lock needed).
         self.append_count.fetch_add(1, Ordering::Relaxed);
         self.bytes_written
             .fetch_add(frame.payload.as_ref().map_or(0, |p| p.len()) as u64, Ordering::Relaxed);
 
-        // Build AppendAck payload with byte_pos so the caller can build an index.
-        let ack_byte_pos = byte_pos;
-
         // Check replica info for this stream (per-stream lock, brief).
         let replica = self.replicas.get(&stream_id).map(|r| r.clone());
 
         match replica {
             None => {
-                // Standalone mode: immediate ACK with byte_pos.
+                // Standalone mode: immediate ACK.
                 Some(Frame::new(
                     VariableHeader::AppendAck {
                         request_id: frame.request_id(),
                         stream_id,
                         extent_id: ExtentId(0),
                         offset,
-                        byte_pos: ack_byte_pos,
                     },
                     None,
                 ))
@@ -553,7 +545,6 @@ impl ExtentNodeStore {
                             stream_id,
                             extent_id: ExtentId(0),
                             offset,
-                            byte_pos: ack_byte_pos,
                         },
                         None,
                     ));
@@ -585,7 +576,6 @@ impl ExtentNodeStore {
                         stream_id,
                         response_tx: resp_tx.clone(),
                         assigned_offset: offset.0,
-                        byte_pos: ack_byte_pos,
                     });
                 }
 
@@ -600,7 +590,6 @@ impl ExtentNodeStore {
                         stream_id,
                         extent_id: ExtentId(0),
                         offset,
-                        byte_pos: 0,
                     },
                     None,
                 ))
@@ -623,9 +612,8 @@ impl ExtentNodeStore {
         };
 
         let count = frame.count();
-        let byte_pos = frame.byte_pos();
 
-        match stream_ref.read(frame.offset(), byte_pos, count) {
+        match stream_ref.read(frame.offset(), count) {
             Ok(messages) => {
                 let total_size: usize = messages.iter().map(|m| 4 + m.len()).sum();
                 let mut payload = BytesMut::with_capacity(total_size);
@@ -771,8 +759,6 @@ mod tests {
 
         assert_eq!(resp.opcode(), Opcode::AppendAck);
         assert_eq!(resp.offset(), Offset(0));
-        // AppendAck carries byte_pos in the frame field.
-        assert_eq!(resp.byte_pos(), 0); // first record starts at byte 0
     }
 
     #[tokio::test]
@@ -800,7 +786,6 @@ mod tests {
         let store = ExtentNodeStore::new();
         let sid = register_stream(&store, 1, 1).await;
 
-        let mut byte_positions = Vec::new();
         for i in 0u32..3 {
             let resp = store
                 .handle_frame(
@@ -818,7 +803,6 @@ mod tests {
                 .unwrap();
             assert_eq!(resp.opcode(), Opcode::AppendAck);
             assert_eq!(resp.offset(), Offset(i as u64));
-            byte_positions.push(resp.byte_pos());
         }
 
         let resp = store
@@ -837,7 +821,7 @@ mod tests {
         assert_eq!(resp.opcode(), Opcode::QueryOffsetResp);
         assert_eq!(resp.offset(), Offset(3));
 
-        // Read all 3 from byte_pos=0.
+        // Read all 3 from offset 0.
         let resp = store
             .handle_frame(
                 Frame::new(
@@ -845,7 +829,6 @@ mod tests {
                         request_id: 30,
                         stream_id: sid,
                         offset: Offset(0),
-                        byte_pos: 0,
                         count: 3,
                     },
                     None,
@@ -868,7 +851,7 @@ mod tests {
         }
         assert!(payload.is_empty());
 
-        // Read msg1 directly via its byte_pos.
+        // Read msg1 directly via its offset.
         let resp = store
             .handle_frame(
                 Frame::new(
@@ -876,7 +859,6 @@ mod tests {
                         request_id: 31,
                         stream_id: sid,
                         offset: Offset(1),
-                        byte_pos: byte_positions[1],
                         count: 1,
                     },
                     None,
@@ -1167,7 +1149,6 @@ mod tests {
                 stream_id: StreamId(10),
                 response_tx: resp_tx.clone(),
                 assigned_offset: i,
-                byte_pos: 0,
             });
         }
 
@@ -1341,7 +1322,6 @@ mod tests {
                             request_id: 0,
                             stream_id: sid,
                             offset: Offset(0),
-                            byte_pos: 0,
                             count: 100,
                         },
                         None,
@@ -1487,7 +1467,6 @@ mod tests {
                                     request_id: 0,
                                     stream_id: sid,
                                     offset: Offset(0),
-                                    byte_pos: 0,
                                     count: 10,
                                 },
                                 None,

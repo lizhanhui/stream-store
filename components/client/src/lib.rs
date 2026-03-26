@@ -16,14 +16,12 @@ use rpc::payload::{
 use tokio::net::TcpStream;
 use tokio_util::codec::Framed;
 
-/// Result of a successful append: logical offset and byte position within the extent.
-/// The byte_pos can be stored in an index stream for O(1) random reads.
+/// Result of a successful append: the logical offset assigned to this record.
+/// The server-side index stream handles byte position tracking internally.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
     /// Logical offset assigned to this record.
     pub offset: Offset,
-    /// Byte position from the beginning of the extent arena.
-    pub byte_pos: u64,
 }
 
 /// A client for communicating with an Extent Node or Stream Manager.
@@ -117,7 +115,7 @@ impl StorageClient {
         Ok((resp.stream_id(), resp.extent_id(), addr))
     }
 
-    /// Append a message to a stream. Returns the assigned offset and byte position.
+    /// Append a message to a stream. Returns the assigned offset.
     pub async fn append(
         &mut self,
         stream_id: StreamId,
@@ -136,19 +134,17 @@ impl StorageClient {
 
         Ok(AppendResult {
             offset: resp.offset(),
-            byte_pos: resp.byte_pos(),
         })
     }
 
-    /// Read `count` messages from a stream starting at `offset` and `byte_pos`.
+    /// Read `count` messages from a stream starting at `offset`.
     ///
-    /// The `byte_pos` indicates the byte position within the extent arena to start
-    /// reading from. When byte_pos=0, reads from the beginning of the extent.
+    /// The server resolves byte positions internally via its index stream,
+    /// so only the logical offset is needed.
     pub async fn read(
         &mut self,
         stream_id: StreamId,
         offset: Offset,
-        byte_pos: u64,
         count: u16,
     ) -> Result<Vec<Bytes>, StorageError> {
         let req = Frame::new(
@@ -156,7 +152,6 @@ impl StorageClient {
                 request_id: self.alloc_request_id(),
                 stream_id,
                 offset,
-                byte_pos,
                 count: count as u32,
             },
             None,

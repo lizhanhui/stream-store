@@ -126,8 +126,8 @@ async fn main() {
             .await
             .expect("append failed");
         info!(
-            "    Appended \"{}\" at offset {}, byte_pos={}",
-            msg, offset.offset.0, offset.byte_pos
+            "    Appended \"{}\" at offset {}",
+            msg, offset.offset.0
         );
     }
 
@@ -140,7 +140,7 @@ async fn main() {
 
     // ── 8. Read all messages back ──
     let read_messages = extent_node_client
-        .read(stream_id, Offset(0), 0, messages.len() as u16)
+        .read(stream_id, Offset(0), messages.len() as u16)
         .await
         .expect("read failed");
 
@@ -186,15 +186,15 @@ async fn main() {
             .await
             .expect("append after seal failed");
         info!(
-            "    Appended \"{}\" at offset {}, byte_pos={}",
-            msg, offset.offset.0, offset.byte_pos
+            "    Appended \"{}\" at offset {}",
+            msg, offset.offset.0
         );
     }
 
     // ── 11. Read from new extent ──
     let start_offset = sealed_count as u64; // new extent starts after sealed messages
     let read_new = extent_node_client_2
-        .read(stream_id, Offset(start_offset), 0, new_messages.len() as u16)
+        .read(stream_id, Offset(start_offset), new_messages.len() as u16)
         .await
         .expect("read after seal failed");
 

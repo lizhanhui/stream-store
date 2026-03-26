@@ -3,12 +3,21 @@ use common::errors::StorageError;
 use common::types::{ExtentId, ExtentState, Offset, StreamId};
 
 use crate::extent::{AppendResult, DEFAULT_ARENA_CAPACITY, Extent};
+use crate::index_stream::IndexExtent;
+
+/// Minimum record size in the arena: 4-byte length prefix + 1-byte payload.
+/// Used to compute the maximum number of records an extent can hold.
+const MIN_RECORD_SIZE: usize = 5;
 
 /// A stream: an ordered, append-only sequence of messages backed by a list of extents.
 ///
 /// The active (last) extent is a lock-free arena. Multiple concurrent appenders
 /// can write to it without any external mutex -- offset assignment, payload copy,
 /// and commit advancement are all handled by the Extent's internal atomics.
+///
+/// Each data extent has a corresponding `IndexExtent` that maps sequence numbers
+/// to byte positions within the arena. The index is populated atomically during
+/// append and used during read to resolve offsets without client-side byte_pos.
 ///
 /// Stream-level mutation (`seal_active`, adding new extents) still requires `&mut self`
 /// because these operations change the extent list. In the ExtentNodeStore, this is
@@ -17,6 +26,8 @@ use crate::extent::{AppendResult, DEFAULT_ARENA_CAPACITY, Extent};
 pub struct Stream {
     pub id: StreamId,
     extents: Vec<Extent>,
+    /// Parallel index extents (1:1 with data extents).
+    index_extents: Vec<IndexExtent>,
     /// Next extent ID to allocate (local counter for seal-and-new).
     next_extent_id: u32,
     /// Arena capacity for new extents created during seal-and-new.
@@ -28,9 +39,11 @@ impl Stream {
     /// and the default arena capacity (64 MiB).
     pub fn new(id: StreamId) -> Self {
         let extent = Extent::new(ExtentId(0), Offset(0));
+        let index = IndexExtent::new(DEFAULT_ARENA_CAPACITY / MIN_RECORD_SIZE);
         Self {
             id,
             extents: vec![extent],
+            index_extents: vec![index],
             next_extent_id: 1,
             arena_capacity: DEFAULT_ARENA_CAPACITY,
         }
@@ -40,9 +53,11 @@ impl Stream {
     /// and the specified arena capacity in bytes.
     pub fn with_capacity(id: StreamId, arena_capacity: usize) -> Self {
         let extent = Extent::with_capacity(ExtentId(0), Offset(0), arena_capacity);
+        let index = IndexExtent::new(arena_capacity / MIN_RECORD_SIZE);
         Self {
             id,
             extents: vec![extent],
+            index_extents: vec![index],
             next_extent_id: 1,
             arena_capacity,
         }
@@ -52,29 +67,37 @@ impl Stream {
     /// offset and byte position within the extent arena.
     ///
     /// Only requires `&self` -- the Extent is internally synchronized (lock-free).
+    /// After a successful append, the byte_pos is recorded in the corresponding
+    /// IndexExtent for server-side offset→byte_pos resolution.
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
         let active = self
             .extents
             .last()
             .expect("stream always has at least one extent");
-        active.append(payload)
+        let result = active.append(payload)?;
+
+        // Record byte_pos in the index extent (lock-free atomic store).
+        let index = self
+            .index_extents
+            .last()
+            .expect("index_extents parallel to extents");
+        let seq = result.offset.0 - active.start_offset.0;
+        index.record(seq, result.byte_pos);
+
+        Ok(result)
     }
 
-    /// Read `count` messages starting from the given byte position within the
-    /// extent that contains `offset`.
+    /// Read `count` messages starting from the given logical `offset`.
     ///
-    /// The caller provides a logical `offset` to locate the correct extent,
-    /// and a `byte_pos` to seek directly within the extent's arena.
-    /// This enables O(1) random access when the caller has an external index.
-    ///
-    /// If `byte_pos` is 0, this reads from the beginning of the extent.
+    /// The server resolves `offset → byte_pos` internally via the index stream,
+    /// so callers only need to provide the logical offset. This keeps byte_pos
+    /// as an internal implementation detail invisible to clients.
     pub fn read(
         &self,
         offset: Offset,
-        byte_pos: u64,
         count: u32,
     ) -> Result<Vec<Bytes>, StorageError> {
-        for extent in &self.extents {
+        for (i, extent) in self.extents.iter().enumerate() {
             // Skip extents entirely before our read range.
             if extent.next_offset().0 <= offset.0 {
                 continue;
@@ -85,7 +108,13 @@ impl Stream {
                 break;
             }
 
-            // Found the extent — read directly at the given byte position.
+            // Found the extent — resolve byte_pos via index lookup.
+            let seq = offset.0 - extent.start_offset.0;
+            let byte_pos = self.index_extents[i]
+                .lookup(seq)
+                .ok_or_else(|| StorageError::Internal(
+                    format!("index lookup failed for offset {}", offset.0)
+                ))?;
             return extent.read(byte_pos, count);
         }
 
@@ -137,6 +166,8 @@ impl Stream {
         self.next_extent_id += 1;
         self.extents
             .push(Extent::with_capacity(new_id, Offset(end_offset), self.arena_capacity));
+        self.index_extents
+            .push(IndexExtent::new(self.arena_capacity / MIN_RECORD_SIZE));
 
         Some((start_offset, end_offset))
     }
@@ -158,29 +189,29 @@ mod tests {
         assert_eq!(r2.offset, Offset(2));
         assert_eq!(stream.max_offset(), Offset(3));
 
-        // Read all 3 from byte_pos 0.
-        let msgs = stream.read(Offset(0), r0.byte_pos, 3).unwrap();
+        // Read all 3 from offset 0.
+        let msgs = stream.read(Offset(0), 3).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0], Bytes::from_static(b"msg0"));
         assert_eq!(msgs[2], Bytes::from_static(b"msg2"));
 
-        // Random access: read msg1 directly via its byte_pos.
-        let msgs = stream.read(r1.offset, r1.byte_pos, 1).unwrap();
+        // Random access: read msg1 directly via its offset.
+        let msgs = stream.read(r1.offset, 1).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0], Bytes::from_static(b"msg1"));
     }
 
     #[test]
-    fn read_from_byte_pos() {
+    fn read_from_offset() {
         let stream = Stream::new(StreamId(1));
         let mut results = Vec::new();
         for i in 0..10 {
             results.push(stream.append(Bytes::from(format!("msg{i}"))).unwrap());
         }
 
-        // Read 3 messages starting at record 5's byte_pos.
+        // Read 3 messages starting at offset 5.
         let r5 = &results[5];
-        let msgs = stream.read(r5.offset, r5.byte_pos, 3).unwrap();
+        let msgs = stream.read(r5.offset, 3).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0], Bytes::from("msg5"));
         assert_eq!(msgs[1], Bytes::from("msg6"));
@@ -192,7 +223,7 @@ mod tests {
         let stream = Stream::new(StreamId(1));
         let r = stream.append(Bytes::from_static(b"only")).unwrap();
 
-        let msgs = stream.read(r.offset, r.byte_pos, 100).unwrap();
+        let msgs = stream.read(r.offset, 100).unwrap();
         assert_eq!(msgs.len(), 1);
     }
 
@@ -201,7 +232,7 @@ mod tests {
         let stream = Stream::new(StreamId(1));
         assert_eq!(stream.max_offset(), Offset(0));
 
-        let msgs = stream.read(Offset(0), 0, 10).unwrap();
+        let msgs = stream.read(Offset(0), 10).unwrap();
         assert!(msgs.is_empty());
     }
 
@@ -209,9 +240,8 @@ mod tests {
     fn seal_and_new() {
         let mut stream = Stream::new(StreamId(1));
         // Append 3 messages to first extent.
-        let mut results = Vec::new();
         for i in 0..3 {
-            results.push(stream.append(Bytes::from(format!("msg{i}"))).unwrap());
+            stream.append(Bytes::from(format!("msg{i}"))).unwrap();
         }
         assert_eq!(stream.max_offset(), Offset(3));
 
@@ -230,7 +260,7 @@ mod tests {
         assert_eq!(stream.max_offset(), Offset(4));
 
         // Read from the new extent.
-        let msgs = stream.read(r.offset, r.byte_pos, 1).unwrap();
+        let msgs = stream.read(r.offset, 1).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0], Bytes::from_static(b"after-seal"));
     }
