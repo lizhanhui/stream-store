@@ -3,6 +3,10 @@ name = "extent-node"
 version = "0.1.0"
 edition = "2024"
 
+[[bench]]
+name = "extent_append"
+harness = false
+
 [dependencies]
 tokio = { workspace = true }
 bytes = { workspace = true }
@@ -15,3 +19,6 @@ common = { path = "../common" }
 rpc = { path = "../rpc" }
 server = { path = "../server" }
 client = { path = "../client" }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
