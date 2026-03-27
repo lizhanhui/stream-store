@@ -2,7 +2,7 @@ use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{ExtentId, ExtentState, Offset, StreamId};
 
-use crate::extent::{AppendResult, DEFAULT_ARENA_CAPACITY, Extent};
+use crate::extent::{AppendResult, Extent};
 
 /// A stream: an ordered, append-only sequence of messages backed by a list of extents.
 ///
@@ -21,35 +21,21 @@ use crate::extent::{AppendResult, DEFAULT_ARENA_CAPACITY, Extent};
 pub struct Stream {
     pub id: StreamId,
     extents: Vec<Extent>,
-    /// Next extent ID to allocate (local counter for seal-and-new).
-    next_extent_id: u32,
-    /// Arena capacity for new extents created during seal-and-new.
-    arena_capacity: usize,
 }
 
 impl Stream {
-    /// Create a new stream with a single active extent starting at offset 0
-    /// and the default arena capacity (64 MiB).
+    /// Create a new stream with no extents. Extents are added via `register_extent()`.
     pub fn new(id: StreamId) -> Self {
-        let extent = Extent::new(ExtentId(0), Offset(0));
         Self {
             id,
-            extents: vec![extent],
-            next_extent_id: 1,
-            arena_capacity: DEFAULT_ARENA_CAPACITY,
+            extents: Vec::new(),
         }
     }
 
-    /// Create a new stream with a single active extent starting at offset 0
-    /// and the specified arena capacity in bytes.
-    pub fn with_capacity(id: StreamId, arena_capacity: usize) -> Self {
-        let extent = Extent::with_capacity(ExtentId(0), Offset(0), arena_capacity);
-        Self {
-            id,
-            extents: vec![extent],
-            next_extent_id: 1,
-            arena_capacity,
-        }
+    /// Register a new extent on this stream (called when SM sends RegisterExtent).
+    pub fn register_extent(&mut self, id: ExtentId, start_offset: Offset, capacity: usize) {
+        self.extents
+            .push(Extent::with_capacity(id, start_offset, capacity));
     }
 
     /// Append a message to the active (last) extent. Returns the assigned
@@ -58,25 +44,11 @@ impl Stream {
     /// Only requires `&self` -- the Extent is internally synchronized (lock-free).
     /// The byte_pos is recorded in the extent's internal index automatically.
     ///
-    /// If the previous (sealed) extent still accepts post-seal writes (late
-    /// forwarded appends from the primary that were committed before seal),
-    /// the append is routed there first.
+    /// Returns an error if there are no extents (no active extent registered yet).
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
-        // Try the previous sealed extent if it still has room for late forwarded writes.
-        if self.extents.len() >= 2 {
-            let prev = &self.extents[self.extents.len() - 2];
-            if prev.accepts_post_seal_writes() {
-                match prev.append(payload.clone()) {
-                    ok @ Ok(_) => return ok,
-                    Err(StorageError::ExtentSealed(_)) => { /* fall through to active extent */ }
-                    err => return err,
-                }
-            }
-        }
-        let active = self
-            .extents
-            .last()
-            .expect("stream always has at least one extent");
+        let active = self.extents.last().ok_or_else(|| {
+            StorageError::Internal(format!("stream {:?} has no active extent", self.id))
+        })?;
         active.append(payload)
     }
 
@@ -116,23 +88,21 @@ impl Stream {
             .unwrap_or(false)
     }
 
-    /// The extent ID of the active (last) extent.
-    pub fn active_extent_id(&self) -> ExtentId {
-        self.extents
-            .last()
-            .expect("stream always has at least one extent")
-            .id
+    /// The extent ID of the active (last) extent, or None if no extents.
+    pub fn active_extent_id(&self) -> Option<ExtentId> {
+        self.extents.last().map(|e| e.id)
     }
 
     /// The maximum offset (exclusive): the next offset that would be assigned.
+    /// Returns `Offset(0)` if the stream has no extents.
     pub fn max_offset(&self) -> Offset {
         self.extents
             .last()
-            .expect("stream always has at least one extent")
-            .next_offset()
+            .map(|e| e.next_offset())
+            .unwrap_or(Offset(0))
     }
 
-    /// Seal the active (last) extent and create a new one.
+    /// Seal the active (last) extent.
     /// Returns `(start_offset, end_offset)` of the sealed extent, or None if no active extent.
     ///
     /// `end_offset` = `start_offset + message_count` (exclusive upper bound).
@@ -140,6 +110,8 @@ impl Stream {
     /// If `committed_offset` is `Some`, it's the primary's committed offset propagated
     /// via SM. The sealed extent will accept late forwarded appends up to that offset.
     /// If `None`, the extent uses its local record_count (primary sealing itself).
+    ///
+    /// After seal, the stream has no active extent until SM sends a new `RegisterExtent`.
     ///
     /// Requires `&mut self` because it modifies the extent list.
     pub fn seal_active(&mut self, committed_offset: Option<u64>) -> Option<(u64, u64)> {
@@ -151,16 +123,6 @@ impl Stream {
         let message_count = last.message_count();
         let end_offset = start_offset + message_count;
         last.seal(committed_offset);
-
-        // Create a new active extent starting at the end offset.
-        let new_id = ExtentId(self.next_extent_id);
-        self.next_extent_id += 1;
-        self.extents.push(Extent::with_capacity(
-            new_id,
-            Offset(end_offset),
-            self.arena_capacity,
-        ));
-
         Some((start_offset, end_offset))
     }
 
@@ -180,10 +142,18 @@ impl Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extent::DEFAULT_ARENA_CAPACITY;
+
+    /// Helper: create a stream with one active extent (simulating RegisterExtent from SM).
+    fn new_stream_with_extent(id: StreamId) -> Stream {
+        let mut stream = Stream::new(id);
+        stream.register_extent(ExtentId(0), Offset(0), DEFAULT_ARENA_CAPACITY);
+        stream
+    }
 
     #[test]
     fn basic_append_and_read() {
-        let stream = Stream::new(StreamId(1));
+        let stream = new_stream_with_extent(StreamId(1));
         let r0 = stream.append(Bytes::from_static(b"msg0")).unwrap();
         let r1 = stream.append(Bytes::from_static(b"msg1")).unwrap();
         let r2 = stream.append(Bytes::from_static(b"msg2")).unwrap();
@@ -207,7 +177,7 @@ mod tests {
 
     #[test]
     fn read_from_offset() {
-        let stream = Stream::new(StreamId(1));
+        let stream = new_stream_with_extent(StreamId(1));
         let mut results = Vec::new();
         for i in 0..10 {
             results.push(stream.append(Bytes::from(format!("msg{i}"))).unwrap());
@@ -224,7 +194,7 @@ mod tests {
 
     #[test]
     fn read_beyond_end_returns_available() {
-        let stream = Stream::new(StreamId(1));
+        let stream = new_stream_with_extent(StreamId(1));
         let r = stream.append(Bytes::from_static(b"only")).unwrap();
 
         let msgs = stream.read(r.offset, 100).unwrap();
@@ -236,13 +206,23 @@ mod tests {
         let stream = Stream::new(StreamId(1));
         assert_eq!(stream.max_offset(), Offset(0));
 
+        // Stream with no extents: read returns empty.
         let msgs = stream.read(Offset(0), 10).unwrap();
         assert!(msgs.is_empty());
     }
 
     #[test]
+    fn empty_stream_properties() {
+        let stream = Stream::new(StreamId(1));
+        assert_eq!(stream.max_offset(), Offset(0));
+        assert!(!stream.is_mutable());
+        assert_eq!(stream.active_extent_id(), None);
+        assert!(stream.append(Bytes::from_static(b"fail")).is_err());
+    }
+
+    #[test]
     fn seal_and_new() {
-        let mut stream = Stream::new(StreamId(1));
+        let mut stream = new_stream_with_extent(StreamId(1));
         // Append 3 messages to first extent.
         for i in 0..3 {
             stream.append(Bytes::from(format!("msg{i}"))).unwrap();
@@ -254,7 +234,12 @@ mod tests {
         assert_eq!(start_offset, 0);
         assert_eq!(end_offset, 3);
 
-        // A new extent should exist with start_offset = 3.
+        // After seal, stream has no active extent until register_extent.
+        assert!(!stream.is_mutable());
+
+        // Register a new extent (simulating SM sending RegisterExtent).
+        stream.register_extent(ExtentId(1), Offset(3), DEFAULT_ARENA_CAPACITY);
+        assert!(stream.is_mutable());
         assert_eq!(stream.max_offset(), Offset(3)); // new extent is empty
 
         // Append to the new extent.
@@ -271,12 +256,14 @@ mod tests {
 
     #[test]
     fn seal_already_sealed_returns_none() {
-        let mut stream = Stream::new(StreamId(1));
+        let mut stream = new_stream_with_extent(StreamId(1));
         let r = stream.append(Bytes::from_static(b"a")).unwrap();
         assert_eq!(r.offset, Offset(0));
-        stream.seal_active(None); // seals extent with 1 msg, creates new at offset 1
-        stream.seal_active(None); // seals empty extent, creates new at offset 1
-        // Now append to the third extent.
+        stream.seal_active(None); // seals extent with 1 msg
+        assert_eq!(stream.seal_active(None), None); // already sealed, returns None
+
+        // Register a new extent and append.
+        stream.register_extent(ExtentId(1), Offset(1), DEFAULT_ARENA_CAPACITY);
         let r = stream.append(Bytes::from_static(b"b")).unwrap();
         assert_eq!(r.offset, Offset(1));
         assert_eq!(stream.max_offset(), Offset(2));

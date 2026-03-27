@@ -25,6 +25,7 @@ use crate::allocator::Allocator;
 async fn seal_extent_node_static(
     addr: &str,
     stream_id: StreamId,
+    extent_id: ExtentId,
     committed_offset: Option<u64>,
 ) -> Result<u64, StorageError> {
     let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
@@ -36,7 +37,7 @@ async fn seal_extent_node_static(
             VariableHeader::Seal {
                 request_id: 0,
                 stream_id,
-                extent_id: ExtentId(0),
+                extent_id,
                 offset: committed_offset.map(Offset),
             },
             None,
@@ -513,10 +514,11 @@ impl StreamManagerStore {
 
             if !addrs.is_empty() {
                 let sid = stream_id;
+                let eid = extent_id;
                 let seal_offset = end_offset;
                 tokio::spawn(async move {
                     for addr in addrs {
-                        match seal_extent_node_static(&addr, sid, Some(seal_offset)).await {
+                        match seal_extent_node_static(&addr, sid, eid, Some(seal_offset)).await {
                             Ok(offset) => {
                                 info!("fire-and-forget seal to {addr}: offset={offset}");
                             }
@@ -574,7 +576,7 @@ impl StreamManagerStore {
             let sid = stream_id;
             match tokio::time::timeout(
                 Duration::from_millis(100),
-                seal_extent_node_static(&addr, sid, None),
+                seal_extent_node_static(&addr, sid, extent_id, None),
             )
             .await
             {
@@ -614,8 +616,9 @@ impl StreamManagerStore {
             let addr = replica.node_addr.clone();
             let role = replica.role;
             let sid = stream_id;
+            let eid = extent_id;
             seal_futures.push(async move {
-                let result = seal_extent_node_static(&addr, sid, None).await;
+                let result = seal_extent_node_static(&addr, sid, eid, None).await;
                 (addr, role, result)
             });
         }

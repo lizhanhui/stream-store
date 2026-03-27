@@ -391,11 +391,17 @@ impl ExtentNodeStore {
                 }
             };
 
-        // Create the stream locally with the StreamManager-assigned stream_id if it doesn't exist.
-        if !self.streams.contains_key(&stream_id) {
-            let stream = Stream::with_capacity(stream_id, self.arena_capacity);
+        // Create the stream locally if it doesn't exist, then register the new extent.
+        let _start_offset = if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+            let so = stream_mut.max_offset();
+            stream_mut.register_extent(extent_id, so, self.arena_capacity);
+            so
+        } else {
+            let mut stream = Stream::new(stream_id);
+            stream.register_extent(extent_id, Offset(0), self.arena_capacity);
             self.streams.insert(stream_id, stream);
-        }
+            Offset(0)
+        };
 
         // Update next_stream_id to avoid collision with StreamManager-assigned IDs.
         // Use fetch_max to atomically ensure we stay above the assigned ID.
@@ -494,7 +500,7 @@ impl ExtentNodeStore {
                 // ExtentSealed (fast path) instead of racing on the full arena.
                 let (extent_id, offset) =
                     if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-                        let eid = stream_mut.active_extent_id();
+                        let eid = stream_mut.active_extent_id().unwrap_or(ExtentId(0));
                         match stream_mut.seal_active(None) {
                             Some((_start_offset, end_offset)) => (eid, end_offset),
                             None => (eid, 0),
@@ -502,48 +508,6 @@ impl ExtentNodeStore {
                     } else {
                         (ExtentId(0), 0)
                     };
-
-                if is_forwarded {
-                    // Secondary: the sealed extent created a new active extent.
-                    // Retry the append — it will land on the new extent.
-                    let stream_ref = match self.streams.get(&stream_id) {
-                        Some(s) => s,
-                        None => {
-                            return Some(Frame::error_response(
-                                frame.request_id(),
-                                ErrorCode::UnknownStream,
-                                &format!("stream {:?} not found on retry", stream_id),
-                                ExtentId(0),
-                            ));
-                        }
-                    };
-                    match stream_ref.append(frame.payload.clone().unwrap_or_default()) {
-                        Ok(retry_result) => {
-                            drop(stream_ref);
-                            let offset = retry_result.offset;
-                            self.append_count.fetch_add(1, Ordering::Relaxed);
-                            self.bytes_written.fetch_add(
-                                frame.payload.as_ref().map_or(0, |p| p.len()) as u64,
-                                Ordering::Relaxed,
-                            );
-                            return Some(Frame::new(
-                                VariableHeader::Watermark {
-                                    stream_id,
-                                    offset,
-                                },
-                                None,
-                            ));
-                        }
-                        Err(e) => {
-                            return Some(Frame::error_response(
-                                frame.request_id(),
-                                ErrorCode::InternalError,
-                                &format!("retry after seal failed: {e}"),
-                                ExtentId(0),
-                            ));
-                        }
-                    }
-                }
 
                 // Primary: notify background task to send Seal to Stream Manager,
                 // triggering new extent allocation before clients retry.
@@ -749,6 +713,7 @@ impl ExtentNodeStore {
 
     fn handle_seal(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
+        let seal_extent_id = frame.extent_id();
         // Extract the committed offset from the Seal frame, if present.
         // When SM propagates the primary's committed offset, secondaries use it
         // to accept late forwarded appends up to that offset.
@@ -767,6 +732,31 @@ impl ExtentNodeStore {
                 );
             }
         };
+
+        // If the seal request targets a specific extent and the active extent is
+        // different (newer), treat as already-sealed — don't seal the new extent.
+        if seal_extent_id.0 != 0 {
+            if let Some(active_eid) = stream_ref.active_extent_id() {
+                if active_eid != seal_extent_id {
+                    let end_offset = stream_ref.sealed_end_offset();
+                    info!(
+                        "seal request for extent {:?} but active is {:?}, returning idempotent SealAck for stream {:?}",
+                        seal_extent_id, active_eid, stream_id
+                    );
+                    return Frame::new(
+                        VariableHeader::SealAck {
+                            request_id: frame.request_id(),
+                            stream_id,
+                            extent_id: seal_extent_id,
+                            offset: Offset(end_offset),
+                            new_extent_id: None,
+                            primary_addr: None,
+                        },
+                        None,
+                    );
+                }
+            }
+        }
 
         match stream_ref.seal_active(committed_offset) {
             Some((start_offset, end_offset)) => {
@@ -1873,7 +1863,8 @@ mod tests {
             );
         }
 
-        // Verify that appends beyond the sealed range go to the new active extent.
+        // After all late forwards have landed and the extent is fully sealed,
+        // further appends should be rejected (no new extent until SM sends RegisterExtent).
         let resp = store
             .handle_frame(
                 {
@@ -1883,7 +1874,7 @@ mod tests {
                             stream_id: StreamId(10),
                             extent_id: ExtentId(0),
                         },
-                        Some(Bytes::from_static(b"new-extent-msg")),
+                        Some(Bytes::from_static(b"should-fail")),
                     );
                     f.header.flags = FLAG_FORWARDED;
                     f
@@ -1892,8 +1883,8 @@ mod tests {
             )
             .await
             .unwrap();
-        // Goes to new active extent created by seal.
-        assert_eq!(resp.opcode(), Opcode::Watermark);
+        // No new extent — append is rejected with ExtentSealed.
+        assert_eq!(resp.opcode(), Opcode::Error);
     }
 
     /// Test Bug 2 fix: handle_seal is idempotent — sealing twice returns SealAck both times.
