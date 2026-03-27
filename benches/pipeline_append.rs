@@ -1,333 +1,179 @@
 //! Pipeline Append Benchmark
 //!
-//! Measures pipeline append performance on a single stream — maintaining N in-flight
-//! append requests without blocking, measuring both per-append latency (p50/p99/max)
-//! and aggregate throughput (ops/sec, MB/sec).
+//! Launches a full cluster (1 StreamManager + 3 ExtentNodes), creates a **single stream**
+//! (RF=2), then spawns N concurrent client connections all appending to the same stream.
+//! Each client measures per-append latency; the harness aggregates throughput and
+//! latency percentiles (p50/p99/max).
 //!
-//! Operates in-process against `ExtentNodeStore` directly (no network, no MySQL),
-//! with a simulated watermark loop to complete the replication ACK path.
+//! When an extent fills up, each client independently seals via StreamManager — the
+//! StreamManager's `seal_and_allocate_transaction` is idempotent: the first seal triggers
+//! allocation of a new extent, and subsequent seals for the same extent simply return the
+//! already-allocated successor.
 //!
-//! Architecture:
-//! ```text
-//! Sender Tasks (N=4, semaphore-gated) ──→ ExtentNodeStore (Primary, RF=2)
-//!         ↑                                      │
-//!         │                                      ├──→ forward_tx ──→ Watermark Simulator
-//!         │                                      │                        │
-//!         └── ACK via response_rx ←── ack_queues ←──── watermark_tx ─────┘
-//! ```
+//! **Prerequisites**: MySQL running at the default StreamManagerConfig URL.
+//!
 //! Run with:
 //! ```sh
 //! cargo bench --bench pipeline_append
 //! ```
 
 use fastant::Instant;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::types::{ExtentId, Opcode, StreamId};
-use extent_node::store::{ExtentNodeStore, ForwardRequest, WatermarkEvent};
-use rpc::frame::{Frame, VariableHeader};
-use rpc::payload::build_register_extent_payload;
-use server::handler::RequestHandler;
-use tokio::sync::{Semaphore, mpsc};
+use client::StorageClient;
+use common::config::{ExtentNodeConfig, StreamManagerConfig};
+use common::errors::StorageError;
+use common::types::ExtentId;
+use extent_node::ExtentNode;
+use sqlx::mysql::MySqlPoolOptions;
+use stream_manager::StreamManager;
+use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 // ── Benchmark Parameters ─────────────────────────────────────────────────────
 
 const BENCH_DURATION: Duration = Duration::from_secs(5);
 const NUM_SENDERS: usize = 4;
-const MAX_IN_FLIGHT: usize = 256;
-const PAYLOAD_SIZE: usize = 1024;
-
-const STREAM_ID: StreamId = StreamId(1);
-const EXTENT_ID: ExtentId = ExtentId(1);
-const FAKE_SECONDARY_ADDR: &str = "127.0.0.1:19802";
+const PAYLOAD_SIZE: usize = 1024; // 1 KiB
+const REPLICATION_FACTOR: u16 = 2;
+const ARENA_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-fn main() {
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(8)
-        .enable_all()
-        .build()
-        .expect("failed to build tokio runtime");
+#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+async fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .init();
 
-    rt.block_on(run_benchmark());
-}
+    // ── 1. Clean database ────────────────────────────────────────────────────
+    let stream_manager_config = StreamManagerConfig {
+        listen_addr: "127.0.0.1:0".into(),
+        ..StreamManagerConfig::default()
+    };
+    clean_database(&stream_manager_config.mysql_url).await;
+    info!("[setup] Database cleaned");
 
-async fn run_benchmark() {
-    // ── 1. Create channels ───────────────────────────────────────────────────
-    let (forward_tx, mut forward_rx) = mpsc::channel::<ForwardRequest>(4096);
-    let (watermark_tx, mut watermark_rx) = mpsc::channel::<WatermarkEvent>(4096);
+    // ── 2. Start StreamManager ───────────────────────────────────────────────
+    let stream_manager = StreamManager::start(stream_manager_config).await;
+    let stream_manager_addr = stream_manager.addr().to_string();
+    info!("[setup] StreamManager started on {stream_manager_addr}");
 
-    // ── 2. Build ExtentNodeStore ─────────────────────────────────────────────
-    let mut store = ExtentNodeStore::with_forward_tx(forward_tx);
-    // Use a large arena (512 MiB) so the extent never fills during the benchmark.
-    store.set_arena_capacity(512 * 1024 * 1024);
-    let store = Arc::new(store);
+    // ── 3. Start 3 ExtentNodes ───────────────────────────────────────────────
+    let mut extent_nodes = vec![];
+    for i in 0..3 {
+        let config = ExtentNodeConfig {
+            listen_addr: "127.0.0.1:0".into(),
+            stream_manager_addr: stream_manager_addr.clone(),
+            extent_arena_capacity: ARENA_CAPACITY,
+            ..Default::default()
+        };
+        let node = ExtentNode::start(config).await;
+        info!("[setup] ExtentNode {i} started on {}", node.addr());
+        extent_nodes.push(node);
+    }
 
-    // ── 3. Register stream as Primary RF=2 with one fake secondary ───────────
-    let payload = build_register_extent_payload(&[FAKE_SECONDARY_ADDR]);
-    let reg_frame = Frame::new(
-        VariableHeader::RegisterExtent {
-            request_id: 0,
-            stream_id: STREAM_ID,
-            extent_id: EXTENT_ID,
-            role: 0, // Primary
-            replication_factor: 2,
-        },
-        Some(payload),
+    // ── 4. Wait for heartbeat registration ───────────────────────────────────
+    info!("[setup] Waiting for ExtentNode registration...");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    info!("[setup] Registration complete");
+
+    // ── 5. Create a single stream via StreamManager ──────────────────────────
+    let mut sm_client = StorageClient::connect(&stream_manager_addr)
+        .await
+        .expect("connect to StreamManager");
+    let (stream_id, initial_extent_id, initial_primary_addr) = sm_client
+        .create_stream("bench-pipeline", REPLICATION_FACTOR)
+        .await
+        .expect("create_stream");
+    info!(
+        "[setup] Stream {:?} created: extent={:?}, primary={}",
+        stream_id, initial_extent_id, initial_primary_addr
     );
-    let resp = store.handle_frame(reg_frame, None).await;
-    assert!(resp.is_some());
-    assert_eq!(resp.unwrap().opcode(), Opcode::RegisterExtentAck);
 
-    // ── 4. Shared state ──────────────────────────────────────────────────────
-    let stop = Arc::new(AtomicBool::new(false));
-    let semaphore = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
-    let next_request_id = Arc::new(AtomicU32::new(1));
+    // ── 6. Spawn sender tasks ────────────────────────────────────────────────
+    let start = Instant::now();
 
-    // Per-request send timestamps for latency measurement.
-    // Key: request_id, Value: send Instant
-    let send_times: Arc<dashmap::DashMap<u32, Instant>> = Arc::new(dashmap::DashMap::new());
+    let mut handles = Vec::with_capacity(NUM_SENDERS);
+    for sender_id in 0..NUM_SENDERS {
+        let sm_addr = stream_manager_addr.clone();
+        let primary_addr = initial_primary_addr.clone();
 
-    // Collected latencies from all ACK collectors
-    let total_appends = Arc::new(AtomicU64::new(0));
-    let all_latencies: Arc<tokio::sync::Mutex<Vec<Duration>>> =
-        Arc::new(tokio::sync::Mutex::new(Vec::new()));
-
-    // ── 5. Create per-sender response channels ───────────────────────────────
-    // Each sender has its own (resp_tx, resp_rx) so that PendingAck responses
-    // route back to the correct ACK collector task.
-    let mut sender_handles = Vec::new();
-    let mut collector_handles = Vec::new();
-
-    for _sender_idx in 0..NUM_SENDERS {
-        let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(MAX_IN_FLIGHT);
-
-        // Clone shared state for sender task
-        let store_s = Arc::clone(&store);
-        let stop_s = Arc::clone(&stop);
-        let semaphore_s = Arc::clone(&semaphore);
-        let next_request_id_s = Arc::clone(&next_request_id);
-        let send_times_s = Arc::clone(&send_times);
-        let resp_tx_s = resp_tx.clone();
-
-        // Clone shared state for collector task
-        let stop_c = Arc::clone(&stop);
-        let semaphore_c = Arc::clone(&semaphore);
-        let send_times_c = Arc::clone(&send_times);
-        let total_appends_c = Arc::clone(&total_appends);
-        let all_latencies_c = Arc::clone(&all_latencies);
-
-        // ── Sender task ──────────────────────────────────────────────────────
-        let sender = tokio::spawn(async move {
-            let payload = Bytes::from(vec![0xABu8; PAYLOAD_SIZE]);
-
-            while !stop_s.load(Ordering::Relaxed) {
-                // Acquire semaphore permit (backpressure when MAX_IN_FLIGHT reached)
-                let permit = match semaphore_s.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => break, // semaphore closed
-                };
-                // We intentionally forget the permit here; the ACK collector will
-                // add permits back when it receives responses.
-                permit.forget();
-
-                let request_id = next_request_id_s.fetch_add(1, Ordering::Relaxed);
-
-                // Record send time
-                send_times_s.insert(request_id, Instant::now());
-
-                let frame = Frame::new(
-                    VariableHeader::Append {
-                        request_id,
-                        stream_id: STREAM_ID,
-                        extent_id: EXTENT_ID,
-                    },
-                    Some(payload.clone()),
-                );
-
-                // handle_frame returns None for deferred Primary appends (RF=2).
-                // The ACK will arrive via resp_tx when quorum is reached.
-                // If the extent is full/sealed, it returns Some(error frame) — stop sending.
-                let result = store_s.handle_frame(frame, Some(&resp_tx_s)).await;
-                if result.is_some() {
-                    // Extent full or sealed — release the permit and stop
-                    semaphore_s.add_permits(1);
-                    send_times_s.remove(&request_id);
-                    break;
-                }
-            }
-        });
-        sender_handles.push(sender);
-
-        // ── ACK collector task ───────────────────────────────────────────────
-        let collector = tokio::spawn(async move {
-            let mut local_latencies = Vec::with_capacity(65536);
-
-            loop {
-                match resp_rx.try_recv() {
-                    Ok(frame) => {
-                        let req_id = frame.request_id();
-
-                        // Compute latency
-                        if let Some((_, sent_at)) = send_times_c.remove(&req_id) {
-                            local_latencies.push(sent_at.elapsed());
-                        }
-
-                        total_appends_c.fetch_add(1, Ordering::Relaxed);
-
-                        // Release semaphore permit
-                        semaphore_c.add_permits(1);
-                    }
-                    Err(mpsc::error::TryRecvError::Empty) => {
-                        if stop_c.load(Ordering::Relaxed) {
-                            // Drain remaining
-                            while let Ok(frame) = resp_rx.try_recv() {
-                                let req_id = frame.request_id();
-                                if let Some((_, sent_at)) = send_times_c.remove(&req_id) {
-                                    local_latencies.push(sent_at.elapsed());
-                                }
-                                total_appends_c.fetch_add(1, Ordering::Relaxed);
-                                semaphore_c.add_permits(1);
-                            }
-                            break;
-                        }
-                        // Yield to avoid busy-spinning
-                        tokio::task::yield_now().await;
-                    }
-                    Err(mpsc::error::TryRecvError::Disconnected) => break,
-                }
-            }
-
-            // Merge local latencies into global
-            all_latencies_c.lock().await.extend(local_latencies);
-        });
-        collector_handles.push(collector);
+        handles.push(tokio::spawn(async move {
+            sender_task(
+                sender_id,
+                sm_addr,
+                stream_id,
+                initial_extent_id,
+                primary_addr,
+                BENCH_DURATION,
+            )
+            .await
+        }));
     }
 
-    // ── 6. Watermark simulator ───────────────────────────────────────────────
-    // Drains forward_rx and immediately sends WatermarkEvent back (simulates
-    // instant secondary ACK — no network delay).
-    let watermark_tx_clone = watermark_tx.clone();
-    let stop_wm_sim = Arc::clone(&stop);
-    let wm_simulator = tokio::spawn(async move {
-        loop {
-            match forward_rx.try_recv() {
-                Ok(req) => {
-                    let event = WatermarkEvent {
-                        stream_id: req.stream_id,
-                        acked_offset: req.offset,
-                        source_addr: req.downstream_addr,
-                    };
-                    let _ = watermark_tx_clone.send(event).await;
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    if stop_wm_sim.load(Ordering::Relaxed) {
-                        // Drain remaining
-                        while let Ok(req) = forward_rx.try_recv() {
-                            let event = WatermarkEvent {
-                                stream_id: req.stream_id,
-                                acked_offset: req.offset,
-                                source_addr: req.downstream_addr,
-                            };
-                            let _ = watermark_tx_clone.send(event).await;
-                        }
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
+    // ── 7. Collect results ───────────────────────────────────────────────────
+    let mut total_appends: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut total_seals: u64 = 0;
+    let mut all_latencies: Vec<Duration> = Vec::new();
+
+    for handle in handles {
+        match handle.await {
+            Ok(result) => {
+                total_appends += result.total_appends;
+                total_bytes += result.total_bytes;
+                total_seals += result.seal_count;
+                all_latencies.extend(result.latencies);
+            }
+            Err(e) => {
+                warn!("[error] Sender task panicked: {e}");
             }
         }
-    });
-
-    // ── 7. Watermark handler ─────────────────────────────────────────────────
-    // Reads WatermarkEvents, updates ack_queue, drains quorum — this sends
-    // AppendAck frames through each PendingAck's response_tx.
-    let store_wm = Arc::clone(&store);
-    let stop_wm = Arc::clone(&stop);
-    let wm_handler = tokio::spawn(async move {
-        loop {
-            match watermark_rx.try_recv() {
-                Ok(event) => {
-                    if let Some(mut ack_queue) = store_wm.ack_queues.get_mut(&event.stream_id) {
-                        ack_queue.ack_from_secondary(&event.source_addr, event.acked_offset);
-                        ack_queue.drain_quorum();
-                    }
-                }
-                Err(mpsc::error::TryRecvError::Empty) => {
-                    if stop_wm.load(Ordering::Relaxed) {
-                        // Drain remaining
-                        while let Ok(event) = watermark_rx.try_recv() {
-                            if let Some(mut ack_queue) =
-                                store_wm.ack_queues.get_mut(&event.stream_id)
-                            {
-                                ack_queue
-                                    .ack_from_secondary(&event.source_addr, event.acked_offset);
-                                ack_queue.drain_quorum();
-                            }
-                        }
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-                Err(mpsc::error::TryRecvError::Disconnected) => break,
-            }
-        }
-    });
-
-    // ── 8. Run for BENCH_DURATION ────────────────────────────────────────────
-    let bench_start = Instant::now();
-    tokio::time::sleep(BENCH_DURATION).await;
-    stop.store(true, Ordering::Relaxed);
-
-    // ── 9. Join all tasks ────────────────────────────────────────────────────
-    // Drop watermark_tx so the handler can finish
-    drop(watermark_tx);
-
-    for h in sender_handles {
-        let _ = h.await;
-    }
-    // Give watermark pipeline time to drain
-    let _ = wm_simulator.await;
-    let _ = wm_handler.await;
-    for h in collector_handles {
-        let _ = h.await;
     }
 
-    let elapsed = bench_start.elapsed();
+    let elapsed = start.elapsed();
 
-    // ── 10. Compute and print statistics ─────────────────────────────────────
-    let appends = total_appends.load(Ordering::Relaxed);
-    let mut latencies = all_latencies.lock().await;
-    latencies.sort();
+    // ── 8. Shutdown ──────────────────────────────────────────────────────────
+    for node in extent_nodes {
+        node.stop().await;
+    }
 
-    let ops_per_sec = appends as f64 / elapsed.as_secs_f64();
-    let mb_per_sec =
-        (appends as f64 * PAYLOAD_SIZE as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    // ── 9. Report ────────────────────────────────────────────────────────────
+    all_latencies.sort();
+
+    let elapsed_secs = elapsed.as_secs_f64();
+    let ops_per_sec = total_appends as f64 / elapsed_secs;
+    let mb_per_sec = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
 
     println!();
     println!("═══════════════════════════════════════════════════════════════");
     println!("  Pipeline Append Benchmark Results");
     println!("═══════════════════════════════════════════════════════════════");
-    println!("  Duration:        {:.2}s", elapsed.as_secs_f64());
-    println!("  Senders:         {NUM_SENDERS}");
-    println!("  Max in-flight:   {MAX_IN_FLIGHT}");
+    println!("  Duration:        {elapsed_secs:.2}s");
+    println!("  Senders:         {NUM_SENDERS} (single stream)");
     println!("  Payload size:    {PAYLOAD_SIZE} bytes");
-    println!("  RF:              2 (1 primary + 1 simulated secondary)");
+    println!(
+        "  Arena capacity:  {} MiB",
+        ARENA_CAPACITY / (1024 * 1024)
+    );
+    println!("  RF:              {REPLICATION_FACTOR}");
     println!("───────────────────────────────────────────────────────────────");
-    println!("  Total appends:   {appends}");
+    println!("  Total appends:   {total_appends}");
+    println!(
+        "  Total bytes:     {total_bytes} ({:.2} MB)",
+        total_bytes as f64 / 1_000_000.0
+    );
     println!("  Throughput:      {ops_per_sec:.0} ops/sec");
     println!("  Throughput:      {mb_per_sec:.2} MB/sec");
+    println!("  Total seals:     {total_seals}");
     println!("───────────────────────────────────────────────────────────────");
 
-    if !latencies.is_empty() {
-        let p50 = latencies[latencies.len() / 2];
-        let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
-        let max = latencies[latencies.len() - 1];
+    if !all_latencies.is_empty() {
+        let p50 = all_latencies[all_latencies.len() / 2];
+        let p99 = all_latencies[(all_latencies.len() as f64 * 0.99) as usize];
+        let max = *all_latencies.last().unwrap();
         println!("  Latency p50:     {p50:?}");
         println!("  Latency p99:     {p99:?}");
         println!("  Latency max:     {max:?}");
@@ -337,4 +183,128 @@ async fn run_benchmark() {
 
     println!("═══════════════════════════════════════════════════════════════");
     println!();
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+/// Per-sender result.
+struct SenderResult {
+    total_appends: u64,
+    total_bytes: u64,
+    seal_count: u64,
+    latencies: Vec<Duration>,
+}
+
+/// Single sender task: connect to the current primary, append in a tight loop,
+/// measure per-append latency. On ExtentFull/ExtentSealed, independently seal via
+/// StreamManager and reconnect to the (potentially new) primary.
+///
+/// The StreamManager handles concurrent seal requests idempotently: the first seal
+/// triggers allocation of a new extent; subsequent seals for the same (stream_id,
+/// extent_id) return the already-allocated successor.
+async fn sender_task(
+    sender_id: usize,
+    stream_manager_addr: String,
+    stream_id: common::types::StreamId,
+    initial_extent_id: ExtentId,
+    initial_primary_addr: String,
+    duration: Duration,
+) -> SenderResult {
+    let payload = Bytes::from(vec![0xABu8; PAYLOAD_SIZE]);
+    let deadline = Instant::now() + duration;
+    let mut total_appends: u64 = 0;
+    let mut total_bytes: u64 = 0;
+    let mut seal_count: u64 = 0;
+    let mut latencies = Vec::with_capacity(65536);
+
+    // Each sender gets its own StreamManager connection for seal RPCs.
+    let mut sm_client = StorageClient::connect(&stream_manager_addr)
+        .await
+        .unwrap_or_else(|e| panic!("sender {sender_id}: SM connect failed: {e}"));
+
+    let mut extent_id = initial_extent_id;
+    let mut primary_addr = initial_primary_addr;
+
+    // Connect to the initial primary.
+    let mut en_client = StorageClient::connect(&primary_addr)
+        .await
+        .unwrap_or_else(|e| panic!("sender {sender_id}: EN connect failed: {e}"));
+
+    while Instant::now() < deadline {
+        let t0 = Instant::now();
+        match en_client.append(stream_id, payload.clone()).await {
+            Ok(_) => {
+                latencies.push(t0.elapsed());
+                total_appends += 1;
+                total_bytes += PAYLOAD_SIZE as u64;
+            }
+            Err(StorageError::ExtentFull(_)) | Err(StorageError::ExtentSealed(_)) => {
+                // Independently seal the current extent via StreamManager.
+                // The SM handles duplicate seals idempotently — if another sender
+                // already sealed this extent, SM returns the existing successor.
+                let (new_extent_id_raw, new_primary_addr) = match sm_client
+                    .seal(stream_id, extent_id, None)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        warn!("sender {sender_id}: seal failed: {e}");
+                        break;
+                    }
+                };
+
+                let new_extent_id = ExtentId(new_extent_id_raw);
+                info!(
+                    "sender {sender_id}: sealed extent {:?} → new {:?} @ {}",
+                    extent_id, new_extent_id, new_primary_addr
+                );
+                extent_id = new_extent_id;
+                primary_addr = new_primary_addr;
+                seal_count += 1;
+
+                // Reconnect to the (potentially different) primary.
+                en_client = match StorageClient::connect(&primary_addr).await {
+                    Ok(c) => c,
+                    Err(e) => {
+                        warn!("sender {sender_id}: reconnect after seal failed: {e}");
+                        break;
+                    }
+                };
+            }
+            Err(e) => {
+                warn!("sender {sender_id}: unexpected append error: {e}");
+                break;
+            }
+        }
+    }
+
+    SenderResult {
+        total_appends,
+        total_bytes,
+        seal_count,
+        latencies,
+    }
+}
+
+/// Drop all tables for a clean slate.
+async fn clean_database(mysql_url: &str) {
+    let pool = MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(mysql_url)
+        .await
+        .expect("failed to connect to MySQL for cleanup");
+    for table in &[
+        "extent_replica",
+        "extent",
+        "stream_sequence",
+        "stream",
+        "node",
+        "refinery_schema_history",
+    ] {
+        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+            .execute(&pool)
+            .await
+            .unwrap_or_else(|e| panic!("drop {table}: {e}"));
+    }
+    pool.close().await;
 }
