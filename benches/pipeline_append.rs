@@ -20,9 +20,10 @@
 //! cargo bench --bench pipeline_append
 //! ```
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use fastant::Instant;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::time::Duration;
 
 use bytes::Bytes;
 use common::types::{ExtentId, Opcode, StreamId};
@@ -30,7 +31,7 @@ use extent_node::store::{ExtentNodeStore, ForwardRequest, WatermarkEvent};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::build_register_extent_payload;
 use server::handler::RequestHandler;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{Semaphore, mpsc};
 
 // ── Benchmark Parameters ─────────────────────────────────────────────────────
 
@@ -264,10 +265,8 @@ async fn run_benchmark() {
                             if let Some(mut ack_queue) =
                                 store_wm.ack_queues.get_mut(&event.stream_id)
                             {
-                                ack_queue.ack_from_secondary(
-                                    &event.source_addr,
-                                    event.acked_offset,
-                                );
+                                ack_queue
+                                    .ack_from_secondary(&event.source_addr, event.acked_offset);
                                 ack_queue.drain_quorum();
                             }
                         }
@@ -307,7 +306,8 @@ async fn run_benchmark() {
     latencies.sort();
 
     let ops_per_sec = appends as f64 / elapsed.as_secs_f64();
-    let mb_per_sec = (appends as f64 * PAYLOAD_SIZE as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    let mb_per_sec =
+        (appends as f64 * PAYLOAD_SIZE as f64) / (1024.0 * 1024.0) / elapsed.as_secs_f64();
 
     println!();
     println!("═══════════════════════════════════════════════════════════════");

@@ -13,7 +13,8 @@
 //! cargo bench --bench concurrent_multi_stream
 //! ```
 
-use std::time::{Duration, Instant};
+use fastant::Instant;
+use std::time::Duration;
 
 use bytes::Bytes;
 use client::StorageClient;

@@ -75,7 +75,7 @@ fn bench_append_concurrent(c: &mut Criterion) {
                             ARENA_CAPACITY,
                         ));
 
-                        let start = std::time::Instant::now();
+                        let start = fastant::Instant::now();
 
                         std::thread::scope(|s| {
                             for _ in 0..num_threads {

@@ -1,6 +1,7 @@
+use fastant::Instant;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::types::{ErrorCode, ExtentId, FLAG_FORWARDED, Offset, Opcode, StreamId};
@@ -1278,7 +1279,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_multi_stream_appends() {
         use std::sync::Arc;
-        use std::time::Instant;
 
         const NUM_STREAMS: u64 = 8;
         const APPENDS_PER_STREAM: u64 = 5_000;
@@ -1623,7 +1623,6 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_appends_same_stream() {
         use std::sync::Arc;
-        use std::time::Instant;
 
         const NUM_TASKS: u64 = 8;
         const APPENDS_PER_TASK: u64 = 2_000;
