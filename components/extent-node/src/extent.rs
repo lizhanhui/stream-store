@@ -2,7 +2,7 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
@@ -14,7 +14,8 @@ pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
 /// Sentinel for unwritten index entries.
 const INDEX_UNSET: u32 = u32::MAX;
 
-/// Minimum record size: 4-byte length prefix + 1-byte payload.
+/// Sentinel value for `limit`: extent is not sealed.
+const LIMIT_OPEN: u64 = u64::MAX;
 const MIN_RECORD_SIZE: usize = 5;
 
 /// Owns the raw heap allocation for an extent's arena buffer.
@@ -157,13 +158,14 @@ pub struct Extent {
     /// Advanced in-order alongside `committed_seq`.
     committed_bytes: AtomicU64,
 
-    /// Whether this extent has been sealed.
-    sealed: AtomicBool,
-
-    /// The committed message count at seal time. Post-seal appends are accepted
-    /// if record_count < sealed_message_count, allowing late forwarded writes
-    /// that the primary already committed to land on secondaries.
-    sealed_message_count: AtomicU64,
+    /// Message limit for this extent.
+    ///
+    /// - `LIMIT_OPEN` (`u64::MAX`): extent is **not sealed**, appends proceed normally.
+    /// - Any other value `N`: extent is **sealed** at message count `N`.
+    ///   Appends with `record_count < N` are still accepted (late forwarded writes
+    ///   within the primary's committed range); appends at or beyond `N` are rejected
+    ///   with `ExtentSealed`.
+    limit: AtomicU64,
 
     /// Internal index mapping sequence number → byte position (compressed u32).
     /// Entry i holds the byte_pos for the i-th record appended to this extent.
@@ -216,8 +218,7 @@ impl Extent {
             record_count: AtomicU64::new(0),
             committed_seq: AtomicU64::new(0),
             committed_bytes: AtomicU64::new(0),
-            sealed: AtomicBool::new(false),
-            sealed_message_count: AtomicU64::new(0),
+            limit: AtomicU64::new(LIMIT_OPEN),
             index,
         }
     }
@@ -233,8 +234,8 @@ impl Extent {
     /// The returned `AppendResult.byte_pos` allows the caller to build an
     /// external offset-to-position index for O(1) random reads.
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
-        if self.sealed.load(Ordering::Acquire) {
-            let limit = self.sealed_message_count.load(Ordering::Acquire);
+        let limit = self.limit.load(Ordering::Acquire);
+        if limit != LIMIT_OPEN {
             let current = self.record_count.load(Ordering::Relaxed);
             if current >= limit {
                 return Err(StorageError::ExtentSealed(self.id));
@@ -389,42 +390,34 @@ impl Extent {
         })
     }
 
-    /// Seal this extent. No more appends will be accepted beyond the sealed
-    /// message count. Late forwarded writes with offsets below the sealed
-    /// message count are still accepted (for replication consistency).
+    /// Seal this extent by setting `limit` to the maximum number of messages
+    /// it will accept.
     ///
-    /// If `committed_offset` is provided (from SM/primary), the sealed message
-    /// count is `committed_offset - start_offset`. This allows secondaries to
-    /// accept late forwarded appends up to the primary's committed offset.
+    /// If `committed_offset` is provided (from SM/primary), the limit is
+    /// `committed_offset - start_offset`. This allows secondaries to accept late
+    /// forwarded appends up to the primary's committed offset.
     /// If `None`, uses the local `record_count` (primary sealing itself).
     pub fn seal(&self, committed_offset: Option<u64>) {
         let count = match committed_offset {
-            Some(offset) => {
-                // SM/primary tells us the committed offset; compute message count.
-                offset.saturating_sub(self.start_offset.0)
-            }
-            None => {
-                // Primary sealing itself: use local record count.
-                self.record_count.load(Ordering::Acquire)
-            }
+            Some(offset) => offset.saturating_sub(self.start_offset.0),
+            None => self.record_count.load(Ordering::Acquire),
         };
-        self.sealed_message_count.store(count, Ordering::Release);
-        self.sealed.store(true, Ordering::Release);
+        self.limit.store(count, Ordering::Release);
     }
 
     /// Whether this extent is sealed.
     pub fn is_sealed(&self) -> bool {
-        self.sealed.load(Ordering::Acquire)
+        self.limit.load(Ordering::Acquire) != LIMIT_OPEN
     }
 
     /// Whether this sealed extent can still accept post-seal forwarded writes.
-    /// Returns true when sealed and committed_seq < sealed_message_count,
+    /// Returns true when sealed and committed_seq < limit,
     /// meaning there are still outstanding writes that haven't landed yet.
     pub fn accepts_post_seal_writes(&self) -> bool {
-        if !self.is_sealed() {
+        let limit = self.limit.load(Ordering::Acquire);
+        if limit == LIMIT_OPEN {
             return false;
         }
-        let limit = self.sealed_message_count.load(Ordering::Acquire);
         let current = self.committed_seq.load(Ordering::Acquire);
         current < limit
     }
@@ -496,11 +489,7 @@ impl std::fmt::Debug for Extent {
                 "committed_bytes",
                 &self.committed_bytes.load(Ordering::Relaxed),
             )
-            .field("sealed", &self.sealed.load(Ordering::Relaxed))
-            .field(
-                "sealed_message_count",
-                &self.sealed_message_count.load(Ordering::Relaxed),
-            )
+            .field("limit", &self.limit.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -756,7 +745,7 @@ mod tests {
         // SM seals with committed_offset=3 (primary committed 3 records).
         ext.seal(Some(3));
         assert!(ext.is_sealed());
-        assert!(ext.accepts_post_seal_writes()); // committed_seq(1) < sealed_message_count(3)
+        assert!(ext.accepts_post_seal_writes()); // committed_seq(1) < limit(3)
 
         // Late forwarded appends within the sealed range should succeed.
         let r1 = ext.append(Bytes::from_static(b"msg1")).unwrap();
@@ -779,7 +768,7 @@ mod tests {
 
         ext.seal(None);
         assert!(ext.is_sealed());
-        // sealed_message_count = record_count = 2, committed_seq = 2 → no room.
+        // limit = record_count = 2, committed_seq = 2 → no room.
         assert!(!ext.accepts_post_seal_writes());
         let result = ext.append(Bytes::from_static(b"should-fail"));
         assert!(matches!(result, Err(StorageError::ExtentSealed(_))));
@@ -795,7 +784,7 @@ mod tests {
         ext.append(Bytes::from_static(b"msg0")).unwrap();
         ext.seal(None);
 
-        // Sealed with local count, committed_seq == sealed_message_count → false.
+        // Sealed with local count, committed_seq == limit → false.
         assert!(!ext.accepts_post_seal_writes());
     }
 }
