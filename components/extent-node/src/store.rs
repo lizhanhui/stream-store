@@ -466,6 +466,7 @@ impl ExtentNodeStore {
         response_tx: Option<&mpsc::Sender<Frame>>,
     ) -> Option<Frame> {
         let stream_id = frame.stream_id();
+        let extent_id = frame.extent_id();
         let is_forwarded = frame.flags() & FLAG_FORWARDED != 0;
 
         // Get the stream entry (per-stream lock, not global).
@@ -481,8 +482,26 @@ impl ExtentNodeStore {
             }
         };
 
+        // Resolve the target extent_id: use the frame's extent_id if specified,
+        // otherwise fall back to the current active extent.
+        let target_extent_id = if extent_id.0 != 0 {
+            extent_id
+        } else {
+            match stream_ref.active_extent_id() {
+                Some(active_extent_id) => active_extent_id,
+                None => {
+                    return Some(Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::ExtentSealed,
+                        "no active extent",
+                        ExtentId(0),
+                    ));
+                }
+            }
+        };
+
         // Write locally. The Extent's append is lock-free (atomic CAS).
-        let append_result = match stream_ref.append(frame.payload.clone().unwrap_or_default()) {
+        let append_result = match stream_ref.append(target_extent_id, frame.payload.clone().unwrap_or_default()) {
             Ok(r) => r,
             Err(common::errors::StorageError::ExtentSealed(_)) => {
                 return Some(Frame::error_response(
@@ -500,10 +519,10 @@ impl ExtentNodeStore {
                 // ExtentSealed (fast path) instead of racing on the full arena.
                 let (extent_id, offset) =
                     if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-                        let eid = stream_mut.active_extent_id().unwrap_or(ExtentId(0));
-                        match stream_mut.seal(eid, None) {
-                            Some((_start_offset, end_offset)) => (eid, end_offset),
-                            None => (eid, 0),
+                        let active_extent_id = stream_mut.active_extent_id().unwrap_or(ExtentId(0));
+                        match stream_mut.seal(active_extent_id, None) {
+                            Some((_start_offset, end_offset)) => (active_extent_id, end_offset),
+                            None => (active_extent_id, 0),
                         }
                     } else {
                         (ExtentId(0), 0)
@@ -646,6 +665,7 @@ impl ExtentNodeStore {
 
     fn handle_read(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
+        let extent_id = frame.extent_id();
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
             None => {
@@ -658,9 +678,17 @@ impl ExtentNodeStore {
             }
         };
 
+        // Resolve the target extent_id: use the frame's extent_id if specified,
+        // otherwise fall back to the current active extent.
+        let target_extent_id = if extent_id.0 != 0 {
+            extent_id
+        } else {
+            stream_ref.active_extent_id().unwrap_or(ExtentId(0))
+        };
+
         let count = frame.count();
 
-        match stream_ref.read(frame.offset(), count) {
+        match stream_ref.read(target_extent_id, frame.offset(), count) {
             Ok(messages) => {
                 let total_size: usize = messages.iter().map(|m| 4 + m.len()).sum();
                 let mut payload = BytesMut::with_capacity(total_size);
@@ -739,9 +767,9 @@ impl ExtentNodeStore {
             seal_extent_id
         } else {
             match stream_ref.active_extent_id() {
-                Some(eid) => eid,
+                Some(active_extent_id) => active_extent_id,
                 None => {
-                    let end_offset = stream_ref.sealed_end_offset();
+                    let end_offset = stream_ref.last_sealed_end_offset();
                     return Frame::new(
                         VariableHeader::SealAck {
                             request_id: frame.request_id(),
@@ -780,7 +808,7 @@ impl ExtentNodeStore {
                 // This is critical for resolve_committed_offset: when the SM seals all
                 // replicas concurrently and the primary already sealed (extent-full path),
                 // it must report its committed offset instead of returning an error.
-                let end_offset = stream_ref.sealed_end_offset();
+                let end_offset = stream_ref.sealed_end_offset(target_extent_id);
                 info!(
                     "stream {:?} already sealed, returning end_offset={end_offset} idempotently",
                     stream_id
