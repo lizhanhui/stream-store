@@ -122,7 +122,7 @@ async fn main() {
     info!("[5] Appending {} messages to stream...", messages.len());
     for msg in &messages {
         let offset = extent_node_client
-            .append(stream_id, Bytes::from(msg.clone()))
+            .append(stream_id, extent_id, Bytes::from(msg.clone()))
             .await
             .expect("append failed");
         info!("    Appended \"{}\" at offset {}", msg, offset.offset.0);
@@ -137,7 +137,7 @@ async fn main() {
 
     // ── 8. Read all messages back ──
     let read_messages = extent_node_client
-        .read(stream_id, Offset(0), messages.len() as u16)
+        .read(stream_id, extent_id, Offset(0), messages.len() as u16)
         .await
         .expect("read failed");
 
@@ -158,6 +158,7 @@ async fn main() {
         .seal(stream_id, extent_id, None)
         .await
         .expect("seal failed");
+    let new_extent_id = ExtentId(new_extent_id_raw);
     let sealed_count = messages.len() as u32;
 
     info!(
@@ -179,7 +180,7 @@ async fn main() {
     );
     for msg in &new_messages {
         let offset = extent_node_client_2
-            .append(stream_id, Bytes::from(msg.clone()))
+            .append(stream_id, new_extent_id, Bytes::from(msg.clone()))
             .await
             .expect("append after seal failed");
         info!("    Appended \"{}\" at offset {}", msg, offset.offset.0);
@@ -188,7 +189,7 @@ async fn main() {
     // ── 11. Read from new extent ──
     let start_offset = sealed_count as u64; // new extent starts after sealed messages
     let read_new = extent_node_client_2
-        .read(stream_id, Offset(start_offset), new_messages.len() as u16)
+        .read(stream_id, new_extent_id, Offset(start_offset), new_messages.len() as u16)
         .await
         .expect("read after seal failed");
 
@@ -212,7 +213,6 @@ async fn main() {
     info!("    (verified: all messages match)");
 
     // ── 12. Seal the second extent ──
-    let new_extent_id = ExtentId(new_extent_id_raw);
     let (final_extent_id, final_addr) = stream_manager_client
         .seal(stream_id, new_extent_id, None)
         .await

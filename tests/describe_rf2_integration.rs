@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::config::StreamManagerConfig;
-use common::types::{ExtentState, NodeMetrics, Offset};
+use common::types::{ExtentId, ExtentState, NodeMetrics, Offset};
 use tokio::sync::{broadcast, mpsc};
 
 use extent_node::store::{ExtentNodeStore, ForwardRequest};
@@ -196,7 +196,7 @@ async fn describe_stream_rf2_integration() {
     let mut en_client = client::StorageClient::connect(&primary_addr).await.unwrap();
     for i in 0u64..5 {
         en_client
-            .append(stream_id, Bytes::from(format!("rf2-msg-{i}")))
+            .append(stream_id, first_extent_id, Bytes::from(format!("rf2-msg-{i}")))
             .await
             .unwrap();
     }
@@ -243,7 +243,7 @@ async fn describe_stream_rf2_integration() {
         .unwrap();
     for i in 0u64..3 {
         en_client2
-            .append(stream_id, Bytes::from(format!("rf2-seal-msg-{i}")))
+            .append(stream_id, ExtentId(second_extent_id), Bytes::from(format!("rf2-seal-msg-{i}")))
             .await
             .unwrap();
     }

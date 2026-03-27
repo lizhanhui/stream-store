@@ -160,7 +160,7 @@ async fn broadcast_replication_rf2() {
     // Append 5 messages — each should be replicated and ACKed.
     for i in 0u64..5 {
         let r = client
-            .append(StreamId(stream_id), Bytes::from(format!("msg-{i}")))
+            .append(StreamId(stream_id), ExtentId(extent_id), Bytes::from(format!("msg-{i}")))
             .await
             .unwrap();
         assert_eq!(r.offset, Offset(i), "message {i} should get offset {i}");
@@ -172,7 +172,7 @@ async fn broadcast_replication_rf2() {
 
     // Read messages from Primary (byte_pos removed, offset-only API).
     let msgs = client
-        .read(StreamId(stream_id), Offset(0), 10)
+        .read(StreamId(stream_id), ExtentId(1), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs.len(), 5);
@@ -191,7 +191,7 @@ async fn broadcast_replication_rf2() {
     assert_eq!(secondary_max, Offset(5));
 
     let secondary_msgs = secondary_client
-        .read(StreamId(stream_id), Offset(0), 10)
+        .read(StreamId(stream_id), ExtentId(1), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(secondary_msgs.len(), 5);
@@ -236,7 +236,7 @@ async fn broadcast_replication_rf3() {
     // Append 3 messages.
     for i in 0u64..3 {
         let r = client
-            .append(StreamId(stream_id), Bytes::from(format!("rf3-msg-{i}")))
+            .append(StreamId(stream_id), ExtentId(extent_id), Bytes::from(format!("rf3-msg-{i}")))
             .await
             .unwrap();
         assert_eq!(r.offset, Offset(i));
@@ -252,7 +252,7 @@ async fn broadcast_replication_rf3() {
         let max = c.query_offset(StreamId(stream_id)).await.unwrap();
         assert_eq!(max, Offset(3), "{label} should have offset 3");
 
-        let msgs = c.read(StreamId(stream_id), Offset(0), 10).await.unwrap();
+        let msgs = c.read(StreamId(stream_id), ExtentId(1), Offset(0), 10).await.unwrap();
         assert_eq!(msgs.len(), 3, "{label} should have 3 messages");
         for i in 0..3 {
             assert_eq!(
@@ -291,7 +291,7 @@ async fn multi_stream_shared_downstream() {
     // Append to stream A.
     for i in 0u64..3 {
         client
-            .append(StreamId(stream_a), Bytes::from(format!("a-msg-{i}")))
+            .append(StreamId(stream_a), ExtentId(1), Bytes::from(format!("a-msg-{i}")))
             .await
             .unwrap();
     }
@@ -299,21 +299,21 @@ async fn multi_stream_shared_downstream() {
     // Append to stream B.
     for i in 0u64..2 {
         client
-            .append(StreamId(stream_b), Bytes::from(format!("b-msg-{i}")))
+            .append(StreamId(stream_b), ExtentId(1), Bytes::from(format!("b-msg-{i}")))
             .await
             .unwrap();
     }
 
     // Verify stream A.
     let msgs_a = client
-        .read(StreamId(stream_a), Offset(0), 10)
+        .read(StreamId(stream_a), ExtentId(1), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs_a.len(), 3);
 
     // Verify stream B.
     let msgs_b = client
-        .read(StreamId(stream_b), Offset(0), 10)
+        .read(StreamId(stream_b), ExtentId(1), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs_b.len(), 2);
@@ -323,13 +323,13 @@ async fn multi_stream_shared_downstream() {
         .await
         .unwrap();
     let sec_a = sec_client
-        .read(StreamId(stream_a), Offset(0), 10)
+        .read(StreamId(stream_a), ExtentId(1), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(sec_a.len(), 3);
 
     let sec_b = sec_client
-        .read(StreamId(stream_b), Offset(0), 10)
+        .read(StreamId(stream_b), ExtentId(1), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(sec_b.len(), 2);
@@ -353,7 +353,7 @@ async fn broadcast_replication_rf1_immediate_ack() {
     // Append should ACK immediately.
     for i in 0u64..5 {
         let r = client
-            .append(StreamId(stream_id), Bytes::from(format!("rf1-msg-{i}")))
+            .append(StreamId(stream_id), ExtentId(extent_id), Bytes::from(format!("rf1-msg-{i}")))
             .await
             .unwrap();
         assert_eq!(r.offset, Offset(i));

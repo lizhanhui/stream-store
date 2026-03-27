@@ -39,6 +39,7 @@ pub enum VariableHeader {
     Read {
         request_id: u32,
         stream_id: StreamId,
+        extent_id: ExtentId,
         offset: Offset,
         count: u32,
     },
@@ -283,6 +284,7 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::Append { extent_id, .. }
             | VariableHeader::AppendAck { extent_id, .. }
+            | VariableHeader::Read { extent_id, .. }
             | VariableHeader::Seal { extent_id, .. }
             | VariableHeader::SealAck { extent_id, .. }
             | VariableHeader::CreateStreamResp { extent_id, .. }
@@ -375,8 +377,8 @@ impl Frame {
             VariableHeader::Append { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) + offset(8)
             VariableHeader::AppendAck { .. } => 4 + 8 + 4 + 8,
-            // request_id(4) + stream_id(8) + offset(8) + count(4)
-            VariableHeader::Read { .. } => 4 + 8 + 8 + 4,
+            // request_id(4) + stream_id(8) + extent_id(4) + offset(8) + count(4)
+            VariableHeader::Read { .. } => 4 + 8 + 4 + 8 + 4,
             // request_id(4) + stream_id(8) + offset(8) + count(4)
             VariableHeader::ReadResp { .. } => 4 + 8 + 8 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) [+ offset(8) if present]
@@ -502,11 +504,13 @@ impl Frame {
             VariableHeader::Read {
                 request_id,
                 stream_id,
+                extent_id,
                 offset,
                 count,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u32(*count);
             }
@@ -772,12 +776,14 @@ impl Frame {
             Opcode::Read => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
+                let extent_id = ExtentId(body.get_u32());
                 let offset = Offset(body.get_u64());
                 let count = body.get_u32();
                 Ok((
                     VariableHeader::Read {
                         request_id,
                         stream_id,
+                        extent_id,
                         offset,
                         count,
                     },
@@ -1276,6 +1282,7 @@ mod tests {
             VariableHeader::Read {
                 request_id: 5,
                 stream_id: StreamId(10),
+                extent_id: ExtentId(2),
                 offset: Offset(50),
                 count: 20,
             },

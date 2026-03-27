@@ -72,7 +72,7 @@ pub async fn run_downstream_manager(
             VariableHeader::Append {
                 request_id: 0,
                 stream_id: req.stream_id,
-                extent_id: ExtentId(0),
+                extent_id: req.extent_id,
             },
             Some(req.payload),
         );

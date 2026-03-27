@@ -166,7 +166,7 @@ async fn stream_manager_integration() {
 
         for i in 0u64..5 {
             en_client
-                .append(stream_id, Bytes::from(format!("msg-{i}")))
+                .append(stream_id, extent_id, Bytes::from(format!("msg-{i}")))
                 .await
                 .unwrap();
         }
@@ -194,7 +194,7 @@ async fn stream_manager_integration() {
             .unwrap();
         for i in 0u64..10 {
             en_client2
-                .append(stream_id, Bytes::from(format!("msg2-{i}")))
+                .append(stream_id, ExtentId(new_extent_id), Bytes::from(format!("msg2-{i}")))
                 .await
                 .unwrap();
         }

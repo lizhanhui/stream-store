@@ -146,6 +146,7 @@ impl AckQueue {
 #[derive(Debug, Clone)]
 pub struct ForwardRequest {
     pub stream_id: StreamId,
+    pub extent_id: ExtentId,
     pub offset: u64,
     pub payload: Bytes,
     pub downstream_addr: String,
@@ -482,26 +483,8 @@ impl ExtentNodeStore {
             }
         };
 
-        // Resolve the target extent_id: use the frame's extent_id if specified,
-        // otherwise fall back to the current active extent.
-        let target_extent_id = if extent_id.0 != 0 {
-            extent_id
-        } else {
-            match stream_ref.active_extent_id() {
-                Some(active_extent_id) => active_extent_id,
-                None => {
-                    return Some(Frame::error_response(
-                        frame.request_id(),
-                        ErrorCode::ExtentSealed,
-                        "no active extent",
-                        ExtentId(0),
-                    ));
-                }
-            }
-        };
-
         // Write locally. The Extent's append is lock-free (atomic CAS).
-        let append_result = match stream_ref.append(target_extent_id, frame.payload.clone().unwrap_or_default()) {
+        let append_result = match stream_ref.append(extent_id, frame.payload.clone().unwrap_or_default()) {
             Ok(r) => r,
             Err(common::errors::StorageError::ExtentSealed(_)) => {
                 return Some(Frame::error_response(
@@ -615,6 +598,7 @@ impl ExtentNodeStore {
                     for secondary_addr in &ri.replica_addrs {
                         let req = ForwardRequest {
                             stream_id,
+                            extent_id,
                             offset: offset.0,
                             payload: frame.payload.clone().unwrap_or_default(),
                             downstream_addr: secondary_addr.clone(),
@@ -678,17 +662,9 @@ impl ExtentNodeStore {
             }
         };
 
-        // Resolve the target extent_id: use the frame's extent_id if specified,
-        // otherwise fall back to the current active extent.
-        let target_extent_id = if extent_id.0 != 0 {
-            extent_id
-        } else {
-            stream_ref.active_extent_id().unwrap_or(ExtentId(0))
-        };
-
         let count = frame.count();
 
-        match stream_ref.read(target_extent_id, frame.offset(), count) {
+        match stream_ref.read(extent_id, frame.offset(), count) {
             Ok(messages) => {
                 let total_size: usize = messages.iter().map(|m| 4 + m.len()).sum();
                 let mut payload = BytesMut::with_capacity(total_size);
@@ -741,7 +717,7 @@ impl ExtentNodeStore {
 
     fn handle_seal(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
-        let seal_extent_id = frame.extent_id();
+        let extent_id = frame.extent_id();
         // Extract the committed offset from the Seal frame, if present.
         // When SM propagates the primary's committed offset, secondaries use it
         // to accept late forwarded appends up to that offset.
@@ -761,41 +737,17 @@ impl ExtentNodeStore {
             }
         };
 
-        // Resolve the target extent_id: use the frame's extent_id if specified,
-        // otherwise fall back to the current active extent.
-        let target_extent_id = if seal_extent_id.0 != 0 {
-            seal_extent_id
-        } else {
-            match stream_ref.active_extent_id() {
-                Some(active_extent_id) => active_extent_id,
-                None => {
-                    let end_offset = stream_ref.last_sealed_end_offset();
-                    return Frame::new(
-                        VariableHeader::SealAck {
-                            request_id: frame.request_id(),
-                            stream_id,
-                            extent_id: seal_extent_id,
-                            offset: Offset(end_offset),
-                            new_extent_id: None,
-                            primary_addr: None,
-                        },
-                        None,
-                    );
-                }
-            }
-        };
-
-        match stream_ref.seal(target_extent_id, committed_offset) {
+        match stream_ref.seal(extent_id, committed_offset) {
             Some((start_offset, end_offset)) => {
                 info!(
-                    "sealed active extent for stream {:?}, start_offset={start_offset}, end_offset={end_offset}",
-                    stream_id
+                    "sealed extent {:?} for stream {:?}, start_offset={start_offset}, end_offset={end_offset}",
+                    extent_id, stream_id
                 );
                 Frame::new(
                     VariableHeader::SealAck {
                         request_id: frame.request_id(),
                         stream_id,
-                        extent_id: ExtentId(0),
+                        extent_id,
                         offset: Offset(end_offset),
                         new_extent_id: None,
                         primary_addr: None,
@@ -804,20 +756,20 @@ impl ExtentNodeStore {
                 )
             }
             None => {
-                // Already sealed — return the sealed extent's end_offset idempotently.
-                // This is critical for resolve_committed_offset: when the SM seals all
-                // replicas concurrently and the primary already sealed (extent-full path),
-                // it must report its committed offset instead of returning an error.
-                let end_offset = stream_ref.sealed_end_offset(target_extent_id);
+                // Already sealed or extent_id mismatch — return the sealed extent's
+                // end_offset idempotently. This is critical for resolve_committed_offset:
+                // when the SM seals all replicas concurrently and the primary already
+                // sealed (extent-full path), it must report its committed offset.
+                let end_offset = stream_ref.sealed_end_offset(extent_id);
                 info!(
-                    "stream {:?} already sealed, returning end_offset={end_offset} idempotently",
-                    stream_id
+                    "extent {:?} for stream {:?} already sealed, returning end_offset={end_offset} idempotently",
+                    extent_id, stream_id
                 );
                 Frame::new(
                     VariableHeader::SealAck {
                         request_id: frame.request_id(),
                         stream_id,
-                        extent_id: ExtentId(0),
+                        extent_id,
                         offset: Offset(end_offset),
                         new_extent_id: None,
                         primary_addr: None,
@@ -871,7 +823,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: sid,
-                        extent_id: ExtentId(0),
+                        extent_id: ExtentId(1),
                     },
                     Some(Bytes::from_static(b"hello")),
                 ),
@@ -916,7 +868,7 @@ mod tests {
                         VariableHeader::Append {
                             request_id: 10 + i,
                             stream_id: sid,
-                            extent_id: ExtentId(0),
+                            extent_id: ExtentId(1),
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),
@@ -951,6 +903,7 @@ mod tests {
                     VariableHeader::Read {
                         request_id: 30,
                         stream_id: sid,
+                        extent_id: ExtentId(1),
                         offset: Offset(0),
                         count: 3,
                     },
@@ -981,6 +934,7 @@ mod tests {
                     VariableHeader::Read {
                         request_id: 31,
                         stream_id: sid,
+                        extent_id: ExtentId(1),
                         offset: Offset(1),
                         count: 1,
                     },
@@ -1113,7 +1067,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: StreamId(10),
-                        extent_id: ExtentId(0),
+                        extent_id: ExtentId(50),
                     },
                     Some(Bytes::from_static(b"hello standalone")),
                 ),
@@ -1161,7 +1115,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: StreamId(10),
-                        extent_id: ExtentId(0),
+                        extent_id: ExtentId(50),
                     },
                     Some(Bytes::from_static(b"broadcast msg")),
                 ),
@@ -1240,7 +1194,7 @@ mod tests {
                         VariableHeader::Append {
                             request_id: 2,
                             stream_id: StreamId(10),
-                            extent_id: ExtentId(0),
+                            extent_id: ExtentId(50),
                         },
                         Some(Bytes::from_static(b"forwarded msg")),
                     );
@@ -1392,7 +1346,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    extent_id: ExtentId(0),
+                                    extent_id: ExtentId(1),
                                 },
                                 Some(Bytes::from(payload_data.clone())),
                             ),
@@ -1482,6 +1436,7 @@ mod tests {
                         VariableHeader::Read {
                             request_id: 0,
                             stream_id: sid,
+                            extent_id: ExtentId(1),
                             offset: Offset(0),
                             count: 100,
                         },
@@ -1574,7 +1529,7 @@ mod tests {
                             VariableHeader::Append {
                                 request_id: j,
                                 stream_id: sid,
-                                extent_id: ExtentId(0),
+                                extent_id: ExtentId(1),
                             },
                             Some(Bytes::from(format!("pre-{j}"))),
                         ),
@@ -1602,7 +1557,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    extent_id: ExtentId(0),
+                                    extent_id: ExtentId(1),
                                 },
                                 Some(Bytes::from_static(b"write-payload")),
                             ),
@@ -1627,6 +1582,7 @@ mod tests {
                                 VariableHeader::Read {
                                     request_id: 0,
                                     stream_id: sid,
+                                    extent_id: ExtentId(1),
                                     offset: Offset(0),
                                     count: 10,
                                 },
@@ -1726,7 +1682,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    extent_id: ExtentId(0),
+                                    extent_id: ExtentId(1),
                                 },
                                 Some(Bytes::from(format!("t{task_idx}-m{seq}"))),
                             ),
@@ -1828,7 +1784,7 @@ mod tests {
                             VariableHeader::Append {
                                 request_id: 10 + i,
                                 stream_id: StreamId(10),
-                                extent_id: ExtentId(0),
+                                extent_id: ExtentId(50),
                             },
                             Some(Bytes::from(format!("msg{i}"))),
                         );
@@ -1850,7 +1806,7 @@ mod tests {
                     VariableHeader::Seal {
                         request_id: 20,
                         stream_id: StreamId(10),
-                        extent_id: ExtentId(0),
+                        extent_id: ExtentId(50),
                         offset: Some(Offset(4)),
                     },
                     None,
@@ -1872,7 +1828,7 @@ mod tests {
                             VariableHeader::Append {
                                 request_id: 30 + i,
                                 stream_id: StreamId(10),
-                                extent_id: ExtentId(0),
+                                extent_id: ExtentId(50),
                             },
                             Some(Bytes::from(format!("msg{i}"))),
                         );
@@ -1899,7 +1855,7 @@ mod tests {
                         VariableHeader::Append {
                             request_id: 40,
                             stream_id: StreamId(10),
-                            extent_id: ExtentId(0),
+                            extent_id: ExtentId(50),
                         },
                         Some(Bytes::from_static(b"should-fail")),
                     );
@@ -1929,7 +1885,7 @@ mod tests {
                         VariableHeader::Append {
                             request_id: 10 + i,
                             stream_id: sid,
-                            extent_id: ExtentId(0),
+                            extent_id: ExtentId(1),
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),
@@ -1947,7 +1903,7 @@ mod tests {
                     VariableHeader::Seal {
                         request_id: 20,
                         stream_id: sid,
-                        extent_id: ExtentId(0),
+                        extent_id: ExtentId(1),
                         offset: None,
                     },
                     None,
@@ -1966,7 +1922,7 @@ mod tests {
                     VariableHeader::Seal {
                         request_id: 21,
                         stream_id: sid,
-                        extent_id: ExtentId(0),
+                        extent_id: ExtentId(1),
                         offset: None,
                     },
                     None,

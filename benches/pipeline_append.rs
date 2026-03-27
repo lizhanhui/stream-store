@@ -232,7 +232,7 @@ async fn sender_task(
 
     while Instant::now() < deadline {
         let t0 = Instant::now();
-        match en_client.append(stream_id, payload.clone()).await {
+        match en_client.append(stream_id, extent_id, payload.clone()).await {
             Ok(_) => {
                 latencies.push(t0.elapsed());
                 total_appends += 1;

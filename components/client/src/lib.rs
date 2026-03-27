@@ -121,13 +121,14 @@ impl StorageClient {
     pub async fn append(
         &mut self,
         stream_id: StreamId,
+        extent_id: ExtentId,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
         let req = Frame::new(
             VariableHeader::Append {
                 request_id: self.alloc_request_id(),
                 stream_id,
-                extent_id: ExtentId(0),
+                extent_id,
             },
             Some(payload),
         );
@@ -146,6 +147,7 @@ impl StorageClient {
     pub async fn read(
         &mut self,
         stream_id: StreamId,
+        extent_id: ExtentId,
         offset: Offset,
         count: u16,
     ) -> Result<Vec<Bytes>, StorageError> {
@@ -153,6 +155,7 @@ impl StorageClient {
             VariableHeader::Read {
                 request_id: self.alloc_request_id(),
                 stream_id,
+                extent_id,
                 offset,
                 count: count as u32,
             },

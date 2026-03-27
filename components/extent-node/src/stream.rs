@@ -149,17 +149,6 @@ impl Stream {
         0
     }
 
-    /// The end_offset of the most recently sealed extent (any extent).
-    /// Used as fallback when the caller doesn't know the specific extent_id.
-    pub fn last_sealed_end_offset(&self) -> u64 {
-        for extent in self.extents.iter().rev() {
-            if extent.is_sealed() {
-                return extent.start_offset.0 + extent.message_count();
-            }
-        }
-        0
-    }
-
     /// Find an extent by its ID.
     fn find_extent(&self, extent_id: ExtentId) -> Option<&Extent> {
         self.extents.iter().find(|e| e.id == extent_id)
