@@ -217,7 +217,10 @@ async fn downstream_reader(
                         return;
                     }
                 } else {
-                    warn!("unexpected opcode {:?} from secondary {addr}", frame.opcode());
+                    warn!(
+                        "unexpected opcode {:?} from secondary {addr}",
+                        frame.opcode()
+                    );
                 }
             }
             Err(e) => {

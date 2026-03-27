@@ -21,12 +21,8 @@ use extent_node::extent::Extent;
 const ARENA_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB
 
 /// Payload sizes to benchmark.
-const PAYLOAD_SIZES: &[(usize, &str)] = &[
-    (64, "64B"),
-    (256, "256B"),
-    (1024, "1KiB"),
-    (4096, "4KiB"),
-];
+const PAYLOAD_SIZES: &[(usize, &str)] =
+    &[(64, "64B"), (256, "256B"), (1024, "1KiB"), (4096, "4KiB")];
 
 /// Thread counts for concurrent benchmarks.
 const THREAD_COUNTS: &[usize] = &[1, 2, 4, 8];
@@ -63,7 +59,9 @@ fn bench_append_concurrent(c: &mut Criterion) {
             // Throughput: each iteration does `num_threads * ops_per_thread` appends.
             // We set per-element throughput so Criterion reports bytes/sec correctly.
             let ops_per_thread: u64 = 10_000;
-            group.throughput(Throughput::Bytes(size as u64 * num_threads as u64 * ops_per_thread));
+            group.throughput(Throughput::Bytes(
+                size as u64 * num_threads as u64 * ops_per_thread,
+            ));
 
             group.bench_function(BenchmarkId::new("payload", &param), |b| {
                 b.iter_custom(|iters| {

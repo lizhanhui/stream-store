@@ -16,10 +16,15 @@
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
+use client::StorageClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::errors::StorageError;
 use common::types::ExtentId;
+use extent_node::ExtentNode;
+use sqlx::mysql::MySqlPoolOptions;
+use stream_manager::StreamManager;
 use tracing::{info, warn};
+use tracing_subscriber::EnvFilter;
 
 const NUM_CLIENTS: usize = 10;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
@@ -29,7 +34,7 @@ const ARENA_CAPACITY: usize = 4 * 1024 * 1024; // 4 MiB — triggers frequent se
 
 /// Drop all tables for a clean slate (same pattern as client-example).
 async fn clean_database(mysql_url: &str) {
-    let pool = sqlx::mysql::MySqlPoolOptions::new()
+    let pool = MySqlPoolOptions::new()
         .max_connections(1)
         .connect(mysql_url)
         .await
@@ -70,7 +75,7 @@ async fn client_task(
     let mut seal_count: u64 = 0;
 
     // Connect to StreamManager and create stream.
-    let mut stream_manager_client = client::StorageClient::connect(&stream_manager_addr)
+    let mut stream_manager_client = StorageClient::connect(&stream_manager_addr)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: StreamManager connect failed: {e}"));
 
@@ -83,7 +88,7 @@ async fn client_task(
     let mut primary_addr = initial_primary_addr;
 
     // Connect to primary ExtentNode.
-    let mut extent_node_client = client::StorageClient::connect(&primary_addr)
+    let mut extent_node_client = StorageClient::connect(&primary_addr)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: ExtentNode connect failed: {e}"));
 
@@ -106,11 +111,14 @@ async fn client_task(
                 seal_count += 1;
 
                 // Reconnect to the (potentially different) primary.
-                extent_node_client = client::StorageClient::connect(&primary_addr)
-                    .await
-                    .unwrap_or_else(|e| {
-                        panic!("client {client_id}: ExtentNode reconnect after seal failed: {e}")
-                    });
+                extent_node_client =
+                    StorageClient::connect(&primary_addr)
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "client {client_id}: ExtentNode reconnect after seal failed: {e}"
+                            )
+                        });
             }
             Err(e) => {
                 warn!("client {client_id}: unexpected append error: {e}");
@@ -129,9 +137,7 @@ async fn client_task(
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
     // ── 1. Clean database ──
@@ -143,7 +149,7 @@ async fn main() {
     info!("[setup] Database cleaned");
 
     // ── 2. Start StreamManager ──
-    let stream_manager_addr = stream_manager::StreamManager::start(stream_manager_config).await;
+    let stream_manager_addr = StreamManager::start(stream_manager_config).await;
     let stream_manager_addr_socket = stream_manager_addr.addr();
     info!("[setup] StreamManager started on {stream_manager_addr_socket}");
 
@@ -156,7 +162,7 @@ async fn main() {
             extent_arena_capacity: ARENA_CAPACITY,
             ..Default::default()
         };
-        let extent_node = extent_node::ExtentNode::start(extent_node_config).await;
+        let extent_node = ExtentNode::start(extent_node_config).await;
 
         info!("[setup] ExtentNode {i} started on {}", extent_node.addr());
         extent_nodes.push(extent_node);

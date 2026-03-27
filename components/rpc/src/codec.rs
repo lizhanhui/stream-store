@@ -29,9 +29,9 @@ impl Encoder<Frame> for FrameCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::VariableHeader;
     use bytes::Bytes;
     use common::types::{ExtentId, StreamId};
-    use crate::frame::VariableHeader;
 
     #[test]
     fn codec_round_trip() {

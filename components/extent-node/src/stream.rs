@@ -70,11 +70,7 @@ impl Stream {
     /// The server resolves `offset → byte_pos` internally via the index stream,
     /// so callers only need to provide the logical offset. This keeps byte_pos
     /// as an internal implementation detail invisible to clients.
-    pub fn read(
-        &self,
-        offset: Offset,
-        count: u32,
-    ) -> Result<Vec<Bytes>, StorageError> {
+    pub fn read(&self, offset: Offset, count: u32) -> Result<Vec<Bytes>, StorageError> {
         for extent in &self.extents {
             // Skip extents entirely before our read range.
             if extent.next_offset().0 <= offset.0 {
@@ -88,11 +84,9 @@ impl Stream {
 
             // Found the extent — resolve byte_pos via internal index lookup.
             let seq = offset.0 - extent.start_offset.0;
-            let byte_pos = extent
-                .index_lookup(seq)
-                .ok_or_else(|| StorageError::Internal(
-                    format!("index lookup failed for offset {}", offset.0)
-                ))?;
+            let byte_pos = extent.index_lookup(seq).ok_or_else(|| {
+                StorageError::Internal(format!("index lookup failed for offset {}", offset.0))
+            })?;
             return extent.read(byte_pos, count);
         }
 
@@ -142,8 +136,11 @@ impl Stream {
         // Create a new active extent starting at the end offset.
         let new_id = ExtentId(self.next_extent_id);
         self.next_extent_id += 1;
-        self.extents
-            .push(Extent::with_capacity(new_id, Offset(end_offset), self.arena_capacity));
+        self.extents.push(Extent::with_capacity(
+            new_id,
+            Offset(end_offset),
+            self.arena_capacity,
+        ));
 
         Some((start_offset, end_offset))
     }

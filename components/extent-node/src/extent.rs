@@ -692,7 +692,9 @@ mod tests {
         for i in 0..total {
             let seq = all_results[i].offset.0;
             let expected_byte_pos = all_results[i].byte_pos;
-            let actual = ext.index_lookup(seq).expect(&format!("seq {} should be set", seq));
+            let actual = ext
+                .index_lookup(seq)
+                .expect(&format!("seq {} should be set", seq));
             assert_eq!(actual, expected_byte_pos, "index mismatch at seq {}", seq);
         }
     }

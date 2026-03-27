@@ -22,13 +22,16 @@
 use std::time::Duration;
 
 use bytes::Bytes;
+use client::StorageClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::{ExtentId, Offset};
+use sqlx::mysql::MySqlPoolOptions;
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 
 /// Drop all tables for a clean slate (development phase: always start from scratch).
 async fn clean_database(mysql_url: &str) {
-    let pool = sqlx::mysql::MySqlPoolOptions::new()
+    let pool = MySqlPoolOptions::new()
         .max_connections(1)
         .connect(mysql_url)
         .await
@@ -54,9 +57,7 @@ async fn main() {
     // Initialize tracing. Default level is `info` so internal component logs are visible.
     // Override via RUST_LOG env var, e.g. RUST_LOG=debug or RUST_LOG=stream_manager=debug,extent_node=trace.
     tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
-        )
+        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
     info!("=== Stream Store Client Example ===");
@@ -95,10 +96,9 @@ async fn main() {
     info!("    Registration complete");
 
     // ── 5. Create stream with replication_factor=2 ──
-    let mut stream_manager_client =
-        client::StorageClient::connect(&stream_manager_addr.to_string())
-            .await
-            .expect("failed to connect to StreamManager");
+    let mut stream_manager_client = StorageClient::connect(&stream_manager_addr.to_string())
+        .await
+        .expect("failed to connect to StreamManager");
 
     let (stream_id, extent_id, primary_addr) = stream_manager_client
         .create_stream("example-stream", 2)
@@ -111,7 +111,7 @@ async fn main() {
     );
 
     // ── 6. Append records to the primary ExtentNode ──
-    let mut extent_node_client = client::StorageClient::connect(&primary_addr)
+    let mut extent_node_client = StorageClient::connect(&primary_addr)
         .await
         .expect("failed to connect to primary ExtentNode");
 
@@ -125,10 +125,7 @@ async fn main() {
             .append(stream_id, Bytes::from(msg.clone()))
             .await
             .expect("append failed");
-        info!(
-            "    Appended \"{}\" at offset {}",
-            msg, offset.offset.0
-        );
+        info!("    Appended \"{}\" at offset {}", msg, offset.offset.0);
     }
 
     // ── 7. Query max offset ──
@@ -170,7 +167,7 @@ async fn main() {
     info!("    New extent_id={new_extent_id_raw}, primary={new_primary_addr}");
 
     // ── 10. Append more records to the new extent ──
-    let mut extent_node_client_2 = client::StorageClient::connect(&new_primary_addr)
+    let mut extent_node_client_2 = StorageClient::connect(&new_primary_addr)
         .await
         .expect("failed to connect to ExtentNode for new extent");
 
@@ -185,10 +182,7 @@ async fn main() {
             .append(stream_id, Bytes::from(msg.clone()))
             .await
             .expect("append after seal failed");
-        info!(
-            "    Appended \"{}\" at offset {}",
-            msg, offset.offset.0
-        );
+        info!("    Appended \"{}\" at offset {}", msg, offset.offset.0);
     }
 
     // ── 11. Read from new extent ──

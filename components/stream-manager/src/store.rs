@@ -40,8 +40,7 @@ async fn seal_extent_node_static(addr: &str, stream_id: StreamId) -> Result<u64,
         .map_err(|e| StorageError::Internal(format!("Seal to ExtentNode {addr}: {e}")))?;
 
     if resp.opcode() == Opcode::Error {
-        let msg =
-            String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
+        let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
         return Err(StorageError::Internal(format!(
             "ExtentNode {addr} rejected Seal: {msg}"
         )));
@@ -102,8 +101,7 @@ impl StreamManagerStore {
                 vec![]
             };
 
-            let payload =
-                build_register_extent_payload(&addrs_for_node);
+            let payload = build_register_extent_payload(&addrs_for_node);
 
             let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
                 StorageError::Internal(format!(
@@ -504,9 +502,7 @@ impl StreamManagerStore {
                     for addr in secondary_addrs {
                         match seal_extent_node_static(&addr, sid).await {
                             Ok(offset) => {
-                                info!(
-                                    "fire-and-forget seal to secondary {addr}: offset={offset}"
-                                );
+                                info!("fire-and-forget seal to secondary {addr}: offset={offset}");
                             }
                             Err(e) => {
                                 warn!("fire-and-forget seal to secondary {addr} failed: {e}");

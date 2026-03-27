@@ -148,27 +148,28 @@ impl StreamManagerClient {
         heartbeat_interval_ms: u32,
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Result<bool, StorageError> {
-        let stream = tokio::time::timeout(
-            RPC_CONNECT_TIMEOUT,
-            TcpStream::connect(stream_manager_addr),
-        )
-        .await
-        .map_err(|_| StorageError::Internal(format!("connect timeout to {stream_manager_addr}")))?
-        ?;
-        stream.set_nodelay(true).map_err(|e| {
-            StorageError::Internal(format!("set TCP_NODELAY: {e}"))
-        })?;
+        let stream =
+            tokio::time::timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(stream_manager_addr))
+                .await
+                .map_err(|_| {
+                    StorageError::Internal(format!("connect timeout to {stream_manager_addr}"))
+                })??;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| StorageError::Internal(format!("set TCP_NODELAY: {e}")))?;
         let mut framed = Framed::new(stream, FrameCodec);
         info!("connected to StreamManager at {stream_manager_addr}");
 
         // Send Connect.
         let connect_payload =
             build_connect_payload(advertised_addr, advertised_addr, heartbeat_interval_ms);
-        let connect_frame = Frame::new(VariableHeader::Connect { request_id: 0 }, Some(connect_payload));
+        let connect_frame = Frame::new(
+            VariableHeader::Connect { request_id: 0 },
+            Some(connect_payload),
+        );
         tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.send(connect_frame))
             .await
-            .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))?
-            ?;
+            .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))??;
 
         match tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.next()).await {
             Ok(Some(Ok(resp))) if resp.opcode() == Opcode::ConnectAck => {
@@ -257,13 +258,15 @@ impl StreamManagerClient {
 
             let heartbeat_payload = build_heartbeat_payload(advertised_addr, &metrics);
 
-            let hb_frame = Frame::new(VariableHeader::Heartbeat { request_id }, Some(heartbeat_payload));
+            let hb_frame = Frame::new(
+                VariableHeader::Heartbeat { request_id },
+                Some(heartbeat_payload),
+            );
             request_id = request_id.wrapping_add(1);
 
             tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.send(hb_frame))
                 .await
-                .map_err(|_| StorageError::Internal("timeout sending Heartbeat".into()))?
-                ?;
+                .map_err(|_| StorageError::Internal("timeout sending Heartbeat".into()))??;
 
             match tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.next()).await {
                 Ok(Some(Ok(resp))) if resp.opcode() == Opcode::Heartbeat => {

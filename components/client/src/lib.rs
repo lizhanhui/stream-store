@@ -3,9 +3,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bytes::{Buf, Bytes};
 use common::config::{RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
 use common::errors::StorageError;
-use common::types::{
-    ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId,
-};
+use common::types::{ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId};
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
@@ -38,11 +36,10 @@ impl StorageClient {
     pub async fn connect(addr: &str) -> Result<Self, StorageError> {
         let stream = tokio::time::timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
-            .map_err(|_| StorageError::Internal(format!("connect timeout to {addr}")))?
-            ?;
-        stream.set_nodelay(true).map_err(|e| {
-            StorageError::Internal(format!("set TCP_NODELAY: {e}"))
-        })?;
+            .map_err(|_| StorageError::Internal(format!("connect timeout to {addr}")))??;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| StorageError::Internal(format!("set TCP_NODELAY: {e}")))?;
         Ok(Self {
             framed: Framed::new(stream, FrameCodec),
             next_request_id: AtomicU32::new(1),
@@ -75,7 +72,8 @@ impl StorageClient {
     fn check_error(resp: &Frame) -> Result<(), StorageError> {
         if resp.opcode() == Opcode::Error {
             let error_code = ErrorCode::from_u16(resp.error_code());
-            let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
+            let msg =
+                String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
             return Err(match error_code {
                 Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id()),
                 Some(ErrorCode::ExtentFull) => StorageError::ExtentFull(resp.extent_id()),
@@ -111,9 +109,10 @@ impl StorageClient {
         }
 
         // extent_id is in the frame field; payload carries [addr_len:u16][addr]
-        let addr = rpc::payload::parse_string_payload(resp.payload.as_deref().unwrap_or_default()).ok_or_else(|| {
-            StorageError::Internal("invalid CreateStreamResp primary_addr payload".into())
-        })?;
+        let addr = rpc::payload::parse_string_payload(resp.payload.as_deref().unwrap_or_default())
+            .ok_or_else(|| {
+                StorageError::Internal("invalid CreateStreamResp primary_addr payload".into())
+            })?;
 
         Ok((resp.stream_id(), resp.extent_id(), addr))
     }
@@ -294,7 +293,12 @@ impl StorageClient {
         }
 
         // SealAck: new_extent_id and primary_addr from variable header
-        if let VariableHeader::SealAck { new_extent_id, primary_addr, .. } = &resp.variable_header {
+        if let VariableHeader::SealAck {
+            new_extent_id,
+            primary_addr,
+            ..
+        } = &resp.variable_header
+        {
             let new_eid = new_extent_id.map(|e| e.0).unwrap_or(0);
             let addr = primary_addr
                 .as_ref()
@@ -302,7 +306,9 @@ impl StorageClient {
                 .unwrap_or_default();
             Ok((new_eid, addr))
         } else {
-            Err(StorageError::Internal("unexpected variable header in SealAck".into()))
+            Err(StorageError::Internal(
+                "unexpected variable header in SealAck".into(),
+            ))
         }
     }
 

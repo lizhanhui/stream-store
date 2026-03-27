@@ -149,9 +149,7 @@ pub const ROLE_PRIMARY: u8 = 0;
 /// `[num_addrs:u16][addr1_len:u16][addr1]...[addrN_len:u16][addrN]`
 ///
 /// `replica_addrs`: all secondary addresses (for Primary); empty for Secondaries.
-pub fn build_register_extent_payload(
-    replica_addrs: &[&str],
-) -> Bytes {
+pub fn build_register_extent_payload(replica_addrs: &[&str]) -> Bytes {
     let addrs_size: usize = replica_addrs.iter().map(|a| 2 + a.len()).sum();
     let mut buf = BytesMut::with_capacity(2 + addrs_size);
     buf.put_u16(replica_addrs.len() as u16);
@@ -232,9 +230,16 @@ pub fn parse_create_stream_payload(payload: &[u8]) -> Option<(String, u16)> {
 /// ```
 pub fn encode_extent_info_vec(extents: &[ExtentInfo]) -> Bytes {
     // Pre-compute capacity: 4 (num_extents) + per extent: 4+8+8+1+2 = 23 + replica data
-    let extent_size: usize = extents.iter().map(|ext| {
-        23 + ext.replicas.iter().map(|r| 2 + r.node_addr.len() + 1 + 1).sum::<usize>()
-    }).sum();
+    let extent_size: usize = extents
+        .iter()
+        .map(|ext| {
+            23 + ext
+                .replicas
+                .iter()
+                .map(|r| 2 + r.node_addr.len() + 1 + 1)
+                .sum::<usize>()
+        })
+        .sum();
     let mut buf = BytesMut::with_capacity(4 + extent_size);
     buf.put_u32(extents.len() as u32);
     for ext in extents {
@@ -350,13 +355,9 @@ mod tests {
     #[test]
     fn register_extent_payload_primary_with_secondaries() {
         // Primary with 2 secondary addresses (RF=3).
-        let payload =
-            build_register_extent_payload(&["127.0.0.1:9802", "127.0.0.1:9803"]);
+        let payload = build_register_extent_payload(&["127.0.0.1:9802", "127.0.0.1:9803"]);
         let parsed = parse_register_extent_payload(&payload).unwrap();
-        assert_eq!(
-            parsed,
-            vec!["127.0.0.1:9802", "127.0.0.1:9803"]
-        );
+        assert_eq!(parsed, vec!["127.0.0.1:9802", "127.0.0.1:9803"]);
     }
 
     #[test]

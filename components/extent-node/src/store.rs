@@ -377,19 +377,18 @@ impl ExtentNodeStore {
         };
 
         // Parse replica addresses from the payload.
-        let replica_addrs = match parse_register_extent_payload(
-            frame.payload.as_deref().unwrap_or_default(),
-        ) {
-            Some(addrs) => addrs,
-            None => {
-                return Frame::error_response(
-                    frame.request_id(),
-                    ErrorCode::InternalError,
-                    "invalid RegisterExtent payload",
-                    ExtentId(0),
-                );
-            }
-        };
+        let replica_addrs =
+            match parse_register_extent_payload(frame.payload.as_deref().unwrap_or_default()) {
+                Some(addrs) => addrs,
+                None => {
+                    return Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::InternalError,
+                        "invalid RegisterExtent payload",
+                        ExtentId(0),
+                    );
+                }
+            };
 
         // Create the stream locally with the StreamManager-assigned stream_id if it doesn't exist.
         if !self.streams.contains_key(&stream_id) {
@@ -492,17 +491,16 @@ impl ExtentNodeStore {
 
                 // Proactively seal the extent so subsequent appends get
                 // ExtentSealed (fast path) instead of racing on the full arena.
-                let (extent_id, offset) = if let Some(mut stream_mut) =
-                    self.streams.get_mut(&stream_id)
-                {
-                    let eid = stream_mut.active_extent_id();
-                    match stream_mut.seal_active() {
-                        Some((_start_offset, end_offset)) => (eid, end_offset),
-                        None => (eid, 0),
-                    }
-                } else {
-                    (ExtentId(0), 0)
-                };
+                let (extent_id, offset) =
+                    if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+                        let eid = stream_mut.active_extent_id();
+                        match stream_mut.seal_active() {
+                            Some((_start_offset, end_offset)) => (eid, end_offset),
+                            None => (eid, 0),
+                        }
+                    } else {
+                        (ExtentId(0), 0)
+                    };
 
                 // Notify background task to send Seal to Stream Manager,
                 // triggering new extent allocation before clients retry.
@@ -538,8 +536,10 @@ impl ExtentNodeStore {
 
         // Update metrics counters (atomic, no lock needed).
         self.append_count.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written
-            .fetch_add(frame.payload.as_ref().map_or(0, |p| p.len()) as u64, Ordering::Relaxed);
+        self.bytes_written.fetch_add(
+            frame.payload.as_ref().map_or(0, |p| p.len()) as u64,
+            Ordering::Relaxed,
+        );
 
         // Check replica info for this stream (per-stream lock, brief).
         let replica = self.replicas.get(&stream_id).map(|r| r.clone());
@@ -1053,8 +1053,7 @@ mod tests {
         let store = ExtentNodeStore::with_forward_tx(forward_tx);
 
         // Register as Primary with 2 secondaries (RF=3).
-        let payload =
-            build_register_extent_payload(&["127.0.0.1:9802", "127.0.0.1:9803"]);
+        let payload = build_register_extent_payload(&["127.0.0.1:9802", "127.0.0.1:9803"]);
         store
             .handle_frame(
                 Frame::new(

@@ -199,13 +199,11 @@ impl MetadataStore {
             .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
 
         // Step 1: Lock and increment stream_sequence atomically within the transaction.
-        sqlx::query(
-            "SELECT next_extent_id FROM stream_sequence WHERE stream_id = ? FOR UPDATE",
-        )
-        .bind(stream_id.0 as i64)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(|e| StorageError::Internal(format!("lock stream_sequence: {e}")))?;
+        sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ? FOR UPDATE")
+            .bind(stream_id.0 as i64)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(format!("lock stream_sequence: {e}")))?;
 
         sqlx::query(
             "UPDATE stream_sequence SET next_extent_id = next_extent_id + 1 WHERE stream_id = ?",

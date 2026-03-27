@@ -1,8 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    ErrorCode, ExtentId, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, HEADER_LEN,
-    MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    ErrorCode, ExtentId, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset,
+    Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.
@@ -233,8 +233,7 @@ impl Frame {
             | VariableHeader::Seek { request_id, .. }
             | VariableHeader::SeekResp { request_id, .. }
             | VariableHeader::Error { request_id, .. } => *request_id,
-            VariableHeader::Watermark { .. }
-            | VariableHeader::StreamManagerMembershipChange => 0,
+            VariableHeader::Watermark { .. } | VariableHeader::StreamManagerMembershipChange => 0,
         }
     }
 
@@ -326,9 +325,7 @@ impl Frame {
                     0
                 }
             }
-            VariableHeader::SealAck {
-                new_extent_id, ..
-            } => {
+            VariableHeader::SealAck { new_extent_id, .. } => {
                 if new_extent_id.is_some() {
                     FLAG_NEW_EXTENT_PRESENT
                 } else {
@@ -385,11 +382,7 @@ impl Frame {
             // request_id(4) + stream_id(8) + extent_id(4) [+ offset(8) if present]
             VariableHeader::Seal { offset, .. } => {
                 let base = 4 + 8 + 4;
-                if offset.is_some() {
-                    base + 8
-                } else {
-                    base
-                }
+                if offset.is_some() { base + 8 } else { base }
             }
             // request_id(4) + stream_id(8) + extent_id(4) + offset(8)
             // [+ new_extent_id(4) + addr_len(2) + addr_bytes if FLAG_NEW_EXTENT_PRESENT]
@@ -727,10 +720,15 @@ impl Frame {
         // Read the remaining bytes into a temporary buffer for parsing.
         let mut body_buf = src.split_to(remaining_len);
 
-        let (variable_header, payload) = Self::decode_variable_header(opcode, flags, &mut body_buf)?;
+        let (variable_header, payload) =
+            Self::decode_variable_header(opcode, flags, &mut body_buf)?;
 
         Ok(Some(Frame {
-            header: FixedHeader { opcode, version, flags },
+            header: FixedHeader {
+                opcode,
+                version,
+                flags,
+            },
             variable_header,
             payload,
         }))
@@ -1212,10 +1210,7 @@ mod tests {
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.opcode(), Opcode::Heartbeat);
         assert_eq!(decoded.request_id(), 7);
-        assert_eq!(
-            decoded.payload,
-            Some(Bytes::from_static(b"metrics-data"))
-        );
+        assert_eq!(decoded.payload, Some(Bytes::from_static(b"metrics-data")));
     }
 
     #[test]
@@ -1352,10 +1347,7 @@ mod tests {
         assert_eq!(decoded.request_id(), 42);
         assert_eq!(decoded.error_code(), ErrorCode::ExtentFull as u16);
         assert_eq!(decoded.extent_id(), ExtentId(7));
-        assert_eq!(
-            decoded.payload,
-            Some(Bytes::from_static(b"arena full"))
-        );
+        assert_eq!(decoded.payload, Some(Bytes::from_static(b"arena full")));
     }
 
     #[test]
@@ -1498,10 +1490,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*new_extent_id, Some(ExtentId(6)));
-                assert_eq!(
-                    primary_addr.as_ref().unwrap(),
-                    &Bytes::from_static(addr)
-                );
+                assert_eq!(primary_addr.as_ref().unwrap(), &Bytes::from_static(addr));
             }
             _ => panic!("expected SealAck"),
         }
