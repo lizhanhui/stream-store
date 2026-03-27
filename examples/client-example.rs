@@ -59,7 +59,7 @@ async fn main() {
         )
         .init();
 
-    info!("=== MQTT Storage Client Example ===");
+    info!("=== Stream Store Client Example ===");
 
     // ── 1. Clean database ──
     let stream_manager_config = StreamManagerConfig {
@@ -116,7 +116,7 @@ async fn main() {
         .expect("failed to connect to primary ExtentNode");
 
     let messages: Vec<String> = (0..5)
-        .map(|i| format!("Hello, MQTT Storage #{i}"))
+        .map(|i| format!("Hello, Stream Store #{i}"))
         .collect();
 
     info!("[5] Appending {} messages to stream...", messages.len());

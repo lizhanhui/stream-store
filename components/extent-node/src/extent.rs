@@ -102,7 +102,7 @@ pub struct AppendResult {
 ///    spins on `committed_seq` until it equals their sequence number, then CAS-advances
 ///    it to seq+1. This ensures `committed_seq` advances in-order. The spin is brief
 ///    because it only waits for the immediately preceding writer to finish its memcpy
-///    (nanoseconds for typical MQTT messages <1 KB). This is the same pattern used by
+///    (nanoseconds for typical messages <1 KB). This is the same pattern used by
 ///    the Linux kernel's io_uring SQ and the LMAX Disruptor.
 ///
 /// 5. **Reads**: Readers observe `committed_bytes` (Acquire load) as the visibility

@@ -56,7 +56,6 @@ If future requirements demanded high-concurrency writes to a single extent (not 
 This is the same technique used by:
 - **LMAX Disruptor**: single-thread event publisher, multi-thread consumers
 - **Linux io_uring**: kernel-side SQ processing is single-threaded
-- **RocketMQ**: `GroupCommitService` batches fsync across multiple producer threads
 
 Given the current architecture (one primary writer per extent, horizontal scaling via streams), this optimization is unnecessary.
 

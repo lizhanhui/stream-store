@@ -2,7 +2,7 @@
 
 ## Motivation
 
-Replace RocketMQ broker's cloud block-based disk storage with object storage (S3-compatible) to reduce cost. Object storage has low IOPS and higher latency, so a replicated in-memory layer is required to serve hot data. The WAS (Windows Azure Storage) stream employs seal-and-new mechanism to achieve consistency,  availability and partition (CAP) at the same time through separation of concern.
+Replace cloud block-based disk storage with object storage (S3-compatible) to reduce cost. Object storage has low IOPS and higher latency, so a replicated in-memory layer is required to serve hot data. The WAS (Windows Azure Storage) stream employs seal-and-new mechanism to achieve consistency,  availability and partition (CAP) at the same time through separation of concern.
 
 ## Core Abstractions
 
@@ -57,31 +57,30 @@ This avoids an error storm where every concurrent client independently discovers
 
 ## Architecture
 
-The storage layer runs as a **dedicated Rust process** (`stream-store`), separate from the Java MQTT proxy. This separation provides:
+The storage layer runs as a **dedicated Rust process** (`stream-store`). This layer provides:
 
-- **No GC pauses**: The storage service holds gigabytes of in-memory message data. Java GC stop-the-world events at this scale would stall replication ACKs and cause false failure detections. Rust gives deterministic deallocation.
-- **Zero-copy I/O**: Broadcast replication forwards bytes from Primary to all Secondaries. Rust's `bytes::Bytes` (reference-counted buffers) enables zero-copy forwarding without the copy overhead of Java ByteBuf conversions.
-- **Precise memory control**: The service has a hard memory budget. Rust enforces it precisely. Java's RSS is opaque due to JVM overhead, metaspace, and GC headroom.
-- **Enforced boundary**: A process boundary prevents accidental coupling of MQTT protocol logic with storage internals.
+- **No GC pauses**: The storage service holds gigabytes of in-memory message data. GC stop-the-world events at this scale would stall replication ACKs and cause false failure detections. Rust gives deterministic deallocation.
+- **Zero-copy I/O**: Broadcast replication forwards bytes from Primary to all Secondaries. Rust's `bytes::Bytes` (reference-counted buffers) enables zero-copy forwarding without the copy overhead.
+- **Precise memory control**: The service has a hard memory budget. Rust enforces it precisely.
+- **Enforced boundary**: A process boundary prevents accidental coupling of protocol logic with storage internals.
 
 ### Process Architecture
 
 ```
-  Java Process (MQTT Proxy)              Rust Process (Storage Service)
+  Client Application                 Rust Process (Storage Service)
  ┌─────────────────────────┐            ┌──────────────────────────────┐
- │  mqtt-cs                │            │  stream-store (Rust/Tokio)   │
- │  (Connection Server)    │            │                              │
- │  - MQTT protocol        │            │  Stream Manager              │
- │  - Session management   │            │  - Extent lifecycle          │
- │  - Subscription match   │  Custom    │  - Seal-and-new              │
+ │                         │            │  stream-store (Rust/Tokio)   │
+ │                         │            │                              │
+ │                         │            │  Stream Manager              │
+ │                         │            │  - Extent lifecycle          │
+ │                         │  Custom    │  - Seal-and-new              │
  │                         │  TCP       │  - Metadata (MySQL client)   │
- │  mqtt-ds                │ ◄────────► │                              │
- │  (Data Server)          │  Protocol  │  Extent Nodes                │
- │  - StreamStoreClient    │            │  - In-memory extents         │
- │    (implements          │            │  - Broadcast replication     │
- │     LmqQueueStore)      │            │  - S3 flush                  │
- │  - Pop state (MySQL)    │            │  - Read cache                │
- │  - Notify/routing       │            │                              │
+ │                         │ ◄────────► │                              │
+ │  - StreamStoreClient    │  Protocol  │  Extent Nodes                │
+ │                         │            │  - Broadcast replication     │
+ │                         │            │  - S3 flush                  │
+ │                         │            │  - Read cache                │
+ │                         │            │                              │
  └─────────────────────────┘            └──────────────────────────────┘
                                                      │
                                                ┌─────▼─────┐
@@ -147,7 +146,7 @@ RF=3 (optional, quorum = Primary + 1 Secondary):
         Quorum ACK: Primary + 1 of 2 secondaries (RF/2 = 1).
 ```
 
-All Extent Nodes, S3 Flusher, and S3 Reader run as Extent Node processes. Stream Manager nodes run as separate Stream Manager processes. The Java MQTT proxy communicates with the Rust storage service via a custom TCP protocol.
+All Extent Nodes, S3 Flusher, and S3 Reader run as Extent Node processes. Stream Manager nodes run as separate Stream Manager processes. Client applications communicate with the Rust storage service via a custom TCP protocol.
 
 **Stream Manager Clustering**: Stream Manager is peer-based -- all Stream Manager nodes are equivalent and can handle any request. MySQL provides transactional metadata coordination (the database is the single source of truth), so no Stream Manager-level leader election or consensus is needed. Stream Manager nodes register themselves in the database and broadcast membership changes to Extent Nodes and clients via `STREAM_MANAGER_MEMBERSHIP_CHANGE` frames.
 
@@ -155,7 +154,6 @@ All Extent Nodes, S3 Flusher, and S3 Reader run as Extent Node processes. Stream
 
 | Component | Language | Role |
 |-----------|----------|------|
-| **MQTT Proxy (mqtt-cs, mqtt-ds)** | Java | Protocol handling, session state, subscription matching, message routing. `StreamStoreClient` implements `LmqQueueStore` as a TCP client to the Rust service. |
 | **Storage Service (stream-store)** | Rust | Dedicated process. Extent nodes, stream manager, broadcast replication, S3 flush/read. |
 | **Stream Manager** | Rust | Metadata coordinator within storage service. Manages stream->extent mappings, seal/allocate, offset translation. MySQL client for metadata persistence. |
 | **Extent Node** | Rust | Holds in-memory extent replicas. Participates in broadcast replication (Primary broadcasts, Secondaries ACK). |
@@ -164,7 +162,7 @@ All Extent Nodes, S3 Flusher, and S3 Reader run as Extent Node processes. Stream
 
 ### Custom TCP Wire Protocol
 
-MQTT-style **Fixed Header + Variable Header + Payload** format for minimal overhead and zero-copy forwarding. Each opcode defines its own variable header layout; only fields relevant to that operation are on the wire. The payload section carries arbitrary application data (e.g., message bytes for APPEND) and is always length-prefixed.
+**Fixed Header + Variable Header + Payload** format for minimal overhead and zero-copy forwarding. Each opcode defines its own variable header layout; only fields relevant to that operation are on the wire. The payload section carries arbitrary application data (e.g., message bytes for APPEND) and is always length-prefixed.
 
 #### Frame Format
 
@@ -340,7 +338,7 @@ Variable Header:
   [request_id         : u32]
 Payload:
   [name_len           : u16]
-  [stream_name        : bytes]  -- stream name (maps to MQTT queue name)
+  [stream_name        : bytes]  -- human-readable stream name
   [replication_factor : u16]
 ```
 
@@ -644,10 +642,9 @@ Payload:
 
 #### Connection Model
 
-- Java proxy maintains a **connection pool** to the storage service (one pool per Extent Node).
+- Clients maintain a **connection pool** to the storage service (one pool per Extent Node).
 - Connections are multiplexed: multiple in-flight requests per connection, correlated by Request ID.
 - Tokio on the Rust side handles async I/O with `tokio::net::TcpListener`.
-- Java side uses Netty for async TCP client (already a dependency via RocketMQ client).
 
 ### Rust Crate Structure (Cargo Workspace)
 
@@ -722,11 +719,11 @@ src/bin/stream-manager.rs ──> stream-manager (lib) ──┬──> server �
 | **common** | lib | Shared types (StreamId, ExtentId, Opcode, NodeState, ExtentState), config structs, error types. Zero runtime dependencies. |
 | **rpc** | lib | Custom TCP wire protocol: frame codec, payload helpers. |
 | **server** | lib | Server infrastructure: RequestHandler trait with deferred response support, connection accept loop. |
-| **client** | lib | Client for talking to Extent Node and Stream Manager: append/read messages, seal/create streams. Used by Extent Node (keepalive heartbeat to Stream Manager) and Stream Manager (seal commands to Extent Nodes). Also the protocol the Java proxy re-implements via Netty. |
+| **client** | lib | Client for talking to Extent Node and Stream Manager: append/read messages, seal/create streams. Used by Extent Node (keepalive heartbeat to Stream Manager) and Stream Manager (seal commands to Extent Nodes). |
 | **extent-node** | lib | Extent Node logic. Holds in-memory extent replicas, participates in broadcast replication (Primary broadcasts to secondaries, receives watermark ACKs, computes quorum), serves APPEND/READ/SEAL requests. Uses client to heartbeat to Stream Manager. Built into a binary via `src/bin/extent-node.rs`. |
 | **stream-manager** | lib | Stream Manager logic. Manages stream->extent mappings, orchestrates seal-and-new, allocates extents across Extent Nodes, persists metadata to MySQL. Uses client to issue seal/allocate to Extent Nodes. Built into a binary via `src/bin/stream-manager.rs`. |
 
-The `client` crate is used internally by both process types: Extent Node uses it to send keepalive heartbeats to Stream Manager, and Stream Manager uses it to issue seal/allocate commands to Extent Nodes. It is also the protocol interface for external consumers -- the Java MQTT proxy's `StreamStoreClient` re-implements the same wire format via Netty.
+The `client` crate is used internally by both process types: Extent Node uses it to send keepalive heartbeats to Stream Manager, and Stream Manager uses it to issue seal/allocate commands to Extent Nodes. It is also the protocol interface for external consumers -- any client can re-implement the same wire format in their language of choice.
 
 ### Key Rust Dependencies
 
@@ -844,7 +841,7 @@ Detailed steps:
 
 #### Commit Cursor: Spin-Wait CAS (Approach A)
 
-The commit advancement step is the only point where writers interact with each other. The spin waits for the **immediately preceding writer** to finish its memcpy. For typical MQTT messages (<1 KB), memcpy completes in tens of nanoseconds, so the spin is negligible.
+The commit advancement step is the only point where writers interact with each other. The spin waits for the **immediately preceding writer** to finish its memcpy. For typical messages (<1 KB), memcpy completes in tens of nanoseconds, so the spin is negligible.
 
 This is the same technique used by:
 - Linux kernel's io_uring submission queue
@@ -935,18 +932,18 @@ Index entries are ~32 bytes. Data stream writes go through broadcast replication
 
 ### Atomicity
 
-- `putMessage` future completes after data stream write ACK.
+- The data stream write future completes after data stream write ACK.
 - Index writes are async. A background **Reconciler** ensures all expected index entries exist.
-- Eventual consistency is acceptable per MQTT QoS semantics (QoS 0: at-most-once; QoS 1: client retransmit covers gaps; QoS 2: protocol-level dedup).
+- Eventual consistency is acceptable for the index stream (the data stream itself is fully consistent via quorum ACK).
 
 ### Read Path
 
 ```
-pullMessage(queue, group, offset, count)
+read(stream, offset, count)
   -> Read Index Stream entries [offset..offset+count]
   -> Batch-resolve data stream references
   -> Read message bodies from Data Stream (memory or S3)
-  -> Return PullResult
+  -> Return batch of messages
 ```
 
 ## S3 Flush
@@ -964,7 +961,7 @@ pullMessage(queue, group, offset, count)
 
 ```
 s3://{bucket}/{namespace}/data/{stream_id}/{extent_id}.dat
-s3://{bucket}/{namespace}/index/{queue_name}/{extent_id}.idx
+s3://{bucket}/{namespace}/index/{stream_id}/{extent_id}.idx
 ```
 
 Each extent object is self-contained:
@@ -996,14 +993,14 @@ Footer index enables efficient random reads within an extent without downloading
 
 ## Stream Manager Metadata
 
-Stored in MySQL. Rust side uses sqlx (async MySQL client) and Refinery (schema migrations). Java side uses JDBC/HikariCP for consumer offset management.
+Stored in MySQL. Uses sqlx (async MySQL client) and Refinery (schema migrations).
 
 ### Tables
 
 ```sql
 CREATE TABLE stream (
     stream_id    BIGINT PRIMARY KEY AUTO_INCREMENT,
-    stream_name  VARCHAR(512) NOT NULL UNIQUE,  -- maps to MQTT queue name
+    stream_name  VARCHAR(512) NOT NULL UNIQUE,  -- human-readable name
     stream_type  VARCHAR(32) NOT NULL DEFAULT 'DATA',  -- 'DATA' or 'INDEX'
     replication_factor SMALLINT NOT NULL DEFAULT 2, -- per-stream RF (1-N)
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -1044,105 +1041,22 @@ CREATE TABLE node (
 );
 
 CREATE TABLE stream_offset (
-    consumer_group VARCHAR(512) NOT NULL,
+    subscription_id VARCHAR(512) NOT NULL,
     stream_id      BIGINT NOT NULL,
     committed_offset BIGINT NOT NULL DEFAULT 0,
     updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (consumer_group, stream_id)
+    PRIMARY KEY (subscription_id, stream_id)
 );
 ```
 
 ### Offset Translation
 
 ```
-pullMessage(queue, group, offset=1050, count=10)
-  -> Stream Manager lookup: stream for queue
+read(stream, offset=1050, count=10)
   -> Find extent where start_offset <= 1050 < end_offset
   -> local_offset = 1050 - start_offset
   -> Read from extent (memory or S3)
 ```
-
-## Integration with rocketmq-mqtt
-
-### Interface Boundary
-
-The `LmqQueueStore` interface (12 methods) is the clean integration boundary. `mqtt-cs` (Connection Server) depends only on this interface and is entirely unaffected.
-
-### New Java Module: mqtt-store (Thin Client)
-
-The Java-side `mqtt-store` module is a **thin client** -- it implements `LmqQueueStore` by translating method calls into custom TCP protocol requests to the Rust storage service. No storage logic lives in Java.
-
-```
-mqtt-store/
-  src/main/java/org/apache/rocketmq/mqtt/store/
-    StreamStoreClient.java         -- implements LmqQueueStore (TCP client)
-    StreamOffsetStore.java         -- implements LmqOffsetStore (TCP client)
-    StreamQueueCache.java          -- implements QueueCache (local cache + TCP)
-    client/
-      StorageConnection.java       -- Single TCP connection with multiplexing
-      StorageConnectionPool.java   -- Connection pool to storage service nodes
-      FrameEncoder.java            -- Encode request frames (Netty ChannelHandler)
-      FrameDecoder.java            -- Decode response frames (Netty ChannelHandler)
-      RequestFuture.java           -- CompletableFuture correlated by Request ID
-    config/
-      StorageClientConfig.java     -- Storage service endpoints, pool size, timeouts
-```
-
-### Method Mapping
-
-| LmqQueueStore Method | StreamStoreClient (Java) | Storage Service (Rust) |
-|---|---|---|
-| `putMessage(queues, msg)` | Encode APPEND frame with message body + index target stream IDs. Send to Primary Extent Node. | Primary receives APPEND, assigns seq, broadcasts to all secondaries in parallel. After quorum ACK confirms majority committed, ACKs client. Async-dispatch index entries. Return APPEND_ACK with offset. |
-| `pullMessage(queue, group, offset, count)` | Encode READ frame with stream_id, offset, count. | Read index entries. Batch-resolve data refs. Return READ_RESP with message bodies (from memory or S3). |
-| `popMessage(group, queue, count)` | Same as pull, but Java side manages pop-state in MySQL (receipt_handle -> offset + invisible_until). | Storage service is unaware of pop semantics. It just serves reads. |
-| `popAck(topic, group, handle)` | Java-side only: delete pop reservation in MySQL, advance committed offset. | Not involved. |
-| `changeInvisibleTime(...)` | Java-side only: update invisible_until in MySQL. | Not involved. |
-| `queryMaxOffset(queue)` | Encode QUERY_OFFSET frame. | Return current max offset from Stream Manager metadata. |
-| `getLag(group, queue)` | maxOffset (from storage) - committedOffset (from MySQL). | Serves max offset query. |
-| `getReadableBrokers()` | Returns storage service node addresses from config/service discovery. | N/A. |
-
-### Configuration
-
-```properties
-# storage.conf (Java side)
-storage.backend=stream          # 'rocketmq' for legacy, 'stream' for new
-storage.service.endpoints=10.0.0.1:9801,10.0.0.2:9801,10.0.0.3:9801
-storage.client.poolSize=8       # connections per endpoint
-storage.client.timeout=3000     # request timeout ms
-```
-
-```toml
-# stream-store.toml (Rust side)
-[server]
-listen_addr = "0.0.0.0:9801"
-
-[s3]
-endpoint = "https://s3.amazonaws.com"
-bucket = "mqtt-data"
-region = "us-east-1"
-
-[extent]
-max_size = 67_108_864           # 64 MB (matches extent_arena_capacity)
-max_age_secs = 30               # 30 seconds
-arena_capacity = 67_108_864     # 64 MiB default; tune per workload
-
-[replication]
-factor = 2                      # replica count (default 2, supports 1-N)
-
-[cache]
-read_cache_size = 1_073_741_824 # 1 GB local read cache
-max_memory = 34_359_738_368     # 32 GB total memory budget for extents
-
-[metadata]
-mysql_url = "mysql://user:pass@db-host:3306/mqtt_storage"
-```
-
-### Migration Strategy
-
-1. **Phase 1**: Build `mqtt-store` module. Integration tests against embedded S3 (e.g., MinIO testcontainer).
-2. **Phase 2**: `storage.backend` config switch. Spring wiring selects `LmqQueueStoreManager` or `StreamStoreManager`.
-3. **Phase 3**: Shadow/dual-write mode. Write to both backends, read from new. Compare results.
-4. **Phase 4**: Cutover. Read and write from new backend only.
 
 ## Implementation Phases
 
@@ -1179,32 +1093,17 @@ mysql_url = "mysql://user:pass@db-host:3306/mqtt_storage"
 - Reconciler: background index consistency checker
 - Batch read path: index entries -> data stream lookups
 
-### Phase 5: Java Client Module (mqtt-store)
-- Netty-based TCP client: FrameEncoder/FrameDecoder/ConnectionPool
-- StreamStoreClient implementing LmqQueueStore
-- StreamOffsetStore implementing LmqOffsetStore
-- StreamQueueCache implementing QueueCache
-- Pop-mode state management in MySQL (Java-side only)
-- Spring configuration for backend selection
-
-### Phase 6: Integration and Migration
-- End-to-end integration tests (MQTT publish -> storage -> MQTT subscribe)
-- Dual-write mode for production migration
-- Performance benchmarks (throughput, latency, memory usage)
-- Production cutover plan
-
 ## Key Design Decisions
 
 | Decision | Choice | Rationale |
 |---|---|---|
 | Process model | Dedicated Rust process | No GC pauses, zero-copy I/O, precise memory control, enforced architectural boundary |
 | Implementation language | Rust (Tokio async runtime) | Deterministic memory, zero-cost abstractions, mature async ecosystem (aws-sdk-s3, sqlx, moka) |
-| RPC protocol | Custom TCP with fixed header + variable header + payload (MQTT-style) | Minimal overhead, zero-copy broadcast forwarding, per-opcode wire layout, full control over batching and framing |
+| RPC protocol | Custom TCP with fixed header + variable header + payload | Minimal overhead, zero-copy broadcast forwarding, per-opcode wire layout, full control over batching and framing |
 | Object storage API | S3-compatible | Widest ecosystem (AWS, MinIO, Ceph, Alibaba OSS S3-compat) |
 | Replication protocol | Broadcast replication with quorum ACK | O(1) hop latency (vs O(N) for chain), tolerates minority failures, simple parallel fan-out |
 | Durability before S3 | Pure in-memory N-way (default 2-way) | Low latency; single-node failure tolerated; S3 flush bounds risk |
 | Extent concurrency | Lock-free arena with atomic cursors (spin-wait commit), external index for O(1) reads | No mutex on append/read hot path; parallel memcpy for concurrent writers; byte-position-based random access |
 | Multi-dispatch | Shared data + index streams | Storage efficient; avoids body duplication across subscribers |
-| Stream Manager metadata store | MySQL (sqlx on Rust, JDBC on Java) | Reuses existing infra; metadata ops are infrequent (per-extent, not per-message) |
+| Stream Manager metadata store | MySQL (sqlx) | Reuses existing infra; metadata ops are infrequent (per-extent, not per-message) |
 | Consistency model | Seal-and-new (WAS) | Separates consistency (sealed extent) from availability (new extent) |
-| Integration boundary | LmqQueueStore interface | mqtt-cs unchanged; Java mqtt-store is a thin TCP client to Rust service |
