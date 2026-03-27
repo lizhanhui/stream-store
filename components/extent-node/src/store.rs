@@ -503,7 +503,49 @@ impl ExtentNodeStore {
                         (ExtentId(0), 0)
                     };
 
-                // Notify background task to send Seal to Stream Manager,
+                if is_forwarded {
+                    // Secondary: the sealed extent created a new active extent.
+                    // Retry the append — it will land on the new extent.
+                    let stream_ref = match self.streams.get(&stream_id) {
+                        Some(s) => s,
+                        None => {
+                            return Some(Frame::error_response(
+                                frame.request_id(),
+                                ErrorCode::UnknownStream,
+                                &format!("stream {:?} not found on retry", stream_id),
+                                ExtentId(0),
+                            ));
+                        }
+                    };
+                    match stream_ref.append(frame.payload.clone().unwrap_or_default()) {
+                        Ok(retry_result) => {
+                            drop(stream_ref);
+                            let offset = retry_result.offset;
+                            self.append_count.fetch_add(1, Ordering::Relaxed);
+                            self.bytes_written.fetch_add(
+                                frame.payload.as_ref().map_or(0, |p| p.len()) as u64,
+                                Ordering::Relaxed,
+                            );
+                            return Some(Frame::new(
+                                VariableHeader::Watermark {
+                                    stream_id,
+                                    offset,
+                                },
+                                None,
+                            ));
+                        }
+                        Err(e) => {
+                            return Some(Frame::error_response(
+                                frame.request_id(),
+                                ErrorCode::InternalError,
+                                &format!("retry after seal failed: {e}"),
+                                ExtentId(0),
+                            ));
+                        }
+                    }
+                }
+
+                // Primary: notify background task to send Seal to Stream Manager,
                 // triggering new extent allocation before clients retry.
                 if let Some(ref tx) = self.seal_tx {
                     let _ = tx.try_send(SealRequest {
