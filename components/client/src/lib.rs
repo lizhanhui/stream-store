@@ -40,6 +40,9 @@ impl StorageClient {
             .await
             .map_err(|_| StorageError::Internal(format!("connect timeout to {addr}")))?
             ?;
+        stream.set_nodelay(true).map_err(|e| {
+            StorageError::Internal(format!("set TCP_NODELAY: {e}"))
+        })?;
         Ok(Self {
             framed: Framed::new(stream, FrameCodec),
             next_request_id: AtomicU32::new(1),

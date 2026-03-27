@@ -155,6 +155,9 @@ impl StreamManagerClient {
         .await
         .map_err(|_| StorageError::Internal(format!("connect timeout to {stream_manager_addr}")))?
         ?;
+        stream.set_nodelay(true).map_err(|e| {
+            StorageError::Internal(format!("set TCP_NODELAY: {e}"))
+        })?;
         let mut framed = Framed::new(stream, FrameCodec);
         info!("connected to StreamManager at {stream_manager_addr}");
 

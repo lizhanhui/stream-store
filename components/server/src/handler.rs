@@ -83,6 +83,8 @@ impl<H: RequestHandler> Server<H> {
 
                 match accept_result {
                     Some(Ok((stream, _addr))) => {
+                        // Disable Nagle's algorithm for low-latency RPC.
+                        let _ = stream.set_nodelay(true);
                         let handler = Arc::clone(&self.handler);
                         let deferred = self.deferred;
                         tokio::spawn(async move {

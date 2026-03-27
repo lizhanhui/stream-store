@@ -148,6 +148,7 @@ async fn main() {
     info!("[setup] StreamManager started on {stream_manager_addr_socket}");
 
     // ── 3. Start 3 ExtentNodes ──
+    let mut extent_nodes = vec![];
     for i in 0..3 {
         let extent_node_config = ExtentNodeConfig {
             listen_addr: "127.0.0.1:0".into(),
@@ -155,11 +156,10 @@ async fn main() {
             extent_arena_capacity: ARENA_CAPACITY,
             ..Default::default()
         };
-        let extent_node_addr = extent_node::ExtentNode::start(extent_node_config).await;
-        info!(
-            "[setup] ExtentNode {i} started on {}",
-            extent_node_addr.addr()
-        );
+        let extent_node = extent_node::ExtentNode::start(extent_node_config).await;
+
+        info!("[setup] ExtentNode {i} started on {}", extent_node.addr());
+        extent_nodes.push(extent_node);
     }
 
     // ── 4. Wait for heartbeat registration ──
@@ -198,6 +198,10 @@ async fn main() {
     }
 
     let elapsed = start.elapsed().as_secs_f64();
+
+    for extent_node in extent_nodes.into_iter() {
+        extent_node.stop().await;
+    }
 
     // ── 7. Report ──
     info!("=== Benchmark Results ===");

@@ -97,6 +97,9 @@ async fn create_downstream_connection(
     watermark_tx: mpsc::Sender<WatermarkEvent>,
 ) -> Result<FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>, std::io::Error> {
     let stream = TcpStream::connect(addr).await?;
+    // Disable Nagle's algorithm: Watermark responses are small frames (~20 bytes)
+    // that would otherwise be delayed up to 40ms by Nagle buffering.
+    stream.set_nodelay(true)?;
     let (read_half, write_half) = stream.into_split();
 
     let framed_write = FramedWrite::new(write_half, FrameCodec);
