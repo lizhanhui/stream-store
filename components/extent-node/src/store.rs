@@ -501,7 +501,7 @@ impl ExtentNodeStore {
                 let (extent_id, offset) =
                     if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
                         let eid = stream_mut.active_extent_id().unwrap_or(ExtentId(0));
-                        match stream_mut.seal_active(None) {
+                        match stream_mut.seal(eid, None) {
                             Some((_start_offset, end_offset)) => (eid, end_offset),
                             None => (eid, 0),
                         }
@@ -733,16 +733,15 @@ impl ExtentNodeStore {
             }
         };
 
-        // If the seal request targets a specific extent and the active extent is
-        // different (newer), treat as already-sealed — don't seal the new extent.
-        if seal_extent_id.0 != 0 {
-            if let Some(active_eid) = stream_ref.active_extent_id() {
-                if active_eid != seal_extent_id {
+        // Resolve the target extent_id: use the frame's extent_id if specified,
+        // otherwise fall back to the current active extent.
+        let target_extent_id = if seal_extent_id.0 != 0 {
+            seal_extent_id
+        } else {
+            match stream_ref.active_extent_id() {
+                Some(eid) => eid,
+                None => {
                     let end_offset = stream_ref.sealed_end_offset();
-                    info!(
-                        "seal request for extent {:?} but active is {:?}, returning idempotent SealAck for stream {:?}",
-                        seal_extent_id, active_eid, stream_id
-                    );
                     return Frame::new(
                         VariableHeader::SealAck {
                             request_id: frame.request_id(),
@@ -756,9 +755,9 @@ impl ExtentNodeStore {
                     );
                 }
             }
-        }
+        };
 
-        match stream_ref.seal_active(committed_offset) {
+        match stream_ref.seal(target_extent_id, committed_offset) {
             Some((start_offset, end_offset)) => {
                 info!(
                     "sealed active extent for stream {:?}, start_offset={start_offset}, end_offset={end_offset}",

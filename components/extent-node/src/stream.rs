@@ -14,7 +14,7 @@ use crate::extent::{AppendResult, Extent};
 /// positions (compressed u32 pointers). The index is populated atomically during
 /// append and used during read to resolve offsets without client-side byte_pos.
 ///
-/// Stream-level mutation (`seal_active`, adding new extents) still requires `&mut self`
+/// Stream-level mutation (`seal`, adding new extents) still requires `&mut self`
 /// because these operations change the extent list. In the ExtentNodeStore, this is
 /// handled at a higher level (DashMap per-stream write lock or equivalent).
 #[derive(Debug)]
@@ -102,8 +102,11 @@ impl Stream {
             .unwrap_or(Offset(0))
     }
 
-    /// Seal the active (last) extent.
-    /// Returns `(start_offset, end_offset)` of the sealed extent, or None if no active extent.
+    /// Seal the extent identified by `extent_id`.
+    /// Returns `(start_offset, end_offset)` of the sealed extent, or `None` if:
+    /// - no extents exist
+    /// - the active extent doesn't match `extent_id`
+    /// - the extent is already sealed
     ///
     /// `end_offset` = `start_offset + message_count` (exclusive upper bound).
     ///
@@ -114,8 +117,11 @@ impl Stream {
     /// After seal, the stream has no active extent until SM sends a new `RegisterExtent`.
     ///
     /// Requires `&mut self` because it modifies the extent list.
-    pub fn seal_active(&mut self, committed_offset: Option<u64>) -> Option<(u64, u64)> {
+    pub fn seal(&mut self, extent_id: ExtentId, committed_offset: Option<u64>) -> Option<(u64, u64)> {
         let last = self.extents.last()?;
+        if last.id != extent_id {
+            return None;
+        }
         if last.state() == ExtentState::Sealed {
             return None;
         }
@@ -230,7 +236,7 @@ mod tests {
         assert_eq!(stream.max_offset(), Offset(3));
 
         // Seal active extent.
-        let (start_offset, end_offset) = stream.seal_active(None).unwrap();
+        let (start_offset, end_offset) = stream.seal(ExtentId(0), None).unwrap();
         assert_eq!(start_offset, 0);
         assert_eq!(end_offset, 3);
 
@@ -259,8 +265,8 @@ mod tests {
         let mut stream = new_stream_with_extent(StreamId(1));
         let r = stream.append(Bytes::from_static(b"a")).unwrap();
         assert_eq!(r.offset, Offset(0));
-        stream.seal_active(None); // seals extent with 1 msg
-        assert_eq!(stream.seal_active(None), None); // already sealed, returns None
+        stream.seal(ExtentId(0), None); // seals extent with 1 msg
+        assert_eq!(stream.seal(ExtentId(0), None), None); // already sealed, returns None
 
         // Register a new extent and append.
         stream.register_extent(ExtentId(1), Offset(1), DEFAULT_ARENA_CAPACITY);
