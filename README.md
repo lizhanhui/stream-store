@@ -54,16 +54,16 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
 
 ```
                       ┌─────────────────────────────────────────────────┐
-                      │                Stream Store (Rust)               │
-                      │                                                  │
+                      │               Stream Store (Rust)               │
+                      │                                                 │
   ┌──────────┐  TCP   │   ┌──────────────┐        ┌──────────────────┐  │   ┌────────┐
   │          │────────┤   │              │  alloc │                  │  │   │        │
-  │  Client  │────────┤   │    Stream    │───────►│    Extent        │  ├───►│  S3    │
+  │  Client  │────────┤   │    Stream    │───────►│    Extent        │  ├──►│  S3    │
   │          │  TCP   │   │   Manager    │  seal  │    Node(s)       │  │   │ (cold) │
   └──────────┘        │   │   (MySQL)    │        │   (in-memory,    │  │   │        │
                       │   └──────────────┘        │    replicated)   │  │   └────────┘
-                      │     metadata                └──────────────────┘  │
-                      │    control plane                 data plane       │
+                      │     metadata              └──────────────────┘  │
+                      │    control plane               data plane       │
                       └─────────────────────────────────────────────────┘
 ```
 
