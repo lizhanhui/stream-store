@@ -4,8 +4,14 @@
 //! that secondary node. The connection is bidirectional:
 //! - Write half: sends forwarded Append frames (FLAG_FORWARDED set)
 //! - Read half: receives cumulative Watermark ACKs, forwarded as WatermarkEvents
+//!
+//! Each secondary gets its own forwarding task with a dedicated mpsc channel,
+//! so a stalled secondary cannot block other secondaries (Fix 4).
+//! Send failures trigger a single reconnect-and-retry before giving up (Fix 2).
+//! TCP keepalive detects half-open connections after power failures (Fix 5).
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use futures_util::SinkExt;
 use tokio::net::TcpStream;
@@ -19,12 +25,20 @@ use rpc::frame::{Frame, VariableHeader};
 
 use crate::store::{ForwardRequest, WatermarkEvent};
 
+/// Capacity for each per-connection forwarding channel.
+const PER_CONNECTION_CHANNEL_CAPACITY: usize = 1024;
+
+/// Wrapper for a per-connection forwarding channel.
+struct DownstreamConnection {
+    tx: mpsc::Sender<Frame>,
+}
+
 /// Run the DownstreamManager task.
 ///
-/// Continuously receives `ForwardRequest`s and sends them to the appropriate
-/// secondary ExtentNode. Creates connections on demand and caches them by node address.
-/// In broadcast mode, the Primary sends one ForwardRequest per secondary per append,
-/// so this task naturally fans out to multiple connections.
+/// Continuously receives `ForwardRequest`s and routes them to per-connection
+/// forwarding tasks. Each secondary gets its own task with a dedicated channel,
+/// isolating secondaries from each other (a stalled secondary only blocks its
+/// own channel, not all streams).
 ///
 /// Returns when the shutdown signal is received or the forward channel is closed.
 pub async fn run_downstream_manager(
@@ -34,9 +48,8 @@ pub async fn run_downstream_manager(
 ) {
     info!("DownstreamManager started");
 
-    // Cache of write halves, keyed by secondary node address.
-    let mut connections: HashMap<String, FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>> =
-        HashMap::new();
+    // Per-connection forwarding tasks, keyed by secondary node address.
+    let mut connections: HashMap<String, DownstreamConnection> = HashMap::new();
 
     loop {
         let req = tokio::select! {
@@ -52,20 +65,7 @@ pub async fn run_downstream_manager(
             }
         };
 
-        let addr = &req.downstream_addr;
-
-        // Get or create connection to this secondary node.
-        if !connections.contains_key(addr) {
-            match create_downstream_connection(addr, watermark_tx.clone()).await {
-                Ok(write_half) => {
-                    connections.insert(addr.clone(), write_half);
-                }
-                Err(e) => {
-                    error!("failed to connect to secondary {addr}: {e}");
-                    continue;
-                }
-            }
-        }
+        let addr = req.downstream_addr.clone();
 
         // Build the forwarded Append frame.
         let mut frame = Frame::new(
@@ -78,28 +78,104 @@ pub async fn run_downstream_manager(
         );
         frame.header.flags = FLAG_FORWARDED;
 
-        // Send to secondary.
-        let write_half = connections.get_mut(addr).unwrap();
-        if let Err(e) = write_half.send(frame).await {
-            warn!("failed to send to secondary {addr}: {e}; removing connection");
-            connections.remove(addr);
+        // Get or create per-connection forwarding task.
+        let conn = connections.entry(addr.clone()).or_insert_with(|| {
+            let (tx, rx) = mpsc::channel(PER_CONNECTION_CHANNEL_CAPACITY);
+            spawn_connection_writer(addr.clone(), rx, watermark_tx.clone());
+            DownstreamConnection { tx }
+        });
+
+        // Non-blocking send to per-connection channel.
+        // If the channel is full, this secondary is backpressured — log and drop.
+        // Fix 1's PendingAck timeout ensures the client eventually gets an error.
+        if let Err(e) = conn.tx.try_send(frame) {
+            warn!(
+                "per-connection channel full for secondary {}: {e}; frame dropped",
+                req.downstream_addr,
+            );
         }
     }
 
     info!("DownstreamManager shutting down");
 }
 
+/// Spawn a per-connection writer task that owns a TCP connection to a secondary.
+///
+/// Receives frames from a dedicated mpsc channel and sends them sequentially.
+/// On send failure, reconnects once and retries (Fix 2). If retry also fails,
+/// the frame is dropped and Fix 1's timeout handles the client-facing impact.
+fn spawn_connection_writer(
+    addr: String,
+    mut rx: mpsc::Receiver<Frame>,
+    watermark_tx: mpsc::Sender<WatermarkEvent>,
+) {
+    tokio::spawn(async move {
+        let mut writer: Option<FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>> = None;
+
+        while let Some(frame) = rx.recv().await {
+            // Ensure we have a connection.
+            if writer.is_none() {
+                match create_downstream_connection(&addr, watermark_tx.clone()).await {
+                    Ok(w) => writer = Some(w),
+                    Err(e) => {
+                        error!("failed to connect to secondary {addr}: {e}; dropping frame");
+                        continue;
+                    }
+                }
+            }
+
+            // Try to send the frame.
+            let w = writer.as_mut().unwrap();
+            if let Err(e) = w.send(frame.clone()).await {
+                warn!("send to secondary {addr} failed: {e}; reconnecting");
+                writer = None;
+
+                // Retry once with a fresh connection (Fix 2).
+                match create_downstream_connection(&addr, watermark_tx.clone()).await {
+                    Ok(mut new_writer) => {
+                        if let Err(e) = new_writer.send(frame).await {
+                            warn!("retry send to {addr} failed: {e}; giving up on frame");
+                            // Connection is likely dead, drop it.
+                        } else {
+                            writer = Some(new_writer);
+                        }
+                    }
+                    Err(e) => {
+                        error!("reconnect to secondary {addr} failed: {e}");
+                    }
+                }
+            }
+        }
+
+        info!("connection writer for {addr} shutting down");
+    });
+}
+
 /// Create a new TCP connection to a secondary ExtentNode node.
 /// Returns the write half for sending frames.
 /// Spawns a background reader task that forwards Watermarks to the watermark channel.
+///
+/// Sets TCP keepalive with aggressive timers to detect half-open connections
+/// after power failures (Fix 5).
 async fn create_downstream_connection(
     addr: &str,
     watermark_tx: mpsc::Sender<WatermarkEvent>,
 ) -> Result<FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>, std::io::Error> {
     let stream = TcpStream::connect(addr).await?;
+
     // Disable Nagle's algorithm: Watermark responses are small frames (~20 bytes)
     // that would otherwise be delayed up to 40ms by Nagle buffering.
     stream.set_nodelay(true)?;
+
+    // Set TCP keepalive to detect half-open connections (Fix 5).
+    // After 10s idle, probe every 5s. This detects dead peers within ~25s
+    // instead of the default 2+ hours.
+    let sock_ref = socket2::SockRef::from(&stream);
+    let keepalive = socket2::TcpKeepalive::new()
+        .with_time(Duration::from_secs(10))
+        .with_interval(Duration::from_secs(5));
+    sock_ref.set_tcp_keepalive(&keepalive)?;
+
     let (read_half, write_half) = stream.into_split();
 
     let framed_write = FramedWrite::new(write_half, FrameCodec);

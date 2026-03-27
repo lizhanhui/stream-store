@@ -541,6 +541,7 @@ dependencies = [
  "futures-util",
  "rpc",
  "server",
+ "socket2 0.5.10",
  "sysinfo",
  "tokio",
  "tokio-util",

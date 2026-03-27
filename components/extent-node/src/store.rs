@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::types::{ErrorCode, ExtentId, FLAG_FORWARDED, Offset, Opcode, StreamId};
@@ -15,6 +16,11 @@ use crate::stream::Stream;
 
 // ── Broadcast replication types ──────────────────────────────────────────────
 
+/// Timeout for replication quorum. PendingAcks older than this are expired
+/// with an error response to the client, preventing unbounded accumulation
+/// when a secondary dies and quorum_offset() returns None forever.
+const REPLICATION_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// A pending client ACK waiting for quorum replication.
 #[derive(Debug)]
 pub struct PendingAck {
@@ -26,6 +32,8 @@ pub struct PendingAck {
     pub response_tx: mpsc::Sender<Frame>,
     /// The offset assigned to this append.
     pub assigned_offset: u64,
+    /// When this PendingAck was created, for timeout expiry.
+    pub created_at: Instant,
 }
 
 /// Per-stream ACK queue on the Primary with cumulative quorum tracking.
@@ -79,24 +87,50 @@ impl AckQueue {
 
     /// Drain all pending ACKs that have reached quorum, sending AppendAck
     /// frames back to the client connections.
+    ///
+    /// After the normal quorum drain, sweeps the front of the queue for expired
+    /// entries (older than REPLICATION_TIMEOUT) and sends error responses.
     pub fn drain_quorum(&mut self) {
-        let qo = match self.quorum_offset() {
-            Some(o) => o,
-            None => return,
-        };
+        let qo = self.quorum_offset();
+        if let Some(qo) = qo {
+            while let Some(front) = self.pending.front() {
+                if front.assigned_offset <= qo {
+                    let ack = self.pending.pop_front().unwrap();
+                    let frame = Frame::new(
+                        VariableHeader::AppendAck {
+                            request_id: ack.request_id,
+                            stream_id: ack.stream_id,
+                            extent_id: ExtentId(0),
+                            offset: Offset(ack.assigned_offset),
+                        },
+                        None,
+                    );
+                    // Best-effort send — if the client disconnected, the channel is closed.
+                    let _ = ack.response_tx.try_send(frame);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Timeout sweep: expire PendingAcks older than REPLICATION_TIMEOUT.
+        // Queue is ordered by creation time, so stop at the first non-expired entry.
+        let now = Instant::now();
         while let Some(front) = self.pending.front() {
-            if front.assigned_offset <= qo {
+            if now.duration_since(front.created_at) > REPLICATION_TIMEOUT {
                 let ack = self.pending.pop_front().unwrap();
-                let frame = Frame::new(
-                    VariableHeader::AppendAck {
-                        request_id: ack.request_id,
-                        stream_id: ack.stream_id,
-                        extent_id: ExtentId(0),
-                        offset: Offset(ack.assigned_offset),
-                    },
-                    None,
+                warn!(
+                    request_id = ack.request_id,
+                    stream_id = ?ack.stream_id,
+                    offset = ack.assigned_offset,
+                    "PendingAck expired after replication timeout",
                 );
-                // Best-effort send — if the client disconnected, the channel is closed.
+                let frame = Frame::error_response(
+                    ack.request_id,
+                    ErrorCode::InternalError,
+                    "replication timeout",
+                    ExtentId(0),
+                );
                 let _ = ack.response_tx.try_send(frame);
             } else {
                 break;
@@ -560,7 +594,12 @@ impl ExtentNodeStore {
                             downstream_addr: secondary_addr.clone(),
                         };
                         if let Err(e) = tx.try_send(req) {
-                            warn!("failed to send ForwardRequest to {secondary_addr}: {e}");
+                            warn!(
+                                secondary = %secondary_addr,
+                                stream_id = ?stream_id,
+                                offset = offset.0,
+                                "forward channel backpressure: {e}; frame dropped, PendingAck timeout will handle client",
+                            );
                         }
                     }
                 }
@@ -576,6 +615,7 @@ impl ExtentNodeStore {
                         stream_id,
                         response_tx: resp_tx.clone(),
                         assigned_offset: offset.0,
+                        created_at: Instant::now(),
                     });
                 }
 
@@ -1149,6 +1189,7 @@ mod tests {
                 stream_id: StreamId(10),
                 response_tx: resp_tx.clone(),
                 assigned_offset: i,
+                created_at: Instant::now(),
             });
         }
 
@@ -1183,6 +1224,45 @@ mod tests {
         aq.ack_from_secondary("sec-3", 10);
         // top-2 descending: [10, 5], so quorum_offset = 5
         assert_eq!(aq.quorum_offset(), Some(5));
+    }
+
+    #[tokio::test]
+    async fn pending_ack_timeout() {
+        // Verify that PendingAcks expire after REPLICATION_TIMEOUT.
+        let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(100);
+
+        let mut ack_queue = AckQueue::new(1); // need 1 secondary ACK
+
+        // Queue a PendingAck with a creation time far in the past (simulates timeout).
+        ack_queue.pending.push_back(PendingAck {
+            request_id: 42,
+            stream_id: StreamId(10),
+            response_tx: resp_tx.clone(),
+            assigned_offset: 0,
+            created_at: Instant::now() - REPLICATION_TIMEOUT - Duration::from_secs(1),
+        });
+
+        // Queue a second PendingAck that is NOT expired.
+        ack_queue.pending.push_back(PendingAck {
+            request_id: 43,
+            stream_id: StreamId(10),
+            response_tx: resp_tx.clone(),
+            assigned_offset: 1,
+            created_at: Instant::now(),
+        });
+
+        // No quorum (no secondary has acked), but timeout sweep should fire.
+        ack_queue.drain_quorum();
+
+        // First PendingAck should have been expired with an error.
+        let err_frame = resp_rx.try_recv().unwrap();
+        assert_eq!(err_frame.opcode(), Opcode::Error);
+        assert_eq!(err_frame.request_id(), 42);
+
+        // Second PendingAck should still be pending (not expired).
+        assert!(resp_rx.try_recv().is_err());
+        assert_eq!(ack_queue.pending.len(), 1);
+        assert_eq!(ack_queue.pending[0].request_id, 43);
     }
 
     // ── Concurrent multi-stream benchmark ────────────────────────────────────

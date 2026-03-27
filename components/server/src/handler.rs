@@ -255,6 +255,10 @@ async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, ha
 
         // Drop the sender so the write task finishes.
         drop(response_tx);
+        // Abort the write task in case PendingAck clones keep the channel alive
+        // after the client disconnects. Without this, the write task blocks forever
+        // on response_rx.recv() because the channel never fully closes.
+        write_task.abort();
         let _ = write_task.await;
         info!("closed");
     }
