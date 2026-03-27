@@ -486,31 +486,36 @@ impl StreamManagerStore {
             .seal_allocate_notify(stream_id, extent_id, end_offset)
             .await?;
 
-        // When offset was provided (EN-initiated seal), fire-and-forget seal to secondaries.
-        // The caller (EN Primary) has already sealed locally, so we only need to seal secondaries.
-        if committed_offset.is_some() {
+        // Fire-and-forget seal to all replicas with the committed offset.
+        //
+        // EN-initiated path (committed_offset.is_some()): primary already sealed locally,
+        // secondaries haven't been sealed yet — seal them with the committed offset.
+        //
+        // Client-initiated path (committed_offset.is_none()): resolve_committed_offset
+        // already sealed all replicas with offset=None (using their local record_count),
+        // but secondaries may have a lower limit than the primary's committed count.
+        // Re-seal with the resolved committed offset so they accept late forwarded appends.
+        //
+        // Both paths are idempotent: handle_seal returns SealAck even if already sealed.
+        {
             let replicas = self
                 .store
                 .get_replicas(stream_id, extent_id)
                 .await
                 .unwrap_or_default();
-            let secondary_addrs: Vec<String> = replicas
-                .into_iter()
-                .filter(|r| r.role != 0)
-                .map(|r| r.node_addr)
-                .collect();
+            let addrs: Vec<String> = replicas.into_iter().map(|r| r.node_addr).collect();
 
-            if !secondary_addrs.is_empty() {
+            if !addrs.is_empty() {
                 let sid = stream_id;
                 let seal_offset = end_offset;
                 tokio::spawn(async move {
-                    for addr in secondary_addrs {
+                    for addr in addrs {
                         match seal_extent_node_static(&addr, sid, Some(seal_offset)).await {
                             Ok(offset) => {
-                                info!("fire-and-forget seal to secondary {addr}: offset={offset}");
+                                info!("fire-and-forget seal to {addr}: offset={offset}");
                             }
                             Err(e) => {
-                                warn!("fire-and-forget seal to secondary {addr} failed: {e}");
+                                warn!("fire-and-forget seal to {addr} failed: {e}");
                             }
                         }
                     }
