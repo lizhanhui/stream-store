@@ -57,7 +57,22 @@ impl Stream {
     ///
     /// Only requires `&self` -- the Extent is internally synchronized (lock-free).
     /// The byte_pos is recorded in the extent's internal index automatically.
+    ///
+    /// If the previous (sealed) extent still accepts post-seal writes (late
+    /// forwarded appends from the primary that were committed before seal),
+    /// the append is routed there first.
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
+        // Try the previous sealed extent if it still has room for late forwarded writes.
+        if self.extents.len() >= 2 {
+            let prev = &self.extents[self.extents.len() - 2];
+            if prev.accepts_post_seal_writes() {
+                match prev.append(payload.clone()) {
+                    ok @ Ok(_) => return ok,
+                    Err(StorageError::ExtentSealed(_)) => { /* fall through to active extent */ }
+                    err => return err,
+                }
+            }
+        }
         let active = self
             .extents
             .last()
@@ -122,8 +137,12 @@ impl Stream {
     ///
     /// `end_offset` = `start_offset + message_count` (exclusive upper bound).
     ///
+    /// If `committed_offset` is `Some`, it's the primary's committed offset propagated
+    /// via SM. The sealed extent will accept late forwarded appends up to that offset.
+    /// If `None`, the extent uses its local record_count (primary sealing itself).
+    ///
     /// Requires `&mut self` because it modifies the extent list.
-    pub fn seal_active(&mut self) -> Option<(u64, u64)> {
+    pub fn seal_active(&mut self, committed_offset: Option<u64>) -> Option<(u64, u64)> {
         let last = self.extents.last()?;
         if last.state() == ExtentState::Sealed {
             return None;
@@ -131,7 +150,7 @@ impl Stream {
         let start_offset = last.start_offset.0;
         let message_count = last.message_count();
         let end_offset = start_offset + message_count;
-        last.seal();
+        last.seal(committed_offset);
 
         // Create a new active extent starting at the end offset.
         let new_id = ExtentId(self.next_extent_id);
@@ -143,6 +162,18 @@ impl Stream {
         ));
 
         Some((start_offset, end_offset))
+    }
+
+    /// The end_offset of the most recently sealed extent.
+    /// Used by handle_seal to return committed offset idempotently when the
+    /// extent was already sealed (e.g., primary already sealed via extent-full path).
+    pub fn sealed_end_offset(&self) -> u64 {
+        for extent in self.extents.iter().rev() {
+            if extent.is_sealed() {
+                return extent.start_offset.0 + extent.message_count();
+            }
+        }
+        0
     }
 }
 
@@ -219,7 +250,7 @@ mod tests {
         assert_eq!(stream.max_offset(), Offset(3));
 
         // Seal active extent.
-        let (start_offset, end_offset) = stream.seal_active().unwrap();
+        let (start_offset, end_offset) = stream.seal_active(None).unwrap();
         assert_eq!(start_offset, 0);
         assert_eq!(end_offset, 3);
 
@@ -243,8 +274,8 @@ mod tests {
         let mut stream = Stream::new(StreamId(1));
         let r = stream.append(Bytes::from_static(b"a")).unwrap();
         assert_eq!(r.offset, Offset(0));
-        stream.seal_active(); // seals extent with 1 msg, creates new at offset 1
-        stream.seal_active(); // seals empty extent, creates new at offset 1
+        stream.seal_active(None); // seals extent with 1 msg, creates new at offset 1
+        stream.seal_active(None); // seals empty extent, creates new at offset 1
         // Now append to the third extent.
         let r = stream.append(Bytes::from_static(b"b")).unwrap();
         assert_eq!(r.offset, Offset(1));

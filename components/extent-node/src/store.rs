@@ -495,7 +495,7 @@ impl ExtentNodeStore {
                 let (extent_id, offset) =
                     if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
                         let eid = stream_mut.active_extent_id();
-                        match stream_mut.seal_active() {
+                        match stream_mut.seal_active(None) {
                             Some((_start_offset, end_offset)) => (eid, end_offset),
                             None => (eid, 0),
                         }
@@ -707,6 +707,13 @@ impl ExtentNodeStore {
 
     fn handle_seal(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
+        // Extract the committed offset from the Seal frame, if present.
+        // When SM propagates the primary's committed offset, secondaries use it
+        // to accept late forwarded appends up to that offset.
+        let committed_offset = match &frame.variable_header {
+            VariableHeader::Seal { offset: Some(off), .. } => Some(off.0),
+            _ => None,
+        };
         let mut stream_ref = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => {
@@ -719,7 +726,7 @@ impl ExtentNodeStore {
             }
         };
 
-        match stream_ref.seal_active() {
+        match stream_ref.seal_active(committed_offset) {
             Some((start_offset, end_offset)) => {
                 info!(
                     "sealed active extent for stream {:?}, start_offset={start_offset}, end_offset={end_offset}",
@@ -737,12 +744,28 @@ impl ExtentNodeStore {
                     None,
                 )
             }
-            None => Frame::error_response(
-                frame.request_id(),
-                ErrorCode::InternalError,
-                &format!("no active extent to seal on stream {:?}", stream_id),
-                ExtentId(0),
-            ),
+            None => {
+                // Already sealed — return the sealed extent's end_offset idempotently.
+                // This is critical for resolve_committed_offset: when the SM seals all
+                // replicas concurrently and the primary already sealed (extent-full path),
+                // it must report its committed offset instead of returning an error.
+                let end_offset = stream_ref.sealed_end_offset();
+                info!(
+                    "stream {:?} already sealed, returning end_offset={end_offset} idempotently",
+                    stream_id
+                );
+                Frame::new(
+                    VariableHeader::SealAck {
+                        request_id: frame.request_id(),
+                        stream_id,
+                        extent_id: ExtentId(0),
+                        offset: Offset(end_offset),
+                        new_extent_id: None,
+                        primary_addr: None,
+                    },
+                    None,
+                )
+            }
         }
     }
 }
@@ -1705,6 +1728,202 @@ mod tests {
              Throughput: {throughput:.0} ops/sec\n\
              =========================================\n",
             elapsed.as_secs_f64() * 1000.0,
+        );
+    }
+
+    /// Test Bug 1 fix: secondary accepts forwarded appends after seal (within committed range).
+    /// Simulates: primary commits 4 records, secondary only received 2 before SM seals it
+    /// with committed_offset=4. Late forwarded appends for offsets 2,3 arrive — secondary
+    /// must accept them (not reject with ExtentSealed).
+    #[tokio::test]
+    async fn secondary_accepts_forwarded_append_after_seal() {
+        use rpc::payload::build_register_extent_payload;
+
+        let store = ExtentNodeStore::new();
+
+        // Register as Secondary (RF=2).
+        let payload = build_register_extent_payload(&[]);
+        store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::RegisterExtent {
+                        request_id: 1,
+                        stream_id: StreamId(10),
+                        extent_id: ExtentId(50),
+                        role: 1,
+                        replication_factor: 2,
+                    },
+                    Some(payload),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        // Secondary receives 2 forwarded messages before seal.
+        for i in 0u32..2 {
+            let resp = store
+                .handle_frame(
+                    {
+                        let mut f = Frame::new(
+                            VariableHeader::Append {
+                                request_id: 10 + i,
+                                stream_id: StreamId(10),
+                                extent_id: ExtentId(0),
+                            },
+                            Some(Bytes::from(format!("msg{i}"))),
+                        );
+                        f.header.flags = FLAG_FORWARDED;
+                        f
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.opcode(), Opcode::Watermark);
+        }
+
+        // SM seals with committed_offset=4 (primary committed 4 records).
+        // Secondary has only 2, so sealed_message_count = 4 - 0 = 4.
+        let seal_resp = store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::Seal {
+                        request_id: 20,
+                        stream_id: StreamId(10),
+                        extent_id: ExtentId(0),
+                        offset: Some(Offset(4)),
+                    },
+                    None,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(seal_resp.opcode(), Opcode::SealAck);
+        assert_eq!(seal_resp.offset(), Offset(2)); // secondary's local end_offset is 2
+
+        // Late forwarded appends for offsets 2 and 3 arrive — should be accepted
+        // because they fall within the sealed_message_count (4).
+        for i in 2u32..4 {
+            let resp = store
+                .handle_frame(
+                    {
+                        let mut f = Frame::new(
+                            VariableHeader::Append {
+                                request_id: 30 + i,
+                                stream_id: StreamId(10),
+                                extent_id: ExtentId(0),
+                            },
+                            Some(Bytes::from(format!("msg{i}"))),
+                        );
+                        f.header.flags = FLAG_FORWARDED;
+                        f
+                    },
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.opcode(),
+                Opcode::Watermark,
+                "late forwarded append for offset {i} should be accepted"
+            );
+        }
+
+        // Verify that appends beyond the sealed range go to the new active extent.
+        let resp = store
+            .handle_frame(
+                {
+                    let mut f = Frame::new(
+                        VariableHeader::Append {
+                            request_id: 40,
+                            stream_id: StreamId(10),
+                            extent_id: ExtentId(0),
+                        },
+                        Some(Bytes::from_static(b"new-extent-msg")),
+                    );
+                    f.header.flags = FLAG_FORWARDED;
+                    f
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        // Goes to new active extent created by seal.
+        assert_eq!(resp.opcode(), Opcode::Watermark);
+    }
+
+    /// Test Bug 2 fix: handle_seal is idempotent — sealing twice returns SealAck both times.
+    /// Simulates: primary seals via extent-full path, then SM sends seal RPC (idempotent retry).
+    #[tokio::test]
+    async fn handle_seal_is_idempotent() {
+        let store = ExtentNodeStore::new();
+        let sid = register_stream(&store, 1, 1).await;
+
+        // Append some messages.
+        for i in 0u32..3 {
+            let resp = store
+                .handle_frame(
+                    Frame::new(
+                        VariableHeader::Append {
+                            request_id: 10 + i,
+                            stream_id: sid,
+                            extent_id: ExtentId(0),
+                        },
+                        Some(Bytes::from(format!("msg{i}"))),
+                    ),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.opcode(), Opcode::AppendAck);
+        }
+
+        // First seal — no committed_offset (simulates SM resolve_committed_offset path).
+        let seal1 = store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::Seal {
+                        request_id: 20,
+                        stream_id: sid,
+                        extent_id: ExtentId(0),
+                        offset: None,
+                    },
+                    None,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(seal1.opcode(), Opcode::SealAck);
+        assert_eq!(seal1.offset(), Offset(3));
+
+        // Second seal — should also return SealAck with the same offset (idempotent).
+        let seal2 = store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::Seal {
+                        request_id: 21,
+                        stream_id: sid,
+                        extent_id: ExtentId(0),
+                        offset: None,
+                    },
+                    None,
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            seal2.opcode(),
+            Opcode::SealAck,
+            "second seal should return SealAck, not Error"
+        );
+        assert_eq!(
+            seal2.offset(),
+            Offset(3),
+            "second seal should report same committed offset"
         );
     }
 }

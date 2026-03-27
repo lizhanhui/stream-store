@@ -21,7 +21,11 @@ use crate::allocator::Allocator;
 ///
 /// This is a free function (not a method) so that it can be called from async tasks
 /// spawned for concurrent sealing without borrowing `self`.
-async fn seal_extent_node_static(addr: &str, stream_id: StreamId) -> Result<u64, StorageError> {
+async fn seal_extent_node_static(
+    addr: &str,
+    stream_id: StreamId,
+    committed_offset: Option<u64>,
+) -> Result<u64, StorageError> {
     let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
         StorageError::Internal(format!("connect to ExtentNode {addr} for Seal: {e}"))
     })?;
@@ -32,7 +36,7 @@ async fn seal_extent_node_static(addr: &str, stream_id: StreamId) -> Result<u64,
                 request_id: 0,
                 stream_id,
                 extent_id: ExtentId(0),
-                offset: None,
+                offset: committed_offset.map(Offset),
             },
             None,
         ))
@@ -498,9 +502,10 @@ impl StreamManagerStore {
 
             if !secondary_addrs.is_empty() {
                 let sid = stream_id;
+                let seal_offset = end_offset;
                 tokio::spawn(async move {
                     for addr in secondary_addrs {
-                        match seal_extent_node_static(&addr, sid).await {
+                        match seal_extent_node_static(&addr, sid, Some(seal_offset)).await {
                             Ok(offset) => {
                                 info!("fire-and-forget seal to secondary {addr}: offset={offset}");
                             }
@@ -540,7 +545,7 @@ impl StreamManagerStore {
             let role = replica.role;
             let sid = stream_id;
             seal_futures.push(async move {
-                let result = seal_extent_node_static(&addr, sid).await;
+                let result = seal_extent_node_static(&addr, sid, None).await;
                 (addr, role, result)
             });
         }
