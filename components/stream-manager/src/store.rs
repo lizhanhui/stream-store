@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
@@ -443,12 +444,24 @@ impl StreamManagerStore {
         }
     }
 
-    /// Seal an extent and allocate a new replica set.
+    /// Seal an extent and allocate a new one.
     ///
-    /// - `committed_offset = None`: SM queries all EN replicas for the committed offset
-    ///   via quorum, then seals-and-allocates.
-    /// - `committed_offset = Some(offset)`: SM trusts the provided offset, seals-and-allocates,
-    ///   then fire-and-forgets seal RPCs to secondary ENs.
+    /// Both seal paths follow the same two-phase protocol:
+    ///
+    /// **Phase 1 — Seal primary, obtain committed offset.**
+    /// - EN-initiated (extent-full): Primary already sealed locally and provides
+    ///   `committed_offset=Some(offset)`. Phase 1 is done.
+    /// - Client-initiated: `committed_offset=None`. `resolve_committed_offset`
+    ///   seals the primary with a short timeout (100ms). If primary responds,
+    ///   we have the committed offset. If it times out, we fall back to
+    ///   secondary quorum.
+    ///
+    /// **Phase 2 — Seal secondaries with the committed offset.**
+    /// - Client-initiated: `resolve_committed_offset` seals secondaries with
+    ///   the primary's committed offset so their `limit` is set correctly.
+    /// - EN-initiated: fire-and-forget seals secondaries after seal_allocate_notify.
+    /// - Both paths finish with a fire-and-forget re-seal of all replicas as a
+    ///   safety net (idempotent).
     async fn seal_extent(
         &self,
         stream_id: StreamId,
@@ -488,15 +501,11 @@ impl StreamManagerStore {
 
         // Fire-and-forget seal to all replicas with the committed offset.
         //
-        // EN-initiated path (committed_offset.is_some()): primary already sealed locally,
-        // secondaries haven't been sealed yet — seal them with the committed offset.
+        // EN-initiated path: primary already sealed locally, secondaries need sealing.
         //
-        // Client-initiated path (committed_offset.is_none()): resolve_committed_offset
-        // already sealed all replicas with offset=None (using their local record_count),
-        // but secondaries may have a lower limit than the primary's committed count.
-        // Re-seal with the resolved committed offset so they accept late forwarded appends.
-        //
-        // Both paths are idempotent: handle_seal returns SealAck even if already sealed.
+        // Client-initiated path: resolve_committed_offset already sealed secondaries
+        // with the primary's committed offset (two-phase approach). This re-seal is
+        // still useful as a safety net — idempotent, no harm if limit is already set.
         {
             let replicas = self
                 .store
@@ -526,10 +535,18 @@ impl StreamManagerStore {
         Ok(result)
     }
 
-    /// Query all EN replicas for the committed offset via quorum algorithm.
+    /// Resolve the committed offset for a client-initiated seal.
     ///
-    /// Concurrently seals ALL replicas on ExtentNodes (stopping further appends),
-    /// then determines the committed offset from the responses.
+    /// Two-phase approach to minimize the window for late forwarded append races:
+    ///
+    /// **Phase 1** — Seal primary with a short timeout (10ms). If the primary is
+    /// alive (common case), it returns its committed offset immediately. This is
+    /// authoritative because the primary is the source of truth for committed records.
+    ///
+    /// **Phase 2** — Seal all secondaries, passing the primary's committed offset
+    /// (if obtained) so their `limit` is set correctly from the start. If the primary
+    /// timed out (outage), secondaries are sealed with `offset=None` and the committed
+    /// offset is computed from secondary quorum.
     async fn resolve_committed_offset(
         &self,
         stream_id: StreamId,
@@ -543,34 +560,106 @@ impl StreamManagerStore {
             )));
         }
 
-        // Concurrently seal ALL replicas on ExtentNodes.
-        let mut seal_futures = Vec::new();
+        // Partition replicas into primary and secondaries.
+        let mut primary_addr: Option<String> = None;
+        let mut secondary_replicas: Vec<(String, u8)> = Vec::new();
         for replica in &replicas {
-            let addr = replica.node_addr.clone();
-            let role = replica.role;
-            let sid = stream_id;
-            seal_futures.push(async move {
-                let result = seal_extent_node_static(&addr, sid, None).await;
-                (addr, role, result)
-            });
+            if replica.role == 0 {
+                primary_addr = Some(replica.node_addr.clone());
+            } else {
+                secondary_replicas.push((replica.node_addr.clone(), replica.role));
+            }
         }
-        let seal_results = future::join_all(seal_futures).await;
 
-        // Determine committed offset from responses.
-        let mut primary_offset: Option<u64> = None;
-        let mut secondary_offsets: Vec<u64> = Vec::new();
+        // Phase 1: Seal primary with short timeout (100ms).
+        // Covers TCP connect + seal RPC round-trip on a healthy node.
+        let primary_offset: Option<u64> = if let Some(ref addr) = primary_addr {
+            let sid = stream_id;
+            let addr = addr.clone();
+            match tokio::time::timeout(
+                Duration::from_millis(100),
+                seal_extent_node_static(&addr, sid, None),
+            )
+            .await
+            {
+                Ok(Ok(offset)) => {
+                    info!(
+                        "Primary {addr} reports committed offset {offset} for stream {:?} (fast path)",
+                        stream_id
+                    );
+                    Some(offset)
+                }
+                Ok(Err(e)) => {
+                    warn!("Primary {addr} seal failed for stream {:?}: {e}", stream_id);
+                    None
+                }
+                Err(_) => {
+                    warn!(
+                        "Primary {addr} seal timed out (100ms) for stream {:?}, falling back to secondary quorum",
+                        stream_id
+                    );
+                    None
+                }
+            }
+        } else {
+            warn!(
+                "No primary replica found for stream {:?} extent {:?}",
+                stream_id, extent_id
+            );
+            None
+        };
+
+        // Phase 2: Seal all secondaries with the primary's committed offset (if known).
         let rf = replicas.len() as u16;
         let required_secondary_acks = (rf as u32) / 2;
 
+        let mut seal_futures: Vec<
+            std::pin::Pin<
+                Box<
+                    dyn std::future::Future<
+                            Output = (String, u8, Result<u64, StorageError>),
+                        > + Send,
+                >,
+            >,
+        > = Vec::new();
+        for (addr, role) in &secondary_replicas {
+            let addr = addr.clone();
+            let role = *role;
+            let sid = stream_id;
+            let offset_for_secondary = primary_offset;
+            seal_futures.push(Box::pin(async move {
+                let result =
+                    seal_extent_node_static(&addr, sid, offset_for_secondary).await;
+                (addr, role, result)
+            }));
+        }
+
+        // If primary timed out in phase 1, seal it concurrently with secondaries (no timeout).
+        if primary_offset.is_none() {
+            if let Some(ref addr) = primary_addr {
+                let addr = addr.clone();
+                let sid = stream_id;
+                seal_futures.push(Box::pin(async move {
+                    let result = seal_extent_node_static(&addr, sid, None).await;
+                    (addr, 0u8, result)
+                }));
+            }
+        }
+
+        let seal_results = future::join_all(seal_futures).await;
+
+        // Collect secondary offsets for quorum calculation.
+        let mut secondary_offsets: Vec<u64> = Vec::new();
+        let mut late_primary_offset: Option<u64> = None;
         for (addr, role, result) in &seal_results {
             match result {
                 Ok(offset) => {
                     if *role == 0 {
                         info!(
-                            "Primary {addr} reports committed offset {offset} for stream {:?}",
+                            "Primary {addr} reports committed offset {offset} for stream {:?} (late)",
                             stream_id
                         );
-                        primary_offset = Some(*offset);
+                        late_primary_offset = Some(*offset);
                     } else {
                         info!(
                             "Secondary {addr} reports offset {offset} for stream {:?}",
@@ -585,10 +674,12 @@ impl StreamManagerStore {
             }
         }
 
-        let committed = if let Some(offset) = primary_offset {
+        // Determine committed offset.
+        // If we got primary offset from either phase, use it (authoritative).
+        let committed = if let Some(offset) = primary_offset.or(late_primary_offset) {
             offset
         } else {
-            // Primary failed: compute from Secondary responses using quorum math.
+            // Primary completely unreachable: compute from secondary quorum.
             if (secondary_offsets.len() as u32) < required_secondary_acks {
                 return Err(StorageError::Internal(format!(
                     "insufficient replicas for seal: need {} secondary ACKs, got {}",
