@@ -53,27 +53,36 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
 ## Architecture
 
 ```
-  Client Application                Rust Process (Storage Service)
- ┌─────────────────────────┐            ┌──────────────────────────────┐
- │                         │            │  stream-store (Rust/Tokio)   │
- │                         │            │                              │
- │                         │            │  Stream Manager              │
- │   (Data Server)         │  Custom    │  - Extent lifecycle          │
- │  - StreamStoreClient    │  TCP       │  - Seal-and-new              │
- │                         │ ◄────────► │  - Metadata (MySQL)          │
- │                         │  Protocol  │                              │
- │                         │            │  Extent Nodes                │
- │                         │            │  - In-memory extents         │
- │                         │            │  - Broadcast replication     │
- └─────────────────────────┘            └──────────────┬───────────────┘
-                                                       │
-                                                 ┌─────▼─────┐
-                                                 │  S3 Bucket │
-                                                 │  (cold)    │
-                                                 └────────────┘
+                      ┌─────────────────────────────────────────────────┐
+                      │                Stream Store (Rust)               │
+                      │                                                  │
+  ┌──────────┐  TCP   │   ┌──────────────┐        ┌──────────────────┐  │   ┌────────┐
+  │          │────────┤   │              │  alloc │                  │  │   │        │
+  │  Client  │────────┤   │    Stream    │───────►│    Extent        │  ├───►│  S3    │
+  │          │  TCP   │   │   Manager    │  seal  │    Node(s)       │  │   │ (cold) │
+  └──────────┘        │   │   (MySQL)    │        │   (in-memory,    │  │   │        │
+                      │   └──────────────┘        │    replicated)   │  │   └────────┘
+                      │     metadata                └──────────────────┘  │
+                      │    control plane                 data plane       │
+                      └─────────────────────────────────────────────────┘
 ```
 
-Two process types:
+- **Client -> Stream Manager**: Metadata operations (create/describe streams, seal extents)
+- **Client -> Extent Node**: Data operations (append, read)
+- **Stream Manager -> Extent Node**: Extent allocation, seal commands, heartbeat monitoring
+
+```
+  Broadcast Replication (RF=2):
+
+       ┌─────────────┐   broadcast    ┌─────────────┐
+       │  ExtentNode │───────────────►│  ExtentNode │
+       │  (Primary)  │                │ (Secondary) │
+       └─────────────┘                └──────┬──────┘
+              ◄──────────────────────────────┘
+                    watermark ACK
+```
+
+### Process Types
 
 - **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests.
 - **Stream Manager** -- Metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Includes load-aware extent placement and heartbeat-based failure detection.
