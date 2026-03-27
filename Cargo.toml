@@ -20,6 +20,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql"] }
 refinery = { version = "0.8", features = ["mysql_async"] }
 mysql_async = "0.35"
+fastant = "0.1"
 
 [package]
 name = "stream-store"
@@ -42,7 +43,12 @@ rpc = { path = "components/rpc" }
 futures-util = { workspace = true }
 tokio-util = { workspace = true }
 sqlx = { workspace = true }
+dashmap = "6"
 
 [[bench]]
 name = "concurrent_multi_stream"
+harness = false
+
+[[bench]]
+name = "pipeline_append"
 harness = false

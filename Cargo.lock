@@ -2116,6 +2116,7 @@ dependencies = [
  "bytes",
  "client",
  "common",
+ "dashmap",
  "extent-node",
  "futures-util",
  "rpc",
