@@ -4,7 +4,7 @@ A high-performance, replicated in-memory message storage system built in Rust, d
 
 ## Motivation
 
-Traditional message brokers rely on cloud block storage for durability. Block storage is expensive at scale. Object storage (S3) is orders of magnitude cheaper per GB but has higher latency and lower IOPS. Stream Store bridges this gap by maintaining a **replicated in-memory layer** for hot data and flushing to S3 for cold storage, inspired by the [Windows Azure Storage stream layer](https://dl.acm.org/doi/10.1145/3297858.3304053).
+Traditional message brokers rely on cloud block storage for durability. Block storage is expensive at scale. Object storage (S3) is orders of magnitude cheaper per GB but has higher latency and lower IOPS. Stream Store bridges this gap by maintaining a **replicated in-memory layer** for hot data and flushing to S3 for cold storage, inspired by the [Windows Azure Storage](https://dl.acm.org/doi/10.1145/3297858.3304053).
 
 ## Key Highlights
 
@@ -58,7 +58,7 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
                       │                                                 │
   ┌──────────┐  TCP   │   ┌──────────────┐        ┌──────────────────┐  │   ┌────────┐
   │          │────────┤   │              │  alloc │                  │  │   │        │
-  │  Client  │────────┤   │    Stream    │───────►│    Extent        │  ├──►│  S3    │
+  │  Client  │────────┤   │   Stream     │───────►│    Extent        │  ├──►│  S3    │
   │          │  TCP   │   │   Manager    │  seal  │    Node(s)       │  │   │ (cold) │
   └──────────┘        │   │   (MySQL)    │        │   (in-memory,    │  │   │        │
                       │   └──────────────┘        │    replicated)   │  │   └────────┘
