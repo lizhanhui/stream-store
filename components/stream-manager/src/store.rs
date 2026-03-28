@@ -111,12 +111,11 @@ impl StreamManagerStore {
         let rf = replication_factor;
 
         let result = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut client =
-                client::StorageClient::connect(&addr).await.map_err(|e| {
-                    StorageError::Internal(format!(
-                        "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
-                    ))
-                })?;
+            let mut client = client::StorageClient::connect(&addr).await.map_err(|e| {
+                StorageError::Internal(format!(
+                    "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
+                ))
+            })?;
 
             let resp = client
                 .send_frame(Frame::new(
@@ -152,7 +151,9 @@ impl StreamManagerStore {
             Ok(Ok(())) => {
                 info!(
                     "RegisterExtent ACK from Primary {primary_addr}: stream={:?}, extent={:?}, rf={replication_factor}, secondaries={}",
-                    stream_id, extent_id, secondary_addrs.join(", ")
+                    stream_id,
+                    extent_id,
+                    secondary_addrs.join(", ")
                 );
                 Ok(())
             }
@@ -578,7 +579,8 @@ impl StreamManagerStore {
             }
             None => {
                 // Query all EN replicas to determine committed offset via quorum.
-                self.resolve_committed_offset(stream_id, extent_id, extent_start_offset).await?
+                self.resolve_committed_offset(stream_id, extent_id, extent_start_offset)
+                    .await?
             }
         };
 
@@ -609,7 +611,9 @@ impl StreamManagerStore {
                 let so = extent_start_offset;
                 tokio::spawn(async move {
                     for addr in addrs {
-                        match seal_extent_node_static(&addr, sid, eid, Some(seal_offset), Some(so)).await {
+                        match seal_extent_node_static(&addr, sid, eid, Some(seal_offset), Some(so))
+                            .await
+                        {
                             Ok(offset) => {
                                 info!("fire-and-forget seal to {addr}: offset={offset}");
                             }
@@ -813,7 +817,8 @@ impl StreamManagerStore {
             SealResult::Sealed { new_extent_id } => {
                 let primary_addr = new_replicas[0].0.clone();
                 let node_addrs: Vec<String> = new_replicas.iter().map(|(a, _)| a.clone()).collect();
-                let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
+                let secondary_addrs: Vec<&str> =
+                    node_addrs[1..].iter().map(|s| s.as_str()).collect();
                 let rf = node_addrs.len() as u16;
 
                 info!(
@@ -823,10 +828,20 @@ impl StreamManagerStore {
 
                 // Register new extent: best-effort. If Primary is dead/slow,
                 // client will discover on first append and trigger another seal-and-new.
-                if let Err(e) = self.register_primary(stream_id, new_extent_id, &primary_addr, &secondary_addrs, rf)
+                if let Err(e) = self
+                    .register_primary(
+                        stream_id,
+                        new_extent_id,
+                        &primary_addr,
+                        &secondary_addrs,
+                        rf,
+                    )
                     .await
                 {
-                    warn!("register_primary failed for extent {:?}: {e}; client will discover on first append", new_extent_id);
+                    warn!(
+                        "register_primary failed for extent {:?}: {e}; client will discover on first append",
+                        new_extent_id
+                    );
                 }
 
                 // notify extent secondary nodes in fire-and-forget way

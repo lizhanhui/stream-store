@@ -193,7 +193,10 @@ async fn client_task(
 
     // Append loop.
     while Instant::now() < deadline {
-        match extent_node_client.append(stream_id, extent_id, payload.clone()).await {
+        match extent_node_client
+            .append(stream_id, extent_id, payload.clone())
+            .await
+        {
             Ok(_) => {
                 total_appends += 1;
                 total_bytes += PAYLOAD_SIZE as u64;

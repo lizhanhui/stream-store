@@ -154,10 +154,7 @@ async fn main() {
     println!("  Duration:        {elapsed_secs:.2}s");
     println!("  Senders:         {NUM_SENDERS} (single stream)");
     println!("  Payload size:    {PAYLOAD_SIZE} bytes");
-    println!(
-        "  Arena capacity:  {} MiB",
-        ARENA_CAPACITY / (1024 * 1024)
-    );
+    println!("  Arena capacity:  {} MiB", ARENA_CAPACITY / (1024 * 1024));
     println!("  RF:              {REPLICATION_FACTOR}");
     println!("───────────────────────────────────────────────────────────────");
     println!("  Total appends:   {total_appends}");
@@ -232,7 +229,10 @@ async fn sender_task(
 
     while Instant::now() < deadline {
         let t0 = Instant::now();
-        match en_client.append(stream_id, extent_id, payload.clone()).await {
+        match en_client
+            .append(stream_id, extent_id, payload.clone())
+            .await
+        {
             Ok(_) => {
                 latencies.push(t0.elapsed());
                 total_appends += 1;
@@ -242,16 +242,14 @@ async fn sender_task(
                 // Independently seal the current extent via StreamManager.
                 // The SM handles duplicate seals idempotently — if another sender
                 // already sealed this extent, SM returns the existing successor.
-                let (new_extent_id_raw, new_primary_addr) = match sm_client
-                    .seal(stream_id, extent_id, None)
-                    .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warn!("sender {sender_id}: seal failed: {e}");
-                        break;
-                    }
-                };
+                let (new_extent_id_raw, new_primary_addr) =
+                    match sm_client.seal(stream_id, extent_id, None).await {
+                        Ok(result) => result,
+                        Err(e) => {
+                            warn!("sender {sender_id}: seal failed: {e}");
+                            break;
+                        }
+                    };
 
                 let new_extent_id = ExtentId(new_extent_id_raw);
                 info!(

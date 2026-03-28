@@ -337,10 +337,18 @@ impl Frame {
     /// (eliminating stale-flag bugs). For other opcodes, returns `header.flags`.
     pub fn flags(&self) -> u8 {
         let computed = match &self.variable_header {
-            VariableHeader::Seal { offset, start_offset, .. } => {
+            VariableHeader::Seal {
+                offset,
+                start_offset,
+                ..
+            } => {
                 let mut f = 0u8;
-                if offset.is_some() { f |= FLAG_OFFSET_PRESENT; }
-                if start_offset.is_some() { f |= FLAG_START_OFFSET_PRESENT; }
+                if offset.is_some() {
+                    f |= FLAG_OFFSET_PRESENT;
+                }
+                if start_offset.is_some() {
+                    f |= FLAG_START_OFFSET_PRESENT;
+                }
                 f
             }
             VariableHeader::SealAck { new_extent_id, .. } => {
@@ -398,7 +406,11 @@ impl Frame {
             // request_id(4) + stream_id(8) + offset(8) + count(4)
             VariableHeader::ReadResp { .. } => 4 + 8 + 8 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) [+ offset(8) if present]
-            VariableHeader::Seal { offset, start_offset, .. } => {
+            VariableHeader::Seal {
+                offset,
+                start_offset,
+                ..
+            } => {
                 let base = 4 + 8 + 4;
                 let so = if start_offset.is_some() { 8 } else { 0 };
                 let off = if offset.is_some() { 8 } else { 0 };
@@ -1429,7 +1441,12 @@ mod tests {
         assert_eq!(decoded.flags(), FLAG_START_OFFSET_PRESENT);
         assert_eq!(decoded.extent_id(), ExtentId(5));
         assert_eq!(decoded.offset(), Offset(0)); // no offset present
-        if let VariableHeader::Seal { start_offset, offset, .. } = &decoded.variable_header {
+        if let VariableHeader::Seal {
+            start_offset,
+            offset,
+            ..
+        } = &decoded.variable_header
+        {
             assert_eq!(*start_offset, Some(100));
             assert_eq!(*offset, None);
         } else {
@@ -1456,10 +1473,18 @@ mod tests {
         assert_eq!(buf.len(), 40);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.flags(), FLAG_OFFSET_PRESENT | FLAG_START_OFFSET_PRESENT);
+        assert_eq!(
+            decoded.flags(),
+            FLAG_OFFSET_PRESENT | FLAG_START_OFFSET_PRESENT
+        );
         assert_eq!(decoded.extent_id(), ExtentId(5));
         assert_eq!(decoded.offset(), Offset(42));
-        if let VariableHeader::Seal { start_offset, offset, .. } = &decoded.variable_header {
+        if let VariableHeader::Seal {
+            start_offset,
+            offset,
+            ..
+        } = &decoded.variable_header
+        {
             assert_eq!(*start_offset, Some(100));
             assert_eq!(*offset, Some(Offset(42)));
         } else {

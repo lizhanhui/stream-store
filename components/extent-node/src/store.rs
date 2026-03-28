@@ -1,7 +1,7 @@
-use std::time::Instant;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
+use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId};
@@ -495,7 +495,9 @@ impl ExtentNodeStore {
         };
 
         // Write locally. The Extent's append is lock-free (atomic CAS).
-        let append_result = match stream_ref.append(extent_id, frame.payload.clone().unwrap_or_default()) {
+        let append_result = match stream_ref
+            .append(extent_id, frame.payload.clone().unwrap_or_default())
+        {
             Ok(r) => r,
             Err(common::errors::StorageError::ExtentSealed(_)) => {
                 return Some(Frame::error_response(
@@ -707,14 +709,20 @@ impl ExtentNodeStore {
         };
 
         // Try replicate. If extent not found, lazily create it and retry.
-        let replicate_result = stream_ref.replicate(extent_id, seq, byte_pos, frame.payload.clone().unwrap_or_default());
+        let replicate_result = stream_ref.replicate(
+            extent_id,
+            seq,
+            byte_pos,
+            frame.payload.clone().unwrap_or_default(),
+        );
 
         let result_offset = match replicate_result {
             Ok(r) => {
                 drop(stream_ref);
                 r.offset
             }
-            Err(common::errors::StorageError::ExtentSealed(_)) | Err(common::errors::StorageError::ExtentFull(_)) => {
+            Err(common::errors::StorageError::ExtentSealed(_))
+            | Err(common::errors::StorageError::ExtentFull(_)) => {
                 let max_offset = stream_ref.max_offset();
                 drop(stream_ref);
                 return Frame::new(
@@ -736,7 +744,12 @@ impl ExtentNodeStore {
                             stream_id, extent_id, start_offset,
                         );
                     }
-                    match stream_mut.replicate(extent_id, seq, byte_pos, frame.payload.clone().unwrap_or_default()) {
+                    match stream_mut.replicate(
+                        extent_id,
+                        seq,
+                        byte_pos,
+                        frame.payload.clone().unwrap_or_default(),
+                    ) {
                         Ok(r) => r.offset,
                         Err(_) => {
                             let max_offset = stream_mut.max_offset();
@@ -853,12 +866,17 @@ impl ExtentNodeStore {
         // When SM propagates the primary's committed offset, secondaries use it
         // to accept late forwarded appends up to that offset.
         let committed_offset = match &frame.variable_header {
-            VariableHeader::Seal { offset: Some(off), .. } => Some(off.0),
+            VariableHeader::Seal {
+                offset: Some(off), ..
+            } => Some(off.0),
             _ => None,
         };
         // Extract start_offset for absent-extent handling.
         let start_offset = match &frame.variable_header {
-            VariableHeader::Seal { start_offset: Some(so), .. } => Some(*so),
+            VariableHeader::Seal {
+                start_offset: Some(so),
+                ..
+            } => Some(*so),
             _ => None,
         };
         let mut stream_ref = match self.streams.get_mut(&stream_id) {
@@ -1025,7 +1043,6 @@ mod tests {
                             request_id: 10 + i,
                             stream_id: sid,
                             extent_id: ExtentId(1),
-
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),
@@ -1225,7 +1242,6 @@ mod tests {
                         request_id: 2,
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
-
                     },
                     Some(Bytes::from_static(b"hello standalone")),
                 ),
@@ -1274,7 +1290,6 @@ mod tests {
                         request_id: 2,
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
-
                     },
                     Some(Bytes::from_static(b"broadcast msg")),
                 ),
@@ -1504,7 +1519,6 @@ mod tests {
                                     request_id: seq as u32,
                                     stream_id: sid,
                                     extent_id: ExtentId(1),
-        
                                 },
                                 Some(Bytes::from(payload_data.clone())),
                             ),
@@ -1688,7 +1702,6 @@ mod tests {
                                 request_id: j,
                                 stream_id: sid,
                                 extent_id: ExtentId(1),
-    
                             },
                             Some(Bytes::from(format!("pre-{j}"))),
                         ),
@@ -1717,7 +1730,6 @@ mod tests {
                                     request_id: seq as u32,
                                     stream_id: sid,
                                     extent_id: ExtentId(1),
-        
                                 },
                                 Some(Bytes::from_static(b"write-payload")),
                             ),
@@ -1843,7 +1855,6 @@ mod tests {
                                     request_id: seq as u32,
                                     stream_id: sid,
                                     extent_id: ExtentId(1),
-        
                                 },
                                 Some(Bytes::from(format!("t{task_idx}-m{seq}"))),
                             ),
@@ -2047,7 +2058,6 @@ mod tests {
                             request_id: 10 + i,
                             stream_id: sid,
                             extent_id: ExtentId(1),
-
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),

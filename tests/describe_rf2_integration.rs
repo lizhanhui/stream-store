@@ -196,7 +196,11 @@ async fn describe_stream_rf2_integration() {
     let mut en_client = client::StorageClient::connect(&primary_addr).await.unwrap();
     for i in 0u64..5 {
         en_client
-            .append(stream_id, first_extent_id, Bytes::from(format!("rf2-msg-{i}")))
+            .append(
+                stream_id,
+                first_extent_id,
+                Bytes::from(format!("rf2-msg-{i}")),
+            )
             .await
             .unwrap();
     }
@@ -243,7 +247,11 @@ async fn describe_stream_rf2_integration() {
         .unwrap();
     for i in 0u64..3 {
         en_client2
-            .append(stream_id, ExtentId(second_extent_id), Bytes::from(format!("rf2-seal-msg-{i}")))
+            .append(
+                stream_id,
+                ExtentId(second_extent_id),
+                Bytes::from(format!("rf2-seal-msg-{i}")),
+            )
             .await
             .unwrap();
     }

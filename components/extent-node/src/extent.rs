@@ -336,7 +336,12 @@ impl Extent {
     /// of `fetch_add`/CAS. No `in_flight` tracking is needed.
     ///
     /// Returns the logical offset (`start_offset + seq`) on success.
-    pub fn replicate(&self, seq: u64, byte_pos: u64, payload: Bytes) -> Result<AppendResult, StorageError> {
+    pub fn replicate(
+        &self,
+        seq: u64,
+        byte_pos: u64,
+        payload: Bytes,
+    ) -> Result<AppendResult, StorageError> {
         // Check seal limit.
         let limit = self.limit.load(Ordering::Acquire);
         if limit != LIMIT_OPEN && seq >= limit {
@@ -379,7 +384,8 @@ impl Extent {
         }
 
         // Update committed state.
-        self.committed_bytes.store(new_write_cursor, Ordering::Release);
+        self.committed_bytes
+            .store(new_write_cursor, Ordering::Release);
         self.index_record(seq, byte_pos);
         self.committed_seq.store(new_count, Ordering::Release);
 
@@ -495,10 +501,12 @@ impl Extent {
         if let Some(offset) = committed_offset {
             // Secondary path: SM provides the authoritative committed offset.
             let count = offset.saturating_sub(self.start_offset.0);
-            match self
-                .limit
-                .compare_exchange(LIMIT_OPEN, count, Ordering::Release, Ordering::Acquire)
-            {
+            match self.limit.compare_exchange(
+                LIMIT_OPEN,
+                count,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => self.start_offset.0 + count,
                 Err(limit) => self.start_offset.0 + limit,
             }
@@ -509,10 +517,12 @@ impl Extent {
             // appender from passing the sealed check. Appenders already past the
             // check (loaded LIMIT_OPEN) are in-flight and will commit normally.
             let preliminary = self.record_count.load(Ordering::Acquire);
-            match self
-                .limit
-                .compare_exchange(LIMIT_OPEN, preliminary, Ordering::Release, Ordering::Acquire)
-            {
+            match self.limit.compare_exchange(
+                LIMIT_OPEN,
+                preliminary,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
                 Ok(_) => {}
                 Err(limit) => {
                     // Already sealed (e.g., concurrent seal call).
@@ -1015,7 +1025,11 @@ mod tests {
 
         // Run multiple iterations to exercise the race window.
         for _ in 0..50 {
-            let ext = Arc::new(Extent::with_capacity(ExtentId(1), Offset(0), 4 * 1024 * 1024));
+            let ext = Arc::new(Extent::with_capacity(
+                ExtentId(1),
+                Offset(0),
+                4 * 1024 * 1024,
+            ));
             let num_appenders = 8;
             let appends_per_thread = 500;
 
@@ -1050,7 +1064,10 @@ mod tests {
             let seal_offset = ext.seal(None);
 
             // Collect total successful appends from all threads.
-            let total_appended: u64 = appender_handles.into_iter().map(|h| h.join().unwrap()).sum();
+            let total_appended: u64 = appender_handles
+                .into_iter()
+                .map(|h| h.join().unwrap())
+                .sum();
 
             // Key invariants — the entire point of atomic seal:
             let final_limit = ext.limit.load(Ordering::Acquire);

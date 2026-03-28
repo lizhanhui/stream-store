@@ -189,7 +189,12 @@ async fn main() {
     // ── 11. Read from new extent ──
     let start_offset = sealed_count as u64; // new extent starts after sealed messages
     let read_new = extent_node_client_2
-        .read(stream_id, new_extent_id, Offset(start_offset), new_messages.len() as u16)
+        .read(
+            stream_id,
+            new_extent_id,
+            Offset(start_offset),
+            new_messages.len() as u16,
+        )
         .await
         .expect("read after seal failed");
 
