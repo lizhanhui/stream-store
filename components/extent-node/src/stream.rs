@@ -44,22 +44,19 @@ impl Stream {
     /// Only requires `&self` -- the Extent is internally synchronized (lock-free).
     /// The byte_pos is recorded in the extent's internal index automatically.
     ///
-    /// Returns an error if the extent doesn't exist or doesn't match the active extent.
+    /// Returns an error if the extent doesn't exist.
     pub fn append(
         &self,
         extent_id: ExtentId,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
-        let active = self.extents.last().ok_or_else(|| {
-            StorageError::Internal(format!("stream {:?} has no active extent", self.id))
+        let extent = self.find_extent(extent_id).ok_or_else(|| {
+            StorageError::Internal(format!(
+                "stream {:?}: extent {:?} not found",
+                self.id, extent_id
+            ))
         })?;
-        if active.id != extent_id {
-            return Err(StorageError::Internal(format!(
-                "stream {:?}: append targets extent {:?} but active is {:?}",
-                self.id, extent_id, active.id
-            )));
-        }
-        active.append(payload)
+        extent.append(payload)
     }
 
     /// Read `count` messages starting from the given logical `offset` within

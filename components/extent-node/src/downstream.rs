@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
-use common::types::{ExtentId, FLAG_FORWARDED, Opcode};
+use common::types::{FLAG_FORWARDED, Opcode};
 use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
 
