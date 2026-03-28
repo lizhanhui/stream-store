@@ -1816,7 +1816,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(seal_resp.opcode(), Opcode::SealAck);
-        assert_eq!(seal_resp.offset(), Offset(2)); // secondary's local end_offset is 2
+        assert_eq!(seal_resp.offset(), Offset(4)); // SM's committed offset determines end_offset
 
         // Late forwarded appends for offsets 2 and 3 arrive — should be accepted
         // because they fall within the sealed_message_count (4).

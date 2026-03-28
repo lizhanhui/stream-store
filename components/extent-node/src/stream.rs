@@ -45,7 +45,11 @@ impl Stream {
     /// The byte_pos is recorded in the extent's internal index automatically.
     ///
     /// Returns an error if the extent doesn't exist or doesn't match the active extent.
-    pub fn append(&self, extent_id: ExtentId, payload: Bytes) -> Result<AppendResult, StorageError> {
+    pub fn append(
+        &self,
+        extent_id: ExtentId,
+        payload: Bytes,
+    ) -> Result<AppendResult, StorageError> {
         let active = self.extents.last().ok_or_else(|| {
             StorageError::Internal(format!("stream {:?} has no active extent", self.id))
         })?;
@@ -64,7 +68,12 @@ impl Stream {
     /// The server resolves `offset → byte_pos` internally via the index stream,
     /// so callers only need to provide the logical offset. This keeps byte_pos
     /// as an internal implementation detail invisible to clients.
-    pub fn read(&self, extent_id: ExtentId, offset: Offset, count: u32) -> Result<Vec<Bytes>, StorageError> {
+    pub fn read(
+        &self,
+        extent_id: ExtentId,
+        offset: Offset,
+        count: u32,
+    ) -> Result<Vec<Bytes>, StorageError> {
         let extent = self.find_extent(extent_id).ok_or_else(|| {
             StorageError::Internal(format!(
                 "stream {:?}: extent {:?} not found",
@@ -121,7 +130,11 @@ impl Stream {
     /// After seal, the stream has no active extent until SM sends a new `RegisterExtent`.
     ///
     /// Requires `&mut self` because it modifies the extent list.
-    pub fn seal(&mut self, extent_id: ExtentId, committed_offset: Option<u64>) -> Option<(u64, u64)> {
+    pub fn seal(
+        &mut self,
+        extent_id: ExtentId,
+        committed_offset: Option<u64>,
+    ) -> Option<(u64, u64)> {
         let last = self.extents.last()?;
         if last.id != extent_id {
             return None;
@@ -130,9 +143,7 @@ impl Stream {
             return None;
         }
         let start_offset = last.start_offset.0;
-        let message_count = last.message_count();
-        let end_offset = start_offset + message_count;
-        last.seal(committed_offset);
+        let end_offset = last.seal(committed_offset);
         Some((start_offset, end_offset))
     }
 
@@ -171,9 +182,15 @@ mod tests {
     fn basic_append_and_read() {
         let stream = new_stream_with_extent(StreamId(1));
         let extent_id = ExtentId(0);
-        let r0 = stream.append(extent_id, Bytes::from_static(b"msg0")).unwrap();
-        let r1 = stream.append(extent_id, Bytes::from_static(b"msg1")).unwrap();
-        let r2 = stream.append(extent_id, Bytes::from_static(b"msg2")).unwrap();
+        let r0 = stream
+            .append(extent_id, Bytes::from_static(b"msg0"))
+            .unwrap();
+        let r1 = stream
+            .append(extent_id, Bytes::from_static(b"msg1"))
+            .unwrap();
+        let r2 = stream
+            .append(extent_id, Bytes::from_static(b"msg2"))
+            .unwrap();
 
         assert_eq!(r0.offset, Offset(0));
         assert_eq!(r1.offset, Offset(1));
@@ -198,7 +215,11 @@ mod tests {
         let extent_id = ExtentId(0);
         let mut results = Vec::new();
         for i in 0..10 {
-            results.push(stream.append(extent_id, Bytes::from(format!("msg{i}"))).unwrap());
+            results.push(
+                stream
+                    .append(extent_id, Bytes::from(format!("msg{i}")))
+                    .unwrap(),
+            );
         }
 
         // Read 3 messages starting at offset 5.
@@ -214,7 +235,9 @@ mod tests {
     fn read_beyond_end_returns_available() {
         let stream = new_stream_with_extent(StreamId(1));
         let extent_id = ExtentId(0);
-        let r = stream.append(extent_id, Bytes::from_static(b"only")).unwrap();
+        let r = stream
+            .append(extent_id, Bytes::from_static(b"only"))
+            .unwrap();
 
         let msgs = stream.read(extent_id, r.offset, 100).unwrap();
         assert_eq!(msgs.len(), 1);
@@ -236,7 +259,11 @@ mod tests {
         assert_eq!(stream.max_offset(), Offset(0));
         assert!(!stream.is_mutable());
         assert_eq!(stream.active_extent_id(), None);
-        assert!(stream.append(ExtentId(0), Bytes::from_static(b"fail")).is_err());
+        assert!(
+            stream
+                .append(ExtentId(0), Bytes::from_static(b"fail"))
+                .is_err()
+        );
     }
 
     #[test]
@@ -245,7 +272,9 @@ mod tests {
         let first_extent_id = ExtentId(0);
         // Append 3 messages to first extent.
         for i in 0..3 {
-            stream.append(first_extent_id, Bytes::from(format!("msg{i}"))).unwrap();
+            stream
+                .append(first_extent_id, Bytes::from(format!("msg{i}")))
+                .unwrap();
         }
         assert_eq!(stream.max_offset(), Offset(3));
 
@@ -264,7 +293,9 @@ mod tests {
         assert_eq!(stream.max_offset(), Offset(3)); // new extent is empty
 
         // Append to the new extent.
-        let r = stream.append(second_extent_id, Bytes::from_static(b"after-seal")).unwrap();
+        let r = stream
+            .append(second_extent_id, Bytes::from_static(b"after-seal"))
+            .unwrap();
         assert_eq!(r.offset, Offset(3));
         assert_eq!(r.byte_pos, 0); // new extent, byte_pos starts at 0
         assert_eq!(stream.max_offset(), Offset(4));
@@ -279,7 +310,9 @@ mod tests {
     fn seal_already_sealed_returns_none() {
         let mut stream = new_stream_with_extent(StreamId(1));
         let first_extent_id = ExtentId(0);
-        let r = stream.append(first_extent_id, Bytes::from_static(b"a")).unwrap();
+        let r = stream
+            .append(first_extent_id, Bytes::from_static(b"a"))
+            .unwrap();
         assert_eq!(r.offset, Offset(0));
         stream.seal(first_extent_id, None); // seals extent with 1 msg
         assert_eq!(stream.seal(first_extent_id, None), None); // already sealed, returns None
@@ -287,7 +320,9 @@ mod tests {
         // Register a new extent and append.
         let second_extent_id = ExtentId(1);
         stream.register_extent(second_extent_id, Offset(1), DEFAULT_ARENA_CAPACITY);
-        let r = stream.append(second_extent_id, Bytes::from_static(b"b")).unwrap();
+        let r = stream
+            .append(second_extent_id, Bytes::from_static(b"b"))
+            .unwrap();
         assert_eq!(r.offset, Offset(1));
         assert_eq!(stream.max_offset(), Offset(2));
     }

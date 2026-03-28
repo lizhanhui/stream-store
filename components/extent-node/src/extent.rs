@@ -397,12 +397,18 @@ impl Extent {
     /// `committed_offset - start_offset`. This allows secondaries to accept late
     /// forwarded appends up to the primary's committed offset.
     /// If `None`, uses the local `record_count` (primary sealing itself).
-    pub fn seal(&self, committed_offset: Option<u64>) {
+    pub fn seal(&self, committed_offset: Option<u64>) -> u64 {
         let count = match committed_offset {
             Some(offset) => offset.saturating_sub(self.start_offset.0),
             None => self.record_count.load(Ordering::Acquire),
         };
-        self.limit.store(count, Ordering::Release);
+        match self
+            .limit
+            .compare_exchange(LIMIT_OPEN, count, Ordering::Release, Ordering::Acquire)
+        {
+            Ok(_) => self.start_offset.0 + count,
+            Err(limit) => self.start_offset.0 + limit,
+        }
     }
 
     /// Whether this extent is sealed.
