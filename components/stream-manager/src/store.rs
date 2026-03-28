@@ -82,72 +82,151 @@ impl StreamManagerStore {
         }
     }
 
-    /// Send RegisterExtent to each ExtentNode in the replica set for broadcast replication.
+    /// Register the new extent on the Primary ExtentNode and wait for its ACK.
     ///
-    /// `replica_addrs`: ordered [Primary, Secondary_1, ...].
-    /// - Primary receives all secondary addresses so it can broadcast appends.
-    /// - Secondaries receive empty replica_addrs (they don't forward to anyone).
-    async fn notify_replica_set(
+    /// This guarantees the Primary is ready to accept appends before any client
+    /// learns about the new extent (via SealAck or DescribeStream).
+    ///
+    /// Uses a 1-second timeout covering both TCP connect and the RegisterExtent
+    /// round-trip. On a healthy LAN this completes in sub-millisecond; a timeout
+    /// indicates the Primary is likely dead or unreachable.
+    ///
+    /// `primary_addr`: the Primary's listen address.
+    /// `secondary_addrs`: addresses of all Secondaries (passed to Primary so it
+    /// can broadcast Forward frames).
+    async fn register_primary(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
-        replica_addrs: &[String],
+        primary_addr: &str,
+        secondary_addrs: &[&str],
+        replication_factor: u16,
     ) -> Result<(), StorageError> {
-        // Collect secondary addresses (all addresses after the first).
-        let secondary_addrs: Vec<&str> = replica_addrs[1..].iter().map(|s| s.as_str()).collect();
+        let payload = build_register_extent_payload(secondary_addrs);
+        let addr = primary_addr.to_string();
+        let sid = stream_id;
+        let eid = extent_id;
+        let rf = replication_factor;
 
-        for (i, addr) in replica_addrs.iter().enumerate() {
-            let role = i as u8;
-            let rf = replica_addrs.len() as u16;
-
-            // Primary gets all secondary addresses; secondaries get none.
-            let addrs_for_node: Vec<&str> = if role == 0 {
-                secondary_addrs.clone()
-            } else {
-                vec![]
-            };
-
-            let payload = build_register_extent_payload(&addrs_for_node);
-
-            let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
-                StorageError::Internal(format!(
-                    "connect to ExtentNode {addr} for RegisterExtent: {e}"
-                ))
-            })?;
+        let result = tokio::time::timeout(Duration::from_secs(1), async {
+            let mut client =
+                client::StorageClient::connect(&addr).await.map_err(|e| {
+                    StorageError::Internal(format!(
+                        "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
+                    ))
+                })?;
 
             let resp = client
                 .send_frame(Frame::new(
                     VariableHeader::RegisterExtent {
                         request_id: 0,
-                        stream_id,
-                        extent_id,
-                        role,
+                        stream_id: sid,
+                        extent_id: eid,
+                        role: 0, // Primary
                         replication_factor: rf,
                     },
                     Some(payload),
                 ))
                 .await
                 .map_err(|e| {
-                    StorageError::Internal(format!("RegisterExtent to ExtentNode {addr}: {e}"))
+                    StorageError::Internal(format!(
+                        "RegisterExtent to Primary ExtentNode {addr}: {e}"
+                    ))
                 })?;
 
             if resp.opcode() == Opcode::Error {
                 let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default())
                     .to_string();
                 return Err(StorageError::Internal(format!(
-                    "ExtentNode {addr} rejected RegisterExtent: {msg}"
+                    "Primary ExtentNode {addr} rejected RegisterExtent: {msg}"
                 )));
             }
 
-            let role_name = if role == 0 { "Primary" } else { "Secondary" };
-            info!(
-                "RegisterExtent sent to ExtentNode {addr}: stream={:?}, extent={:?}, role={role_name}, rf={rf}, secondaries={}",
-                stream_id,
-                extent_id,
-                addrs_for_node.join(", ")
-            );
+            Ok(())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                info!(
+                    "RegisterExtent ACK from Primary {primary_addr}: stream={:?}, extent={:?}, rf={replication_factor}, secondaries={}",
+                    stream_id, extent_id, secondary_addrs.join(", ")
+                );
+                Ok(())
+            }
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(StorageError::Internal(format!(
+                "RegisterExtent to Primary {primary_addr} timed out (1s)"
+            ))),
         }
-        Ok(())
+    }
+
+    /// Fire-and-forget RegisterExtent to each Secondary ExtentNode.
+    ///
+    /// Secondaries create extents lazily on the first Forward frame, so these
+    /// RPCs are hints for pre-allocation, not required for correctness.
+    /// Each is spawned as an independent task to avoid blocking the caller.
+    fn notify_secondaries(
+        &self,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        secondary_addrs: &[String],
+        replication_factor: u16,
+    ) {
+        for (i, addr) in secondary_addrs.iter().enumerate() {
+            let role = (i + 1) as u8; // 1, 2, ...
+            let addr = addr.clone();
+            let sid = stream_id;
+            let eid = extent_id;
+            let rf = replication_factor;
+
+            tokio::spawn(async move {
+                let payload = build_register_extent_payload(&[]); // secondaries get no downstream addrs
+                match client::StorageClient::connect(&addr).await {
+                    Ok(mut client) => {
+                        let result = client
+                            .send_frame(Frame::new(
+                                VariableHeader::RegisterExtent {
+                                    request_id: 0,
+                                    stream_id: sid,
+                                    extent_id: eid,
+                                    role,
+                                    replication_factor: rf,
+                                },
+                                Some(payload),
+                            ))
+                            .await;
+                        match result {
+                            Ok(resp) if resp.opcode() == Opcode::Error => {
+                                let msg = String::from_utf8_lossy(
+                                    resp.payload.as_deref().unwrap_or_default(),
+                                );
+                                warn!(
+                                    "Secondary {addr} rejected RegisterExtent for stream={:?} extent={:?}: {msg}",
+                                    sid, eid
+                                );
+                            }
+                            Ok(_) => {
+                                info!(
+                                    "RegisterExtent sent to Secondary {addr}: stream={:?}, extent={:?}, role={role}",
+                                    sid, eid
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    "RegisterExtent to Secondary {addr} failed: {e} (will create lazily on first Forward)"
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!(
+                            "connect to Secondary {addr} for RegisterExtent failed: {e} (will create lazily on first Forward)"
+                        );
+                    }
+                }
+            });
+        }
     }
 
     /// Allocate a replica set for a new extent: pick nodes, store in DB, notify ExtentNodes.
@@ -185,11 +264,16 @@ impl StreamManagerStore {
             extent_id, stream_id, node_addrs
         );
 
-        // Notify each ExtentNode of its replication role.
+        // Notify ExtentNodes of their replication roles.
         // Always send RegisterExtent, even for replication_factor=1, so the ExtentNode knows
         // the StreamManager-assigned stream_id and extent_id (required for seal coordination).
-        self.notify_replica_set(stream_id, extent_id, &node_addrs)
+        let primary_addr = &node_addrs[0];
+        let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
+        let rf = node_addrs.len() as u16;
+
+        self.register_primary(stream_id, extent_id, primary_addr, &secondary_addrs, rf)
             .await?;
+        self.notify_secondaries(stream_id, extent_id, &node_addrs[1..].to_vec(), rf);
 
         Ok((extent_id, node_addrs[0].clone()))
     }
@@ -457,7 +541,7 @@ impl StreamManagerStore {
     ///   left unsealed so they continue accepting in-flight forwarded appends.
     ///
     /// **Phase 2 — Seal all replicas with the committed offset (fire-and-forget).**
-    /// After `seal_allocate_notify`, all replicas are sealed with the final
+    /// After `seal_allocate_register`, all replicas are sealed with the final
     /// committed offset. Secondaries update their `limit` so no further appends
     /// are accepted. This is idempotent — already-sealed nodes return SealAck.
     async fn seal_extent(
@@ -494,7 +578,7 @@ impl StreamManagerStore {
 
         // Seal + allocate + notify new replica set.
         let result = self
-            .seal_allocate_notify(stream_id, extent_id, end_offset)
+            .seal_allocate_register(stream_id, extent_id, end_offset)
             .await?;
 
         // Fire-and-forget seal to all replicas with the committed offset.
@@ -690,8 +774,8 @@ impl StreamManagerStore {
     }
 
     /// Shared logic for both seal paths: pick new nodes, seal-and-allocate in DB,
-    /// notify new replica set, and return (new_extent_id, primary_addr).
-    async fn seal_allocate_notify(
+    /// register new replica set, and return (new_extent_id, primary_addr).
+    async fn seal_allocate_register(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
@@ -720,15 +804,20 @@ impl StreamManagerStore {
             SealResult::Sealed { new_extent_id } => {
                 let primary_addr = new_replicas[0].0.clone();
                 let node_addrs: Vec<String> = new_replicas.iter().map(|(a, _)| a.clone()).collect();
+                let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
+                let rf = node_addrs.len() as u16;
 
                 info!(
                     "new extent {:?} allocated for stream {:?}, primary={primary_addr}",
                     new_extent_id, stream_id
                 );
 
-                // Register new extent on ExtentNodes.
-                self.notify_replica_set(stream_id, new_extent_id, &node_addrs)
+                // Register new extent: await Primary.
+                self.register_primary(stream_id, new_extent_id, &primary_addr, &secondary_addrs, rf)
                     .await?;
+
+                // notify extent secondary nodes in fire-and-forget way
+                self.notify_secondaries(stream_id, new_extent_id, &node_addrs[1..].to_vec(), rf);
 
                 (new_extent_id, primary_addr)
             }
