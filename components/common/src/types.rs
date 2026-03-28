@@ -13,6 +13,11 @@ pub const HEADER_LEN: usize = 8;
 /// When set (extent-node seal): offset field is present and trusted by SM.
 pub const FLAG_OFFSET_PRESENT: u8 = 0x01;
 
+/// Flag bit on SEAL indicating the frame carries the extent's start_offset.
+/// When set, secondaries that have no extent can respond with SealAck(start_offset)
+/// to indicate zero committed records, enabling Stream Manager quorum resolution.
+pub const FLAG_START_OFFSET_PRESENT: u8 = 0x02;
+
 /// Flag bit on SEAL_ACK indicating the response carries new extent info.
 /// When clear (EN→SM): only base variable header (no new extent info).
 /// When set (SM→Client): variable header includes new_extent_id + primary_addr.

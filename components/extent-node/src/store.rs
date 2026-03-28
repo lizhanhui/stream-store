@@ -856,9 +856,34 @@ impl ExtentNodeStore {
             VariableHeader::Seal { offset: Some(off), .. } => Some(off.0),
             _ => None,
         };
+        // Extract start_offset for absent-extent handling.
+        let start_offset = match &frame.variable_header {
+            VariableHeader::Seal { start_offset: Some(so), .. } => Some(*so),
+            _ => None,
+        };
         let mut stream_ref = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => {
+                // Stream not found. If start_offset is present, the SM is sealing
+                // a secondary that never received any Forward frames — respond with
+                // start_offset to indicate zero committed records for quorum.
+                if let Some(so) = start_offset {
+                    info!(
+                        "seal for absent stream {:?} extent {:?}: responding with start_offset={so}",
+                        stream_id, extent_id
+                    );
+                    return Frame::new(
+                        VariableHeader::SealAck {
+                            request_id: frame.request_id(),
+                            stream_id,
+                            extent_id,
+                            offset: Offset(so),
+                            new_extent_id: None,
+                            primary_addr: None,
+                        },
+                        None,
+                    );
+                }
                 return Frame::error_response(
                     frame.request_id(),
                     ErrorCode::UnknownStream,
@@ -1944,6 +1969,7 @@ mod tests {
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
                         offset: Some(Offset(4)),
+                        start_offset: None,
                     },
                     None,
                 ),
@@ -2041,6 +2067,7 @@ mod tests {
                         stream_id: sid,
                         extent_id: ExtentId(1),
                         offset: None,
+                        start_offset: None,
                     },
                     None,
                 ),
@@ -2060,6 +2087,7 @@ mod tests {
                         stream_id: sid,
                         extent_id: ExtentId(1),
                         offset: None,
+                        start_offset: None,
                     },
                     None,
                 ),

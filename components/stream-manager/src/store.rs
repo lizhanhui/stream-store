@@ -27,6 +27,7 @@ async fn seal_extent_node_static(
     stream_id: StreamId,
     extent_id: ExtentId,
     committed_offset: Option<u64>,
+    start_offset: Option<u64>,
 ) -> Result<u64, StorageError> {
     let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
         StorageError::Internal(format!("connect to ExtentNode {addr} for Seal: {e}"))
@@ -39,6 +40,7 @@ async fn seal_extent_node_static(
                 stream_id,
                 extent_id,
                 offset: committed_offset.map(Offset),
+                start_offset,
             },
             None,
         ))
@@ -272,7 +274,10 @@ impl StreamManagerStore {
         let rf = node_addrs.len() as u16;
 
         self.register_primary(stream_id, extent_id, primary_addr, &secondary_addrs, rf)
-            .await?;
+            .await
+            .unwrap_or_else(|e| {
+                warn!("register_primary failed for initial extent {:?}: {e}; client will discover on first append", extent_id);
+            });
         self.notify_secondaries(stream_id, extent_id, &node_addrs[1..].to_vec(), rf);
 
         Ok((extent_id, node_addrs[0].clone()))
@@ -550,6 +555,19 @@ impl StreamManagerStore {
         extent_id: ExtentId,
         committed_offset: Option<u64>,
     ) -> Result<(ExtentId, String), StorageError> {
+        // Get extent metadata early — needed for start_offset in seal RPCs.
+        let extent_row = self
+            .store
+            .get_active_extent(stream_id)
+            .await?
+            .ok_or_else(|| {
+                StorageError::Internal(format!(
+                    "no active extent found for stream {:?} during seal_extent",
+                    stream_id
+                ))
+            })?;
+        let extent_start_offset = extent_row.start_offset;
+
         let end_offset = match committed_offset {
             Some(offset) => {
                 info!(
@@ -560,21 +578,9 @@ impl StreamManagerStore {
             }
             None => {
                 // Query all EN replicas to determine committed offset via quorum.
-                self.resolve_committed_offset(stream_id, extent_id).await?
+                self.resolve_committed_offset(stream_id, extent_id, extent_start_offset).await?
             }
         };
-
-        // Verify active extent exists.
-        let _extent_row = self
-            .store
-            .get_active_extent(stream_id)
-            .await?
-            .ok_or_else(|| {
-                StorageError::Internal(format!(
-                    "no active extent found for stream {:?} during seal_extent",
-                    stream_id
-                ))
-            })?;
 
         // Seal + allocate + notify new replica set.
         let result = self
@@ -600,9 +606,10 @@ impl StreamManagerStore {
                 let sid = stream_id;
                 let eid = extent_id;
                 let seal_offset = end_offset;
+                let so = extent_start_offset;
                 tokio::spawn(async move {
                     for addr in addrs {
-                        match seal_extent_node_static(&addr, sid, eid, Some(seal_offset)).await {
+                        match seal_extent_node_static(&addr, sid, eid, Some(seal_offset), Some(so)).await {
                             Ok(offset) => {
                                 info!("fire-and-forget seal to {addr}: offset={offset}");
                             }
@@ -633,6 +640,7 @@ impl StreamManagerStore {
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
+        start_offset: u64,
     ) -> Result<u64, StorageError> {
         let replicas = self.store.get_replicas(stream_id, extent_id).await?;
         if replicas.is_empty() {
@@ -660,7 +668,7 @@ impl StreamManagerStore {
             let sid = stream_id;
             match tokio::time::timeout(
                 Duration::from_millis(100),
-                seal_extent_node_static(&addr, sid, extent_id, None),
+                seal_extent_node_static(&addr, sid, extent_id, None, None),
             )
             .await
             {
@@ -701,8 +709,9 @@ impl StreamManagerStore {
             let role = replica.role;
             let sid = stream_id;
             let eid = extent_id;
+            let so = start_offset;
             seal_futures.push(async move {
-                let result = seal_extent_node_static(&addr, sid, eid, None).await;
+                let result = seal_extent_node_static(&addr, sid, eid, None, Some(so)).await;
                 (addr, role, result)
             });
         }
@@ -812,9 +821,13 @@ impl StreamManagerStore {
                     new_extent_id, stream_id
                 );
 
-                // Register new extent: await Primary.
-                self.register_primary(stream_id, new_extent_id, &primary_addr, &secondary_addrs, rf)
-                    .await?;
+                // Register new extent: best-effort. If Primary is dead/slow,
+                // client will discover on first append and trigger another seal-and-new.
+                if let Err(e) = self.register_primary(stream_id, new_extent_id, &primary_addr, &secondary_addrs, rf)
+                    .await
+                {
+                    warn!("register_primary failed for extent {:?}: {e}; client will discover on first append", new_extent_id);
+                }
 
                 // notify extent secondary nodes in fire-and-forget way
                 self.notify_secondaries(stream_id, new_extent_id, &node_addrs[1..].to_vec(), rf);

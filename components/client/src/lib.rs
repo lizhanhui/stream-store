@@ -283,6 +283,7 @@ impl StorageClient {
                 stream_id,
                 extent_id,
                 offset: committed_offset.map(|off| Offset(off)),
+                start_offset: None,
             },
             None,
         );
