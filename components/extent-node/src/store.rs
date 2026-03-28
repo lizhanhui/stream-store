@@ -473,6 +473,19 @@ impl ExtentNodeStore {
         // Get the stream entry (per-stream lock, not global).
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
+            None if is_forwarded => {
+                // Forwarded append arrived before RegisterExtent — expected race.
+                // Return Watermark(0) so the primary's downstream reader doesn't
+                // see an Error opcode. The primary's cumulative quorum tracking
+                // will advance once the secondary processes RegisterExtent.
+                return Some(Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset: Offset(0),
+                    },
+                    None,
+                ));
+            }
             None => {
                 return Some(Frame::error_response(
                     frame.request_id(),
@@ -486,12 +499,36 @@ impl ExtentNodeStore {
         // Write locally. The Extent's append is lock-free (atomic CAS).
         let append_result = match stream_ref.append(extent_id, frame.payload.clone().unwrap_or_default()) {
             Ok(r) => r,
+            Err(common::errors::StorageError::ExtentSealed(_)) if is_forwarded => {
+                // Forwarded append to a sealed extent — expected race.
+                let offset = stream_ref.max_offset();
+                drop(stream_ref);
+                return Some(Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset,
+                    },
+                    None,
+                ));
+            }
             Err(common::errors::StorageError::ExtentSealed(_)) => {
                 return Some(Frame::error_response(
                     frame.request_id(),
                     ErrorCode::ExtentSealed,
                     "extent is sealed",
                     ExtentId(0),
+                ));
+            }
+            Err(common::errors::StorageError::ExtentFull(_)) if is_forwarded => {
+                // Forwarded append hit a full arena — expected race.
+                let offset = stream_ref.max_offset();
+                drop(stream_ref);
+                return Some(Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset,
+                    },
+                    None,
                 ));
             }
             Err(common::errors::StorageError::ExtentFull(_)) => {
@@ -526,6 +563,19 @@ impl ExtentNodeStore {
                     ErrorCode::ExtentFull,
                     "extent arena is full, seal initiated",
                     extent_id,
+                ));
+            }
+            Err(e) if is_forwarded => {
+                // Forwarded append failed (e.g., extent not found because
+                // RegisterExtent hasn't arrived yet) — expected race.
+                let offset = stream_ref.max_offset();
+                drop(stream_ref);
+                return Some(Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset,
+                    },
+                    None,
                 ));
             }
             Err(e) => {
@@ -1866,8 +1916,10 @@ mod tests {
             )
             .await
             .unwrap();
-        // No new extent — append is rejected with ExtentSealed.
-        assert_eq!(resp.opcode(), Opcode::Error);
+        // No new extent — append is rejected, but since it's a forwarded append,
+        // the secondary returns Watermark (not Error) to avoid triggering
+        // "unexpected opcode Error" warnings on the primary's downstream reader.
+        assert_eq!(resp.opcode(), Opcode::Watermark);
     }
 
     /// Test Bug 2 fix: handle_seal is idempotent — sealing twice returns SealAck both times.
