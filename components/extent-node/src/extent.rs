@@ -167,6 +167,11 @@ pub struct Extent {
     ///   with `ExtentSealed`.
     limit: AtomicU64,
 
+    /// Number of in-flight appenders: threads that have passed the `limit` check
+    /// but have not yet finished committing. Used by `seal()` to wait for all
+    /// in-flight appenders to complete before reading the final `record_count`.
+    in_flight: AtomicU64,
+
     /// Internal index mapping sequence number → byte position (compressed u32).
     /// Entry i holds the byte_pos for the i-th record appended to this extent.
     /// Capacity = arena_capacity / MIN_RECORD_SIZE.
@@ -219,6 +224,7 @@ impl Extent {
             committed_seq: AtomicU64::new(0),
             committed_bytes: AtomicU64::new(0),
             limit: AtomicU64::new(LIMIT_OPEN),
+            in_flight: AtomicU64::new(0),
             index,
         }
     }
@@ -234,10 +240,15 @@ impl Extent {
     /// The returned `AppendResult.byte_pos` allows the caller to build an
     /// external offset-to-position index for O(1) random reads.
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
+        // Increment in_flight BEFORE loading limit. This ensures seal() can wait
+        // for all appenders who might have seen LIMIT_OPEN.
+        self.in_flight.fetch_add(1, Ordering::AcqRel);
+
         let limit = self.limit.load(Ordering::Acquire);
         if limit != LIMIT_OPEN {
             let current = self.record_count.load(Ordering::Relaxed);
             if current >= limit {
+                self.in_flight.fetch_sub(1, Ordering::AcqRel);
                 return Err(StorageError::ExtentSealed(self.id));
             }
             // Fall through to normal append path — late forwarded write within sealed range.
@@ -255,6 +266,7 @@ impl Extent {
             // Extent full. The cursor may overshoot capacity -- that's fine because
             // seal will stop further appends and committed_bytes won't advance past
             // the last successful record.
+            self.in_flight.fetch_sub(1, Ordering::AcqRel);
             return Err(StorageError::ExtentFull(self.id));
         }
 
@@ -272,35 +284,40 @@ impl Extent {
             }
         }
 
-        // 4. Advance committed_seq and committed_bytes in-order (spin-wait CAS).
-        //    Each writer spins until committed_seq == their seq, then advances to seq+1.
-        //    The spin waits only for the immediately preceding writer's memcpy to finish.
+        // 4. Advance committed_seq and committed_bytes in-order (spin-wait).
+        //    Each writer spins until committed_seq == their seq (preceding writer is done),
+        //    then updates committed_bytes and the index, and FINALLY advances committed_seq.
+        //    This ordering ensures that when an observer sees committed_seq == N,
+        //    ALL records with seq < N have their committed_bytes and index entries
+        //    fully visible. This is critical for seal() atomicity.
         //    Uses exponential backoff: up to 63 spin iterations (sub-µs), then yield to OS.
         let new_committed_bytes = byte_pos + record_len as u64;
+
+        // Phase A: Spin until it's our turn (committed_seq == seq).
         for spin_count in 0u32.. {
-            match self.committed_seq.compare_exchange_weak(
-                seq,
-                seq + 1,
-                Ordering::AcqRel,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    self.committed_bytes
-                        .store(new_committed_bytes, Ordering::Release);
-                    self.index_record(seq, byte_pos);
-                    break;
+            if self.committed_seq.load(Ordering::Acquire) == seq {
+                break;
+            }
+            if spin_count < 6 {
+                for _ in 0..(1 << spin_count) {
+                    std::hint::spin_loop();
                 }
-                Err(_) => {
-                    if spin_count < 6 {
-                        for _ in 0..(1 << spin_count) {
-                            std::hint::spin_loop();
-                        }
-                    } else {
-                        std::thread::yield_now();
-                    }
-                }
+            } else {
+                std::thread::yield_now();
             }
         }
+
+        // Phase B: Update committed_bytes and index BEFORE advancing committed_seq.
+        self.committed_bytes
+            .store(new_committed_bytes, Ordering::Release);
+        self.index_record(seq, byte_pos);
+
+        // Phase C: Signal completion — advance committed_seq so the next writer
+        // (and any seal() spin-wait) can proceed.
+        self.committed_seq.store(seq + 1, Ordering::Release);
+
+        // Decrement in-flight counter — seal() may be waiting for this.
+        self.in_flight.fetch_sub(1, Ordering::AcqRel);
 
         Ok(AppendResult {
             offset: Offset(self.start_offset.0 + seq),
@@ -396,18 +413,82 @@ impl Extent {
     /// If `committed_offset` is provided (from SM/primary), the limit is
     /// `committed_offset - start_offset`. This allows secondaries to accept late
     /// forwarded appends up to the primary's committed offset.
-    /// If `None`, uses the local `record_count` (primary sealing itself).
+    ///
+    /// If `None` (primary sealing itself), the seal is **atomic** with respect
+    /// to concurrent appenders:
+    ///
+    /// 1. Set `limit` to the current `record_count` to block new appenders from
+    ///    passing the sealed check in `append()`.
+    /// 2. Spin-wait until `committed_seq == record_count`, ensuring all in-flight
+    ///    writers (who loaded `limit == LIMIT_OPEN` before step 1) have finished
+    ///    their commit.
+    /// 3. Re-read `record_count` — it may have advanced beyond the initial limit
+    ///    due to those in-flight writers. Update `limit` to the final value.
+    ///
+    /// This guarantees: after `seal()` returns, `limit == committed_seq == record_count`.
+    /// No phantom writes, no orphaned data.
     pub fn seal(&self, committed_offset: Option<u64>) -> u64 {
-        let count = match committed_offset {
-            Some(offset) => offset.saturating_sub(self.start_offset.0),
-            None => self.record_count.load(Ordering::Acquire),
-        };
-        match self
-            .limit
-            .compare_exchange(LIMIT_OPEN, count, Ordering::Release, Ordering::Acquire)
-        {
-            Ok(_) => self.start_offset.0 + count,
-            Err(limit) => self.start_offset.0 + limit,
+        if let Some(offset) = committed_offset {
+            // Secondary path: SM provides the authoritative committed offset.
+            let count = offset.saturating_sub(self.start_offset.0);
+            match self
+                .limit
+                .compare_exchange(LIMIT_OPEN, count, Ordering::Release, Ordering::Acquire)
+            {
+                Ok(_) => self.start_offset.0 + count,
+                Err(limit) => self.start_offset.0 + limit,
+            }
+        } else {
+            // Primary path: seal atomically with concurrent appenders.
+
+            // Step 1: Set limit to current record_count. This prevents any NEW
+            // appender from passing the sealed check. Appenders already past the
+            // check (loaded LIMIT_OPEN) are in-flight and will commit normally.
+            let preliminary = self.record_count.load(Ordering::Acquire);
+            match self
+                .limit
+                .compare_exchange(LIMIT_OPEN, preliminary, Ordering::Release, Ordering::Acquire)
+            {
+                Ok(_) => {}
+                Err(limit) => {
+                    // Already sealed (e.g., concurrent seal call).
+                    return self.start_offset.0 + limit;
+                }
+            }
+
+            // Step 2: Wait for all in-flight appenders to drain.
+            //
+            // After step 1 set limit, new appenders see `limit != LIMIT_OPEN` and
+            // either return ExtentSealed (if at/past limit) or proceed as a late
+            // forwarded write (if within limit). Either way they decrement in_flight.
+            //
+            // Appenders who loaded LIMIT_OPEN before step 1 are in-flight: they will
+            // increment record_count, write, commit, advance committed_seq, and then
+            // decrement in_flight. We wait for all of them to finish.
+            let mut spin_count = 0u32;
+            loop {
+                let inflight = self.in_flight.load(Ordering::Acquire);
+                if inflight == 0 {
+                    break;
+                }
+                if spin_count < 6 {
+                    for _ in 0..(1 << spin_count) {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    std::thread::yield_now();
+                }
+                spin_count += 1;
+            }
+
+            // Step 3: All in-flight appenders have committed. Read the true final
+            // record_count and update limit. This is the authoritative sealed count.
+            let final_count = self.record_count.load(Ordering::Acquire);
+            if final_count > preliminary {
+                self.limit.store(final_count, Ordering::Release);
+            }
+
+            self.start_offset.0 + final_count
         }
     }
 
@@ -496,6 +577,7 @@ impl std::fmt::Debug for Extent {
                 &self.committed_bytes.load(Ordering::Relaxed),
             )
             .field("limit", &self.limit.load(Ordering::Relaxed))
+            .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -792,5 +874,85 @@ mod tests {
 
         // Sealed with local count, committed_seq == limit → false.
         assert!(!ext.accepts_post_seal_writes());
+    }
+
+    /// Proves that seal(None) is atomic with concurrent appenders:
+    /// after seal returns, limit == committed_seq == record_count.
+    /// No phantom writes, no orphaned data.
+    #[test]
+    fn seal_is_atomic_with_concurrent_appends() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        // Run multiple iterations to exercise the race window.
+        for _ in 0..50 {
+            let ext = Arc::new(Extent::with_capacity(ExtentId(1), Offset(0), 4 * 1024 * 1024));
+            let num_appenders = 8;
+            let appends_per_thread = 500;
+
+            // Barrier so all appenders and the sealer start simultaneously.
+            let barrier = Arc::new(Barrier::new(num_appenders + 1));
+
+            // Spawn appender threads — they race with the seal.
+            let appender_handles: Vec<_> = (0..num_appenders)
+                .map(|t| {
+                    let ext = Arc::clone(&ext);
+                    let barrier = Arc::clone(&barrier);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        let mut count = 0u64;
+                        for i in 0..appends_per_thread {
+                            let msg = format!("t{t}-m{i}");
+                            match ext.append(Bytes::from(msg)) {
+                                Ok(_) => count += 1,
+                                Err(StorageError::ExtentSealed(_)) => break,
+                                Err(e) => panic!("unexpected error: {e}"),
+                            }
+                        }
+                        count
+                    })
+                })
+                .collect();
+
+            // Seal from the main thread — races with appenders.
+            barrier.wait();
+            // Let appenders run briefly before sealing.
+            std::hint::spin_loop();
+            let seal_offset = ext.seal(None);
+
+            // Collect total successful appends from all threads.
+            let total_appended: u64 = appender_handles.into_iter().map(|h| h.join().unwrap()).sum();
+
+            // Key invariants — the entire point of atomic seal:
+            let final_limit = ext.limit.load(Ordering::Acquire);
+            let final_committed = ext.committed_seq.load(Ordering::Acquire);
+            let final_record_count = ext.record_count.load(Ordering::Acquire);
+
+            assert_eq!(
+                final_limit, final_committed,
+                "limit must equal committed_seq (no phantom writes)"
+            );
+            assert_eq!(
+                final_limit, final_record_count,
+                "limit must equal record_count (all in-flight writers finished)"
+            );
+            assert_eq!(
+                seal_offset,
+                ext.start_offset.0 + final_limit,
+                "seal return value must match final limit"
+            );
+            assert_eq!(
+                total_appended, final_limit,
+                "total successful appends must match sealed limit"
+            );
+
+            // Every committed record's index entry must be set — no orphaned data.
+            for seq in 0..final_committed {
+                assert!(
+                    ext.index_lookup(seq).is_some(),
+                    "index entry for seq {seq} must be set"
+                );
+            }
+        }
     }
 }
