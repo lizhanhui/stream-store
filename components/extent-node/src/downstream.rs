@@ -2,7 +2,7 @@
 //!
 //! One TCP connection per unique node_addr, shared across all streams that route through
 //! that secondary node. The connection is bidirectional:
-//! - Write half: sends forwarded Append frames (FLAG_FORWARDED set)
+//! - Write half: sends Forward frames (dedicated 0x0B opcode with deterministic byte_pos)
 //! - Read half: receives cumulative Watermark ACKs, forwarded as WatermarkEvents
 //!
 //! Each secondary gets its own forwarding task with a dedicated mpsc channel,
@@ -19,7 +19,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
-use common::types::{FLAG_FORWARDED, Opcode};
+use common::types::Opcode;
 use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
 
@@ -67,16 +67,19 @@ pub async fn run_downstream_manager(
 
         let addr = req.downstream_addr.clone();
 
-        // Build the forwarded Append frame.
-        let mut frame = Frame::new(
-            VariableHeader::Append {
-                request_id: 0,
+        // Build the Forward frame with deterministic byte_pos.
+        // The Forward opcode (0x0B) carries all metadata so the secondary writes
+        // each record at the exact same arena position as the primary.
+        let frame = Frame::new(
+            VariableHeader::Forward {
                 stream_id: req.stream_id,
                 extent_id: req.extent_id,
+                start_offset: common::types::Offset(req.start_offset),
+                offset: common::types::Offset(req.offset),
+                byte_pos: req.byte_pos,
             },
             Some(req.payload),
         );
-        frame.header.flags = FLAG_FORWARDED;
 
         // Get or create per-connection forwarding task.
         let conn = connections.entry(addr.clone()).or_insert_with(|| {

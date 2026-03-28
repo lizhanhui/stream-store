@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::types::{ErrorCode, ExtentId, FLAG_FORWARDED, Offset, Opcode, StreamId};
+use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use dashmap::DashMap;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
@@ -148,6 +148,12 @@ pub struct ForwardRequest {
     pub stream_id: StreamId,
     pub extent_id: ExtentId,
     pub offset: u64,
+    /// The extent's start_offset, included in the forwarded frame so the secondary
+    /// can create the extent with the correct base offset during lazy creation.
+    pub start_offset: u64,
+    /// The byte position in the arena where this record was written on the primary.
+    /// Carried in the Forward frame so the secondary writes at the exact same position.
+    pub byte_pos: u64,
     pub payload: Bytes,
     pub downstream_addr: String,
 }
@@ -328,6 +334,7 @@ impl RequestHandler for ExtentNodeStore {
     ) -> Option<Frame> {
         match frame.opcode() {
             Opcode::Append => self.handle_append(frame, response_tx),
+            Opcode::Forward => Some(self.handle_forward(frame)),
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
             Opcode::Seal => Some(self.handle_seal(frame)),
@@ -393,10 +400,16 @@ impl ExtentNodeStore {
             };
 
         // Create the stream locally if it doesn't exist, then register the new extent.
+        // Skip extent creation if it already exists (idempotent — extent may have been
+        // lazily created by a forwarded append that arrived before this RegisterExtent).
         let _start_offset = if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-            let so = stream_mut.max_offset();
-            stream_mut.register_extent(extent_id, so, self.arena_capacity);
-            so
+            if stream_mut.find_extent(extent_id).is_none() {
+                let so = stream_mut.max_offset();
+                stream_mut.register_extent(extent_id, so, self.arena_capacity);
+                so
+            } else {
+                stream_mut.max_offset()
+            }
         } else {
             let mut stream = Stream::new(stream_id);
             stream.register_extent(extent_id, Offset(0), self.arena_capacity);
@@ -455,12 +468,11 @@ impl ExtentNodeStore {
     ///
     /// **No replication / standalone**: Write locally, return AppendAck immediately.
     ///
-    /// **Primary (no FLAG_FORWARDED)**: Write locally, broadcast ForwardRequests
-    /// to all secondaries in parallel, queue PendingAck, return None (deferred ACK).
+    /// **Primary**: Write locally, broadcast ForwardRequests to all secondaries
+    /// in parallel, queue PendingAck, return None (deferred ACK).
     /// If standalone (RF=1), ACK immediately.
     ///
-    /// **Secondary (FLAG_FORWARDED set)**: Write locally, return Watermark with
-    /// the written offset. No forwarding to any other node.
+    /// Forwarded replication is now handled by `handle_forward()` (opcode 0x0B).
     fn handle_append(
         &self,
         frame: Frame,
@@ -468,24 +480,10 @@ impl ExtentNodeStore {
     ) -> Option<Frame> {
         let stream_id = frame.stream_id();
         let extent_id = frame.extent_id();
-        let is_forwarded = frame.flags() & FLAG_FORWARDED != 0;
 
         // Get the stream entry (per-stream lock, not global).
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
-            None if is_forwarded => {
-                // Forwarded append arrived before RegisterExtent — expected race.
-                // Return Watermark(0) so the primary's downstream reader doesn't
-                // see an Error opcode. The primary's cumulative quorum tracking
-                // will advance once the secondary processes RegisterExtent.
-                return Some(Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        offset: Offset(0),
-                    },
-                    None,
-                ));
-            }
             None => {
                 return Some(Frame::error_response(
                     frame.request_id(),
@@ -499,36 +497,12 @@ impl ExtentNodeStore {
         // Write locally. The Extent's append is lock-free (atomic CAS).
         let append_result = match stream_ref.append(extent_id, frame.payload.clone().unwrap_or_default()) {
             Ok(r) => r,
-            Err(common::errors::StorageError::ExtentSealed(_)) if is_forwarded => {
-                // Forwarded append to a sealed extent — expected race.
-                let offset = stream_ref.max_offset();
-                drop(stream_ref);
-                return Some(Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        offset,
-                    },
-                    None,
-                ));
-            }
             Err(common::errors::StorageError::ExtentSealed(_)) => {
                 return Some(Frame::error_response(
                     frame.request_id(),
                     ErrorCode::ExtentSealed,
                     "extent is sealed",
                     ExtentId(0),
-                ));
-            }
-            Err(common::errors::StorageError::ExtentFull(_)) if is_forwarded => {
-                // Forwarded append hit a full arena — expected race.
-                let offset = stream_ref.max_offset();
-                drop(stream_ref);
-                return Some(Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        offset,
-                    },
-                    None,
                 ));
             }
             Err(common::errors::StorageError::ExtentFull(_)) => {
@@ -565,19 +539,6 @@ impl ExtentNodeStore {
                     extent_id,
                 ));
             }
-            Err(e) if is_forwarded => {
-                // Forwarded append failed (e.g., extent not found because
-                // RegisterExtent hasn't arrived yet) — expected race.
-                let offset = stream_ref.max_offset();
-                drop(stream_ref);
-                return Some(Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        offset,
-                    },
-                    None,
-                ));
-            }
             Err(e) => {
                 return Some(Frame::error_response(
                     frame.request_id(),
@@ -587,6 +548,13 @@ impl ExtentNodeStore {
                 ));
             }
         };
+
+        // Capture extent's start_offset before dropping stream guard.
+        // Needed for forwarded frames to carry the correct base offset.
+        let extent_start_offset = stream_ref
+            .find_extent(extent_id)
+            .map(|e| e.start_offset.0)
+            .unwrap_or(0);
 
         // Drop per-stream read guard as soon as possible.
         drop(stream_ref);
@@ -616,18 +584,6 @@ impl ExtentNodeStore {
                     None,
                 ))
             }
-            Some(ref _ri) if is_forwarded => {
-                // Secondary: forwarded append from Primary.
-                // Write locally (already done), return Watermark with cumulative offset.
-                // No forwarding to any other node.
-                Some(Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        offset, // cumulative: highest written offset
-                    },
-                    None,
-                ))
-            }
             Some(ref ri) if ri.is_primary() => {
                 // Primary.
                 if ri.is_standalone() {
@@ -650,6 +606,8 @@ impl ExtentNodeStore {
                             stream_id,
                             extent_id,
                             offset: offset.0,
+                            start_offset: extent_start_offset,
+                            byte_pos: append_result.byte_pos,
                             payload: frame.payload.clone().unwrap_or_default(),
                             downstream_addr: secondary_addr.clone(),
                         };
@@ -683,7 +641,7 @@ impl ExtentNodeStore {
                 None
             }
             Some(_) => {
-                // Secondary but not forwarded — shouldn't normally happen.
+                // Secondary but received a normal Append (not Forward) — shouldn't normally happen.
                 Some(Frame::new(
                     VariableHeader::AppendAck {
                         request_id: frame.request_id(),
@@ -695,6 +653,129 @@ impl ExtentNodeStore {
                 ))
             }
         }
+    }
+
+    /// Handle Forward (0x0B) — dedicated opcode for Primary→Secondary replication.
+    ///
+    /// The Forward frame carries all metadata (stream_id, extent_id, start_offset,
+    /// offset, byte_pos) so the secondary writes each record at the exact same
+    /// arena position as the primary, enabling bit-for-bit identical replicas.
+    ///
+    /// Returns a cumulative Watermark with the highest written offset.
+    fn handle_forward(&self, frame: Frame) -> Frame {
+        let (stream_id, extent_id, start_offset, offset, byte_pos) = match &frame.variable_header {
+            VariableHeader::Forward {
+                stream_id,
+                extent_id,
+                start_offset,
+                offset,
+                byte_pos,
+            } => (*stream_id, *extent_id, *start_offset, *offset, *byte_pos),
+            _ => {
+                return Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id: frame.stream_id(),
+                        offset: Offset(0),
+                    },
+                    None,
+                );
+            }
+        };
+
+        // Compute seq from offset and start_offset.
+        let seq = offset.0 - start_offset.0;
+
+        // Get or lazily create the stream/extent.
+        let stream_ref = match self.streams.get(&stream_id) {
+            Some(s) => s,
+            None => {
+                // Forward arrived before RegisterExtent — lazy extent creation.
+                let mut stream = Stream::new(stream_id);
+                stream.register_extent(extent_id, start_offset, self.arena_capacity);
+                self.streams.insert(stream_id, stream);
+
+                self.next_stream_id
+                    .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
+
+                info!(
+                    "Lazy extent creation on forward: stream={:?}, extent={:?}, start_offset={:?}",
+                    stream_id, extent_id, start_offset,
+                );
+
+                self.streams.get(&stream_id).unwrap()
+            }
+        };
+
+        // Try replicate. If extent not found, lazily create it and retry.
+        let replicate_result = stream_ref.replicate(extent_id, seq, byte_pos, frame.payload.clone().unwrap_or_default());
+
+        let result_offset = match replicate_result {
+            Ok(r) => {
+                drop(stream_ref);
+                r.offset
+            }
+            Err(common::errors::StorageError::ExtentSealed(_)) | Err(common::errors::StorageError::ExtentFull(_)) => {
+                let max_offset = stream_ref.max_offset();
+                drop(stream_ref);
+                return Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset: max_offset,
+                    },
+                    None,
+                );
+            }
+            Err(_) => {
+                // Extent not found — lazily create and retry.
+                drop(stream_ref);
+                if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+                    if stream_mut.find_extent(extent_id).is_none() {
+                        stream_mut.register_extent(extent_id, start_offset, self.arena_capacity);
+                        info!(
+                            "Lazy extent creation on forward (existing stream): stream={:?}, extent={:?}, start_offset={:?}",
+                            stream_id, extent_id, start_offset,
+                        );
+                    }
+                    match stream_mut.replicate(extent_id, seq, byte_pos, frame.payload.clone().unwrap_or_default()) {
+                        Ok(r) => r.offset,
+                        Err(_) => {
+                            let max_offset = stream_mut.max_offset();
+                            drop(stream_mut);
+                            return Frame::new(
+                                VariableHeader::Watermark {
+                                    stream_id,
+                                    offset: max_offset,
+                                },
+                                None,
+                            );
+                        }
+                    }
+                } else {
+                    return Frame::new(
+                        VariableHeader::Watermark {
+                            stream_id,
+                            offset: Offset(0),
+                        },
+                        None,
+                    );
+                }
+            }
+        };
+
+        // Update metrics counters.
+        self.append_count.fetch_add(1, Ordering::Relaxed);
+        self.bytes_written.fetch_add(
+            frame.payload.as_ref().map_or(0, |p| p.len()) as u64,
+            Ordering::Relaxed,
+        );
+
+        Frame::new(
+            VariableHeader::Watermark {
+                stream_id,
+                offset: result_offset,
+            },
+            None,
+        )
     }
 
     fn handle_read(&self, frame: Frame) -> Frame {
@@ -919,6 +1000,7 @@ mod tests {
                             request_id: 10 + i,
                             stream_id: sid,
                             extent_id: ExtentId(1),
+
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),
@@ -1118,6 +1200,7 @@ mod tests {
                         request_id: 2,
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
+
                     },
                     Some(Bytes::from_static(b"hello standalone")),
                 ),
@@ -1166,6 +1249,7 @@ mod tests {
                         request_id: 2,
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
+
                     },
                     Some(Bytes::from_static(b"broadcast msg")),
                 ),
@@ -1236,21 +1320,19 @@ mod tests {
             .await
             .unwrap();
 
-        // Forwarded append.
+        // Forward frame (dedicated opcode for replication).
         let resp = store
             .handle_frame(
-                {
-                    let mut f = Frame::new(
-                        VariableHeader::Append {
-                            request_id: 2,
-                            stream_id: StreamId(10),
-                            extent_id: ExtentId(50),
-                        },
-                        Some(Bytes::from_static(b"forwarded msg")),
-                    );
-                    f.header.flags = FLAG_FORWARDED;
-                    f
-                },
+                Frame::new(
+                    VariableHeader::Forward {
+                        stream_id: StreamId(10),
+                        extent_id: ExtentId(50),
+                        start_offset: Offset(0),
+                        offset: Offset(0),
+                        byte_pos: 0,
+                    },
+                    Some(Bytes::from_static(b"forwarded msg")),
+                ),
                 None,
             )
             .await
@@ -1397,6 +1479,7 @@ mod tests {
                                     request_id: seq as u32,
                                     stream_id: sid,
                                     extent_id: ExtentId(1),
+        
                                 },
                                 Some(Bytes::from(payload_data.clone())),
                             ),
@@ -1580,6 +1663,7 @@ mod tests {
                                 request_id: j,
                                 stream_id: sid,
                                 extent_id: ExtentId(1),
+    
                             },
                             Some(Bytes::from(format!("pre-{j}"))),
                         ),
@@ -1608,6 +1692,7 @@ mod tests {
                                     request_id: seq as u32,
                                     stream_id: sid,
                                     extent_id: ExtentId(1),
+        
                                 },
                                 Some(Bytes::from_static(b"write-payload")),
                             ),
@@ -1733,6 +1818,7 @@ mod tests {
                                     request_id: seq as u32,
                                     stream_id: sid,
                                     extent_id: ExtentId(1),
+        
                                 },
                                 Some(Bytes::from(format!("t{task_idx}-m{seq}"))),
                             ),
@@ -1796,9 +1882,9 @@ mod tests {
         );
     }
 
-    /// Test Bug 1 fix: secondary accepts forwarded appends after seal (within committed range).
+    /// Test Bug 1 fix: secondary accepts forwarded records after seal (within committed range).
     /// Simulates: primary commits 4 records, secondary only received 2 before SM seals it
-    /// with committed_offset=4. Late forwarded appends for offsets 2,3 arrive — secondary
+    /// with committed_offset=4. Late Forward frames for offsets 2,3 arrive — secondary
     /// must accept them (not reject with ExtentSealed).
     #[tokio::test]
     async fn secondary_accepts_forwarded_append_after_seal() {
@@ -1826,21 +1912,21 @@ mod tests {
             .unwrap();
 
         // Secondary receives 2 forwarded messages before seal.
+        // Each record: 4 bytes len prefix + payload. "msg0" = 4 bytes, record = 8 bytes.
         for i in 0u32..2 {
+            let byte_pos = i as u64 * 8; // "msgN" = 4 bytes payload, record = 8 bytes
             let resp = store
                 .handle_frame(
-                    {
-                        let mut f = Frame::new(
-                            VariableHeader::Append {
-                                request_id: 10 + i,
-                                stream_id: StreamId(10),
-                                extent_id: ExtentId(50),
-                            },
-                            Some(Bytes::from(format!("msg{i}"))),
-                        );
-                        f.header.flags = FLAG_FORWARDED;
-                        f
-                    },
+                    Frame::new(
+                        VariableHeader::Forward {
+                            stream_id: StreamId(10),
+                            extent_id: ExtentId(50),
+                            start_offset: Offset(0),
+                            offset: Offset(i as u64),
+                            byte_pos,
+                        },
+                        Some(Bytes::from(format!("msg{i}"))),
+                    ),
                     None,
                 )
                 .await
@@ -1868,23 +1954,22 @@ mod tests {
         assert_eq!(seal_resp.opcode(), Opcode::SealAck);
         assert_eq!(seal_resp.offset(), Offset(4)); // SM's committed offset determines end_offset
 
-        // Late forwarded appends for offsets 2 and 3 arrive — should be accepted
+        // Late Forward frames for offsets 2 and 3 arrive — should be accepted
         // because they fall within the sealed_message_count (4).
         for i in 2u32..4 {
+            let byte_pos = i as u64 * 8;
             let resp = store
                 .handle_frame(
-                    {
-                        let mut f = Frame::new(
-                            VariableHeader::Append {
-                                request_id: 30 + i,
-                                stream_id: StreamId(10),
-                                extent_id: ExtentId(50),
-                            },
-                            Some(Bytes::from(format!("msg{i}"))),
-                        );
-                        f.header.flags = FLAG_FORWARDED;
-                        f
-                    },
+                    Frame::new(
+                        VariableHeader::Forward {
+                            stream_id: StreamId(10),
+                            extent_id: ExtentId(50),
+                            start_offset: Offset(0),
+                            offset: Offset(i as u64),
+                            byte_pos,
+                        },
+                        Some(Bytes::from(format!("msg{i}"))),
+                    ),
                     None,
                 )
                 .await
@@ -1892,33 +1977,31 @@ mod tests {
             assert_eq!(
                 resp.opcode(),
                 Opcode::Watermark,
-                "late forwarded append for offset {i} should be accepted"
+                "late forward for offset {i} should be accepted"
             );
         }
 
         // After all late forwards have landed and the extent is fully sealed,
-        // further appends should be rejected (no new extent until SM sends RegisterExtent).
+        // further forwards should be rejected.
         let resp = store
             .handle_frame(
-                {
-                    let mut f = Frame::new(
-                        VariableHeader::Append {
-                            request_id: 40,
-                            stream_id: StreamId(10),
-                            extent_id: ExtentId(50),
-                        },
-                        Some(Bytes::from_static(b"should-fail")),
-                    );
-                    f.header.flags = FLAG_FORWARDED;
-                    f
-                },
+                Frame::new(
+                    VariableHeader::Forward {
+                        stream_id: StreamId(10),
+                        extent_id: ExtentId(50),
+                        start_offset: Offset(0),
+                        offset: Offset(4),
+                        byte_pos: 32,
+                    },
+                    Some(Bytes::from_static(b"should-fail")),
+                ),
                 None,
             )
             .await
             .unwrap();
-        // No new extent — append is rejected, but since it's a forwarded append,
-        // the secondary returns Watermark (not Error) to avoid triggering
-        // "unexpected opcode Error" warnings on the primary's downstream reader.
+        // The secondary returns Watermark (not Error) for Forward frames
+        // to avoid triggering "unexpected opcode Error" warnings on the primary's
+        // downstream reader.
         assert_eq!(resp.opcode(), Opcode::Watermark);
     }
 
@@ -1938,6 +2021,7 @@ mod tests {
                             request_id: 10 + i,
                             stream_id: sid,
                             extent_id: ExtentId(1),
+
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),

@@ -325,6 +325,70 @@ impl Extent {
         })
     }
 
+    /// Replicate a record at the exact position assigned by the primary.
+    ///
+    /// This method is used by secondaries to write records at the same
+    /// `byte_pos` and sequence number as the primary, ensuring bit-for-bit
+    /// identical arena layouts across replicas.
+    ///
+    /// Unlike `append()`, this method is **single-writer** (one secondary
+    /// processes forwards sequentially), so it uses plain `store()` instead
+    /// of `fetch_add`/CAS. No `in_flight` tracking is needed.
+    ///
+    /// Returns the logical offset (`start_offset + seq`) on success.
+    pub fn replicate(&self, seq: u64, byte_pos: u64, payload: Bytes) -> Result<AppendResult, StorageError> {
+        // Check seal limit.
+        let limit = self.limit.load(Ordering::Acquire);
+        if limit != LIMIT_OPEN && seq >= limit {
+            return Err(StorageError::ExtentSealed(self.id));
+        }
+
+        let payload_len = payload.len();
+        let record_len = 4 + payload_len;
+
+        // Check capacity.
+        if byte_pos + record_len as u64 > self.capacity as u64 {
+            return Err(StorageError::ExtentFull(self.id));
+        }
+
+        // Write record at exact byte_pos (same layout as append).
+        unsafe {
+            let dst = self.buf.add(byte_pos as usize);
+            // Write length prefix (big-endian u32).
+            std::ptr::copy_nonoverlapping((payload_len as u32).to_be_bytes().as_ptr(), dst, 4);
+            // Write payload bytes.
+            if payload_len > 0 {
+                std::ptr::copy_nonoverlapping(payload.as_ref().as_ptr(), dst.add(4), payload_len);
+            }
+        }
+
+        // Update cursors via plain store (single-writer on secondary).
+        let new_write_cursor = byte_pos + record_len as u64;
+        let new_count = seq + 1;
+
+        // Advance write_cursor to max(current, new) — records may arrive out of order.
+        let current_wc = self.write_cursor.load(Ordering::Relaxed);
+        if new_write_cursor > current_wc {
+            self.write_cursor.store(new_write_cursor, Ordering::Relaxed);
+        }
+
+        // Advance record_count to max(current, new).
+        let current_rc = self.record_count.load(Ordering::Relaxed);
+        if new_count > current_rc {
+            self.record_count.store(new_count, Ordering::Relaxed);
+        }
+
+        // Update committed state.
+        self.committed_bytes.store(new_write_cursor, Ordering::Release);
+        self.index_record(seq, byte_pos);
+        self.committed_seq.store(new_count, Ordering::Release);
+
+        Ok(AppendResult {
+            offset: Offset(self.start_offset.0 + seq),
+            byte_pos,
+        })
+    }
+
     /// Read `count` records starting from the given byte position in the arena.
     ///
     /// The caller provides the byte position (obtained from `AppendResult.byte_pos`
@@ -817,6 +881,71 @@ mod tests {
                 .expect(&format!("seq {} should be set", seq));
             assert_eq!(actual, expected_byte_pos, "index mismatch at seq {}", seq);
         }
+    }
+
+    #[test]
+    fn replicate_basic() {
+        // Simulate a secondary receiving 3 records from the primary.
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+
+        let r0 = ext.replicate(0, 0, Bytes::from_static(b"msg0")).unwrap();
+        assert_eq!(r0.offset, Offset(0));
+        assert_eq!(r0.byte_pos, 0);
+
+        // "msg0" = 4 bytes payload, record = 4 + 4 = 8 bytes
+        let r1 = ext.replicate(1, 8, Bytes::from_static(b"msg1")).unwrap();
+        assert_eq!(r1.offset, Offset(1));
+        assert_eq!(r1.byte_pos, 8);
+
+        let r2 = ext.replicate(2, 16, Bytes::from_static(b"msg2")).unwrap();
+        assert_eq!(r2.offset, Offset(2));
+        assert_eq!(r2.byte_pos, 16);
+
+        assert_eq!(ext.message_count(), 3);
+        assert_eq!(ext.next_offset(), Offset(3));
+
+        // Read all 3 starting from byte_pos 0.
+        let msgs = ext.read(0, 3).unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0], Bytes::from_static(b"msg0"));
+        assert_eq!(msgs[1], Bytes::from_static(b"msg1"));
+        assert_eq!(msgs[2], Bytes::from_static(b"msg2"));
+    }
+
+    #[test]
+    fn replicate_matches_append_layout() {
+        // Prove that replicate() produces a bit-for-bit identical arena as append().
+        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+
+        let payloads: Vec<Bytes> = vec![
+            Bytes::from_static(b"hello"),
+            Bytes::from_static(b"world"),
+            Bytes::from_static(b"foo"),
+        ];
+
+        // Append on primary, replicate on secondary with same positions.
+        for payload in &payloads {
+            let result = primary.append(payload.clone()).unwrap();
+            secondary
+                .replicate(result.offset.0, result.byte_pos, payload.clone())
+                .unwrap();
+        }
+
+        // Arenas must be identical.
+        assert_eq!(primary.committed_data(), secondary.committed_data());
+        assert_eq!(primary.message_count(), secondary.message_count());
+    }
+
+    #[test]
+    fn replicate_sealed_extent_rejects() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        ext.replicate(0, 0, Bytes::from_static(b"msg0")).unwrap();
+        ext.seal(Some(1)); // seal at 1 record
+
+        // Replicate at seq=1 (at limit) should fail.
+        let result = ext.replicate(1, 8, Bytes::from_static(b"msg1"));
+        assert!(matches!(result, Err(StorageError::ExtentSealed(_))));
     }
 
     #[test]

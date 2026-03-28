@@ -51,4 +51,27 @@ mod tests {
         let decoded = Decoder::decode(&mut codec, &mut buf).unwrap().unwrap();
         assert_eq!(frame, decoded);
     }
+
+    #[test]
+    fn forward_round_trip() {
+        use common::types::Offset;
+
+        let mut codec = FrameCodec;
+        let frame = Frame::new(
+            VariableHeader::Forward {
+                stream_id: StreamId(10),
+                extent_id: ExtentId(5),
+                start_offset: Offset(0),
+                offset: Offset(3),
+                byte_pos: 42,
+            },
+            Some(Bytes::from_static(b"replicated payload")),
+        );
+
+        let mut buf = BytesMut::new();
+        Encoder::encode(&mut codec, frame.clone(), &mut buf).unwrap();
+
+        let decoded = Decoder::decode(&mut codec, &mut buf).unwrap().unwrap();
+        assert_eq!(frame, decoded);
+    }
 }

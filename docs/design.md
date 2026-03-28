@@ -34,7 +34,7 @@ A single `SEAL` opcode (0x05) covers all trigger sources. `Flags` bit 0 (`FLAG_O
 2. Stream Manager sends `Seal` RPC to **each Extent Node holding a replica** (Primary and all Secondaries). Each Extent Node stops accepting appends and responds with its local commit length.
 3. Stream Manager determines the committed offset: if the Primary responded, its quorum offset is used (most accurate). Otherwise, SM computes the committed offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
 4. Stream Manager updates extent metadata to SEALED with the committed end_offset.
-5. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to each new Extent Node.
+5. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtentAck`** before proceeding. `RegisterExtent` to Secondaries is fire-and-forget (see "Lazy Secondary Extent Creation" below).
 6. Stream Manager responds to client with the new extent info (Primary address). Writes resume immediately.
 
 **Extent-node Seal** (`FLAG_OFFSET_PRESENT = 1`):
@@ -42,14 +42,18 @@ A single `SEAL` opcode (0x05) covers all trigger sources. `Flags` bit 0 (`FLAG_O
 2. Stream Manager trusts the reported offset and records it as the extent's `end_offset` in metadata.
 3. Stream Manager updates extent metadata to SEALED.
 4. Stream Manager **fire-and-forgets** Seal RPCs to secondary extent nodes only (`tokio::spawn` -- does not block the response), skipping the Primary (already sealed locally). This ensures secondaries learn about the seal asynchronously.
-5. Stream Manager allocates a new active extent and responds to the Extent Node with the new extent info.
+5. Stream Manager allocates a new active extent, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtentAck`**, then responds to the Extent Node with the new extent info. `RegisterExtent` to Secondaries is fire-and-forget.
 
-Both paths share the same downstream procedure in Stream Manager: seal in MySQL (transaction), allocate new extent, notify ExtentNodes via RegisterExtent.
+Both paths share the same downstream procedure in Stream Manager: seal in MySQL (transaction), allocate new extent, wait for Primary `RegisterExtentAck`, respond to requester.
+
+**Why SM waits for Primary RegisterExtentAck**: Multiple clients may seal the same extent concurrently. SM may return the new extent info to the client (or the client may discover it via `DescribeStream`) before the target Primary has processed `RegisterExtent`. Waiting for the Primary's ACK adds only one SM↔EN round-trip (negligible compared to the MySQL transaction already in the seal path) and guarantees the Primary is ready to accept appends by the time any client learns about the new extent. For EN-initiated seal (ExtentFull), this is especially important — clients that received `ExtentFull` are already spinning on `DescribeStream` and would fail repeatedly if the new Primary isn't registered yet.
+
+**Lazy Secondary Extent Creation**: Secondaries create extents on-demand when they receive the **first Forward frame** from the Primary, rather than requiring `RegisterExtent` to arrive first. The Forward frame (opcode 0x0B) carries all information the secondary needs (`stream_id`, `extent_id`, `start_offset`, `offset`, `byte_pos` in the variable header; arena capacity is a node-level config). This eliminates the race where a secondary receives forwards before `RegisterExtent` arrives, and reduces the seal-and-new critical path to a single SM↔Primary round-trip. `RegisterExtent` to secondaries is still sent as a fire-and-forget hint for arena pre-allocation, but is **not required for correctness**.
 
 **ExtentFull handling**: When the Primary's arena is exhausted, it takes two actions:
 
 1. **Returns `ErrorCode::ExtentFull` (5)** to the client whose append triggered the overflow. This client knows to retry after obtaining the new extent from Stream Manager.
-2. **Proactively seals the extent and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` to Stream Manager** in the background. The `offset` is the committed end_offset that Stream Manager trusts without querying replicas. Stream Manager updates metadata, fire-and-forgets Seal RPCs to secondary ExtentNodes, allocates a new extent, and responds -- all before most clients even see the error.
+2. **Proactively seals the extent and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` to Stream Manager** in the background. The `offset` is the committed end_offset that Stream Manager trusts without querying replicas. Stream Manager updates metadata, fire-and-forgets Seal RPCs to secondary ExtentNodes, allocates a new extent, waits for the new Primary's `RegisterExtentAck`, and responds -- all before most clients even see the error.
 
 This avoids an error storm where every concurrent client independently discovers the extent is full and races to trigger seal-and-new. Only the Primary initiates the seal -- once. Subsequent clients that arrive after the local seal see `ExtentSealed` and call `DescribeStream(count=1)` to get the new extent, which is already being allocated.
 
@@ -189,7 +193,7 @@ All Extent Nodes, S3 Flusher, and S3 Reader run as Extent Node processes. Stream
 | Magic | 1B | `0xEF` -- protocol identification |
 | Version | 1B | Protocol version (currently 1) |
 | Opcode | 1B | Operation type (see below) |
-| Flags | 1B | Per-opcode flags (e.g., `FLAG_FORWARDED = 0x01` for replication) |
+| Flags | 1B | Per-opcode flags (e.g., `FLAG_OFFSET_PRESENT = 0x01` for Seal) |
 | Remaining Length | 4B | Total bytes of variable header + payload section that follow the fixed header |
 
 **Variable Header**: Determined entirely by the Opcode (and sometimes Flags). Each opcode section below specifies the exact fields and their order. Fields carry protocol-level metadata specific to the operation (stream IDs, offsets, extent IDs, counts, request IDs, etc.). Only the fields meaningful for that opcode appear on the wire. Request ID is a variable header field present in request-response opcodes, absent in fire-and-forget opcodes (e.g., WATERMARK, SM_MEMBERSHIP_CHANGE).
@@ -204,23 +208,20 @@ Grouped by category with gaps for future growth.
 
 **Data path (0x01-0x0F) -- Client <-> Extent Node**
 
-##### 0x01 APPEND (Client -> Primary; Primary -> Secondary when forwarded)
+##### 0x01 APPEND (Client -> Primary)
 
-Append a message to a data stream. `Flags` bit 0 (`FLAG_FORWARDED`): 0 = client request, 1 = forwarded from Primary to Secondary for broadcast replication.
+Append a message to a data stream. Client-only operation; replication uses the dedicated Forward opcode (0x0B).
 
 ```
 Fixed Header (8B)
-  Flags: bit 0 = FLAG_FORWARDED
 Variable Header:
-  [request_id   : u32]    -- correlates request/response (0 when forwarded)
+  [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
   [extent_id    : u32]    -- target extent (for server-side validation)
 Payload:
   [payload_len  : u32]    -- length of message bytes
   [payload      : bytes]  -- message body (application data)
 ```
-
-When forwarded (Primary -> Secondary), `request_id = 0` (not meaningful) and the Secondary derives the logical offset locally from its arena's `record_count`.
 
 ##### 0x02 APPEND_ACK (Primary -> Client)
 
@@ -382,6 +383,23 @@ Variable Header:
 No Payload.
 ```
 
+##### 0x0B FORWARD (Primary -> Secondary)
+
+Dedicated opcode for Primary→Secondary broadcast replication. Carries all metadata including the primary-assigned `byte_pos` so the secondary writes each record at the exact same arena position as the primary, enabling bit-for-bit identical replicas and cross-replica checksum verification. Fire-and-forget: no `request_id`; secondary responds with cumulative `Watermark`.
+
+```
+Fixed Header (8B)
+Variable Header (36B):
+  [stream_id    : u64]    -- target stream
+  [extent_id    : u32]    -- target extent
+  [start_offset : u64]    -- extent base offset (for lazy creation)
+  [offset       : u64]    -- primary-assigned logical offset for this record
+  [byte_pos     : u64]    -- primary-assigned byte position in arena
+Payload:
+  [payload_len  : u32]    -- length of message bytes
+  [payload      : bytes]  -- message body
+```
+
 **Lifecycle (0x10-0x1F) -- Extent Node <-> Stream Manager**
 
 ##### 0x10 CONNECT (Extent Node -> Stream Manager)
@@ -464,7 +482,7 @@ No Payload.
 
 ##### 0x15 REGISTER_EXTENT (Stream Manager -> Extent Node)
 
-Register an extent's replica membership on an Extent Node. Primary receives all secondary addresses for broadcast forwarding; Secondaries receive an empty address list.
+Register an extent's replica membership on an Extent Node. Primary receives all secondary addresses for broadcast forwarding; Secondaries receive an empty address list. SM waits for the **Primary's** `RegisterExtentAck` before responding to the seal requester. `RegisterExtent` to Secondaries is fire-and-forget -- secondaries create extents lazily on first forwarded append (see "Lazy Secondary Extent Creation" in Seal-and-New).
 
 ```
 Fixed Header (8B)
@@ -771,7 +789,7 @@ CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)
 ```
 
 1. Client sends APPEND to Primary. Primary assigns monotonic sequence number, buffers in memory.
-2. Primary broadcasts the append to **all Secondaries in parallel** (O(1) hop, FLAG_FORWARDED set in Flags).
+2. Primary broadcasts the append to **all Secondaries in parallel** using the dedicated Forward opcode (0x0B), which carries the primary-assigned `byte_pos` for deterministic replication.
 3. Each Secondary buffers the append and sends a cumulative WATERMARK ACK back to Primary with its highest committed offset.
 4. Primary tracks per-secondary watermarks in an AckQueue. It computes the quorum offset: sorts secondary watermarks descending, takes the k-th value where `k = RF/2`.
 5. Primary ACKs all pending clients whose offset <= quorum offset (deferred response via per-connection channel).
@@ -1107,3 +1125,4 @@ read(stream, offset=1050, count=10)
 | Multi-dispatch | Shared data + index streams | Storage efficient; avoids body duplication across subscribers |
 | Stream Manager metadata store | MySQL (sqlx) | Reuses existing infra; metadata ops are infrequent (per-extent, not per-message) |
 | Consistency model | Seal-and-new (WAS) | Separates consistency (sealed extent) from availability (new extent) |
+| Seal-and-new readiness | SM waits for Primary `RegisterExtentAck`; secondaries create extents lazily on first forwarded append | Guarantees Primary is ready before clients learn about new extent; eliminates secondary registration race; reduces critical path to 1 SM↔Primary RTT |

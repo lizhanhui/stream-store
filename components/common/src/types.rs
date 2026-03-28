@@ -8,11 +8,6 @@ pub const PROTOCOL_VERSION: u8 = 1;
 /// + RemainingLength 4 = 8).
 pub const HEADER_LEN: usize = 8;
 
-/// Flag bit indicating a forwarded append (broadcast replication).
-/// When set on an Append frame, the receiving ExtentNode acts as a Secondary
-/// (writes locally and returns a Watermark).
-pub const FLAG_FORWARDED: u8 = 0x01;
-
 /// Flag bit on SEAL indicating the caller provides the resolved end offset.
 /// When clear (client seal): Stream Manager queries all EN replicas for offset.
 /// When set (extent-node seal): offset field is present and trusted by SM.
@@ -54,6 +49,10 @@ pub enum Opcode {
     QueryOffset = 0x08,
     QueryOffsetResp = 0x09,
     CreateStreamResp = 0x0A,
+    /// Dedicated forward opcode for Primary→Secondary replication.
+    /// Carries all metadata (including byte_pos) so the secondary writes
+    /// each record at the exact same position as the primary.
+    Forward = 0x0B,
 
     // -- Lifecycle (0x10-0x1F): ExtentNode <-> StreamManager --
     Connect = 0x10,
@@ -94,6 +93,7 @@ impl Opcode {
             0x08 => Some(Opcode::QueryOffset),
             0x09 => Some(Opcode::QueryOffsetResp),
             0x0A => Some(Opcode::CreateStreamResp),
+            0x0B => Some(Opcode::Forward),
             // Lifecycle
             0x10 => Some(Opcode::Connect),
             0x11 => Some(Opcode::ConnectAck),

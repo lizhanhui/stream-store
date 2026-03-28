@@ -59,6 +59,26 @@ impl Stream {
         extent.append(payload)
     }
 
+    /// Replicate a record at the exact position assigned by the primary.
+    ///
+    /// Delegates to `Extent::replicate()` for deterministic replication.
+    /// Only requires `&self` — the Extent handles writes internally.
+    pub fn replicate(
+        &self,
+        extent_id: ExtentId,
+        seq: u64,
+        byte_pos: u64,
+        payload: Bytes,
+    ) -> Result<AppendResult, StorageError> {
+        let extent = self.find_extent(extent_id).ok_or_else(|| {
+            StorageError::Internal(format!(
+                "stream {:?}: extent {:?} not found",
+                self.id, extent_id
+            ))
+        })?;
+        extent.replicate(seq, byte_pos, payload)
+    }
+
     /// Read `count` messages starting from the given logical `offset` within
     /// the specified extent.
     ///
@@ -158,7 +178,7 @@ impl Stream {
     }
 
     /// Find an extent by its ID.
-    fn find_extent(&self, extent_id: ExtentId) -> Option<&Extent> {
+    pub fn find_extent(&self, extent_id: ExtentId) -> Option<&Extent> {
         self.extents.iter().find(|e| e.id == extent_id)
     }
 }

@@ -1,8 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    ErrorCode, ExtentId, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset,
-    Opcode, PROTOCOL_VERSION, StreamId,
+    ErrorCode, ExtentId, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, HEADER_LEN,
+    MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.
@@ -110,6 +110,17 @@ pub enum VariableHeader {
     Watermark {
         stream_id: StreamId,
         offset: Offset,
+    },
+    /// Dedicated forward opcode (0x0B) for Primary→Secondary replication.
+    /// Carries all metadata including byte_pos so the secondary writes
+    /// each record at the exact same arena position as the primary.
+    /// Fire-and-forget: no request_id; secondary responds with cumulative Watermark.
+    Forward {
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        start_offset: Offset,
+        offset: Offset,
+        byte_pos: u64,
     },
     StreamManagerMembershipChange,
     DescribeStream {
@@ -234,7 +245,9 @@ impl Frame {
             | VariableHeader::Seek { request_id, .. }
             | VariableHeader::SeekResp { request_id, .. }
             | VariableHeader::Error { request_id, .. } => *request_id,
-            VariableHeader::Watermark { .. } | VariableHeader::StreamManagerMembershipChange => 0,
+            VariableHeader::Watermark { .. }
+            | VariableHeader::Forward { .. }
+            | VariableHeader::StreamManagerMembershipChange => 0,
         }
     }
 
@@ -253,6 +266,7 @@ impl Frame {
             | VariableHeader::RegisterExtentAck { stream_id, .. }
             | VariableHeader::RegisterExtent { stream_id, .. }
             | VariableHeader::Watermark { stream_id, .. }
+            | VariableHeader::Forward { stream_id, .. }
             | VariableHeader::DescribeStream { stream_id, .. }
             | VariableHeader::DescribeStreamResp { stream_id, .. }
             | VariableHeader::DescribeExtent { stream_id, .. }
@@ -271,6 +285,7 @@ impl Frame {
             | VariableHeader::SealAck { offset, .. }
             | VariableHeader::QueryOffsetResp { offset, .. }
             | VariableHeader::Watermark { offset, .. }
+            | VariableHeader::Forward { offset, .. }
             | VariableHeader::Seek { offset, .. }
             | VariableHeader::SeekResp { offset, .. } => *offset,
             VariableHeader::Read { offset, .. } => *offset,
@@ -290,6 +305,7 @@ impl Frame {
             | VariableHeader::CreateStreamResp { extent_id, .. }
             | VariableHeader::RegisterExtentAck { extent_id, .. }
             | VariableHeader::RegisterExtent { extent_id, .. }
+            | VariableHeader::Forward { extent_id, .. }
             | VariableHeader::DescribeExtent { extent_id, .. }
             | VariableHeader::Error { extent_id, .. } => *extent_id,
             _ => ExtentId(0),
@@ -316,8 +332,8 @@ impl Frame {
 
     /// Get the flags byte for this frame on the wire.
     ///
-    /// For Seal/SealAck, flags are computed from `Option` fields.
-    /// For other opcodes, returns `header.flags` (e.g. FLAG_FORWARDED on Append).
+    /// For Append, Seal, and SealAck, flags are computed from `Option` fields
+    /// (eliminating stale-flag bugs). For other opcodes, returns `header.flags`.
     pub fn flags(&self) -> u8 {
         let computed = match &self.variable_header {
             VariableHeader::Seal { offset, .. } => {
@@ -420,6 +436,8 @@ impl Frame {
             VariableHeader::RegisterExtentAck { .. } => 4 + 8 + 4,
             // stream_id(8) + offset(8) -- no request_id
             VariableHeader::Watermark { .. } => 8 + 8,
+            // stream_id(8) + extent_id(4) + start_offset(8) + offset(8) + byte_pos(8) -- no request_id
+            VariableHeader::Forward { .. } => 8 + 4 + 8 + 8 + 8,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
             // request_id(4) + stream_id(8) + count(4)
@@ -447,6 +465,7 @@ impl Frame {
             | VariableHeader::Disconnect { .. }
             | VariableHeader::Heartbeat { .. }
             | VariableHeader::RegisterExtent { .. }
+            | VariableHeader::Forward { .. }
             | VariableHeader::StreamManagerMembershipChange
             | VariableHeader::DescribeStreamResp { .. }
             | VariableHeader::DescribeExtentResp { .. }
@@ -619,6 +638,19 @@ impl Frame {
             VariableHeader::Watermark { stream_id, offset } => {
                 dst.put_u64(stream_id.0);
                 dst.put_u64(offset.0);
+            }
+            VariableHeader::Forward {
+                stream_id,
+                extent_id,
+                start_offset,
+                offset,
+                byte_pos,
+            } => {
+                dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u64(start_offset.0);
+                dst.put_u64(offset.0);
+                dst.put_u64(*byte_pos);
             }
             VariableHeader::StreamManagerMembershipChange => {
                 // no variable header fields, just payload
@@ -956,6 +988,24 @@ impl Frame {
                 let offset = Offset(body.get_u64());
                 Ok((VariableHeader::Watermark { stream_id, offset }, None))
             }
+            Opcode::Forward => {
+                let stream_id = StreamId(body.get_u64());
+                let extent_id = ExtentId(body.get_u32());
+                let start_offset = Offset(body.get_u64());
+                let offset = Offset(body.get_u64());
+                let byte_pos = body.get_u64();
+                let payload = Self::read_payload(body);
+                Ok((
+                    VariableHeader::Forward {
+                        stream_id,
+                        extent_id,
+                        start_offset,
+                        offset,
+                        byte_pos,
+                    },
+                    payload,
+                ))
+            }
             Opcode::StreamManagerMembershipChange => {
                 let payload = Self::read_payload(body);
                 Ok((VariableHeader::StreamManagerMembershipChange, payload))
@@ -1088,6 +1138,7 @@ impl VariableHeader {
             VariableHeader::RegisterExtent { .. } => Opcode::RegisterExtent,
             VariableHeader::RegisterExtentAck { .. } => Opcode::RegisterExtentAck,
             VariableHeader::Watermark { .. } => Opcode::Watermark,
+            VariableHeader::Forward { .. } => Opcode::Forward,
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
             VariableHeader::DescribeStream { .. } => Opcode::DescribeStream,
             VariableHeader::DescribeStreamResp { .. } => Opcode::DescribeStreamResp,
