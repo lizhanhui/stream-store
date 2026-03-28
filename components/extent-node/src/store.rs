@@ -1427,12 +1427,15 @@ mod tests {
         let mut ack_queue = AckQueue::new(1); // need 1 secondary ACK
 
         // Queue a PendingAck with a creation time far in the past (simulates timeout).
+        // Use Instant::ZERO instead of subtracting a Duration from Instant::now(),
+        // because on some x86-64 Linux systems the TSC-based subtraction can underflow
+        // when the cycle counter hasn't been running long enough (e.g. VMs, containers).
         ack_queue.pending.push_back(PendingAck {
             request_id: 42,
             stream_id: StreamId(10),
             response_tx: resp_tx.clone(),
             assigned_offset: 0,
-            created_at: Instant::now() - REPLICATION_TIMEOUT - Duration::from_secs(1),
+            created_at: Instant::ZERO,
         });
 
         // Queue a second PendingAck that is NOT expired.
