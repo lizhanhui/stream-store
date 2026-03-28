@@ -538,7 +538,6 @@ dependencies = [
  "common",
  "criterion",
  "dashmap",
- "fastant",
  "futures-util",
  "rpc",
  "server",

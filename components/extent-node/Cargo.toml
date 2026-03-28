@@ -8,7 +8,6 @@ name = "extent_append"
 harness = false
 
 [dependencies]
-fastant = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tokio-util = { workspace = true }
