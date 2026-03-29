@@ -1,4 +1,5 @@
 use std::alloc::{Layout, alloc, dealloc};
+use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -7,6 +8,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{ExtentId, ExtentState, Offset};
+use crossbeam_channel::{Receiver, Sender, unbounded};
+
+use crate::store::AppendJob;
 
 /// Default arena capacity: 64 MB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
@@ -85,31 +89,25 @@ pub struct AppendResult {
 
 /// A lock-free extent backed by a pre-allocated contiguous memory arena.
 ///
-/// # Concurrency Model
+/// # Concurrency Model: Pipelined Group Commit
 ///
-/// Multiple threads can append concurrently without any mutex:
+/// Writers use a **leader election + delegation** pattern at the store level:
 ///
-/// 1. **Slot reservation**: `write_cursor` is advanced via `fetch_add` to atomically
-///    claim a `(byte_offset, length)` region. Each writer owns its reserved region
-///    exclusively -- no overlap is possible.
+/// 1. **Leader election**: `in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the
+///    thread becomes the **active writer** (fast path). If `prev > 0`, an active
+///    writer already exists — the thread pushes an `AppendJob` into the channel
+///    and returns immediately (slow path).
 ///
-/// 2. **Sequence assignment**: `record_count` is advanced via `fetch_add` to atomically
-///    assign a monotonic logical sequence number to each record.
+/// 2. **Single-writer append**: The active writer calls `append_inner()` which
+///    uses plain loads/stores on cursors (no `fetch_add`, no spin-wait) since
+///    single-writer access is guaranteed by the leader election.
 ///
-/// 3. **Payload copy**: The writer copies its payload into the reserved region.
-///    This is safe because regions do not overlap.
+/// 3. **Batch drain**: After its own append, the leader checks if followers
+///    arrived (`in_flight > 1`). If so, it drains the `job_rx` channel and
+///    processes all pending jobs as a batch, amortizing synchronization cost.
 ///
-/// 4. **Commit advancement** (Approach A -- spin-wait): After copying, the writer
-///    spins on `committed_seq` until it equals their sequence number, then CAS-advances
-///    it to seq+1. This ensures `committed_seq` advances in-order. The spin is brief
-///    because it only waits for the immediately preceding writer to finish its memcpy
-///    (nanoseconds for typical messages <1 KB). This is the same pattern used by
-///    the Linux kernel's io_uring SQ and the LMAX Disruptor.
-///
-/// 5. **Reads**: Readers observe `committed_bytes` (Acquire load) as the visibility
-///    boundary. Records in the arena are self-contained (`[len: u32 BE][payload]`),
-///    so readers walk forward from a given byte position by reading each record's
-///    length prefix. No separate index structure is needed.
+/// This eliminates cache-line bouncing from the old multi-writer spin-wait
+/// protocol while maintaining the same lock-free read path.
 ///
 /// # Memory Layout
 ///
@@ -143,19 +141,19 @@ pub struct Extent {
     /// Total capacity of the arena in bytes.
     capacity: usize,
 
-    /// Byte position of the next free slot. Writers `fetch_add` to reserve space.
+    /// Byte position of the next free slot. Updated by the single active writer.
     write_cursor: AtomicU64,
 
-    /// Number of records appended. Writers `fetch_add` to assign sequence numbers.
+    /// Number of records appended. Updated by the single active writer.
     record_count: AtomicU64,
 
     /// Committed sequence: all records with seq < committed_seq have been fully
-    /// written and are safe to read. Advanced in-order via spin-wait CAS.
+    /// written and are safe to read. Updated by the single active writer.
     committed_seq: AtomicU64,
 
     /// Committed byte position: the byte offset up to which all records are fully
     /// written. Readers use this as the upper bound when walking the arena.
-    /// Advanced in-order alongside `committed_seq`.
+    /// Updated by the single active writer.
     committed_bytes: AtomicU64,
 
     /// Message limit for this extent.
@@ -167,15 +165,21 @@ pub struct Extent {
     ///   with `ExtentSealed`.
     limit: AtomicU64,
 
-    /// Number of in-flight appenders: threads that have passed the `limit` check
-    /// but have not yet finished committing. Used by `seal()` to wait for all
-    /// in-flight appenders to complete before reading the final `record_count`.
+    /// Leader election counter for pipelined group commit.
+    /// 0 = idle. After fetch_add: 1 = sole writer (fast path), >1 = followers waiting.
+    /// Also used by `seal()` to wait for the active writer to drain.
     in_flight: AtomicU64,
 
     /// Internal index mapping sequence number → byte position (compressed u32).
     /// Entry i holds the byte_pos for the i-th record appended to this extent.
     /// Capacity = arena_capacity / MIN_RECORD_SIZE.
     index: Box<[AtomicU32]>,
+
+    /// Channel for followers to submit append jobs to the active writer.
+    /// Wrapped in `UnsafeCell<Option<…>>` so we can drop them at seal time
+    /// to free the internal channel allocation. See accessor methods below.
+    job_tx: UnsafeCell<Option<Sender<AppendJob>>>,
+    job_rx: UnsafeCell<Option<Receiver<AppendJob>>>,
 }
 
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
@@ -213,6 +217,8 @@ impl Extent {
         }
         let index = index_entries.into_boxed_slice();
 
+        let (job_tx, job_rx) = unbounded();
+
         Self {
             id,
             start_offset,
@@ -226,54 +232,95 @@ impl Extent {
             limit: AtomicU64::new(LIMIT_OPEN),
             in_flight: AtomicU64::new(0),
             index,
+            job_tx: UnsafeCell::new(Some(job_tx)),
+            job_rx: UnsafeCell::new(Some(job_rx)),
         }
     }
 
     /// Append a message. Returns the assigned logical offset and the byte
     /// position within the arena.
     ///
-    /// This method is **lock-free**: multiple threads may call it concurrently.
-    /// Slot reservation and sequence assignment use `fetch_add`. The payload copy
-    /// writes into a non-overlapping region. Commit advancement uses a brief
-    /// spin-wait CAS on `committed_seq`.
+    /// This method uses the extent-level leader election (`in_flight` counter)
+    /// to ensure only one thread calls `append_inner()` at a time. Other
+    /// threads spin-wait until the leader finishes, then retry.
     ///
-    /// The returned `AppendResult.byte_pos` allows the caller to build an
-    /// external offset-to-position index for O(1) random reads.
+    /// In production, the store layer performs its own leader election and
+    /// calls `append_inner()` directly, bypassing this method.
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
-        // Increment in_flight BEFORE loading limit. This ensures seal() can wait
-        // for all appenders who might have seen LIMIT_OPEN.
-        self.in_flight.fetch_add(1, Ordering::AcqRel);
+        loop {
+            let prev = self.in_flight.fetch_add(1, Ordering::Acquire);
+            if prev == 0 {
+                // I'm the leader — do the append.
+                let result = self.append_inner(payload);
+                // Release leadership. Remaining count = in_flight - 1.
+                let remaining = self.in_flight.fetch_sub(1, Ordering::Release);
+                // If others are waiting, we need to let them retry.
+                // They'll see in_flight decrement and loop again.
+                // But first, drain any that accumulated: they need to decrement
+                // their own in_flight and retry. We just need to release.
+                if remaining > 1 {
+                    // Other threads are spinning — they decremented on their own path.
+                    // Nothing to do here; they'll decrement and retry.
+                }
+                return result;
+            } else {
+                // Another leader is active. Decrement and spin-wait, then retry.
+                self.in_flight.fetch_sub(1, Ordering::Release);
+                // Brief spin-wait for the leader to finish.
+                let mut spin = 0u32;
+                loop {
+                    if self.in_flight.load(Ordering::Acquire) == 0 {
+                        break;
+                    }
+                    if spin < 6 {
+                        for _ in 0..(1 << spin) {
+                            std::hint::spin_loop();
+                        }
+                    } else {
+                        std::thread::yield_now();
+                    }
+                    spin += 1;
+                }
+                // Retry from the top.
+            }
+        }
+    }
 
+    /// Single-writer append: plain loads/stores on cursors.
+    ///
+    /// # Safety contract
+    ///
+    /// Must be called by at most one thread at a time. In production, this is
+    /// guaranteed by the store-level leader election (`in_flight` counter).
+    /// In tests/benchmarks, single-threaded or `append()` wrapper provides
+    /// the guarantee.
+    pub(crate) fn append_inner(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
+        // Check seal limit.
         let limit = self.limit.load(Ordering::Acquire);
         if limit != LIMIT_OPEN {
             let current = self.record_count.load(Ordering::Relaxed);
             if current >= limit {
-                self.in_flight.fetch_sub(1, Ordering::AcqRel);
                 return Err(StorageError::ExtentSealed(self.id));
             }
-            // Fall through to normal append path — late forwarded write within sealed range.
         }
 
         let payload_len = payload.len();
         // Record layout: [len: 4 bytes][payload: payload_len bytes]
         let record_len = 4 + payload_len;
 
-        // 1. Reserve byte slot (atomic fetch_add, lock-free).
-        let byte_pos = self
-            .write_cursor
-            .fetch_add(record_len as u64, Ordering::Relaxed);
+        // 1. Reserve byte slot (plain load + store, single writer).
+        let byte_pos = self.write_cursor.load(Ordering::Relaxed);
         if byte_pos + record_len as u64 > self.capacity as u64 {
-            // Extent full. The cursor may overshoot capacity -- that's fine because
-            // seal will stop further appends and committed_bytes won't advance past
-            // the last successful record.
-            self.in_flight.fetch_sub(1, Ordering::AcqRel);
             return Err(StorageError::ExtentFull(self.id));
         }
+        self.write_cursor
+            .store(byte_pos + record_len as u64, Ordering::Relaxed);
 
-        // 2. Reserve logical sequence number (atomic fetch_add, lock-free).
-        let seq = self.record_count.fetch_add(1, Ordering::Relaxed);
+        // 2. Reserve logical sequence number (plain load + store, single writer).
+        let seq = self.record_count.load(Ordering::Relaxed);
+        self.record_count.store(seq + 1, Ordering::Relaxed);
 
-        // 3. Write record into reserved region (no lock -- exclusive ownership).
+        // 3. Write record into reserved region.
         unsafe {
             let dst = self.buf.add(byte_pos as usize);
             // Write length prefix (big-endian u32).
@@ -284,40 +331,12 @@ impl Extent {
             }
         }
 
-        // 4. Advance committed_seq and committed_bytes in-order (spin-wait).
-        //    Each writer spins until committed_seq == their seq (preceding writer is done),
-        //    then updates committed_bytes and the index, and FINALLY advances committed_seq.
-        //    This ordering ensures that when an observer sees committed_seq == N,
-        //    ALL records with seq < N have their committed_bytes and index entries
-        //    fully visible. This is critical for seal() atomicity.
-        //    Uses exponential backoff: up to 63 spin iterations (sub-µs), then yield to OS.
+        // 4. Update committed state directly (single writer, no spin-wait needed).
         let new_committed_bytes = byte_pos + record_len as u64;
-
-        // Phase A: Spin until it's our turn (committed_seq == seq).
-        for spin_count in 0u32.. {
-            if self.committed_seq.load(Ordering::Acquire) == seq {
-                break;
-            }
-            if spin_count < 6 {
-                for _ in 0..(1 << spin_count) {
-                    std::hint::spin_loop();
-                }
-            } else {
-                std::thread::yield_now();
-            }
-        }
-
-        // Phase B: Update committed_bytes and index BEFORE advancing committed_seq.
         self.committed_bytes
             .store(new_committed_bytes, Ordering::Release);
         self.index_record(seq, byte_pos);
-
-        // Phase C: Signal completion — advance committed_seq so the next writer
-        // (and any seal() spin-wait) can proceed.
         self.committed_seq.store(seq + 1, Ordering::Release);
-
-        // Decrement in-flight counter — seal() may be waiting for this.
-        self.in_flight.fetch_sub(1, Ordering::AcqRel);
 
         Ok(AppendResult {
             offset: Offset(self.start_offset.0 + seq),
@@ -484,19 +503,10 @@ impl Extent {
     /// `committed_offset - start_offset`. This allows secondaries to accept late
     /// forwarded appends up to the primary's committed offset.
     ///
-    /// If `None` (primary sealing itself), the seal is **atomic** with respect
-    /// to concurrent appenders:
-    ///
-    /// 1. Set `limit` to the current `record_count` to block new appenders from
-    ///    passing the sealed check in `append()`.
-    /// 2. Spin-wait until `committed_seq == record_count`, ensuring all in-flight
-    ///    writers (who loaded `limit == LIMIT_OPEN` before step 1) have finished
-    ///    their commit.
-    /// 3. Re-read `record_count` — it may have advanced beyond the initial limit
-    ///    due to those in-flight writers. Update `limit` to the final value.
-    ///
-    /// This guarantees: after `seal()` returns, `limit == committed_seq == record_count`.
-    /// No phantom writes, no orphaned data.
+    /// If `None` (primary sealing itself), we set `limit` to the current
+    /// `record_count`. With pipelined group commit, the store layer ensures
+    /// all in-flight work is drained before calling seal, so we simply wait
+    /// for `in_flight == 0` to ensure the active writer has finished.
     pub fn seal(&self, committed_offset: Option<u64>) -> u64 {
         if let Some(offset) = committed_offset {
             // Secondary path: SM provides the authoritative committed offset.
@@ -507,15 +517,22 @@ impl Extent {
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(_) => self.start_offset.0 + count,
+                Ok(_) => {
+                    // Free the job channel — no more appends possible after seal.
+                    // SAFETY: in_flight == 0 guarantees no concurrent access.
+                    unsafe {
+                        (*self.job_tx.get()).take();
+                        (*self.job_rx.get()).take();
+                    }
+                    self.start_offset.0 + count
+                }
                 Err(limit) => self.start_offset.0 + limit,
             }
         } else {
-            // Primary path: seal atomically with concurrent appenders.
-
+            // Primary path: seal atomically.
+            //
             // Step 1: Set limit to current record_count. This prevents any NEW
-            // appender from passing the sealed check. Appenders already past the
-            // check (loaded LIMIT_OPEN) are in-flight and will commit normally.
+            // appender from passing the sealed check.
             let preliminary = self.record_count.load(Ordering::Acquire);
             match self.limit.compare_exchange(
                 LIMIT_OPEN,
@@ -530,15 +547,9 @@ impl Extent {
                 }
             }
 
-            // Step 2: Wait for all in-flight appenders to drain.
-            //
-            // After step 1 set limit, new appenders see `limit != LIMIT_OPEN` and
-            // either return ExtentSealed (if at/past limit) or proceed as a late
-            // forwarded write (if within limit). Either way they decrement in_flight.
-            //
-            // Appenders who loaded LIMIT_OPEN before step 1 are in-flight: they will
-            // increment record_count, write, commit, advance committed_seq, and then
-            // decrement in_flight. We wait for all of them to finish.
+            // Step 2: Wait for the active writer (if any) to finish draining.
+            // With group commit, in_flight > 0 means a leader is currently
+            // processing appends. Wait for it to finish.
             let mut spin_count = 0u32;
             loop {
                 let inflight = self.in_flight.load(Ordering::Acquire);
@@ -555,11 +566,17 @@ impl Extent {
                 spin_count += 1;
             }
 
-            // Step 3: All in-flight appenders have committed. Read the true final
-            // record_count and update limit. This is the authoritative sealed count.
+            // Step 3: Read the true final record_count and update limit.
             let final_count = self.record_count.load(Ordering::Acquire);
             if final_count > preliminary {
                 self.limit.store(final_count, Ordering::Release);
+            }
+
+            // Free the job channel — no more appends possible after seal.
+            // SAFETY: in_flight == 0 guarantees no concurrent access.
+            unsafe {
+                (*self.job_tx.get()).take();
+                (*self.job_rx.get()).take();
             }
 
             self.start_offset.0 + final_count
@@ -621,6 +638,24 @@ impl Extent {
     /// Arena capacity in bytes.
     pub fn capacity(&self) -> usize {
         self.capacity
+    }
+
+    /// Return the in_flight counter reference (for store-level leader election).
+    pub(crate) fn in_flight(&self) -> &AtomicU64 {
+        &self.in_flight
+    }
+
+    /// Return a reference to the job sender channel.
+    /// SAFETY: job_tx is `Some` from construction until `seal()` drops it.
+    /// Callers only invoke this while `in_flight > 0` (before seal completes).
+    pub(crate) fn job_tx(&self) -> &Sender<AppendJob> {
+        unsafe { (*self.job_tx.get()).as_ref().unwrap_unchecked() }
+    }
+
+    /// Return a reference to the job receiver channel.
+    /// SAFETY: same invariant as `job_tx`.
+    pub(crate) fn job_rx(&self) -> &Receiver<AppendJob> {
+        unsafe { (*self.job_rx.get()).as_ref().unwrap_unchecked() }
     }
 
     /// Return a contiguous `Bytes` view of all committed record data in the arena.

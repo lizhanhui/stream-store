@@ -807,15 +807,15 @@ CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)
 - **Hot data** (active/sealed-in-memory extents): Read from any replica.
 - **Cold data** (flushed extents): Read from S3 via read cache.
 
-### Extent-Node Concurrency: Lock-Free Arena
+### Extent-Node Concurrency: Pipelined Group Commit
 
-The active extent on each Extent Node uses a **lock-free pre-allocated memory arena** to maximize append throughput under high concurrency. Multiple client connections (and the replication path) can append to the same extent concurrently without any mutex.
+The active extent on each Extent Node uses a **pipelined group commit** pattern to maximize append throughput under high concurrency. Instead of multiple writers contending on atomic cursors (which causes cache-line bouncing), a **leader election** delegates all writes to a single active writer per extent.
 
 #### Arena Layout
 
 Each active extent pre-allocates a contiguous buffer (configurable, default 64 MiB via `ExtentNodeConfig.extent_arena_capacity`). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed extents.
 
-The arena has no internal index structure. Records are self-contained: a reader can walk forward from any byte position by reading the length prefix and advancing by `4 + len` bytes. Random access is provided by an **external index** maintained by the application layer (see "Index-Based Read Path" below).
+The arena has no internal index structure. Records are self-contained: a reader can walk forward from any byte position by reading the length prefix and advancing by `4 + len` bytes. Random access is provided by an **internal index** (see below).
 
 ```
 Extent Arena (pre-allocated contiguous buffer, configurable size):
@@ -830,54 +830,59 @@ Extent Arena (pre-allocated contiguous buffer, configurable size):
   record_count    : AtomicU64 — number of records (sequence counter)
   committed_seq   : AtomicU64 — all records with seq < committed_seq are readable
   committed_bytes : AtomicU64 — byte position up to which all records are fully written
-  sealed          : AtomicBool
+  in_flight       : AtomicU64 — leader election counter (0 = idle)
+  job_tx/job_rx   : crossbeam unbounded channel for follower delegation
 ```
 
-#### Append Path (Lock-Free, Multiple Concurrent Writers)
+#### Append Path (Pipelined Group Commit)
 
 ```
-Thread A ──► fetch_add(write_cursor, recA_len) ──► got byte_pos=0
-Thread B ──► fetch_add(write_cursor, recB_len) ──► got byte_pos=recA_len
-Thread C ──► fetch_add(write_cursor, recC_len) ──► got byte_pos=recA_len+recB_len
-
-  Each thread now owns an exclusive, non-overlapping region.
-  They copy their payload into their region in parallel.
-
-Thread A ──► memcpy into [0..recA_len]
-Thread B ──► memcpy into [recA_len..recA_len+recB_len]      (parallel)
-Thread C ──► memcpy into [recA_len+recB_len..]              (parallel)
+Writer A arrives: in_flight.fetch_add(1) → prev=0 → LEADER
+  ├─ append_inner(payload_A) — plain load/store on cursors
+  ├─ broadcast Forward (if RF≥2) or send AppendAck (if RF=1)
+  ├─ in_flight.fetch_sub(1) → remaining=3 → drain batch
+  │
+  │  Writer B arrives: in_flight.fetch_add(1) → prev=1 → FOLLOWER
+  │  ├─ push AppendJob to job_tx
+  │  └─ return None (deferred)
+  │
+  │  Writer C arrives: in_flight.fetch_add(1) → prev=2 → FOLLOWER
+  │  ├─ push AppendJob to job_tx
+  │  └─ return None (deferred)
+  │
+  └─ drain loop:
+     ├─ recv jobs [B, C] from job_rx
+     ├─ append_inner(payload_B), send ACK/Forward for B
+     ├─ append_inner(payload_C), send ACK/Forward for C
+     ├─ in_flight.fetch_sub(2) → remaining=0 → done
+     └─ break
 ```
 
 Detailed steps:
 
-1. **Check sealed** (atomic load, Acquire). If sealed, return `ExtentSealed`.
-2. **Reserve byte slot**: `write_cursor.fetch_add(record_len)` -- atomically claims a non-overlapping region in the arena. If the cursor exceeds capacity, return `ExtentFull` (triggers seal-and-new).
-3. **Reserve logical sequence**: `record_count.fetch_add(1)` -- atomically assigns a monotonic sequence number.
-4. **Copy payload**: Write `[len][payload]` into the reserved region. No lock needed -- each writer owns its region exclusively.
-5. **Advance committed_seq and committed_bytes** (spin-wait CAS, Approach A): The writer spins on `committed_seq.compare_exchange_weak(seq, seq+1)` until it succeeds, then stores the new `committed_bytes`. This ensures both cursors advance **in-order** -- a reader seeing `committed_bytes=N` is guaranteed that all bytes in `0..N` are fully written.
-6. **Return `AppendResult { offset, byte_pos }`**: The caller receives both the logical offset and the byte position within the arena. The byte position is recorded in the extent's internal compressed index (`AtomicU32`) for O(1) offset→byte_pos resolution during reads.
+1. **Leader election**: `in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the thread is the **active writer** (fast path). If `prev > 0`, an active writer exists — push `AppendJob` to the channel and return immediately (slow path).
 
-#### Commit Cursor: Spin-Wait CAS (Approach A)
+2. **Single-writer append** (`append_inner`): The leader uses plain `load`/`store` on `write_cursor` and `record_count` (no `fetch_add`). Same memcpy as before. Direct `store` of `committed_bytes`, index entry, and `committed_seq` — no spin-wait needed since there's only one writer.
 
-The commit advancement step is the only point where writers interact with each other. The spin waits for the **immediately preceding writer** to finish its memcpy. For typical messages (<1 KB), memcpy completes in tens of nanoseconds, so the spin is negligible.
+3. **Replication / ACK**: After append, the leader checks `ReplicaInfo`:
+   - **RF=1 / standalone / no replica**: Send immediate `AppendAck` via `response_tx`.
+   - **RF≥2 Primary**: Broadcast `Forward` to all secondaries, queue `PendingAck`.
 
-This is the same technique used by:
-- Linux kernel's io_uring submission queue
-- LMAX Disruptor's multi-producer sequencer
-- Intel DPDK ring buffer
+4. **Batch drain**: After own append, `in_flight.fetch_sub(1, Release)`. If `remaining > 1`, drain `job_rx` and process each follower's payload through the same append + replicate path. `in_flight.fetch_sub(batch_size, Release)` after each batch. Loop until `remaining ≤ batch_size`.
 
-```
-committed_seq: 0
+5. **Follower return**: Followers return `None` immediately. Their ACK (or error) is sent via `response_tx` by the leader.
 
-Thread A (seq=0): memcpy done → CAS(0→1) succeeds immediately
-Thread C (seq=2): memcpy done → CAS(0→3)? NO, spin... CAS(1→3)? NO, spin...
-Thread B (seq=1): memcpy done → CAS(1→2) succeeds
-Thread C (seq=2): CAS(2→3) succeeds  ← waited only for Thread B's memcpy
-```
+#### Atomic Ordering Analysis
+
+- **`fetch_add(1, Acquire)` on entry**: If we see `prev > 0`, Acquire ensures visibility of the leader's prior operations. If `prev == 0`, harmless.
+- **`fetch_sub(1, Release)` after own append**: Release ensures the next reader (via Acquire in fetch_add) sees committed writes to the arena.
+- **`fetch_sub(batch_size, Release)` after batch drain**: Same Release semantics. The returned value determines whether to loop.
+
+Why not AcqRel everywhere? The `fetch_sub` doesn't need Acquire — the draining leader already has full visibility. The `fetch_add` doesn't need Release — the follower publishes via channel, not via atomic. Minimal orderings reduce overhead on ARM.
 
 #### Internal Extent Index (Compressed u32 Pointers)
 
-Each extent maintains an **internal index** — a lock-free array mapping sequence numbers to byte positions within the arena. The index is populated atomically inside `Extent::append()` after the commit CAS succeeds, and used during reads to resolve logical offsets to physical byte positions. There is no separate `IndexExtent` struct; the index is absorbed directly into `Extent`.
+Each extent maintains an **internal index** — a lock-free array mapping sequence numbers to byte positions within the arena. The index is populated atomically inside `append_inner()` after the commit stores succeed, and used during reads to resolve logical offsets to physical byte positions. There is no separate `IndexExtent` struct; the index is absorbed directly into `Extent`.
 
 **Index structure:**
 - `Box<[AtomicU32]>` — one entry per possible record in the extent, using compressed 32-bit pointers (sufficient for 64 MiB arenas, max byte_pos < 2^32).
@@ -886,7 +891,7 @@ Each extent maintains an **internal index** — a lock-free array mapping sequen
 - Sentinel value `u32::MAX` distinguishes unwritten entries from byte_pos=0.
 - Memory savings: 4 bytes per entry vs 8 bytes with `AtomicU64` — halves index memory overhead.
 
-**Write path:** Inside `Extent::append()`, after the committed_seq CAS succeeds and committed_bytes is stored, the writer records `index[seq].store(byte_pos as u32, Release)`. This is lock-free and happens in the same thread as the commit — no external coordination needed.
+**Write path:** Inside `append_inner()`, after `committed_bytes.store(Release)`, the writer records `index[seq].store(byte_pos as u32, Release)`. Single-writer guarantee means no contention.
 
 **Ordering analysis:** The reader's Acquire load on `index[seq]` synchronizes-with the writer's Release store. Since the index store happens after `committed_bytes.store(Release)`, which happens after the payload memcpy, the reader is guaranteed to see the fully written payload. On x86-64, `AtomicU32` with Release/Acquire compiles to plain `mov` instructions (TSO provides the ordering for free) — zero runtime cost.
 
@@ -901,9 +906,8 @@ Each extent maintains an **internal index** — a lock-free array mapping sequen
 - **Clients only need logical offsets.** The `byte_pos` concept is invisible to the external API (wire protocol, client library, AppendResult).
 - **O(1) random reads** — no sequential walk from byte 0. Index lookup is a direct array access.
 - **No additional I/O** — the index lives in-memory alongside the data extent.
-- **Lock-free** — both record and lookup use atomic operations with no mutex contention.
-- **Readers never block writers.** The only synchronization is atomic loads on `committed_bytes` and index entries.
-- **Single-struct ownership** — one `Extent` owns both data and index, simplifying lifecycle management and eliminating parallel-vector bookkeeping.
+- **Lock-free reads** — readers use atomic loads on `committed_bytes` and index entries, never blocking the writer.
+- **Single-struct ownership** — one `Extent` owns both data and index, simplifying lifecycle management.
 
 #### Configurable Arena Capacity
 
@@ -914,21 +918,22 @@ The arena capacity is configurable per ExtentNode via `ExtentNodeConfig.extent_a
 
 The capacity is applied to all extents created on the ExtentNode, including new extents created during seal-and-new.
 
-#### Seal (Atomic Flag)
+#### Seal
 
-Sealing sets `sealed.store(true, Release)`. Subsequent appends see the flag and return `ExtentSealed`. The `committed_seq` at seal time is the definitive record count reported to Stream Manager.
+Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (leader has finished draining), then reads the final `record_count`. Subsequent appends see the limit and return `ExtentSealed`. The `committed_seq` at seal time is the definitive record count reported to Stream Manager.
 
 #### Properties
 
 | Property | Guarantee |
 |----------|----------|
-| Offset uniqueness | `record_count.fetch_add` is atomic -- no two writers get the same sequence |
-| No overlap | `write_cursor.fetch_add` gives each writer a disjoint byte region |
+| Offset uniqueness | Single writer assigns sequences via plain `load`/`store` — no contention |
+| No overlap | Single writer advances `write_cursor` — each record occupies a disjoint region |
 | Read consistency | `committed_bytes` advances in-order; readers see a gap-free prefix |
 | Zero-copy reads | `Bytes::slice` into the arena buffer; no allocation or copy |
 | Zero-copy S3 flush | Arena bytes are in wire format; sealed extent uploads the buffer directly |
-| No mutex on hot path | Append and read use only atomic operations and brief spin-wait |
+| No mutex on hot path | Leader election uses a single `fetch_add`; followers push to unbounded channel |
 | O(1) random read | Internal extent index resolves offset→byte_pos; no sequential walk needed |
+| Scalable under contention | Followers delegate to leader, eliminating cache-line bouncing |
 
 ### Failure Handling
 

@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [[bench]]
-name = "extent_append"
+name = "store_append"
 harness = false
 
 [dependencies]
@@ -21,6 +21,7 @@ rpc = { path = "../rpc" }
 server = { path = "../server" }
 client = { path = "../client" }
 fastant = { workspace = true }
+crossbeam-channel = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

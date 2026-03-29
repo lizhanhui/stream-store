@@ -4,6 +4,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use common::errors::StorageError;
 use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use dashmap::DashMap;
 use rpc::frame::{Frame, VariableHeader};
@@ -12,7 +13,7 @@ use server::handler::RequestHandler;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::extent::DEFAULT_ARENA_CAPACITY;
+use crate::extent::{DEFAULT_ARENA_CAPACITY, Extent};
 use crate::stream::Stream;
 
 // ── Broadcast replication types ──────────────────────────────────────────────
@@ -216,6 +217,23 @@ impl ReplicaInfo {
     pub fn required_secondary_acks(&self) -> u32 {
         (self.replication_factor as u32) / 2
     }
+}
+
+// ── Pipelined group commit types ─────────────────────────────────────────────
+
+/// A pending append job delegated from a follower to the active writer.
+///
+/// When a thread arrives at an extent and finds another writer already active
+/// (via `in_flight` counter), it pushes an `AppendJob` into the extent's channel
+/// and returns immediately. The active writer drains these jobs as a batch.
+pub(crate) struct AppendJob {
+    pub request_id: u32,
+    pub stream_id: StreamId,
+    pub extent_id: ExtentId,
+    pub payload: Bytes,
+    /// Channel back to the client connection for sending response frames.
+    /// `None` in test mode (no client connection).
+    pub response_tx: Option<mpsc::Sender<Frame>>,
 }
 
 // ── ExtentNodeStore ──────────────────────────────────────────────────────────
@@ -464,15 +482,16 @@ impl ExtentNodeStore {
         )
     }
 
-    /// Handle Append — behaviour depends on replication role:
+    /// Handle Append — pipelined group commit with leader election.
     ///
-    /// **No replication / standalone**: Write locally, return AppendAck immediately.
+    /// Uses per-extent `in_flight` counter for leader election:
+    /// - `prev == 0`: This thread becomes the active writer (fast path).
+    ///   Appends its own payload, then drains any follower jobs from the channel.
+    /// - `prev > 0`: An active writer exists. Push an `AppendJob` to the channel
+    ///   and return `None` immediately (deferred ACK).
     ///
-    /// **Primary**: Write locally, broadcast ForwardRequests to all secondaries
-    /// in parallel, queue PendingAck, return None (deferred ACK).
-    /// If standalone (RF=1), ACK immediately.
-    ///
-    /// Forwarded replication is now handled by `handle_forward()` (opcode 0x0B).
+    /// The active writer handles replication (Forward + PendingAck for RF≥2)
+    /// or sends immediate AppendAck (RF=1/standalone) for each job.
     fn handle_append(
         &self,
         frame: Frame,
@@ -494,166 +513,345 @@ impl ExtentNodeStore {
             }
         };
 
-        // Write locally. The Extent's append is lock-free (atomic CAS).
-        let append_result = match stream_ref
-            .append(extent_id, frame.payload.clone().unwrap_or_default())
-        {
-            Ok(r) => r,
-            Err(common::errors::StorageError::ExtentSealed(_)) => {
-                return Some(Frame::error_response(
-                    frame.request_id(),
-                    ErrorCode::ExtentSealed,
-                    "extent is sealed",
-                    ExtentId(0),
-                ));
-            }
-            Err(common::errors::StorageError::ExtentFull(_)) => {
-                // Drop the read guard before acquiring write guard for seal.
-                drop(stream_ref);
-
-                // Proactively seal the extent so subsequent appends get
-                // ExtentSealed (fast path) instead of racing on the full arena.
-                let (extent_id, offset) =
-                    if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-                        let active_extent_id = stream_mut.active_extent_id().unwrap_or(ExtentId(0));
-                        match stream_mut.seal(active_extent_id, None) {
-                            Some((_start_offset, end_offset)) => (active_extent_id, end_offset),
-                            None => (active_extent_id, 0),
-                        }
-                    } else {
-                        (ExtentId(0), 0)
-                    };
-
-                // Primary: notify background task to send Seal to Stream Manager,
-                // triggering new extent allocation before clients retry.
-                if let Some(ref tx) = self.seal_tx {
-                    let _ = tx.try_send(SealRequest {
-                        stream_id,
-                        extent_id,
-                        offset,
-                    });
-                }
-
-                return Some(Frame::error_response(
-                    frame.request_id(),
-                    ErrorCode::ExtentFull,
-                    "extent arena is full, seal initiated",
-                    extent_id,
-                ));
-            }
-            Err(e) => {
+        // Find the active extent for leader election.
+        let extent = match stream_ref.find_extent(extent_id) {
+            Some(e) => e,
+            None => {
                 return Some(Frame::error_response(
                     frame.request_id(),
                     ErrorCode::InternalError,
-                    &e.to_string(),
+                    &format!("extent {:?} not found", extent_id),
                     ExtentId(0),
                 ));
             }
         };
 
-        // Capture extent's start_offset before dropping stream guard.
-        // Needed for forwarded frames to carry the correct base offset.
-        let extent_start_offset = stream_ref
-            .find_extent(extent_id)
-            .map(|e| e.start_offset.0)
-            .unwrap_or(0);
+        // Reject early if the extent is already sealed.
+        if extent.is_sealed() {
+            return Some(Frame::error_response(
+                frame.request_id(),
+                ErrorCode::ExtentSealed,
+                "extent is sealed",
+                ExtentId(0),
+            ));
+        }
 
-        // Drop per-stream read guard as soon as possible.
-        drop(stream_ref);
+        // Leader election: fetch_add(1, Acquire) on the extent's in_flight counter.
+        let prev = extent.in_flight().fetch_add(1, Ordering::Acquire);
 
-        let offset = append_result.offset;
+        if prev > 0 {
+            // SLOW PATH: active writer exists. Push job to channel and return None.
+            let job = AppendJob {
+                request_id: frame.request_id(),
+                stream_id,
+                extent_id,
+                payload: frame.payload.clone().unwrap_or_default(),
+                response_tx: response_tx.cloned(),
+            };
+            // Channel is unbounded — send always succeeds.
+            let _ = extent.job_tx().send(job);
+            // Drop stream guard.
+            drop(stream_ref);
+            return None;
+        }
 
-        // Update metrics counters (atomic, no lock needed).
-        self.append_count.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written.fetch_add(
-            frame.payload.as_ref().map_or(0, |p| p.len()) as u64,
-            Ordering::Relaxed,
+        // FAST PATH: I'm the active writer (prev == 0).
+        let payload = frame.payload.clone().unwrap_or_default();
+        let request_id = frame.request_id();
+
+        // Process my own append.
+        let (own_result, extent_full) = self.do_append_and_respond(
+            extent,
+            request_id,
+            stream_id,
+            extent_id,
+            payload,
+            response_tx.cloned(),
         );
 
-        // Check replica info for this stream (per-stream lock, brief).
+        // Check if followers arrived while we were appending.
+        let remaining = extent.in_flight().fetch_sub(1, Ordering::Release);
+        if remaining > 1 {
+            // Followers are waiting — drain the batch.
+            self.drain_append_batch(extent, extent_full);
+        }
+
+        // Drop stream guard before proactive seal (needs write lock).
+        drop(stream_ref);
+
+        if extent_full {
+            self.trigger_proactive_seal(stream_id, extent_id);
+        }
+
+        own_result
+    }
+
+    /// Perform a single append and handle replication / ACK.
+    ///
+    /// Returns `(Option<Frame>, bool)` where the bool indicates ExtentFull
+    /// occurred, signaling the caller to trigger proactive seal after dropping
+    /// the stream guard.
+    ///
+    /// When response_tx is Some, success ACKs are sent via the channel and the
+    /// Frame return is None. When response_tx is None, success ACKs are returned
+    /// as Some(Frame).
+    fn do_append_and_respond(
+        &self,
+        extent: &Extent,
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        payload: Bytes,
+        response_tx: Option<mpsc::Sender<Frame>>,
+    ) -> (Option<Frame>, bool) {
+        let payload_len = payload.len();
+        let payload_for_forward = payload.clone();
+
+        // Write locally via single-writer append.
+        let append_result = match extent.append_inner(payload) {
+            Ok(r) => r,
+            Err(StorageError::ExtentSealed(_)) => {
+                let err = Frame::error_response(
+                    request_id,
+                    ErrorCode::ExtentSealed,
+                    "extent is sealed",
+                    ExtentId(0),
+                );
+                if let Some(ref tx) = response_tx {
+                    let _ = tx.try_send(err);
+                    return (None, false);
+                }
+                return (Some(err), false);
+            }
+            Err(StorageError::ExtentFull(_)) => {
+                let err = Frame::error_response(
+                    request_id,
+                    ErrorCode::ExtentFull,
+                    "extent arena is full, seal initiated",
+                    extent_id,
+                );
+                if let Some(ref tx) = response_tx {
+                    let _ = tx.try_send(err);
+                    return (None, true);
+                }
+                return (Some(err), true);
+            }
+            Err(e) => {
+                let err = Frame::error_response(
+                    request_id,
+                    ErrorCode::InternalError,
+                    &e.to_string(),
+                    ExtentId(0),
+                );
+                if let Some(ref tx) = response_tx {
+                    let _ = tx.try_send(err);
+                    return (None, false);
+                }
+                return (Some(err), false);
+            }
+        };
+
+        let offset = append_result.offset;
+        let extent_start_offset = extent.start_offset.0;
+
+        // Update metrics counters.
+        self.append_count.fetch_add(1, Ordering::Relaxed);
+        self.bytes_written
+            .fetch_add(payload_len as u64, Ordering::Relaxed);
+
+        // Check replica info for this stream.
         let replica = self.replicas.get(&stream_id).map(|r| r.clone());
 
         match replica {
             None => {
                 // Standalone mode: immediate ACK.
-                Some(Frame::new(
+                let ack = Frame::new(
                     VariableHeader::AppendAck {
-                        request_id: frame.request_id(),
+                        request_id,
                         stream_id,
                         extent_id: ExtentId(0),
                         offset,
                     },
                     None,
-                ))
+                );
+                if let Some(ref tx) = response_tx {
+                    let _ = tx.try_send(ack);
+                    (None, false)
+                } else {
+                    (Some(ack), false)
+                }
             }
             Some(ref ri) if ri.is_primary() => {
-                // Primary.
                 if ri.is_standalone() {
                     // RF=1: no secondaries, ACK immediately.
-                    return Some(Frame::new(
+                    let ack = Frame::new(
                         VariableHeader::AppendAck {
-                            request_id: frame.request_id(),
+                            request_id,
                             stream_id,
                             extent_id: ExtentId(0),
                             offset,
                         },
                         None,
-                    ));
-                }
-
-                // Broadcast to ALL secondaries in parallel (outside per-stream lock).
-                if let Some(ref tx) = self.forward_tx {
-                    for secondary_addr in &ri.replica_addrs {
-                        let req = ForwardRequest {
-                            stream_id,
-                            extent_id,
-                            offset: offset.0,
-                            start_offset: extent_start_offset,
-                            byte_pos: append_result.byte_pos,
-                            payload: frame.payload.clone().unwrap_or_default(),
-                            downstream_addr: secondary_addr.clone(),
-                        };
-                        if let Err(e) = tx.try_send(req) {
-                            warn!(
-                                secondary = %secondary_addr,
-                                stream_id = ?stream_id,
-                                offset = offset.0,
-                                "forward channel backpressure: {e}; frame dropped, PendingAck timeout will handle client",
-                            );
+                    );
+                    if let Some(ref tx) = response_tx {
+                        let _ = tx.try_send(ack);
+                        (None, false)
+                    } else {
+                        (Some(ack), false)
+                    }
+                } else {
+                    // RF≥2: broadcast Forward to secondaries.
+                    if let Some(ref tx) = self.forward_tx {
+                        for secondary_addr in &ri.replica_addrs {
+                            let req = ForwardRequest {
+                                stream_id,
+                                extent_id,
+                                offset: offset.0,
+                                start_offset: extent_start_offset,
+                                byte_pos: append_result.byte_pos,
+                                payload: payload_for_forward.clone(),
+                                downstream_addr: secondary_addr.clone(),
+                            };
+                            if let Err(e) = tx.try_send(req) {
+                                warn!(
+                                    secondary = %secondary_addr,
+                                    stream_id = ?stream_id,
+                                    offset = offset.0,
+                                    "forward channel backpressure: {e}; frame dropped",
+                                );
+                            }
                         }
                     }
-                }
 
-                // Queue deferred ACK (per-stream lock on ack_queues).
-                if let Some(resp_tx) = response_tx {
-                    let mut ack_queue = self
-                        .ack_queues
-                        .entry(stream_id)
-                        .or_insert_with(|| AckQueue::new(ri.required_secondary_acks()));
-                    ack_queue.pending.push_back(PendingAck {
-                        request_id: frame.request_id(),
-                        stream_id,
-                        response_tx: resp_tx.clone(),
-                        assigned_offset: offset.0,
-                        created_at: Instant::now(),
-                    });
-                }
+                    // Queue deferred ACK.
+                    if let Some(ref resp_tx) = response_tx {
+                        let mut ack_queue = self
+                            .ack_queues
+                            .entry(stream_id)
+                            .or_insert_with(|| AckQueue::new(ri.required_secondary_acks()));
+                        ack_queue.pending.push_back(PendingAck {
+                            request_id,
+                            stream_id,
+                            response_tx: resp_tx.clone(),
+                            assigned_offset: offset.0,
+                            created_at: Instant::now(),
+                        });
+                    }
 
-                // Deferred: return None.
-                None
+                    (None, false)
+                }
             }
             Some(_) => {
-                // Secondary but received a normal Append (not Forward) — shouldn't normally happen.
-                Some(Frame::new(
+                // Secondary received normal Append (not Forward) — shouldn't normally happen.
+                let ack = Frame::new(
                     VariableHeader::AppendAck {
-                        request_id: frame.request_id(),
+                        request_id,
                         stream_id,
                         extent_id: ExtentId(0),
                         offset,
                     },
                     None,
-                ))
+                );
+                if let Some(ref tx) = response_tx {
+                    let _ = tx.try_send(ack);
+                    (None, false)
+                } else {
+                    (Some(ack), false)
+                }
             }
+        }
+    }
+
+    /// Drain follower append jobs from the extent's channel and process them.
+    ///
+    /// Called by the active writer after its own append when `in_flight > 1`.
+    /// Loops until all followers have been processed.
+    fn drain_append_batch(
+        &self,
+        extent: &Extent,
+        mut extent_full: bool,
+    ) {
+        loop {
+            let mut batch: Vec<AppendJob> = Vec::new();
+
+            // Drain all available jobs from the channel.
+            // Brief spin if a follower has incremented in_flight but hasn't pushed yet.
+            loop {
+                match extent.job_rx().try_recv() {
+                    Ok(job) => batch.push(job),
+                    Err(_) => {
+                        if batch.is_empty() {
+                            // Follower incremented in_flight but hasn't pushed to channel yet.
+                            // Brief spin to wait.
+                            std::hint::spin_loop();
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // Process each job. Fast-fail with ExtentFull when the extent is
+            // already known to be full; otherwise attempt the append normally.
+            for job in &batch {
+                if extent_full {
+                    if let Some(ref tx) = job.response_tx {
+                        let _ = tx.try_send(Frame::error_response(
+                            job.request_id,
+                            ErrorCode::ExtentFull,
+                            "extent is full",
+                            job.extent_id,
+                        ));
+                    }
+                } else {
+                    let (_, job_full) = self.do_append_and_respond(
+                        extent,
+                        job.request_id,
+                        job.stream_id,
+                        job.extent_id,
+                        job.payload.clone(),
+                        job.response_tx.clone(),
+                    );
+                    if job_full {
+                        extent_full = true;
+                    }
+                }
+            }
+
+            // Decrement in_flight by the batch size.
+            let remaining = extent
+                .in_flight()
+                .fetch_sub(batch.len() as u64, Ordering::Release);
+            if remaining <= batch.len() as u64 {
+                // No more followers waiting.
+                break;
+            }
+            // More followers arrived during processing — loop again.
+        }
+    }
+
+    /// Trigger a proactive seal when an extent is full.
+    /// Best-effort, non-blocking. The seal itself happens outside the hot path.
+    fn trigger_proactive_seal(&self, stream_id: StreamId, extent_id: ExtentId) {
+        // Try to seal the extent (needs write lock on stream).
+        let (seal_extent_id, offset) =
+            if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+                let active_extent_id = stream_mut.active_extent_id().unwrap_or(ExtentId(0));
+                match stream_mut.seal(active_extent_id, None) {
+                    Some((_start_offset, end_offset)) => (active_extent_id, end_offset),
+                    None => (active_extent_id, 0),
+                }
+            } else {
+                (extent_id, 0)
+            };
+
+        // Notify background task to send Seal to Stream Manager.
+        if let Some(ref tx) = self.seal_tx {
+            let _ = tx.try_send(SealRequest {
+                stream_id,
+                extent_id: seal_extent_id,
+                offset,
+            });
         }
     }
 
@@ -721,8 +919,8 @@ impl ExtentNodeStore {
                 drop(stream_ref);
                 r.offset
             }
-            Err(common::errors::StorageError::ExtentSealed(_))
-            | Err(common::errors::StorageError::ExtentFull(_)) => {
+            Err(StorageError::ExtentSealed(_))
+            | Err(StorageError::ExtentFull(_)) => {
                 let max_offset = stream_ref.max_offset();
                 drop(stream_ref);
                 return Frame::new(
@@ -1826,10 +2024,10 @@ mod tests {
 
     /// Benchmark: multiple tasks appending to the SAME stream concurrently.
     ///
-    /// Verifies the lock-free extent append works correctly when multiple
-    /// tokio tasks target the same stream. Each append goes through the
-    /// DashMap per-stream lock, but the Extent's atomic CAS handles the
-    /// actual slot reservation and commit ordering.
+    /// Verifies that the pipelined group commit works correctly when multiple
+    /// tokio tasks target the same stream. The leader election on the extent's
+    /// in_flight counter serializes writes, and followers receive their ACKs
+    /// via the response_tx channel.
     #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
     async fn concurrent_appends_same_stream() {
         use std::sync::Arc;
@@ -1846,9 +2044,10 @@ mod tests {
         for task_idx in 0..NUM_TASKS {
             let store = Arc::clone(&store);
             handles.push(tokio::spawn(async move {
+                let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(16);
                 let mut offsets = Vec::with_capacity(APPENDS_PER_TASK as usize);
                 for seq in 0..APPENDS_PER_TASK {
-                    let resp = store
+                    let result = store
                         .handle_frame(
                             Frame::new(
                                 VariableHeader::Append {
@@ -1858,10 +2057,20 @@ mod tests {
                                 },
                                 Some(Bytes::from(format!("t{task_idx}-m{seq}"))),
                             ),
-                            None,
+                            Some(&resp_tx),
                         )
-                        .await
-                        .unwrap();
+                        .await;
+
+                    // With group commit, the response comes either:
+                    // - directly as Some(Frame) from handle_frame (leader path, no response_tx match)
+                    // - via the response_tx channel (both leader and follower paths)
+                    let resp = if let Some(frame) = result {
+                        frame
+                    } else {
+                        // ACK was sent via response_tx channel.
+                        resp_rx.recv().await.unwrap()
+                    };
+
                     assert_eq!(resp.opcode(), Opcode::AppendAck);
                     offsets.push(resp.offset().0);
                 }
