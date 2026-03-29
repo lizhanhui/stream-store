@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{FutureExt, SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::Framed;
 use tracing::{Instrument, error, info, info_span};
 
+use common::types::Opcode;
 use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
 
@@ -22,6 +23,27 @@ pub trait RequestHandler: Send + Sync + 'static {
         frame: Frame,
         response_tx: Option<&mpsc::Sender<Frame>>,
     ) -> impl std::future::Future<Output = Option<Frame>> + Send;
+
+    /// Handle a batch of Append frames targeting the same stream/extent.
+    ///
+    /// Default implementation falls back to per-frame `handle_frame()`.
+    /// `ExtentNodeStore` overrides this with an optimized path that amortizes
+    /// DashMap lookups, leader elections, and ReplicaInfo access across the batch.
+    fn handle_append_batch(
+        &self,
+        frames: &[Frame],
+        response_tx: Option<&mpsc::Sender<Frame>>,
+    ) -> impl std::future::Future<Output = Vec<Frame>> + Send {
+        async move {
+            let mut responses = Vec::new();
+            for frame in frames {
+                if let Some(resp) = self.handle_frame(frame.clone(), response_tx).await {
+                    responses.push(resp);
+                }
+            }
+            responses
+        }
+    }
 }
 
 /// A TCP server identified by a name (e.g., "ExtentNode", "StreamManager").
@@ -203,6 +225,15 @@ async fn serve_connection<H: RequestHandler>(stream: TcpStream, handler: Arc<H>)
 /// a per-connection mpsc channel. This enables deferred responses: the handler
 /// can return `None` for an Append, and later the WatermarkHandler sends the
 /// AppendAck through the channel.
+///
+/// The read task uses greedy batching: when it receives an Append frame, it
+/// peeks ahead for more Appends targeting the same stream/extent (via
+/// `now_or_never()`) and dispatches them as a single batch through
+/// `handle_append_batch()`. This amortizes DashMap lookups and leader elections.
+///
+/// The write task uses feed+flush batching: it feeds all immediately-available
+/// response frames into the codec buffer, then flushes once per batch to reduce
+/// syscalls.
 async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, handler: Arc<H>) {
     let peer = stream
         .peer_addr()
@@ -214,16 +245,29 @@ async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, ha
         info!("accepted");
 
         let (read_half, write_half) = stream.into_split();
-        let (response_tx, mut response_rx) = mpsc::channel::<Frame>(256);
+        let (response_tx, mut response_rx) = mpsc::channel::<Frame>(1024);
 
-        // Write task: drain response channel, send frames to client.
+        // Write task: drain response channel, batch feed+flush to reduce syscalls.
         let write_span = info_span!("writer");
         let write_task = tokio::spawn(
             async move {
                 let mut framed_write = tokio_util::codec::FramedWrite::new(write_half, FrameCodec);
                 while let Some(frame) = response_rx.recv().await {
-                    if let Err(e) = framed_write.send(frame).await {
-                        error!("failed to send response: {e}");
+                    // Feed the first frame without flushing.
+                    if let Err(e) = framed_write.feed(frame).await {
+                        error!("failed to write response: {e}");
+                        return;
+                    }
+                    // Drain all immediately-available frames without blocking.
+                    while let Ok(frame) = response_rx.try_recv() {
+                        if let Err(e) = framed_write.feed(frame).await {
+                            error!("failed to write response: {e}");
+                            return;
+                        }
+                    }
+                    // Single flush for the entire batch.
+                    if let Err(e) = framed_write.flush().await {
+                        error!("failed to flush responses: {e}");
                         return;
                     }
                 }
@@ -232,23 +276,69 @@ async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, ha
             .instrument(write_span),
         );
 
-        // Read task: read client frames, dispatch to handler.
+        // Read task: read client frames, batch consecutive same-extent Appends.
         let mut framed_read = tokio_util::codec::FramedRead::new(read_half, FrameCodec);
+        let mut look_ahead: Option<Frame> = None;
 
-        while let Some(result) = framed_read.next().await {
-            match result {
-                Ok(frame) => {
-                    let response = handler.handle_frame(frame, Some(&response_tx)).await;
-                    if let Some(response) = response {
-                        if response_tx.send(response).await.is_err() {
-                            error!("response channel closed");
-                            break;
+        'outer: loop {
+            // Get the next frame: from look_ahead or from the wire.
+            let frame = if let Some(f) = look_ahead.take() {
+                f
+            } else {
+                match framed_read.next().await {
+                    Some(Ok(f)) => f,
+                    Some(Err(e)) => {
+                        error!("frame decode error: {e}");
+                        break;
+                    }
+                    None => break, // connection closed
+                }
+            };
+
+            if frame.opcode() == Opcode::Append {
+                let target_stream = frame.stream_id();
+                let target_extent = frame.extent_id();
+                let mut batch = vec![frame];
+
+                // Greedily extend: peek next frame, only take if same-extent Append.
+                while let Some(result) = framed_read.next().now_or_never() {
+                    match result {
+                        Some(Ok(next)) => {
+                            if next.opcode() == Opcode::Append
+                                && next.stream_id() == target_stream
+                                && next.extent_id() == target_extent
+                            {
+                                batch.push(next);
+                            } else {
+                                // Save for next iteration — don't process inline.
+                                look_ahead = Some(next);
+                                break;
+                            }
                         }
+                        Some(Err(e)) => {
+                            error!("frame decode error: {e}");
+                            break 'outer;
+                        }
+                        None => break 'outer, // connection closed
                     }
                 }
-                Err(e) => {
-                    error!("frame decode error: {e}");
-                    break;
+
+                let responses = handler
+                    .handle_append_batch(&batch, Some(&response_tx))
+                    .await;
+                for response in responses {
+                    if response_tx.send(response).await.is_err() {
+                        error!("response channel closed");
+                        break 'outer;
+                    }
+                }
+            } else {
+                // Non-append: process individually.
+                if let Some(resp) = handler.handle_frame(frame, Some(&response_tx)).await {
+                    if response_tx.send(resp).await.is_err() {
+                        error!("response channel closed");
+                        break;
+                    }
                 }
             }
         }

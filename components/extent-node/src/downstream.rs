@@ -127,9 +127,9 @@ fn spawn_connection_writer(
                 }
             }
 
-            // Try to send the frame.
+            // Feed the first frame without flushing.
             let w = writer.as_mut().unwrap();
-            if let Err(e) = w.send(frame.clone()).await {
+            if let Err(e) = w.feed(frame.clone()).await {
                 warn!("send to secondary {addr} failed: {e}; reconnecting");
                 writer = None;
 
@@ -138,7 +138,6 @@ fn spawn_connection_writer(
                     Ok(mut new_writer) => {
                         if let Err(e) = new_writer.send(frame).await {
                             warn!("retry send to {addr} failed: {e}; giving up on frame");
-                            // Connection is likely dead, drop it.
                         } else {
                             writer = Some(new_writer);
                         }
@@ -146,6 +145,38 @@ fn spawn_connection_writer(
                     Err(e) => {
                         error!("reconnect to secondary {addr} failed: {e}");
                     }
+                }
+                continue;
+            }
+
+            // Drain all immediately-available frames without blocking.
+            while let Ok(next_frame) = rx.try_recv() {
+                let w = writer.as_mut().unwrap();
+                if let Err(e) = w.feed(next_frame.clone()).await {
+                    warn!("send to secondary {addr} failed during batch: {e}; reconnecting");
+                    writer = None;
+
+                    match create_downstream_connection(&addr, watermark_tx.clone()).await {
+                        Ok(mut new_writer) => {
+                            if let Err(e) = new_writer.send(next_frame).await {
+                                warn!("retry send to {addr} failed: {e}; giving up on frame");
+                            } else {
+                                writer = Some(new_writer);
+                            }
+                        }
+                        Err(e) => {
+                            error!("reconnect to secondary {addr} failed: {e}");
+                        }
+                    }
+                    break;
+                }
+            }
+
+            // Single flush for the entire batch.
+            if let Some(ref mut w) = writer {
+                if let Err(e) = w.flush().await {
+                    warn!("flush to secondary {addr} failed: {e}; reconnecting");
+                    writer = None;
                 }
             }
         }

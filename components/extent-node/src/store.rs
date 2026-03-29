@@ -65,18 +65,35 @@ impl AckQueue {
     /// `required_secondary_acks` secondaries have confirmed.
     ///
     /// Returns None if quorum cannot be met (not enough secondaries have reported).
+    ///
+    /// Optimized to avoid heap allocation:
+    /// - RF=2 (required=1): just take the max of secondary offsets.
+    /// - General case: use a fixed-size stack array (RF never exceeds ~4).
     pub fn quorum_offset(&self) -> Option<u64> {
         if self.required_secondary_acks == 0 {
             return None; // RF=1, no quorum needed
         }
-        let mut offsets: Vec<u64> = self.secondary_acked.values().copied().collect();
-        if offsets.len() < self.required_secondary_acks as usize {
+        let required = self.required_secondary_acks as usize;
+        if self.secondary_acked.len() < required {
             return None; // Not enough secondaries have reported yet
         }
-        offsets.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        offsets
-            .get(self.required_secondary_acks as usize - 1)
-            .copied()
+        // Fast path for RF=2 (required=1): just return the max offset.
+        if required == 1 {
+            return self.secondary_acked.values().copied().max();
+        }
+        // General case: use a stack-allocated array (RF rarely exceeds 4).
+        // Collect into a fixed buffer, sort descending, pick the required-th.
+        let mut offsets = [0u64; 8];
+        let mut count = 0;
+        for &offset in self.secondary_acked.values() {
+            if count < offsets.len() {
+                offsets[count] = offset;
+                count += 1;
+            }
+        }
+        let slice = &mut offsets[..count];
+        slice.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        slice.get(required - 1).copied()
     }
 
     /// Record a cumulative ACK from a secondary at a given offset.
@@ -376,6 +393,31 @@ impl RequestHandler for ExtentNodeStore {
                 ExtentId(0),
             )),
         }
+    }
+
+    /// Optimized batch append for consecutive same-extent frames.
+    ///
+    /// All frames in the batch share the same stream_id/extent_id, so we:
+    /// - Do a single DashMap.get(streams) instead of N
+    /// - Do a single leader election (fetch_add(batch.len())) instead of N
+    /// - Borrow ReplicaInfo once (no clone) instead of N clones
+    /// - Do a single DashMap.get_mut(ack_queues) push instead of N
+    async fn handle_append_batch(
+        &self,
+        frames: &[Frame],
+        response_tx: Option<&mpsc::Sender<Frame>>,
+    ) -> Vec<Frame> {
+        if frames.is_empty() {
+            return Vec::new();
+        }
+        // Single frame: fall back to normal path (avoids overhead of batch setup).
+        if frames.len() == 1 {
+            return self
+                .handle_append(frames[0].clone(), response_tx)
+                .into_iter()
+                .collect();
+        }
+        self.handle_append_batch_inner(frames, response_tx)
     }
 }
 
@@ -849,6 +891,323 @@ impl ExtentNodeStore {
                 offset,
             });
         }
+    }
+
+    /// Optimized batch append: all frames share the same stream_id/extent_id.
+    ///
+    /// Amortizes DashMap lookups (3N → 3), leader elections (N → 1),
+    /// ReplicaInfo access (N clones → 0, borrow within guard), and
+    /// atomic operations (2N → 2).
+    fn handle_append_batch_inner(
+        &self,
+        frames: &[Frame],
+        response_tx: Option<&mpsc::Sender<Frame>>,
+    ) -> Vec<Frame> {
+        let stream_id = frames[0].stream_id();
+        let extent_id = frames[0].extent_id();
+        let mut responses = Vec::new();
+
+        // Single DashMap.get(streams).
+        let stream_ref = match self.streams.get(&stream_id) {
+            Some(s) => s,
+            None => {
+                for frame in frames {
+                    responses.push(Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::UnknownStream,
+                        &format!("stream {:?} not found", stream_id),
+                        ExtentId(0),
+                    ));
+                }
+                return responses;
+            }
+        };
+
+        // Single extent lookup.
+        let extent = match stream_ref.find_extent(extent_id) {
+            Some(e) => e,
+            None => {
+                for frame in frames {
+                    responses.push(Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::InternalError,
+                        &format!("extent {:?} not found", extent_id),
+                        ExtentId(0),
+                    ));
+                }
+                return responses;
+            }
+        };
+
+        // Single sealed check.
+        if extent.is_sealed() {
+            for frame in frames {
+                responses.push(Frame::error_response(
+                    frame.request_id(),
+                    ErrorCode::ExtentSealed,
+                    "extent is sealed",
+                    ExtentId(0),
+                ));
+            }
+            return responses;
+        }
+
+        let batch_len = frames.len() as u64;
+
+        // Single leader election: fetch_add(batch_len).
+        let prev = extent.in_flight().fetch_add(batch_len, Ordering::Acquire);
+
+        if prev > 0 {
+            // SLOW PATH: active writer exists. Push all as AppendJobs.
+            for frame in frames {
+                let job = AppendJob {
+                    request_id: frame.request_id(),
+                    stream_id,
+                    extent_id,
+                    payload: frame.payload.clone().unwrap_or_default(),
+                    response_tx: response_tx.cloned(),
+                };
+                let _ = extent.job_tx().send(job);
+            }
+            drop(stream_ref);
+            return responses; // All deferred — empty responses.
+        }
+
+        // FAST PATH: I'm the active writer (prev == 0).
+        // Process all appends with amortized lookups.
+
+        // Collect append results: (request_id, payload, result).
+        struct BatchEntry {
+            request_id: u32,
+            payload_for_forward: Bytes,
+            offset: Offset,
+            byte_pos: u64,
+            payload_len: usize,
+        }
+        let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
+        let mut extent_full = false;
+
+        for frame in frames {
+            let request_id = frame.request_id();
+            let payload = frame.payload.clone().unwrap_or_default();
+            let payload_len = payload.len();
+            let payload_for_forward = payload.clone();
+
+            if extent_full {
+                // Fast-fail remaining frames.
+                let err = Frame::error_response(
+                    request_id,
+                    ErrorCode::ExtentFull,
+                    "extent arena is full, seal initiated",
+                    extent_id,
+                );
+                if let Some(ref tx) = response_tx {
+                    let _ = tx.try_send(err);
+                } else {
+                    responses.push(err);
+                }
+                continue;
+            }
+
+            match extent.append_inner(payload) {
+                Ok(result) => {
+                    entries.push(BatchEntry {
+                        request_id,
+                        payload_for_forward,
+                        offset: result.offset,
+                        byte_pos: result.byte_pos,
+                        payload_len,
+                    });
+                }
+                Err(StorageError::ExtentSealed(_)) => {
+                    let err = Frame::error_response(
+                        request_id,
+                        ErrorCode::ExtentSealed,
+                        "extent is sealed",
+                        ExtentId(0),
+                    );
+                    if let Some(ref tx) = response_tx {
+                        let _ = tx.try_send(err);
+                    } else {
+                        responses.push(err);
+                    }
+                }
+                Err(StorageError::ExtentFull(_)) => {
+                    extent_full = true;
+                    let err = Frame::error_response(
+                        request_id,
+                        ErrorCode::ExtentFull,
+                        "extent arena is full, seal initiated",
+                        extent_id,
+                    );
+                    if let Some(ref tx) = response_tx {
+                        let _ = tx.try_send(err);
+                    } else {
+                        responses.push(err);
+                    }
+                }
+                Err(e) => {
+                    let err = Frame::error_response(
+                        request_id,
+                        ErrorCode::InternalError,
+                        &e.to_string(),
+                        ExtentId(0),
+                    );
+                    if let Some(ref tx) = response_tx {
+                        let _ = tx.try_send(err);
+                    } else {
+                        responses.push(err);
+                    }
+                }
+            }
+        }
+
+        if entries.is_empty() {
+            // All appends failed — decrement and possibly drain followers.
+            let remaining = extent.in_flight().fetch_sub(batch_len, Ordering::Release);
+            if remaining > batch_len {
+                self.drain_append_batch(extent, extent_full);
+            }
+            drop(stream_ref);
+            if extent_full {
+                self.trigger_proactive_seal(stream_id, extent_id);
+            }
+            return responses;
+        }
+
+        let extent_start_offset = extent.start_offset.0;
+
+        // Update metrics counters in bulk.
+        let total_bytes: u64 = entries.iter().map(|e| e.payload_len as u64).sum();
+        self.append_count
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        self.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
+
+        // Single DashMap.get(replicas) — BORROW, no clone.
+        let replica_ref = self.replicas.get(&stream_id);
+
+        match replica_ref.as_deref() {
+            None => {
+                // Standalone mode: immediate ACKs for all entries.
+                for entry in &entries {
+                    let ack = Frame::new(
+                        VariableHeader::AppendAck {
+                            request_id: entry.request_id,
+                            stream_id,
+                            extent_id: ExtentId(0),
+                            offset: entry.offset,
+                        },
+                        None,
+                    );
+                    if let Some(ref tx) = response_tx {
+                        let _ = tx.try_send(ack);
+                    } else {
+                        responses.push(ack);
+                    }
+                }
+            }
+            Some(ri) if ri.is_primary() => {
+                if ri.is_standalone() {
+                    // RF=1: no secondaries, ACK immediately.
+                    for entry in &entries {
+                        let ack = Frame::new(
+                            VariableHeader::AppendAck {
+                                request_id: entry.request_id,
+                                stream_id,
+                                extent_id: ExtentId(0),
+                                offset: entry.offset,
+                            },
+                            None,
+                        );
+                        if let Some(ref tx) = response_tx {
+                            let _ = tx.try_send(ack);
+                        } else {
+                            responses.push(ack);
+                        }
+                    }
+                } else {
+                    // RF≥2: broadcast Forward to secondaries.
+                    if let Some(ref tx) = self.forward_tx {
+                        for entry in &entries {
+                            for secondary_addr in &ri.replica_addrs {
+                                let req = ForwardRequest {
+                                    stream_id,
+                                    extent_id,
+                                    offset: entry.offset.0,
+                                    start_offset: extent_start_offset,
+                                    byte_pos: entry.byte_pos,
+                                    payload: entry.payload_for_forward.clone(),
+                                    downstream_addr: secondary_addr.clone(),
+                                };
+                                if let Err(e) = tx.try_send(req) {
+                                    warn!(
+                                        secondary = %secondary_addr,
+                                        stream_id = ?stream_id,
+                                        offset = entry.offset.0,
+                                        "forward channel backpressure: {e}; frame dropped",
+                                    );
+                                }
+                            }
+                        }
+                    }
+
+                    // Single DashMap.get_mut(ack_queues) — push all PendingAcks at once.
+                    if let Some(resp_tx) = response_tx {
+                        let mut ack_queue = self
+                            .ack_queues
+                            .entry(stream_id)
+                            .or_insert_with(|| AckQueue::new(ri.required_secondary_acks()));
+                        let now = Instant::now();
+                        for entry in &entries {
+                            ack_queue.pending.push_back(PendingAck {
+                                request_id: entry.request_id,
+                                stream_id,
+                                response_tx: resp_tx.clone(),
+                                assigned_offset: entry.offset.0,
+                                created_at: now,
+                            });
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                // Secondary received normal Append (not Forward).
+                for entry in &entries {
+                    let ack = Frame::new(
+                        VariableHeader::AppendAck {
+                            request_id: entry.request_id,
+                            stream_id,
+                            extent_id: ExtentId(0),
+                            offset: entry.offset,
+                        },
+                        None,
+                    );
+                    if let Some(ref tx) = response_tx {
+                        let _ = tx.try_send(ack);
+                    } else {
+                        responses.push(ack);
+                    }
+                }
+            }
+        }
+
+        // Drop the replica borrow before we potentially need ack_queues again.
+        drop(replica_ref);
+
+        // Check if followers arrived while we were appending.
+        let remaining = extent.in_flight().fetch_sub(batch_len, Ordering::Release);
+        if remaining > batch_len {
+            self.drain_append_batch(extent, extent_full);
+        }
+
+        // Drop stream guard before proactive seal (needs write lock).
+        drop(stream_ref);
+
+        if extent_full {
+            self.trigger_proactive_seal(stream_id, extent_id);
+        }
+
+        responses
     }
 
     /// Handle Forward (0x0B) — dedicated opcode for Primary→Secondary replication.
