@@ -204,6 +204,7 @@ dependencies = [
  "rpc",
  "tokio",
  "tokio-util",
+ "tracing",
 ]
 
 [[package]]

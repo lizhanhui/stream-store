@@ -169,10 +169,10 @@ impl Stream {
     /// extent was already sealed (e.g., primary already sealed via extent-full path).
     /// Returns 0 if the extent is not found or not sealed.
     pub fn sealed_end_offset(&self, extent_id: ExtentId) -> u64 {
-        if let Some(extent) = self.find_extent(extent_id) {
-            if extent.is_sealed() {
-                return extent.start_offset.0 + extent.message_count();
-            }
+        if let Some(extent) = self.find_extent(extent_id)
+            && extent.is_sealed()
+        {
+            return extent.start_offset.0 + extent.message_count();
         }
         0
     }

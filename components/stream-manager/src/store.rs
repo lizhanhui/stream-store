@@ -29,7 +29,7 @@ async fn seal_extent_node_static(
     committed_offset: Option<u64>,
     start_offset: Option<u64>,
 ) -> Result<u64, StorageError> {
-    let mut client = client::StorageClient::connect(addr).await.map_err(|e| {
+    let client = client::StorageClient::connect(addr).await.map_err(|e| {
         StorageError::Internal(format!("connect to ExtentNode {addr} for Seal: {e}"))
     })?;
 
@@ -111,7 +111,7 @@ impl StreamManagerStore {
         let rf = replication_factor;
 
         let result = tokio::time::timeout(Duration::from_secs(1), async {
-            let mut client = client::StorageClient::connect(&addr).await.map_err(|e| {
+            let client = client::StorageClient::connect(&addr).await.map_err(|e| {
                 StorageError::Internal(format!(
                     "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
                 ))
@@ -186,7 +186,7 @@ impl StreamManagerStore {
             tokio::spawn(async move {
                 let payload = build_register_extent_payload(&[]); // secondaries get no downstream addrs
                 match client::StorageClient::connect(&addr).await {
-                    Ok(mut client) => {
+                    Ok(client) => {
                         let result = client
                             .send_frame(Frame::new(
                                 VariableHeader::RegisterExtent {
@@ -279,7 +279,7 @@ impl StreamManagerStore {
             .unwrap_or_else(|e| {
                 warn!("register_primary failed for initial extent {:?}: {e}; client will discover on first append", extent_id);
             });
-        self.notify_secondaries(stream_id, extent_id, &node_addrs[1..].to_vec(), rf);
+        self.notify_secondaries(stream_id, extent_id, &node_addrs[1..], rf);
 
         Ok((extent_id, node_addrs[0].clone()))
     }
@@ -845,7 +845,7 @@ impl StreamManagerStore {
                 }
 
                 // notify extent secondary nodes in fire-and-forget way
-                self.notify_secondaries(stream_id, new_extent_id, &node_addrs[1..].to_vec(), rf);
+                self.notify_secondaries(stream_id, new_extent_id, &node_addrs[1..], rf);
 
                 (new_extent_id, primary_addr)
             }

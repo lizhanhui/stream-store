@@ -766,11 +766,7 @@ impl ExtentNodeStore {
     ///
     /// Called by the active writer after its own append when `in_flight > 1`.
     /// Loops until all followers have been processed.
-    fn drain_append_batch(
-        &self,
-        extent: &Extent,
-        mut extent_full: bool,
-    ) {
+    fn drain_append_batch(&self, extent: &Extent, mut extent_full: bool) {
         loop {
             let mut batch: Vec<AppendJob> = Vec::new();
 
@@ -919,8 +915,7 @@ impl ExtentNodeStore {
                 drop(stream_ref);
                 r.offset
             }
-            Err(StorageError::ExtentSealed(_))
-            | Err(StorageError::ExtentFull(_)) => {
+            Err(StorageError::ExtentSealed(_)) | Err(StorageError::ExtentFull(_)) => {
                 let max_offset = stream_ref.max_offset();
                 drop(stream_ref);
                 return Frame::new(

@@ -135,22 +135,19 @@ fn bench_store_append_concurrent(c: &mut Criterion) {
                                 let p = payload.clone();
                                 s.spawn(move || {
                                     rt.block_on(async {
-                                        let (resp_tx, mut resp_rx) =
-                                            mpsc::channel::<Frame>(16);
+                                        let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(16);
                                         for seq in 0..ops_per_thread {
                                             let frame = Frame::new(
                                                 VariableHeader::Append {
-                                                    request_id: (t as u64 * ops_per_thread
-                                                        + seq)
+                                                    request_id: (t as u64 * ops_per_thread + seq)
                                                         as u32,
                                                     stream_id: StreamId(1),
                                                     extent_id: ExtentId(1),
                                                 },
                                                 Some(p.clone()),
                                             );
-                                            let result = store
-                                                .handle_frame(frame, Some(&resp_tx))
-                                                .await;
+                                            let result =
+                                                store.handle_frame(frame, Some(&resp_tx)).await;
                                             if result.is_none() {
                                                 // Follower path: ACK arrives via channel.
                                                 let _ = resp_rx.recv().await.unwrap();

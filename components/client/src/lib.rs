@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::{Buf, Bytes};
@@ -12,7 +14,10 @@ use rpc::payload::{
     build_string_payload, parse_extent_info_vec,
 };
 use tokio::net::TcpStream;
-use tokio_util::codec::Framed;
+use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio_util::codec::{FramedRead, FramedWrite};
+use tracing::warn;
 
 /// Result of a successful append: the logical offset assigned to this record.
 /// The server-side index stream handles byte position tracking internally.
@@ -22,13 +27,29 @@ pub struct AppendResult {
     pub offset: Offset,
 }
 
+type PendingMap = HashMap<u32, oneshot::Sender<Result<Frame, StorageError>>>;
+
+struct Inner {
+    write_tx: mpsc::Sender<Frame>,
+    pending: Mutex<PendingMap>,
+    next_request_id: AtomicU32,
+}
+
 /// A client for communicating with an Extent Node or Stream Manager.
 ///
-/// Phase 1: simple synchronous request-response over a single connection.
-/// No multiplexing or pipelining yet.
+/// Supports pipelining: multiple requests can be in-flight simultaneously.
+/// All public methods take `&self`, enabling shared ownership via `Arc`.
 pub struct StorageClient {
-    framed: Framed<TcpStream, FrameCodec>,
-    next_request_id: AtomicU32,
+    inner: Arc<Inner>,
+    _reader_handle: JoinHandle<()>,
+    _writer_handle: JoinHandle<()>,
+}
+
+impl Drop for StorageClient {
+    fn drop(&mut self) {
+        self._reader_handle.abort();
+        self._writer_handle.abort();
+    }
 }
 
 impl StorageClient {
@@ -40,33 +61,125 @@ impl StorageClient {
         stream
             .set_nodelay(true)
             .map_err(|e| StorageError::Internal(format!("set TCP_NODELAY: {e}")))?;
-        Ok(Self {
-            framed: Framed::new(stream, FrameCodec),
+
+        let (read_half, write_half) = stream.into_split();
+        let framed_read = FramedRead::new(read_half, FrameCodec);
+        let framed_write = FramedWrite::new(write_half, FrameCodec);
+
+        // Channel for sending frames to the writer task.
+        // Buffer of 256 keeps backpressure reasonable.
+        let (write_tx, write_rx) = mpsc::channel::<Frame>(256);
+
+        let inner = Arc::new(Inner {
+            write_tx,
+            pending: Mutex::new(HashMap::new()),
             next_request_id: AtomicU32::new(1),
+        });
+
+        let writer_handle = tokio::spawn(Self::writer_task(framed_write, write_rx));
+        let reader_handle = tokio::spawn(Self::reader_task(framed_read, Arc::clone(&inner)));
+
+        Ok(Self {
+            inner,
+            _reader_handle: reader_handle,
+            _writer_handle: writer_handle,
         })
+    }
+
+    /// Background writer task: drains frames from the channel into the TCP connection.
+    async fn writer_task(
+        mut framed_write: FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>,
+        mut write_rx: mpsc::Receiver<Frame>,
+    ) {
+        while let Some(frame) = write_rx.recv().await {
+            if let Err(e) = framed_write.send(frame).await {
+                warn!("StorageClient writer error: {e}");
+                break;
+            }
+        }
+    }
+
+    /// Background reader task: reads response frames and dispatches them to pending callers.
+    async fn reader_task(
+        mut framed_read: FramedRead<tokio::net::tcp::OwnedReadHalf, FrameCodec>,
+        inner: Arc<Inner>,
+    ) {
+        loop {
+            match framed_read.next().await {
+                Some(Ok(frame)) => {
+                    let request_id = frame.request_id();
+                    let mut pending = inner.pending.lock().await;
+                    if let Some(tx) = pending.remove(&request_id) {
+                        // Ignore send error: caller may have timed out and dropped the receiver.
+                        let _ = tx.send(Ok(frame));
+                    }
+                }
+                Some(Err(e)) => {
+                    warn!("StorageClient reader error: {e}");
+                    // Notify all pending callers of the error.
+                    let mut pending = inner.pending.lock().await;
+                    for (_, tx) in pending.drain() {
+                        let _ = tx.send(Err(StorageError::Internal(format!(
+                            "connection read error: {e}"
+                        ))));
+                    }
+                    break;
+                }
+                None => {
+                    // Connection closed.
+                    let mut pending = inner.pending.lock().await;
+                    for (_, tx) in pending.drain() {
+                        let _ = tx.send(Err(StorageError::Internal("connection closed".into())));
+                    }
+                    break;
+                }
+            }
+        }
     }
 
     fn alloc_request_id(&self) -> u32 {
-        self.next_request_id.fetch_add(1, Ordering::Relaxed)
+        self.inner.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    async fn send_recv(&mut self, frame: Frame) -> Result<Frame, StorageError> {
-        let result = tokio::time::timeout(RPC_REQUEST_TIMEOUT, async {
-            self.framed.send(frame).await?;
-            match self.framed.next().await {
-                Some(Ok(resp)) => Ok(resp),
-                Some(Err(e)) => Err(e),
-                None => Err(StorageError::Internal("connection closed".into())),
+    /// Send a request frame and wait for the corresponding response.
+    /// Supports pipelining: multiple send_request calls can be in flight concurrently.
+    async fn send_request(&self, frame: Frame) -> Result<Frame, StorageError> {
+        let request_id = frame.request_id();
+        let (tx, rx) = oneshot::channel();
+
+        // Insert into pending map BEFORE sending to avoid race with reader task.
+        {
+            let mut pending = self.inner.pending.lock().await;
+            pending.insert(request_id, tx);
+        }
+
+        // Send the frame to the writer task.
+        if self.inner.write_tx.send(frame).await.is_err() {
+            // Writer task is gone — clean up and report.
+            let mut pending = self.inner.pending.lock().await;
+            pending.remove(&request_id);
+            return Err(StorageError::Internal("connection closed".into()));
+        }
+
+        // Wait for response with timeout.
+        match tokio::time::timeout(RPC_REQUEST_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_recv_err)) => {
+                // Sender was dropped (reader task died).
+                Err(StorageError::Internal("connection closed".into()))
             }
-        })
-        .await
-        .map_err(|_| StorageError::Internal("RPC request timeout".into()))?;
-        result
+            Err(_timeout) => {
+                // Timed out — clean up pending slot.
+                let mut pending = self.inner.pending.lock().await;
+                pending.remove(&request_id);
+                Err(StorageError::Internal("RPC request timeout".into()))
+            }
+        }
     }
 
     /// Send a raw frame and return the response. Used by StreamManager to communicate with ExtentNodes.
-    pub async fn send_frame(&mut self, frame: Frame) -> Result<Frame, StorageError> {
-        self.send_recv(frame).await
+    pub async fn send_frame(&self, frame: Frame) -> Result<Frame, StorageError> {
+        self.send_request(frame).await
     }
 
     fn check_error(resp: &Frame) -> Result<(), StorageError> {
@@ -89,7 +202,7 @@ impl StorageClient {
     /// If replication_factor=0, the StreamManager uses its default.
     /// Returns (StreamId, ExtentId, ExtentNode address for the first extent).
     pub async fn create_stream(
-        &mut self,
+        &self,
         name: &str,
         replication_factor: u16,
     ) -> Result<(StreamId, ExtentId, String), StorageError> {
@@ -99,7 +212,7 @@ impl StorageClient {
             },
             Some(build_create_stream_payload(name, replication_factor)),
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::CreateStreamResp {
             return Err(StorageError::Internal(format!(
@@ -119,7 +232,7 @@ impl StorageClient {
 
     /// Append a message to a stream. Returns the assigned offset.
     pub async fn append(
-        &mut self,
+        &self,
         stream_id: StreamId,
         extent_id: ExtentId,
         payload: Bytes,
@@ -132,7 +245,7 @@ impl StorageClient {
             },
             Some(payload),
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
 
         Ok(AppendResult {
@@ -145,7 +258,7 @@ impl StorageClient {
     /// The server resolves byte positions internally via its index stream,
     /// so only the logical offset is needed.
     pub async fn read(
-        &mut self,
+        &self,
         stream_id: StreamId,
         extent_id: ExtentId,
         offset: Offset,
@@ -161,7 +274,7 @@ impl StorageClient {
             },
             None,
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
 
         // Decode payload: [u32 len][bytes] repeated.
@@ -185,7 +298,7 @@ impl StorageClient {
     }
 
     /// Query the max offset (exclusive) for a stream.
-    pub async fn query_offset(&mut self, stream_id: StreamId) -> Result<Offset, StorageError> {
+    pub async fn query_offset(&self, stream_id: StreamId) -> Result<Offset, StorageError> {
         let req = Frame::new(
             VariableHeader::QueryOffset {
                 request_id: self.alloc_request_id(),
@@ -193,7 +306,7 @@ impl StorageClient {
             },
             None,
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         Ok(resp.offset())
     }
@@ -202,7 +315,7 @@ impl StorageClient {
 
     /// Send Connect to StreamManager to register an ExtentNode node.
     pub async fn connect_extent_node(
-        &mut self,
+        &self,
         node_id: &str,
         addr: &str,
         heartbeat_interval_ms: u32,
@@ -213,7 +326,7 @@ impl StorageClient {
             },
             Some(build_connect_payload(node_id, addr, heartbeat_interval_ms)),
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::ConnectAck {
             return Err(StorageError::Internal(format!(
@@ -226,7 +339,7 @@ impl StorageClient {
 
     /// Send Heartbeat to StreamManager with runtime metrics.
     pub async fn heartbeat(
-        &mut self,
+        &self,
         node_id: &str,
         metrics: &NodeMetrics,
     ) -> Result<(), StorageError> {
@@ -236,20 +349,20 @@ impl StorageClient {
             },
             Some(build_heartbeat_payload(node_id, metrics)),
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         Ok(())
     }
 
     /// Send Disconnect to StreamManager.
-    pub async fn disconnect_extent_node(&mut self, node_id: &str) -> Result<(), StorageError> {
+    pub async fn disconnect_extent_node(&self, node_id: &str) -> Result<(), StorageError> {
         let req = Frame::new(
             VariableHeader::Disconnect {
                 request_id: self.alloc_request_id(),
             },
             Some(build_string_payload(node_id)),
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::DisconnectAck {
             return Err(StorageError::Internal(format!(
@@ -272,7 +385,7 @@ impl StorageClient {
     ///
     /// Returns (new_extent_id, new_primary_addr).
     pub async fn seal(
-        &mut self,
+        &self,
         stream_id: StreamId,
         extent_id: ExtentId,
         committed_offset: Option<u64>,
@@ -287,7 +400,7 @@ impl StorageClient {
             },
             None,
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::SealAck {
             return Err(StorageError::Internal(format!(
@@ -324,7 +437,7 @@ impl StorageClient {
     /// - `count = 1`: return the latest (active/mutable) extent only.
     /// - `count = N`: return at most N extents from latest to earliest.
     pub async fn describe_stream(
-        &mut self,
+        &self,
         stream_id: StreamId,
         count: u32,
     ) -> Result<Vec<ExtentInfo>, StorageError> {
@@ -336,7 +449,7 @@ impl StorageClient {
             },
             None,
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::DescribeStreamResp {
             return Err(StorageError::Internal(format!(
@@ -350,7 +463,7 @@ impl StorageClient {
 
     /// Describe a single extent with replica info and node liveness.
     pub async fn describe_extent(
-        &mut self,
+        &self,
         stream_id: StreamId,
         extent_id: ExtentId,
     ) -> Result<ExtentInfo, StorageError> {
@@ -362,7 +475,7 @@ impl StorageClient {
             },
             None,
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::DescribeExtentResp {
             return Err(StorageError::Internal(format!(
@@ -382,7 +495,7 @@ impl StorageClient {
     /// Returns the `ExtentInfo` for the extent covering `offset`, including replica
     /// addresses so the caller knows which extent node(s) to read from.
     pub async fn seek(
-        &mut self,
+        &self,
         stream_id: StreamId,
         offset: Offset,
     ) -> Result<ExtentInfo, StorageError> {
@@ -394,7 +507,7 @@ impl StorageClient {
             },
             None,
         );
-        let resp = self.send_recv(req).await?;
+        let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::SeekResp {
             return Err(StorageError::Internal(format!(
