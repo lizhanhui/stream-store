@@ -20,6 +20,7 @@ common = { path = "../common" }
 rpc = { path = "../rpc" }
 server = { path = "../server" }
 client = { path = "../client" }
+fastant = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
