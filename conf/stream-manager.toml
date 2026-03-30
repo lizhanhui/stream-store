@@ -1,0 +1,17 @@
+# StreamManager configuration
+# All fields are optional — missing fields use defaults.
+
+listen_addr = "0.0.0.0:9800"
+
+# MySQL connection settings
+mysql_host = "127.0.0.1"
+mysql_port = 3306
+mysql_username = "root"
+mysql_password = "password"
+mysql_database = "metadata"
+
+# Replication
+default_replication_factor = 2
+
+# Heartbeat checker interval (ms)
+heartbeat_check_interval_ms = 3000
