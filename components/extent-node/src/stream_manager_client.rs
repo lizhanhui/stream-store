@@ -166,8 +166,7 @@ impl StreamManagerClient {
         info!("connected to StreamManager at {stream_manager_addr}");
 
         // Send Connect.
-        let connect_payload =
-            build_connect_payload(node_id, advertise_addr, heartbeat_interval_ms);
+        let connect_payload = build_connect_payload(node_id, advertise_addr, heartbeat_interval_ms);
         let connect_frame = Frame::new(
             VariableHeader::Connect { request_id: 0 },
             Some(connect_payload),

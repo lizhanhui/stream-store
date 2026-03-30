@@ -11,12 +11,17 @@
 //! Connections are lazily created on first forward. On write failure, a single
 //! reconnect-and-retry is attempted before giving up (timeout handles client impact).
 
+use futures_util::StreamExt;
+use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
+use std::io::Error;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio_util::codec::FramedRead;
 
 use futures_util::SinkExt;
 use tokio::net::TcpStream;
+use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
@@ -33,7 +38,7 @@ use crate::store::ExtentNodeStore;
 /// so concurrent callers serialize on the same connection (keeps TCP ordering).
 pub struct DownstreamPool {
     /// Per-address TCP writers. Outer Mutex for the map, inner Mutex per writer.
-    connections: Mutex<HashMap<String, Arc<Mutex<FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>>>>>,
+    connections: Mutex<HashMap<String, Arc<Mutex<FramedWrite<OwnedWriteHalf, FrameCodec>>>>>,
     /// Back-reference to the store for inline watermark processing.
     store: Arc<ExtentNodeStore>,
 }
@@ -108,7 +113,7 @@ impl DownstreamPool {
     async fn get_or_create_writer(
         &self,
         addr: &str,
-    ) -> Option<Arc<Mutex<FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>>>> {
+    ) -> Option<Arc<Mutex<FramedWrite<OwnedWriteHalf, FrameCodec>>>> {
         // Fast path: check if connection already exists.
         {
             let conns = self.connections.lock().await;
@@ -136,7 +141,7 @@ impl DownstreamPool {
     async fn reconnect(
         &self,
         addr: &str,
-    ) -> Option<Arc<Mutex<FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>>>> {
+    ) -> Option<Arc<Mutex<FramedWrite<OwnedWriteHalf, FrameCodec>>>> {
         // Remove the old (broken) writer.
         {
             let mut conns = self.connections.lock().await;
@@ -162,15 +167,15 @@ impl DownstreamPool {
     async fn create_connection(
         &self,
         addr: &str,
-    ) -> Result<FramedWrite<tokio::net::tcp::OwnedWriteHalf, FrameCodec>, std::io::Error> {
+    ) -> Result<FramedWrite<OwnedWriteHalf, FrameCodec>, Error> {
         let stream = TcpStream::connect(addr).await?;
 
         // Disable Nagle's algorithm for low-latency small frames.
         stream.set_nodelay(true)?;
 
         // Set TCP keepalive to detect half-open connections.
-        let sock_ref = socket2::SockRef::from(&stream);
-        let keepalive = socket2::TcpKeepalive::new()
+        let sock_ref = SockRef::from(&stream);
+        let keepalive = TcpKeepalive::new()
             .with_time(Duration::from_secs(10))
             .with_interval(Duration::from_secs(5));
         sock_ref.set_tcp_keepalive(&keepalive)?;
@@ -197,12 +202,9 @@ impl DownstreamPool {
 /// eliminating the WatermarkEvent channel hop.
 async fn downstream_reader_inline(
     addr: String,
-    read_half: tokio::net::tcp::OwnedReadHalf,
+    read_half: OwnedReadHalf,
     store: Arc<ExtentNodeStore>,
 ) {
-    use futures_util::StreamExt;
-    use tokio_util::codec::FramedRead;
-
     let mut framed_read = FramedRead::new(read_half, FrameCodec);
 
     while let Some(result) = framed_read.next().await {
