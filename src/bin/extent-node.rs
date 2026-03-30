@@ -1,4 +1,4 @@
-use common::config::ExtentNodeConfig;
+use common::config::{load_config_from_file, ExtentNodeConfig};
 use extent_node::ExtentNode;
 
 #[tokio::main]
@@ -9,7 +9,17 @@ async fn main() {
         )
         .init();
 
-    let config = ExtentNodeConfig::default();
+    let config = match parse_config_path() {
+        Some(path) => load_config_from_file::<ExtentNodeConfig>(&path)
+            .unwrap_or_else(|e| {
+                eprintln!("{e}");
+                std::process::exit(1);
+            }),
+        None => ExtentNodeConfig::default(),
+    };
+
+    tracing::info!("ExtentNode starting with config: {:?}", config);
+
     let node = ExtentNode::start(config).await;
 
     // Wait for Ctrl+C, then gracefully shut down.
@@ -18,4 +28,21 @@ async fn main() {
         .expect("failed to listen for ctrl_c");
 
     node.stop().await;
+}
+
+fn parse_config_path() -> Option<String> {
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--config" || args[i] == "-c" {
+            if i + 1 < args.len() {
+                return Some(args[i + 1].clone());
+            } else {
+                eprintln!("--config requires a file path argument");
+                std::process::exit(1);
+            }
+        }
+        i += 1;
+    }
+    None
 }
