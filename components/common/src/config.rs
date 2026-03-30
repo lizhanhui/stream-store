@@ -74,7 +74,7 @@ impl Default for StreamManagerConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:9800".to_string(),
-            mysql_host: "127.0.0.1".to_string(),
+            mysql_host: "tx.dev".to_string(),
             mysql_port: 3306,
             mysql_username: "root".to_string(),
             mysql_password: "password".to_string(),

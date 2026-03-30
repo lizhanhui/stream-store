@@ -4,7 +4,7 @@
 listen_addr = "0.0.0.0:9800"
 
 # MySQL connection settings
-mysql_host = "127.0.0.1"
+mysql_host = "tx.dev"
 mysql_port = 3306
 mysql_username = "root"
 mysql_password = "password"
