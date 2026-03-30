@@ -3,17 +3,17 @@ pub mod extent;
 pub mod store;
 pub mod stream;
 pub mod stream_manager_client;
-pub mod watermark;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use common::config::{ExtentNodeConfig, resolve_advertise_ip};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::info;
 
+use crate::downstream::DownstreamPool;
 use crate::store::ExtentNodeStore;
 use crate::stream_manager_client::StreamManagerClient;
 
@@ -26,7 +26,7 @@ pub struct ExtentNode {
     addr: SocketAddr,
     /// Shutdown signal sender — sending triggers graceful stop of non-heartbeat tasks.
     shutdown_tx: broadcast::Sender<()>,
-    /// JoinHandles for spawned background tasks (downstream, watermark, accept loop).
+    /// JoinHandles for spawned background tasks (accept loop).
     task_handles: Vec<JoinHandle<()>>,
     /// RAII client managing the StreamManager connection lifecycle.
     /// Sends Disconnect on drop; call `stop()` for guaranteed delivery.
@@ -45,10 +45,9 @@ impl ExtentNode {
     /// Start the ExtentNode.
     ///
     /// 1. Bind the listener and determine the actual bound address.
-    /// 2. Create channels for broadcast replication (ForwardRequest, WatermarkEvent).
-    /// 3. Spawn DownstreamManager and WatermarkHandler tasks.
-    /// 4. Spawn the StreamManagerClient (heartbeat lifecycle with RAII Disconnect).
-    /// 5. Spawn the accept loop.
+    /// 2. Create ExtentNodeStore and DownstreamPool (direct TCP, no channels).
+    /// 3. Spawn the StreamManagerClient (heartbeat lifecycle with RAII Disconnect).
+    /// 4. Spawn the accept loop.
     ///
     /// Returns an `ExtentNode` handle for lifecycle management.
     pub async fn start(config: ExtentNodeConfig) -> Self {
@@ -64,28 +63,15 @@ impl ExtentNode {
             .expect("failed to get ExtentNode local address");
         info!("ExtentNode server bound on {local_addr}");
 
-        // Create broadcast replication channels.
-        let (forward_tx, forward_rx) = mpsc::channel(4096);
-        let (watermark_tx, watermark_rx) = mpsc::channel(4096);
-
-        // Create store with broadcast replication support and per-stream fine-grained locking.
-        let mut store_inner = ExtentNodeStore::with_forward_tx(forward_tx);
+        // Create store first (OnceLock for downstream breaks circular dep).
+        let mut store_inner = ExtentNodeStore::new();
         store_inner.set_arena_capacity(config.extent_arena_capacity);
         let store = Arc::new(store_inner);
 
-        // Spawn DownstreamManager task.
-        let downstream_shutdown = shutdown_tx.subscribe();
-        task_handles.push(tokio::spawn(async move {
-            downstream::run_downstream_manager(forward_rx, watermark_tx, downstream_shutdown).await;
-        }));
-
-        // Spawn WatermarkHandler task.
-        let store_for_watermark = Arc::clone(&store);
-        let watermark_shutdown = shutdown_tx.subscribe();
-        task_handles.push(tokio::spawn(async move {
-            watermark::run_watermark_handler(watermark_rx, store_for_watermark, watermark_shutdown)
-                .await;
-        }));
+        // Create DownstreamPool with back-reference to store (for inline watermark processing).
+        let downstream = Arc::new(DownstreamPool::new(Arc::clone(&store)));
+        // Wire pool into store.
+        store.set_downstream(downstream);
 
         // Resolve advertise_addr: auto-detect IP if bind_ip is 0.0.0.0 and advertise_ip not set.
         // If port was 0 (OS-assigned), use the actual bound port instead.
@@ -142,7 +128,7 @@ impl ExtentNode {
     /// Gracefully stop the ExtentNode: signal all tasks and await their completion.
     pub async fn stop(self) {
         info!("ExtentNode stopping...");
-        // 1. Signal non-heartbeat tasks (downstream, watermark, accept loop).
+        // 1. Signal non-heartbeat tasks (accept loop).
         let _ = self.shutdown_tx.send(());
         // 2. Stop StreamManagerClient (sends Disconnect, awaits task).
         self.stream_manager_client.stop().await;

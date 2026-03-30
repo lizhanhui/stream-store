@@ -1,5 +1,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -10,9 +11,11 @@ use dashmap::DashMap;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use crate::downstream::DownstreamPool;
 use crate::extent::{DEFAULT_ARENA_CAPACITY, Extent};
 use crate::stream::Stream;
 
@@ -158,36 +161,6 @@ impl AckQueue {
     }
 }
 
-/// Request to forward an append to a secondary node.
-/// Sent from the store to the DownstreamManager via channel.
-/// Primary emits one ForwardRequest per secondary (broadcast fan-out).
-#[derive(Debug, Clone)]
-pub struct ForwardRequest {
-    pub stream_id: StreamId,
-    pub extent_id: ExtentId,
-    pub offset: u64,
-    /// The extent's start_offset, included in the forwarded frame so the secondary
-    /// can create the extent with the correct base offset during lazy creation.
-    pub start_offset: u64,
-    /// The byte position in the arena where this record was written on the primary.
-    /// Carried in the Forward frame so the secondary writes at the exact same position.
-    pub byte_pos: u64,
-    pub payload: Bytes,
-    pub downstream_addr: String,
-}
-
-/// Watermark event received from a secondary.
-/// Sent from the DownstreamManager to the WatermarkHandler via channel.
-/// Represents a cumulative ACK: all offsets <= acked_offset are confirmed.
-#[derive(Debug, Clone)]
-pub struct WatermarkEvent {
-    pub stream_id: StreamId,
-    /// The highest offset this secondary has written (cumulative).
-    pub acked_offset: u64,
-    /// The address of the secondary that sent this ACK.
-    pub source_addr: String,
-}
-
 /// Request from the Primary to proactively seal a stream and trigger new extent allocation.
 /// Emitted when the arena is full (ExtentFull). Sent to a background task that forwards
 /// the Seal request to Stream Manager, avoiding an error storm where every client
@@ -276,8 +249,9 @@ pub struct ExtentNodeStore {
     /// Replication info per stream_id (registered via RegisterExtent).
     /// Fine-grained per-stream locking.
     replicas: DashMap<StreamId, ReplicaInfo>,
-    /// Channel to send ForwardRequests to the DownstreamManager (None for standalone/test mode).
-    forward_tx: Option<mpsc::Sender<ForwardRequest>>,
+    /// Direct TCP connection pool for broadcast replication (None for standalone/test mode).
+    /// Initialized via `set_downstream()` after construction (OnceLock breaks circular dep).
+    downstream: OnceLock<Arc<DownstreamPool>>,
     /// Channel to send proactive SealRequests when an extent is full (Primary only).
     /// A background task receives these and forwards Seal RPCs to Stream Manager.
     seal_tx: Option<mpsc::Sender<SealRequest>>,
@@ -299,7 +273,7 @@ impl ExtentNodeStore {
             next_stream_id: AtomicU64::new(1),
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             replicas: DashMap::new(),
-            forward_tx: None,
+            downstream: OnceLock::new(),
             seal_tx: None,
             ack_queues: DashMap::new(),
             append_count: AtomicU64::new(0),
@@ -307,19 +281,11 @@ impl ExtentNodeStore {
         }
     }
 
-    /// Create a new store with broadcast replication support.
-    pub fn with_forward_tx(forward_tx: mpsc::Sender<ForwardRequest>) -> Self {
-        Self {
-            streams: DashMap::new(),
-            next_stream_id: AtomicU64::new(1),
-            arena_capacity: DEFAULT_ARENA_CAPACITY,
-            replicas: DashMap::new(),
-            forward_tx: Some(forward_tx),
-            seal_tx: None,
-            ack_queues: DashMap::new(),
-            append_count: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
-        }
+    /// Set the downstream connection pool for broadcast replication.
+    /// Called once during ExtentNode bootstrap after the store is created.
+    /// Uses OnceLock to break the circular dependency: store needs pool, pool needs store.
+    pub fn set_downstream(&self, pool: Arc<DownstreamPool>) {
+        self.downstream.set(pool).ok();
     }
 
     /// Set the arena capacity for new extents (bytes).
@@ -368,7 +334,7 @@ impl RequestHandler for ExtentNodeStore {
         response_tx: Option<&mpsc::Sender<Frame>>,
     ) -> Option<Frame> {
         match frame.opcode() {
-            Opcode::Append => self.handle_append(frame, response_tx),
+            Opcode::Append => self.handle_append(frame, response_tx).await,
             Opcode::Forward => Some(self.handle_forward(frame)),
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
@@ -414,10 +380,11 @@ impl RequestHandler for ExtentNodeStore {
         if frames.len() == 1 {
             return self
                 .handle_append(frames[0].clone(), response_tx)
+                .await
                 .into_iter()
                 .collect();
         }
-        self.handle_append_batch_inner(frames, response_tx)
+        self.handle_append_batch_inner(frames, response_tx).await
     }
 }
 
@@ -534,7 +501,7 @@ impl ExtentNodeStore {
     ///
     /// The active writer handles replication (Forward + PendingAck for RF≥2)
     /// or sends immediate AppendAck (RF=1/standalone) for each job.
-    fn handle_append(
+    async fn handle_append(
         &self,
         frame: Frame,
         response_tx: Option<&mpsc::Sender<Frame>>,
@@ -602,7 +569,7 @@ impl ExtentNodeStore {
         let request_id = frame.request_id();
 
         // Process my own append.
-        let (own_result, extent_full) = self.do_append_and_respond(
+        let (own_result, extent_full, mut forward_work) = self.do_append_and_respond(
             extent,
             request_id,
             stream_id,
@@ -615,7 +582,8 @@ impl ExtentNodeStore {
         let remaining = extent.in_flight().fetch_sub(1, Ordering::Release);
         if remaining > 1 {
             // Followers are waiting — drain the batch.
-            self.drain_append_batch(extent, extent_full);
+            let batch_forward_work = self.drain_append_batch(extent, extent_full);
+            forward_work.extend(batch_forward_work);
         }
 
         // Drop stream guard before proactive seal (needs write lock).
@@ -625,14 +593,18 @@ impl ExtentNodeStore {
             self.trigger_proactive_seal(stream_id, extent_id);
         }
 
+        // Flush forward work to downstream pool (direct TCP write, no channel hop).
+        self.flush_forward_work(forward_work).await;
+
         own_result
     }
 
     /// Perform a single append and handle replication / ACK.
     ///
-    /// Returns `(Option<Frame>, bool)` where the bool indicates ExtentFull
-    /// occurred, signaling the caller to trigger proactive seal after dropping
-    /// the stream guard.
+    /// Returns `(Option<Frame>, bool, Vec<(String, Frame)>)`:
+    /// - Option<Frame>: response frame (None if deferred or sent via channel)
+    /// - bool: whether ExtentFull occurred (caller should trigger proactive seal)
+    /// - Vec<(String, Frame)>: forward work to flush via DownstreamPool
     ///
     /// When response_tx is Some, success ACKs are sent via the channel and the
     /// Frame return is None. When response_tx is None, success ACKs are returned
@@ -645,7 +617,7 @@ impl ExtentNodeStore {
         extent_id: ExtentId,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
-    ) -> (Option<Frame>, bool) {
+    ) -> (Option<Frame>, bool, Vec<(String, Frame)>) {
         let payload_len = payload.len();
         let payload_for_forward = payload.clone();
 
@@ -661,9 +633,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(err);
-                    return (None, false);
+                    return (None, false, Vec::new());
                 }
-                return (Some(err), false);
+                return (Some(err), false, Vec::new());
             }
             Err(StorageError::ExtentFull(_)) => {
                 let err = Frame::error_response(
@@ -674,9 +646,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(err);
-                    return (None, true);
+                    return (None, true, Vec::new());
                 }
-                return (Some(err), true);
+                return (Some(err), true, Vec::new());
             }
             Err(e) => {
                 let err = Frame::error_response(
@@ -687,9 +659,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(err);
-                    return (None, false);
+                    return (None, false, Vec::new());
                 }
-                return (Some(err), false);
+                return (Some(err), false, Vec::new());
             }
         };
 
@@ -718,9 +690,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(ack);
-                    (None, false)
+                    (None, false, Vec::new())
                 } else {
-                    (Some(ack), false)
+                    (Some(ack), false, Vec::new())
                 }
             }
             Some(ref ri) if ri.is_primary() => {
@@ -737,31 +709,26 @@ impl ExtentNodeStore {
                     );
                     if let Some(ref tx) = response_tx {
                         let _ = tx.try_send(ack);
-                        (None, false)
+                        (None, false, Vec::new())
                     } else {
-                        (Some(ack), false)
+                        (Some(ack), false, Vec::new())
                     }
                 } else {
-                    // RF≥2: broadcast Forward to secondaries.
-                    if let Some(ref tx) = self.forward_tx {
+                    // RF≥2: build Forward frames for secondaries.
+                    let mut forward_work = Vec::new();
+                    if self.downstream.get().is_some() {
                         for secondary_addr in &ri.replica_addrs {
-                            let req = ForwardRequest {
-                                stream_id,
-                                extent_id,
-                                offset: offset.0,
-                                start_offset: extent_start_offset,
-                                byte_pos: append_result.byte_pos,
-                                payload: payload_for_forward.clone(),
-                                downstream_addr: secondary_addr.clone(),
-                            };
-                            if let Err(e) = tx.try_send(req) {
-                                warn!(
-                                    secondary = %secondary_addr,
-                                    stream_id = ?stream_id,
-                                    offset = offset.0,
-                                    "forward channel backpressure: {e}; frame dropped",
-                                );
-                            }
+                            let frame = Frame::new(
+                                VariableHeader::Forward {
+                                    stream_id,
+                                    extent_id,
+                                    start_offset: Offset(extent_start_offset),
+                                    offset,
+                                    byte_pos: append_result.byte_pos,
+                                },
+                                Some(payload_for_forward.clone()),
+                            );
+                            forward_work.push((secondary_addr.clone(), frame));
                         }
                     }
 
@@ -780,7 +747,7 @@ impl ExtentNodeStore {
                         });
                     }
 
-                    (None, false)
+                    (None, false, forward_work)
                 }
             }
             Some(_) => {
@@ -796,9 +763,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(ack);
-                    (None, false)
+                    (None, false, Vec::new())
                 } else {
-                    (Some(ack), false)
+                    (Some(ack), false, Vec::new())
                 }
             }
         }
@@ -808,7 +775,8 @@ impl ExtentNodeStore {
     ///
     /// Called by the active writer after its own append when `in_flight > 1`.
     /// Loops until all followers have been processed.
-    fn drain_append_batch(&self, extent: &Extent, mut extent_full: bool) {
+    fn drain_append_batch(&self, extent: &Extent, mut extent_full: bool) -> Vec<(String, Frame)> {
+        let mut all_forward_work = Vec::new();
         loop {
             let mut batch: Vec<AppendJob> = Vec::new();
 
@@ -842,7 +810,7 @@ impl ExtentNodeStore {
                         ));
                     }
                 } else {
-                    let (_, job_full) = self.do_append_and_respond(
+                    let (_, job_full, forward_work) = self.do_append_and_respond(
                         extent,
                         job.request_id,
                         job.stream_id,
@@ -850,6 +818,7 @@ impl ExtentNodeStore {
                         job.payload.clone(),
                         job.response_tx.clone(),
                     );
+                    all_forward_work.extend(forward_work);
                     if job_full {
                         extent_full = true;
                     }
@@ -866,6 +835,7 @@ impl ExtentNodeStore {
             }
             // More followers arrived during processing — loop again.
         }
+        all_forward_work
     }
 
     /// Trigger a proactive seal when an extent is full.
@@ -898,7 +868,7 @@ impl ExtentNodeStore {
     /// Amortizes DashMap lookups (3N → 3), leader elections (N → 1),
     /// ReplicaInfo access (N clones → 0, borrow within guard), and
     /// atomic operations (2N → 2).
-    fn handle_append_batch_inner(
+    async fn handle_append_batch_inner(
         &self,
         frames: &[Frame],
         response_tx: Option<&mpsc::Sender<Frame>>,
@@ -1062,16 +1032,20 @@ impl ExtentNodeStore {
             }
         }
 
+        let mut forward_work: Vec<(String, Frame)> = Vec::new();
+
         if entries.is_empty() {
             // All appends failed — decrement and possibly drain followers.
             let remaining = extent.in_flight().fetch_sub(batch_len, Ordering::Release);
             if remaining > batch_len {
-                self.drain_append_batch(extent, extent_full);
+                let batch_forward = self.drain_append_batch(extent, extent_full);
+                forward_work.extend(batch_forward);
             }
             drop(stream_ref);
             if extent_full {
                 self.trigger_proactive_seal(stream_id, extent_id);
             }
+            self.flush_forward_work(forward_work).await;
             return responses;
         }
 
@@ -1126,27 +1100,21 @@ impl ExtentNodeStore {
                         }
                     }
                 } else {
-                    // RF≥2: broadcast Forward to secondaries.
-                    if let Some(ref tx) = self.forward_tx {
+                    // RF≥2: build Forward frames for secondaries.
+                    if self.downstream.get().is_some() {
                         for entry in &entries {
                             for secondary_addr in &ri.replica_addrs {
-                                let req = ForwardRequest {
-                                    stream_id,
-                                    extent_id,
-                                    offset: entry.offset.0,
-                                    start_offset: extent_start_offset,
-                                    byte_pos: entry.byte_pos,
-                                    payload: entry.payload_for_forward.clone(),
-                                    downstream_addr: secondary_addr.clone(),
-                                };
-                                if let Err(e) = tx.try_send(req) {
-                                    warn!(
-                                        secondary = %secondary_addr,
-                                        stream_id = ?stream_id,
-                                        offset = entry.offset.0,
-                                        "forward channel backpressure: {e}; frame dropped",
-                                    );
-                                }
+                                let frame = Frame::new(
+                                    VariableHeader::Forward {
+                                        stream_id,
+                                        extent_id,
+                                        start_offset: Offset(extent_start_offset),
+                                        offset: entry.offset,
+                                        byte_pos: entry.byte_pos,
+                                    },
+                                    Some(entry.payload_for_forward.clone()),
+                                );
+                                forward_work.push((secondary_addr.clone(), frame));
                             }
                         }
                     }
@@ -1197,7 +1165,8 @@ impl ExtentNodeStore {
         // Check if followers arrived while we were appending.
         let remaining = extent.in_flight().fetch_sub(batch_len, Ordering::Release);
         if remaining > batch_len {
-            self.drain_append_batch(extent, extent_full);
+            let batch_forward = self.drain_append_batch(extent, extent_full);
+            forward_work.extend(batch_forward);
         }
 
         // Drop stream guard before proactive seal (needs write lock).
@@ -1207,7 +1176,36 @@ impl ExtentNodeStore {
             self.trigger_proactive_seal(stream_id, extent_id);
         }
 
+        // Flush forward work to downstream pool (direct TCP write, no channel hop).
+        self.flush_forward_work(forward_work).await;
+
         responses
+    }
+
+    /// Flush collected forward work to the downstream pool.
+    ///
+    /// Groups frames by destination address and sends each batch directly via TCP.
+    /// This is the point where the async boundary is crossed — all synchronous
+    /// append logic collects forward work, and this method flushes it.
+    async fn flush_forward_work(&self, forward_work: Vec<(String, Frame)>) {
+        if forward_work.is_empty() {
+            return;
+        }
+        if let Some(pool) = self.downstream.get() {
+            // Group by destination address for efficient batching.
+            let mut by_addr: HashMap<&str, Vec<&Frame>> = HashMap::new();
+            for (addr, frame) in &forward_work {
+                by_addr.entry(addr.as_str()).or_default().push(frame);
+            }
+            for (addr, frames) in by_addr {
+                if frames.len() == 1 {
+                    pool.forward(addr, frames[0].clone()).await;
+                } else {
+                    let owned: Vec<Frame> = frames.into_iter().cloned().collect();
+                    pool.forward_batch(addr, &owned).await;
+                }
+            }
+        }
     }
 
     /// Handle Forward (0x0B) — dedicated opcode for Primary→Secondary replication.
@@ -1808,15 +1806,25 @@ mod tests {
 
     #[tokio::test]
     async fn primary_append_defers_and_broadcasts() {
+        use futures_util::StreamExt;
+        use rpc::codec::FrameCodec;
         use rpc::payload::build_register_extent_payload;
+        use tokio_util::codec::FramedRead;
 
-        let (forward_tx, mut forward_rx) = mpsc::channel(100);
         let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(100);
 
-        let store = ExtentNodeStore::with_forward_tx(forward_tx);
+        // Start two mock TCP listeners (acting as secondaries).
+        let listener1 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr1 = listener1.local_addr().unwrap().to_string();
+        let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr2 = listener2.local_addr().unwrap().to_string();
+
+        let store = Arc::new(ExtentNodeStore::new());
+        let pool = Arc::new(crate::downstream::DownstreamPool::new(Arc::clone(&store)));
+        store.set_downstream(Arc::clone(&pool));
 
         // Register as Primary with 2 secondaries (RF=3).
-        let payload = build_register_extent_payload(&["127.0.0.1:9802", "127.0.0.1:9803"]);
+        let payload = build_register_extent_payload(&[&addr1, &addr2]);
         store
             .handle_frame(
                 Frame::new(
@@ -1834,7 +1842,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Append — should return None (deferred), send 2 ForwardRequests.
+        // Append — should return None (deferred), send 2 Forward frames over TCP.
         let result = store
             .handle_frame(
                 Frame::new(
@@ -1854,18 +1862,20 @@ mod tests {
             "Primary with secondaries should defer ACK"
         );
 
-        // Should have 2 ForwardRequests (one per secondary).
-        let fwd1 = forward_rx.try_recv().unwrap();
-        let fwd2 = forward_rx.try_recv().unwrap();
-        assert_eq!(fwd1.stream_id, StreamId(10));
-        assert_eq!(fwd2.stream_id, StreamId(10));
-        // Both have same payload and offset.
-        assert_eq!(fwd1.offset, 0);
-        assert_eq!(fwd2.offset, 0);
-        // Different downstream addrs.
-        let addrs: Vec<String> = vec![fwd1.downstream_addr, fwd2.downstream_addr];
-        assert!(addrs.contains(&"127.0.0.1:9802".to_string()));
-        assert!(addrs.contains(&"127.0.0.1:9803".to_string()));
+        // Accept connections and read Forward frames from mock secondaries.
+        let (conn1, _) = listener1.accept().await.unwrap();
+        let mut reader1 = FramedRead::new(conn1, FrameCodec);
+        let fwd1 = reader1.next().await.unwrap().unwrap();
+        assert_eq!(fwd1.opcode(), Opcode::Forward);
+        assert_eq!(fwd1.stream_id(), StreamId(10));
+        assert_eq!(fwd1.offset(), Offset(0));
+
+        let (conn2, _) = listener2.accept().await.unwrap();
+        let mut reader2 = FramedRead::new(conn2, FrameCodec);
+        let fwd2 = reader2.next().await.unwrap().unwrap();
+        assert_eq!(fwd2.opcode(), Opcode::Forward);
+        assert_eq!(fwd2.stream_id(), StreamId(10));
+        assert_eq!(fwd2.offset(), Offset(0));
 
         // PendingAck should be in the ack_queue.
         let ack_queue = store.ack_queues.get(&StreamId(10)).unwrap();
@@ -1877,7 +1887,7 @@ mod tests {
         // Simulate watermark from first secondary (quorum met with 1 ACK for RF=3).
         drop(ack_queue); // release DashMap read guard before acquiring write guard
         let mut ack_queue = store.ack_queues.get_mut(&StreamId(10)).unwrap();
-        ack_queue.ack_from_secondary("127.0.0.1:9802", 0);
+        ack_queue.ack_from_secondary(&addr1, 0);
         ack_queue.drain_quorum();
 
         // The client response channel should now have the AppendAck.

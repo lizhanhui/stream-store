@@ -10,9 +10,9 @@ use bytes::Bytes;
 use common::types::{ExtentId, Offset, Opcode, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::build_register_extent_payload;
-use tokio::sync::{broadcast, mpsc};
 
-use extent_node::store::{ExtentNodeStore, ForwardRequest};
+use extent_node::downstream::DownstreamPool;
+use extent_node::store::ExtentNodeStore;
 
 /// Initialize tracing for tests. Uses try_init() so it's safe when multiple tests
 /// run in the same process. Override log level via RUST_LOG env var.
@@ -30,40 +30,10 @@ async fn start_extent_node() -> (String, Arc<ExtentNodeStore>) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
 
-    // Create channels for broadcast replication.
-    let (forward_tx, forward_rx) = mpsc::channel::<ForwardRequest>(4096);
-    let (watermark_tx, watermark_rx) = mpsc::channel(4096);
-
-    let store = Arc::new(ExtentNodeStore::with_forward_tx(forward_tx));
-
-    // Shutdown channel (never sent in tests — leak the sender to keep receivers alive).
-    let (shutdown_tx, _) = broadcast::channel::<()>(1);
-
-    // Spawn DownstreamManager.
-    let downstream_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        extent_node::downstream::run_downstream_manager(
-            forward_rx,
-            watermark_tx,
-            downstream_shutdown,
-        )
-        .await;
-    });
-
-    // Spawn WatermarkHandler.
-    let store_for_wm = Arc::clone(&store);
-    let watermark_shutdown = shutdown_tx.subscribe();
-    tokio::spawn(async move {
-        extent_node::watermark::run_watermark_handler(
-            watermark_rx,
-            store_for_wm,
-            watermark_shutdown,
-        )
-        .await;
-    });
-
-    // Keep shutdown_tx alive so receivers don't see Closed.
-    std::mem::forget(shutdown_tx);
+    // Create store with DownstreamPool (direct TCP, no channels).
+    let store = Arc::new(ExtentNodeStore::new());
+    let downstream = Arc::new(DownstreamPool::new(Arc::clone(&store)));
+    store.set_downstream(downstream);
 
     // Accept connections with deferred response support.
     let store_for_accept = Arc::clone(&store);
