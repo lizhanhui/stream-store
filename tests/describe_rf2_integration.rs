@@ -40,7 +40,7 @@ async fn start_stream_manager_rf2() -> String {
     // Drop old tables so Refinery can manage schema from scratch.
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(1)
-        .connect(&config.mysql_url)
+        .connect(&config.mysql_url())
         .await
         .expect("failed to connect for cleanup");
     for table in &[
@@ -59,7 +59,7 @@ async fn start_stream_manager_rf2() -> String {
     pool.close().await;
 
     // Connect and migrate.
-    let store = MetadataStore::connect(&config.mysql_url)
+    let store = MetadataStore::connect(&config.mysql_url())
         .await
         .expect("failed to connect to MySQL");
     store.migrate().await.expect("failed to migrate");

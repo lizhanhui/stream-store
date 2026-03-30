@@ -46,11 +46,11 @@ impl StreamManager {
         let mut task_handles = Vec::new();
 
         // 1. Connect to MySQL metadata store.
-        let store = MetadataStore::connect(&config.mysql_url)
+        let store = MetadataStore::connect(&config.mysql_url())
             .await
             .expect("failed to connect to MySQL");
         store.migrate().await.expect("failed to run migrations");
-        info!("StreamManager connected to MySQL: {}", config.mysql_url);
+        info!("StreamManager connected to MySQL: {}", config.mysql_url());
 
         // 2. Bind TCP listener and get the actual bound address.
         let listener = TcpListener::bind(&config.listen_addr)

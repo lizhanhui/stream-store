@@ -67,7 +67,7 @@ async fn main() {
         listen_addr: "127.0.0.1:0".into(),
         ..StreamManagerConfig::default()
     };
-    clean_database(&stream_manager_config.mysql_url).await;
+    clean_database(&stream_manager_config.mysql_url()).await;
     info!("[1] Database cleaned");
 
     // ── 2. Start StreamManager with port 0 (OS-assigned) ──
