@@ -53,7 +53,7 @@ impl StreamManager {
         info!("StreamManager connected to MySQL: {}", config.mysql_url());
 
         // 2. Bind TCP listener and get the actual bound address.
-        let listener = TcpListener::bind(&config.listen_addr)
+        let listener = TcpListener::bind(&config.listen_addr())
             .await
             .expect("failed to bind StreamManager listener");
         let local_addr = listener

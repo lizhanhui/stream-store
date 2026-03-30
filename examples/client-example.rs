@@ -64,7 +64,8 @@ async fn main() {
 
     // ── 1. Clean database ──
     let stream_manager_config = StreamManagerConfig {
-        listen_addr: "127.0.0.1:0".into(),
+        bind_ip: "127.0.0.1".into(),
+        port: 0,
         ..StreamManagerConfig::default()
     };
     clean_database(&stream_manager_config.mysql_url()).await;
@@ -79,7 +80,8 @@ async fn main() {
     let mut extent_nodes = Vec::new();
     for i in 0..3 {
         let extent_node_config = ExtentNodeConfig {
-            listen_addr: "127.0.0.1:0".into(),
+            bind_ip: "127.0.0.1".into(),
+            port: 0,
             stream_manager_addr: stream_manager_addr.to_string(),
             ..Default::default()
         };

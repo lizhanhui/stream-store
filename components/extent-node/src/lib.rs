@@ -56,7 +56,7 @@ impl ExtentNode {
         let mut task_handles = Vec::new();
 
         // Bind listener and resolve the OS-assigned address (especially when port 0 is used).
-        let listener = TcpListener::bind(&config.listen_addr)
+        let listener = TcpListener::bind(&config.listen_addr())
             .await
             .expect("failed to bind ExtentNode listener");
         let local_addr = listener
@@ -87,10 +87,30 @@ impl ExtentNode {
                 .await;
         }));
 
+        // Resolve advertise_addr: use config method which falls back bind_ip if advertise_ip is empty.
+        // If port was 0 (OS-assigned), use the actual bound port instead.
+        let advertise_addr = if config.port == 0 {
+            if config.advertise_ip.is_empty() {
+                local_addr.to_string()
+            } else {
+                format!("{}:{}", config.advertise_ip, local_addr.port())
+            }
+        } else {
+            config.advertise_addr()
+        };
+
+        // Resolve node_id: use config value if set, otherwise fall back to advertise_addr.
+        let node_id = if config.node_id.is_empty() {
+            advertise_addr.clone()
+        } else {
+            config.node_id.clone()
+        };
+
         // Spawn StreamManagerClient (RAII: sends Disconnect when dropped).
         let stream_manager_client = StreamManagerClient::spawn(
             Arc::clone(&store),
-            local_addr.to_string(),
+            node_id,
+            advertise_addr,
             config.stream_manager_addr.clone(),
             config.heartbeat_interval_ms,
         );

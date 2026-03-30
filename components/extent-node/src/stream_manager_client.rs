@@ -56,7 +56,8 @@ impl StreamManagerClient {
     /// graceful Disconnect.
     pub fn spawn(
         store: Arc<ExtentNodeStore>,
-        advertised_addr: String,
+        node_id: String,
+        advertise_addr: String,
         stream_manager_addr: String,
         heartbeat_interval_ms: u32,
     ) -> Self {
@@ -65,7 +66,8 @@ impl StreamManagerClient {
         let task_handle = tokio::spawn(async move {
             Self::run_loop(
                 store,
-                advertised_addr,
+                node_id,
+                advertise_addr,
                 stream_manager_addr,
                 heartbeat_interval_ms,
                 shutdown_rx,
@@ -97,7 +99,8 @@ impl StreamManagerClient {
     /// Reconnection loop. Runs until shutdown signal.
     async fn run_loop(
         store: Arc<ExtentNodeStore>,
-        advertised_addr: String,
+        node_id: String,
+        advertise_addr: String,
         stream_manager_addr: String,
         heartbeat_interval_ms: u32,
         mut shutdown_rx: oneshot::Receiver<()>,
@@ -105,7 +108,8 @@ impl StreamManagerClient {
         loop {
             match Self::connect_and_heartbeat(
                 &store,
-                &advertised_addr,
+                &node_id,
+                &advertise_addr,
                 &stream_manager_addr,
                 heartbeat_interval_ms,
                 &mut shutdown_rx,
@@ -143,7 +147,8 @@ impl StreamManagerClient {
     /// `Ok(false)` if the connection ended for other reasons.
     async fn connect_and_heartbeat(
         store: &Arc<ExtentNodeStore>,
-        advertised_addr: &str,
+        node_id: &str,
+        advertise_addr: &str,
         stream_manager_addr: &str,
         heartbeat_interval_ms: u32,
         shutdown_rx: &mut oneshot::Receiver<()>,
@@ -162,7 +167,7 @@ impl StreamManagerClient {
 
         // Send Connect.
         let connect_payload =
-            build_connect_payload(advertised_addr, advertised_addr, heartbeat_interval_ms);
+            build_connect_payload(node_id, advertise_addr, heartbeat_interval_ms);
         let connect_frame = Frame::new(
             VariableHeader::Connect { request_id: 0 },
             Some(connect_payload),
@@ -203,7 +208,7 @@ impl StreamManagerClient {
                 _ = &mut *shutdown_rx => {
                     // Graceful shutdown: send Disconnect before closing.
                     info!("shutdown signal received; sending Disconnect to StreamManager");
-                    let disconnect_frame = Frame::new(VariableHeader::Disconnect { request_id }, Some(build_disconnect_payload(advertised_addr)));
+                    let disconnect_frame = Frame::new(VariableHeader::Disconnect { request_id }, Some(build_disconnect_payload(node_id)));
                     if let Err(e) = framed.send(disconnect_frame).await {
                         warn!("failed to send Disconnect to StreamManager: {e}");
                         return Ok(true);
@@ -256,7 +261,7 @@ impl StreamManagerClient {
                 bytes_written_per_sec: bytes_per_sec,
             };
 
-            let heartbeat_payload = build_heartbeat_payload(advertised_addr, &metrics);
+            let heartbeat_payload = build_heartbeat_payload(node_id, &metrics);
 
             let hb_frame = Frame::new(
                 VariableHeader::Heartbeat { request_id },

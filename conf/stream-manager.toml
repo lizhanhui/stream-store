@@ -1,7 +1,11 @@
 # StreamManager configuration
 # All fields are optional — missing fields use defaults.
 
-listen_addr = "0.0.0.0:9800"
+# IP to bind the TCP listener on. Defaults to 0.0.0.0 (all interfaces).
+bind_ip = "0.0.0.0"
+
+# Port to listen on. Defaults to 9800.
+port = 9800
 
 # MySQL connection settings
 mysql_host = "tx.dev"

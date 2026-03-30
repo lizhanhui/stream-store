@@ -1,7 +1,20 @@
 # ExtentNode configuration
 # All fields are optional — missing fields use defaults.
 
-listen_addr = "0.0.0.0:9801"
+# Unique node identifier for StreamManager registration.
+# If omitted or empty, defaults to the advertise address ({advertise_ip}:{port}).
+# node_id = "extent-node-1"
+
+# IP to bind the TCP listener on. Defaults to 0.0.0.0 (all interfaces).
+bind_ip = "0.0.0.0"
+
+# Port to listen on. Defaults to 9801.
+port = 9801
+
+# IP advertised to StreamManager and other nodes.
+# Required when bind_ip is 0.0.0.0 — other nodes cannot connect to a wildcard address.
+# If omitted or empty, defaults to bind_ip.
+# advertise_ip = "192.168.1.100"
 
 # StreamManager address for registration and heartbeat
 stream_manager_addr = "127.0.0.1:9800"

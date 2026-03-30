@@ -27,8 +27,17 @@ impl Default for ServerConfig {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct ExtentNodeConfig {
-    /// Address to listen on for client/StreamManager connections.
-    pub listen_addr: String,
+    /// Unique node identifier for registration with StreamManager.
+    /// If empty, defaults to the advertise address (`{advertise_ip}:{port}`).
+    pub node_id: String,
+    /// IP to bind the TCP listener on. Defaults to `0.0.0.0` (all interfaces).
+    pub bind_ip: String,
+    /// Port to listen on. Defaults to 9801.
+    pub port: u16,
+    /// IP advertised to StreamManager and other nodes for inbound connections.
+    /// Required when `bind_ip` is `0.0.0.0`, since other nodes cannot connect to
+    /// a wildcard address. If empty, defaults to `bind_ip`.
+    pub advertise_ip: String,
     /// StreamManager address to connect to for registration and heartbeat.
     pub stream_manager_addr: String,
     /// Heartbeat interval in milliseconds. StreamManager uses 1.5x as dead-node timeout.
@@ -40,7 +49,10 @@ pub struct ExtentNodeConfig {
 impl Default for ExtentNodeConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:9801".to_string(),
+            node_id: String::new(),
+            bind_ip: "0.0.0.0".to_string(),
+            port: 9801,
+            advertise_ip: String::new(),
             stream_manager_addr: "127.0.0.1:9800".to_string(),
             heartbeat_interval_ms: 5000,
             extent_arena_capacity: 64 * 1024 * 1024, // 64 MiB
@@ -48,12 +60,32 @@ impl Default for ExtentNodeConfig {
     }
 }
 
+impl ExtentNodeConfig {
+    /// The address to bind the TCP listener on: `{bind_ip}:{port}`.
+    pub fn listen_addr(&self) -> String {
+        format!("{}:{}", self.bind_ip, self.port)
+    }
+
+    /// The address advertised to other nodes: `{advertise_ip}:{port}`.
+    /// Falls back to `{bind_ip}:{port}` if `advertise_ip` is empty.
+    pub fn advertise_addr(&self) -> String {
+        let ip = if self.advertise_ip.is_empty() {
+            &self.bind_ip
+        } else {
+            &self.advertise_ip
+        };
+        format!("{ip}:{}", self.port)
+    }
+}
+
 /// Configuration for a StreamManager process.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct StreamManagerConfig {
-    /// Address to listen on for ExtentNode/client connections.
-    pub listen_addr: String,
+    /// IP to bind the TCP listener on. Defaults to `0.0.0.0` (all interfaces).
+    pub bind_ip: String,
+    /// Port to listen on. Defaults to 9800.
+    pub port: u16,
     /// MySQL host.
     pub mysql_host: String,
     /// MySQL port.
@@ -73,8 +105,9 @@ pub struct StreamManagerConfig {
 impl Default for StreamManagerConfig {
     fn default() -> Self {
         Self {
-            listen_addr: "0.0.0.0:9800".to_string(),
-            mysql_host: "localhost".to_string(),
+            bind_ip: "0.0.0.0".to_string(),
+            port: 9800,
+            mysql_host: "tx.dev".to_string(),
             mysql_port: 3306,
             mysql_username: "root".to_string(),
             mysql_password: "password".to_string(),
@@ -86,6 +119,11 @@ impl Default for StreamManagerConfig {
 }
 
 impl StreamManagerConfig {
+    /// The address to bind the TCP listener on: `{bind_ip}:{port}`.
+    pub fn listen_addr(&self) -> String {
+        format!("{}:{}", self.bind_ip, self.port)
+    }
+
     /// Build the MySQL connection URL from individual fields.
     pub fn mysql_url(&self) -> String {
         format!(

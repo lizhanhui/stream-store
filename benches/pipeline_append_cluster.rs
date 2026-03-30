@@ -56,7 +56,7 @@ async fn main() {
         .await
         .expect("connect to StreamManager");
     let (stream_id, initial_extent_id, initial_primary_addr) = stream_manager_client
-        .create_stream("bench-pipeline", REPLICATION_FACTOR)
+        .create_stream("bench-pipeline-cluster", REPLICATION_FACTOR)
         .await
         .expect("create_stream");
     info!(
