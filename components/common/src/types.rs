@@ -178,7 +178,7 @@ impl NodeState {
 /// Used by StreamManager's allocator for load-aware extent placement.
 ///
 /// Wire size: 32 bytes (u64 + u64 + u32 + u32 + u64).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct NodeMetrics {
     /// Available (free) memory in bytes.
     pub available_memory_bytes: u64,
@@ -190,18 +190,6 @@ pub struct NodeMetrics {
     pub active_extent_count: u32,
     /// Bytes written per second (measured over last heartbeat interval).
     pub bytes_written_per_sec: u64,
-}
-
-impl Default for NodeMetrics {
-    fn default() -> Self {
-        Self {
-            available_memory_bytes: 0,
-            total_memory_bytes: 0,
-            appends_per_sec: 0,
-            active_extent_count: 0,
-            bytes_written_per_sec: 0,
-        }
-    }
 }
 
 /// Describes a single extent with its replica set — returned by management APIs.

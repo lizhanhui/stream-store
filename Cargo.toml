@@ -56,3 +56,7 @@ harness = false
 [[bench]]
 name = "pipeline_append"
 harness = false
+
+[[bench]]
+name = "pipeline_append_cluster"
+harness = false
