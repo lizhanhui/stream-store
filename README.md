@@ -8,12 +8,13 @@ Traditional message brokers rely on cloud block storage for durability. Block st
 
 ## Key Highlights
 
-### Lock-Free In-Memory Arena
+### Pipelined Group Commit
 
-The core storage engine uses a **pre-allocated contiguous buffer** with fully lock-free concurrent append:
+The core storage engine uses a **pre-allocated contiguous arena** with a **pipelined group commit** pattern:
 
-- Multiple writers reserve slots via `AtomicU64::fetch_add` and write into non-overlapping regions in parallel.
-- **In-order commit** uses spin-wait CAS (same pattern as Linux io_uring and LMAX Disruptor) -- typically nanoseconds per message.
+- **Leader election** via `AtomicU64::fetch_add` — the first writer becomes the active writer (leader); concurrent writers delegate their payloads to the leader via a lock-free channel.
+- **Single-writer append** — the leader uses plain `load`/`store` on cursors (no contention, no spin-wait), then batch-drains all queued follower payloads, amortizing synchronization cost across the group.
+- **No cache-line bouncing** — followers push to an unbounded channel and return immediately; only the leader touches arena cursors.
 - Internal compressed index (`AtomicU32` pointers) enables **O(1) random reads** at ~950M lookups/sec.
 - **Zero-copy reads** via `Bytes::slice` into the arena buffer.
 - **Zero-copy S3 flush** -- arena bytes are already in wire format.
@@ -99,8 +100,9 @@ stream-store/
 │   ├── rpc/                        # Custom TCP wire protocol (frame, codec, payload)
 │   ├── server/                     # Server infrastructure (RequestHandler, ServerBuilder)
 │   ├── client/                     # StorageClient for Extent Node & Stream Manager
-│   ├── extent-node/                # Lock-free arena, stream, replication, watermark
+│   ├── extent-node/                # Pipelined group commit arena, stream, replication, watermark
 │   └── stream-manager/             # Metadata store, allocator, heartbeat checker
+├── conf/                           # Example TOML configuration files
 ├── tests/                          # Integration tests
 ├── benches/                        # End-to-end benchmarks
 ├── examples/                       # Client usage example
@@ -122,11 +124,17 @@ cargo build --release
 
 ### Run
 
+Both binaries accept an optional `--config <path>` flag to load a TOML configuration file. Missing fields fall back to defaults.
+
 ```bash
 # Start Stream Manager (requires MySQL)
-cargo run --release --bin stream-manager
+cargo run --release --bin stream-manager -- --config conf/stream-manager.toml
 
 # Start Extent Node(s)
+cargo run --release --bin extent-node -- --config conf/extent-node.toml
+
+# Or use defaults (no config file needed)
+cargo run --release --bin stream-manager
 cargo run --release --bin extent-node
 ```
 

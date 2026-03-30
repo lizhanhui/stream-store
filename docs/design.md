@@ -754,6 +754,7 @@ The `client` crate is used internally by both process types: Extent Node uses it
 | `moka` | Concurrent LRU cache for S3 read cache |
 | `tokio-util` | Codec framework for TCP frame encoding/decoding |
 | `tracing` | Structured logging and distributed tracing |
+| `serde` + `toml` | Configuration file deserialization (TOML format) |
 
 ## Replication: Broadcast Replication
 
@@ -1126,7 +1127,7 @@ read(stream, offset=1050, count=10)
 | Object storage API | S3-compatible | Widest ecosystem (AWS, MinIO, Ceph, Alibaba OSS S3-compat) |
 | Replication protocol | Broadcast replication with quorum ACK | O(1) hop latency (vs O(N) for chain), tolerates minority failures, simple parallel fan-out |
 | Durability before S3 | Pure in-memory N-way (default 2-way) | Low latency; single-node failure tolerated; S3 flush bounds risk |
-| Extent concurrency | Lock-free arena with atomic cursors (spin-wait commit), external index for O(1) reads | No mutex on append/read hot path; parallel memcpy for concurrent writers; byte-position-based random access |
+| Extent concurrency | Pipelined group commit with leader election, lock-free arena with internal compressed index for O(1) reads | Single active writer eliminates cache-line bouncing; followers delegate via channel; batch drain amortizes cost; no mutex on hot path |
 | Multi-dispatch | Shared data + index streams | Storage efficient; avoids body duplication across subscribers |
 | Stream Manager metadata store | MySQL (sqlx) | Reuses existing infra; metadata ops are infrequent (per-extent, not per-message) |
 | Consistency model | Seal-and-new (WAS) | Separates consistency (sealed extent) from availability (new extent) |
