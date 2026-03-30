@@ -1001,7 +1001,7 @@ impl ExtentNodeStore {
                     "extent arena is full, seal initiated",
                     extent_id,
                 );
-                if let Some(ref tx) = response_tx {
+                if let Some(tx) = response_tx {
                     let _ = tx.try_send(err);
                 } else {
                     responses.push(err);
@@ -1026,7 +1026,7 @@ impl ExtentNodeStore {
                         "extent is sealed",
                         ExtentId(0),
                     );
-                    if let Some(ref tx) = response_tx {
+                    if let Some(tx) = response_tx {
                         let _ = tx.try_send(err);
                     } else {
                         responses.push(err);
@@ -1040,7 +1040,7 @@ impl ExtentNodeStore {
                         "extent arena is full, seal initiated",
                         extent_id,
                     );
-                    if let Some(ref tx) = response_tx {
+                    if let Some(tx) = response_tx {
                         let _ = tx.try_send(err);
                     } else {
                         responses.push(err);
@@ -1053,7 +1053,7 @@ impl ExtentNodeStore {
                         &e.to_string(),
                         ExtentId(0),
                     );
-                    if let Some(ref tx) = response_tx {
+                    if let Some(tx) = response_tx {
                         let _ = tx.try_send(err);
                     } else {
                         responses.push(err);
@@ -1099,7 +1099,7 @@ impl ExtentNodeStore {
                         },
                         None,
                     );
-                    if let Some(ref tx) = response_tx {
+                    if let Some(tx) = response_tx {
                         let _ = tx.try_send(ack);
                     } else {
                         responses.push(ack);
@@ -1119,7 +1119,7 @@ impl ExtentNodeStore {
                             },
                             None,
                         );
-                        if let Some(ref tx) = response_tx {
+                        if let Some(tx) = response_tx {
                             let _ = tx.try_send(ack);
                         } else {
                             responses.push(ack);
@@ -1182,7 +1182,7 @@ impl ExtentNodeStore {
                         },
                         None,
                     );
-                    if let Some(ref tx) = response_tx {
+                    if let Some(tx) = response_tx {
                         let _ = tx.try_send(ack);
                     } else {
                         responses.push(ack);

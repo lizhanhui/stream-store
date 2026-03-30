@@ -90,7 +90,11 @@ impl StreamManagerConfig {
     pub fn mysql_url(&self) -> String {
         format!(
             "mysql://{}:{}@{}:{}/{}",
-            self.mysql_username, self.mysql_password, self.mysql_host, self.mysql_port, self.mysql_database
+            self.mysql_username,
+            self.mysql_password,
+            self.mysql_host,
+            self.mysql_port,
+            self.mysql_database
         )
     }
 }
@@ -102,6 +106,5 @@ where
 {
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read config file '{}': {}", path, e))?;
-    toml::from_str(&content)
-        .map_err(|e| format!("failed to parse config file '{}': {}", path, e))
+    toml::from_str(&content).map_err(|e| format!("failed to parse config file '{}': {}", path, e))
 }

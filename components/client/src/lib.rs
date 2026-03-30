@@ -395,7 +395,7 @@ impl StorageClient {
                 request_id: self.alloc_request_id(),
                 stream_id,
                 extent_id,
-                offset: committed_offset.map(|off| Offset(off)),
+                offset: committed_offset.map(Offset),
                 start_offset: None,
             },
             None,

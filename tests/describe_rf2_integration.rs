@@ -6,13 +6,16 @@
 //! MySQL connection: mysql://root:password@tx.dev:3306/metadata
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
+use client::StorageClient;
 use common::config::StreamManagerConfig;
 use common::types::{ExtentId, ExtentState, NodeMetrics, Offset};
 use tokio::sync::{broadcast, mpsc};
 
 use extent_node::store::{ExtentNodeStore, ForwardRequest};
+use tokio::time::sleep;
 
 /// Initialize tracing for tests. Uses try_init() so it's safe when multiple tests
 /// run in the same process. Override log level via RUST_LOG env var.
@@ -147,9 +150,7 @@ async fn describe_stream_rf2_integration() {
     let extent_node_2_addr = start_broadcast_extent_node().await;
     let stream_manager_addr = start_stream_manager_rf2().await;
 
-    let mut stream_manager = client::StorageClient::connect(&stream_manager_addr)
-        .await
-        .unwrap();
+    let stream_manager = StorageClient::connect(&stream_manager_addr).await.unwrap();
 
     // Register both ExtentNodes with the StreamManager.
     stream_manager
@@ -190,10 +191,10 @@ async fn describe_stream_rf2_integration() {
     );
 
     // Give a moment for RegisterExtent to settle on both ENs.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    sleep(Duration::from_millis(100)).await;
 
     // Append messages to the primary.
-    let mut en_client = client::StorageClient::connect(&primary_addr).await.unwrap();
+    let en_client = StorageClient::connect(&primary_addr).await.unwrap();
     for i in 0u64..5 {
         en_client
             .append(
@@ -241,10 +242,8 @@ async fn describe_stream_rf2_integration() {
         .unwrap();
 
     // Append to new extent.
-    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-    let mut en_client2 = client::StorageClient::connect(&new_primary_addr)
-        .await
-        .unwrap();
+    sleep(Duration::from_millis(100)).await;
+    let en_client2 = StorageClient::connect(&new_primary_addr).await.unwrap();
     for i in 0u64..3 {
         en_client2
             .append(

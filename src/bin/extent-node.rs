@@ -1,4 +1,4 @@
-use common::config::{load_config_from_file, ExtentNodeConfig};
+use common::config::{ExtentNodeConfig, load_config_from_file};
 use extent_node::ExtentNode;
 
 #[tokio::main]
@@ -10,11 +10,10 @@ async fn main() {
         .init();
 
     let config = match parse_config_path() {
-        Some(path) => load_config_from_file::<ExtentNodeConfig>(&path)
-            .unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }),
+        Some(path) => load_config_from_file::<ExtentNodeConfig>(&path).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }),
         None => ExtentNodeConfig::default(),
     };
 

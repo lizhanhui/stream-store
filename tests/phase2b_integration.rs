@@ -155,7 +155,7 @@ async fn broadcast_replication_rf2() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
     // Client connects to Primary and appends.
-    let mut client = client::StorageClient::connect(&primary_addr).await.unwrap();
+    let client = client::StorageClient::connect(&primary_addr).await.unwrap();
 
     // Append 5 messages — each should be replicated and ACKed.
     for i in 0u64..5 {
@@ -185,7 +185,7 @@ async fn broadcast_replication_rf2() {
     }
 
     // Also verify data is on the Secondary.
-    let mut secondary_client = client::StorageClient::connect(&secondary_addr)
+    let secondary_client = client::StorageClient::connect(&secondary_addr)
         .await
         .unwrap();
     let secondary_max = secondary_client
@@ -235,7 +235,7 @@ async fn broadcast_replication_rf3() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let mut client = client::StorageClient::connect(&primary_addr).await.unwrap();
+    let client = client::StorageClient::connect(&primary_addr).await.unwrap();
 
     // Append 3 messages.
     for i in 0u64..3 {
@@ -256,7 +256,7 @@ async fn broadcast_replication_rf3() {
         ("secondary1", &secondary1_addr),
         ("secondary2", &secondary2_addr),
     ] {
-        let mut c = client::StorageClient::connect(addr).await.unwrap();
+        let c = client::StorageClient::connect(addr).await.unwrap();
         let max = c.query_offset(StreamId(stream_id)).await.unwrap();
         assert_eq!(max, Offset(3), "{label} should have offset 3");
 
@@ -297,7 +297,7 @@ async fn multi_stream_shared_downstream() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    let mut client = client::StorageClient::connect(&primary_addr).await.unwrap();
+    let client = client::StorageClient::connect(&primary_addr).await.unwrap();
 
     // Append to stream A.
     for i in 0u64..3 {
@@ -338,7 +338,7 @@ async fn multi_stream_shared_downstream() {
     assert_eq!(msgs_b.len(), 2);
 
     // Verify on secondary too.
-    let mut sec_client = client::StorageClient::connect(&secondary_addr)
+    let sec_client = client::StorageClient::connect(&secondary_addr)
         .await
         .unwrap();
     let sec_a = sec_client
@@ -367,7 +367,7 @@ async fn broadcast_replication_rf1_immediate_ack() {
     // Register as Primary with RF=1, no secondaries.
     register_extent(&primary_addr, stream_id, extent_id, 0, 1, &[]).await;
 
-    let mut client = client::StorageClient::connect(&primary_addr).await.unwrap();
+    let client = client::StorageClient::connect(&primary_addr).await.unwrap();
 
     // Append should ACK immediately.
     for i in 0u64..5 {

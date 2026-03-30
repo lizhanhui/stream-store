@@ -1,4 +1,4 @@
-use common::config::{load_config_from_file, StreamManagerConfig};
+use common::config::{StreamManagerConfig, load_config_from_file};
 use stream_manager::StreamManager;
 
 #[tokio::main]
@@ -10,11 +10,10 @@ async fn main() {
         .init();
 
     let config = match parse_config_path() {
-        Some(path) => load_config_from_file::<StreamManagerConfig>(&path)
-            .unwrap_or_else(|e| {
-                eprintln!("{e}");
-                std::process::exit(1);
-            }),
+        Some(path) => load_config_from_file::<StreamManagerConfig>(&path).unwrap_or_else(|e| {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }),
         None => StreamManagerConfig::default(),
     };
 
