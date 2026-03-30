@@ -16,6 +16,12 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - uses: shogo82148/actions-setup-mysql@v1
+      with:
+        mysql-version: "8.4"
+        root-password: password
+    - run: mysql -uroot -e 'SELECT version()'
+    - run: mysql -uroot -e 'CREATE DATABASE IF NOT EXISTS stream_store'
     - name: Build
       run: cargo build --verbose
     - name: Run tests

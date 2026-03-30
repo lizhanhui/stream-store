@@ -74,11 +74,11 @@ impl Default for StreamManagerConfig {
     fn default() -> Self {
         Self {
             listen_addr: "0.0.0.0:9800".to_string(),
-            mysql_host: "tx.dev".to_string(),
+            mysql_host: "localhost".to_string(),
             mysql_port: 3306,
             mysql_username: "root".to_string(),
             mysql_password: "password".to_string(),
-            mysql_database: "metadata".to_string(),
+            mysql_database: "stream_store".to_string(),
             default_replication_factor: 2,
             heartbeat_check_interval_ms: 3000,
         }
