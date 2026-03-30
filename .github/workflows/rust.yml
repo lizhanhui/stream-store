@@ -20,8 +20,8 @@ jobs:
       with:
         mysql-version: "8.4"
         root-password: password
-    - run: mysql -uroot -e 'SELECT version()'
-    - run: mysql -uroot -e 'CREATE DATABASE IF NOT EXISTS stream_store'
+    - run: mysql -uroot -ppassword -e 'SELECT version()'
+    - run: mysql -uroot -ppassword -e 'CREATE DATABASE IF NOT EXISTS stream_store'
     - name: Build
       run: cargo build --verbose
     - name: Run tests
