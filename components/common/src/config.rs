@@ -1,4 +1,5 @@
 use serde::Deserialize;
+use std::net::Ipv4Addr;
 use std::time::Duration;
 
 /// Timeout for establishing an RPC TCP connection.
@@ -35,8 +36,8 @@ pub struct ExtentNodeConfig {
     /// Port to listen on. Defaults to 9801.
     pub port: u16,
     /// IP advertised to StreamManager and other nodes for inbound connections.
-    /// Required when `bind_ip` is `0.0.0.0`, since other nodes cannot connect to
-    /// a wildcard address. If empty, defaults to `bind_ip`.
+    /// If empty and `bind_ip` is `0.0.0.0`, auto-detects the primary non-loopback
+    /// interface IP. Set explicitly in multi-homed environments.
     pub advertise_ip: String,
     /// StreamManager address to connect to for registration and heartbeat.
     pub stream_manager_addr: String,
@@ -66,14 +67,15 @@ impl ExtentNodeConfig {
         format!("{}:{}", self.bind_ip, self.port)
     }
 
-    /// The address advertised to other nodes: `{advertise_ip}:{port}`.
-    /// Falls back to `{bind_ip}:{port}` if `advertise_ip` is empty.
+    /// The address advertised to other nodes: `{resolved_ip}:{port}`.
+    ///
+    /// Resolution order:
+    /// 1. `advertise_ip` if explicitly configured.
+    /// 2. `bind_ip` if it's a usable address (not `0.0.0.0`).
+    /// 3. Auto-detected local IP (primary non-loopback interface).
+    /// 4. Falls back to `bind_ip` if auto-detection fails.
     pub fn advertise_addr(&self) -> String {
-        let ip = if self.advertise_ip.is_empty() {
-            &self.bind_ip
-        } else {
-            &self.advertise_ip
-        };
+        let ip = resolve_advertise_ip(&self.bind_ip, &self.advertise_ip);
         format!("{ip}:{}", self.port)
     }
 }
@@ -145,4 +147,52 @@ where
     let content = std::fs::read_to_string(path)
         .map_err(|e| format!("failed to read config file '{}': {}", path, e))?;
     toml::from_str(&content).map_err(|e| format!("failed to parse config file '{}': {}", path, e))
+}
+
+/// Detect the primary non-loopback IPv4 address of this machine.
+///
+/// Enumerates network interfaces via `getifaddrs` and collects all non-loopback
+/// IPv4 addresses. If exactly one is found, returns it — this covers the common
+/// single-NIC case. If multiple are found, returns `None` (the user should set
+/// `advertise_ip` explicitly in multi-homed environments).
+///
+/// Returns `None` if no suitable address is found or if enumeration fails.
+pub fn detect_local_ip() -> Option<String> {
+    use nix::ifaddrs::getifaddrs;
+
+    let addrs = getifaddrs().ok()?;
+    let candidates: Vec<Ipv4Addr> = addrs
+        .filter_map(|ifa| {
+            let addr = ifa.address?;
+            let inet = addr.as_sockaddr_in()?;
+            let ip = Ipv4Addr::from(inet.ip());
+            if !ip.is_loopback() && !ip.is_unspecified() {
+                Some(ip)
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if candidates.len() == 1 {
+        Some(candidates[0].to_string())
+    } else {
+        None
+    }
+}
+
+/// Resolve the effective advertise IP given a `bind_ip` and an optional `advertise_ip`.
+///
+/// - If `advertise_ip` is non-empty, returns it as-is.
+/// - If `bind_ip` is a usable address (not `0.0.0.0`), returns `bind_ip`.
+/// - Otherwise, auto-detects the local IP via [`detect_local_ip`].
+/// - If auto-detection fails, falls back to `bind_ip` unchanged.
+pub fn resolve_advertise_ip(bind_ip: &str, advertise_ip: &str) -> String {
+    if !advertise_ip.is_empty() {
+        return advertise_ip.to_string();
+    }
+    if bind_ip != "0.0.0.0" {
+        return bind_ip.to_string();
+    }
+    detect_local_ip().unwrap_or_else(|| bind_ip.to_string())
 }

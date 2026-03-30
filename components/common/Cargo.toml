@@ -7,3 +7,4 @@ edition = "2024"
 thiserror = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
+nix = { workspace = true }

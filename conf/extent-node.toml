@@ -12,8 +12,8 @@ bind_ip = "0.0.0.0"
 port = 9801
 
 # IP advertised to StreamManager and other nodes.
-# Required when bind_ip is 0.0.0.0 — other nodes cannot connect to a wildcard address.
-# If omitted or empty, defaults to bind_ip.
+# If omitted and bind_ip is 0.0.0.0, auto-detects the primary non-loopback interface IP.
+# Set explicitly in multi-homed environments.
 # advertise_ip = "192.168.1.100"
 
 # StreamManager address for registration and heartbeat

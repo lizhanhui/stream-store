@@ -8,7 +8,7 @@ pub mod watermark;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
-use common::config::ExtentNodeConfig;
+use common::config::{ExtentNodeConfig, resolve_advertise_ip};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
@@ -87,17 +87,15 @@ impl ExtentNode {
                 .await;
         }));
 
-        // Resolve advertise_addr: use config method which falls back bind_ip if advertise_ip is empty.
+        // Resolve advertise_addr: auto-detect IP if bind_ip is 0.0.0.0 and advertise_ip not set.
         // If port was 0 (OS-assigned), use the actual bound port instead.
-        let advertise_addr = if config.port == 0 {
-            if config.advertise_ip.is_empty() {
-                local_addr.to_string()
-            } else {
-                format!("{}:{}", config.advertise_ip, local_addr.port())
-            }
+        let effective_port = if config.port == 0 {
+            local_addr.port()
         } else {
-            config.advertise_addr()
+            config.port
         };
+        let effective_ip = resolve_advertise_ip(&config.bind_ip, &config.advertise_ip);
+        let advertise_addr = format!("{effective_ip}:{effective_port}");
 
         // Resolve node_id: use config value if set, otherwise fall back to advertise_addr.
         let node_id = if config.node_id.is_empty() {

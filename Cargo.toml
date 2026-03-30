@@ -22,6 +22,7 @@ refinery = { version = "0.8", features = ["mysql_async"] }
 mysql_async = "0.35"
 fastant = "0.1"
 crossbeam-channel = "0.5"
+nix = { version = "0.31", features = ["net"] }
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 
