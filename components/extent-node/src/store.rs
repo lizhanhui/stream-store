@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::downstream::DownstreamPool;
-use crate::extent::{DEFAULT_ARENA_CAPACITY, Extent};
+use crate::extent::DEFAULT_ARENA_CAPACITY;
 use crate::stream::Stream;
 
 // ── Broadcast replication types ──────────────────────────────────────────────
@@ -216,13 +216,12 @@ impl ReplicaInfo {
 
 /// A pending append job delegated from a follower to the active writer.
 ///
-/// When a thread arrives at an extent and finds another writer already active
-/// (via `in_flight` counter), it pushes an `AppendJob` into the extent's channel
+/// When a thread arrives at a stream and finds another writer already active
+/// (via `in_flight` counter), it pushes an `AppendJob` into the stream's channel
 /// and returns immediately. The active writer drains these jobs as a batch.
 pub(crate) struct AppendJob {
     pub request_id: u32,
     pub stream_id: StreamId,
-    pub extent_id: ExtentId,
     pub payload: Bytes,
     /// Channel back to the client connection for sending response frames.
     /// `None` in test mode (no client connection).
@@ -509,9 +508,9 @@ impl ExtentNodeStore {
         )
     }
 
-    /// Handle Append — pipelined group commit with leader election.
+    /// Handle Append — pipelined group commit with stream-level leader election.
     ///
-    /// Uses per-extent `in_flight` counter for leader election:
+    /// Uses per-stream `in_flight` counter for leader election:
     /// - `prev == 0`: This thread becomes the active writer (fast path).
     ///   Appends its own payload, then drains any follower jobs from the channel.
     /// - `prev > 0`: An active writer exists. Push an `AppendJob` to the channel
@@ -519,6 +518,8 @@ impl ExtentNodeStore {
     ///
     /// The active writer handles replication (Forward + PendingAck for RF≥2)
     /// or sends immediate AppendAck (RF=1/standalone) for each job.
+    /// On ExtentFull, the leader drops the read ref, acquires write ref to seal+create,
+    /// then re-acquires read ref and retries — all transparently.
     async fn handle_append(
         &self,
         frame: Frame,
@@ -540,43 +541,31 @@ impl ExtentNodeStore {
             }
         };
 
-        // Find the active extent for leader election.
-        let extent = match stream_ref.find_extent(extent_id) {
-            Some(e) => e,
-            None => {
+        // Reject early if the active extent is already sealed.
+        if let Some(extent) = stream_ref.find_extent(extent_id) {
+            if extent.is_sealed() {
                 return Some(Frame::error_response(
                     frame.request_id(),
-                    ErrorCode::InternalError,
-                    &format!("extent {:?} not found", extent_id),
+                    ErrorCode::ExtentSealed,
+                    "extent is sealed",
                     ExtentId(0),
                 ));
             }
-        };
-
-        // Reject early if the extent is already sealed.
-        if extent.is_sealed() {
-            return Some(Frame::error_response(
-                frame.request_id(),
-                ErrorCode::ExtentSealed,
-                "extent is sealed",
-                ExtentId(0),
-            ));
         }
 
-        // Leader election: fetch_add(1, Acquire) on the extent's in_flight counter.
-        let prev = extent.in_flight().fetch_add(1, Ordering::Acquire);
+        // Leader election: fetch_add(1, Acquire) on the stream's in_flight counter.
+        let prev = stream_ref.in_flight().fetch_add(1, Ordering::Acquire);
 
         if prev > 0 {
             // SLOW PATH: active writer exists. Push job to channel and return None.
             let job = AppendJob {
                 request_id: frame.request_id(),
                 stream_id,
-                extent_id,
                 payload: frame.payload.clone().unwrap_or_default(),
                 response_tx: response_tx.cloned(),
             };
             // Channel is unbounded — send always succeeds.
-            let _ = extent.job_tx().send(job);
+            let _ = stream_ref.job_tx().send(job);
             // Drop stream guard.
             drop(stream_ref);
             return None;
@@ -588,56 +577,59 @@ impl ExtentNodeStore {
 
         // Process my own append.
         let (own_result, extent_full, mut forward_work) = self.do_append_and_respond(
-            extent,
+            &stream_ref,
             request_id,
             stream_id,
-            extent_id,
             payload.clone(),
             response_tx.cloned(),
         );
 
-        // Check if followers arrived while we were appending.
-        let remaining = extent.in_flight().fetch_sub(1, Ordering::Release);
-        let mut failed_follower_jobs = Vec::new();
-        if remaining > 1 {
-            // Followers are waiting — drain the batch.
-            let (batch_forward_work, batch_failed) =
-                self.drain_append_batch(extent, extent_full);
-            forward_work.extend(batch_forward_work);
-            failed_follower_jobs = batch_failed;
-        }
-
-        // Drop stream guard before extent-full handling (needs write lock).
-        drop(stream_ref);
-
+        // Handle extent-full before draining followers.
         if extent_full {
-            // Autonomous extent creation: seal, create new extent, retry the append.
-            // The client never sees ExtentFull — we retry transparently on the new extent.
-            let (retry_result, retry_forward_work) = self.handle_extent_full_and_retry(
-                stream_id,
-                extent_id,
+            // Drop read ref, acquire write ref for seal+create.
+            drop(stream_ref);
+            let seal_notification = self.seal_and_create_on_full(stream_id);
+            // Re-acquire read ref and retry the append.
+            let stream_ref = match self.streams.get(&stream_id) {
+                Some(s) => s,
+                None => return None,
+            };
+            let (retry_result, _, retry_forward) = self.do_append_and_respond(
+                &stream_ref,
                 request_id,
+                stream_id,
                 payload,
                 response_tx.cloned(),
             );
-            forward_work.extend(retry_forward_work);
 
-            // Retry failed follower jobs on the new extent too.
-            for job in failed_follower_jobs {
-                let (_, job_forward) = self.handle_extent_full_and_retry(
-                    job.stream_id,
-                    job.extent_id,
-                    job.request_id,
-                    job.payload,
-                    job.response_tx,
-                );
-                forward_work.extend(job_forward);
+            forward_work.extend(retry_forward);
+
+            // Drain followers on the (now new) stream.
+            let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+            if remaining > 1 {
+                let batch_forward = self.drain_append_batch(&stream_ref, stream_id);
+                forward_work.extend(batch_forward);
             }
+            drop(stream_ref);
 
-            // Flush forward work and return the retry result as the response.
+            // Send SM notification if we sealed.
+            if let Some(notif) = seal_notification {
+                self.send_seal_notification(stream_id, &notif);
+            }
             self.flush_forward_work(forward_work).await;
             return retry_result;
         }
+
+        // Check if followers arrived while we were appending.
+        let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+        if remaining > 1 {
+            // Followers are waiting — drain the batch.
+            let batch_forward = self.drain_append_batch(&stream_ref, stream_id);
+            forward_work.extend(batch_forward);
+        }
+
+        // Drop stream guard before async work.
+        drop(stream_ref);
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
         self.flush_forward_work(forward_work).await;
@@ -645,7 +637,7 @@ impl ExtentNodeStore {
         own_result
     }
 
-    /// Perform a single append and handle replication / ACK.
+    /// Perform a single append via the stream's active extent and handle replication / ACK.
     ///
     /// Returns `(Option<Frame>, bool, Vec<(String, Frame)>)`:
     /// - Option<Frame>: response frame (None if deferred or sent via channel)
@@ -657,18 +649,17 @@ impl ExtentNodeStore {
     /// as Some(Frame).
     fn do_append_and_respond(
         &self,
-        extent: &Extent,
+        stream: &Stream,
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
     ) -> (Option<Frame>, bool, Vec<(String, Frame)>) {
         let payload_len = payload.len();
         let payload_for_forward = payload.clone();
 
-        // Write locally via single-writer append.
-        let append_result = match extent.append_inner(payload) {
+        // Write locally via single-writer append on the active extent.
+        let (append_result, extent_id) = match stream.try_append_active(payload) {
             Ok(r) => r,
             Err(StorageError::ExtentSealed(_)) => {
                 let err = Frame::error_response(
@@ -704,7 +695,9 @@ impl ExtentNodeStore {
         };
 
         let offset = append_result.offset;
-        let extent_start_offset = extent.start_offset.0;
+        let extent_start_offset = stream.find_extent(extent_id)
+            .map(|e| e.start_offset.0)
+            .unwrap_or(0);
 
         // Update metrics counters.
         self.append_count.fetch_add(1, Ordering::Relaxed);
@@ -809,27 +802,28 @@ impl ExtentNodeStore {
         }
     }
 
-    /// Drain follower append jobs from the extent's channel and process them.
+    /// Drain follower append jobs from the stream's channel and process them.
     ///
     /// Called by the active writer after its own append when `in_flight > 1`.
     /// Loops until all followers have been processed.
     ///
-    /// Returns `(forward_work, failed_jobs)`: forward_work is Forward frames to flush;
-    /// failed_jobs are AppendJobs that hit ExtentFull and need retry on a new extent.
+    /// On ExtentFull within the drain, drops the stream ref, acquires write ref
+    /// for seal+create, then re-acquires read ref and retries.
+    ///
+    /// Returns forward work to flush.
     fn drain_append_batch(
         &self,
-        extent: &Extent,
-        mut extent_full: bool,
-    ) -> (Vec<(String, Frame)>, Vec<AppendJob>) {
+        stream: &Stream,
+        _stream_id: StreamId,
+    ) -> Vec<(String, Frame)> {
         let mut all_forward_work = Vec::new();
-        let mut failed_jobs = Vec::new();
         loop {
             let mut batch: Vec<AppendJob> = Vec::new();
 
             // Drain all available jobs from the channel.
             // Brief spin if a follower has incremented in_flight but hasn't pushed yet.
             loop {
-                match extent.job_rx().try_recv() {
+                match stream.job_rx().try_recv() {
                     Ok(job) => batch.push(job),
                     Err(_) => {
                         if batch.is_empty() {
@@ -843,32 +837,34 @@ impl ExtentNodeStore {
                 }
             }
 
-            // Process each job. When extent_full, collect jobs for retry instead of erroring.
+            // Process each job.
             let batch_len = batch.len();
             for job in batch {
+                let (_, extent_full, forward_work) = self.do_append_and_respond(
+                    stream,
+                    job.request_id,
+                    job.stream_id,
+                    job.payload.clone(),
+                    job.response_tx.clone(),
+                );
+                all_forward_work.extend(forward_work);
                 if extent_full {
-                    // Don't send error — collect for transparent retry on new extent.
-                    failed_jobs.push(job);
-                } else {
-                    let (_, job_full, forward_work) = self.do_append_and_respond(
-                        extent,
+                    // Need to seal+create. We can't drop the caller's ref from here,
+                    // but we can handle it by doing seal+create and retrying.
+                    // Since drain_append_batch is called with a borrowed stream ref,
+                    // we use the self.seal_and_create_and_retry helper.
+                    self.handle_extent_full_for_job(
                         job.request_id,
                         job.stream_id,
-                        job.extent_id,
-                        job.payload.clone(),
-                        job.response_tx.clone(),
+                        job.payload,
+                        job.response_tx,
+                        &mut all_forward_work,
                     );
-                    all_forward_work.extend(forward_work);
-                    if job_full {
-                        extent_full = true;
-                        // This job also failed — collect for retry.
-                        failed_jobs.push(job);
-                    }
                 }
             }
 
             // Decrement in_flight by the batch size.
-            let remaining = extent
+            let remaining = stream
                 .in_flight()
                 .fetch_sub(batch_len as u64, Ordering::Release);
             if remaining <= batch_len as u64 {
@@ -877,87 +873,78 @@ impl ExtentNodeStore {
             }
             // More followers arrived during processing — loop again.
         }
-        (all_forward_work, failed_jobs)
+        all_forward_work
     }
 
-    /// Handle extent-full by autonomously sealing and creating a new extent.
+    /// Handle extent-full for a single follower job during drain.
     ///
-    /// Called by the leader when append_inner returns ExtentFull. The leader:
-    /// 1. Acquires write lock on the stream
-    /// 2. Seals the current extent locally
-    /// 3. Creates a new extent (same epoch, same replica set)
-    /// 4. Retries the append on the new extent
-    /// 5. Sends async EXTENT_SEALED_NOTIFY to SM (fire-and-forget)
-    ///
-    /// Returns `(new_extent, new_extent_id, forward_work)` for the retried append,
-    /// or None if the seal/retry fails.
-    fn handle_extent_full_and_retry(
+    /// Since the drain loop holds a borrow on the stream, we can't drop it.
+    /// Instead, we acquire a separate get_mut to seal+create, then retry
+    /// via a fresh get().
+    fn handle_extent_full_for_job(
         &self,
-        stream_id: StreamId,
-        extent_id: ExtentId,
         request_id: u32,
+        stream_id: StreamId,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
-    ) -> (Option<Frame>, Vec<(String, Frame)>) {
-        // Acquire write lock and seal + create new extent.
-        let (sealed_extent_id, end_offset, new_extent_id, epoch) =
-            if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-                let active_id = stream_mut.active_extent_id().unwrap_or(extent_id);
-                match stream_mut.seal(active_id, None) {
-                    Some((_start_offset, end_offset)) => {
-                        let (new_id, _new_start) = stream_mut.create_next_extent();
-                        let epoch = stream_mut.epoch();
-                        (active_id, end_offset, new_id, epoch)
-                    }
-                    None => {
-                        // Already sealed (concurrent seal) — try to use whatever is active.
-                        if let Some(current_active) = stream_mut.active_extent_id() {
-                            // Another thread already sealed and created a new extent.
-                            let epoch = stream_mut.epoch();
-                            (extent_id, 0, current_active, epoch)
-                        } else {
-                            // No active extent — cannot recover.
-                            return (None, Vec::new());
-                        }
-                    }
-                }
-            } else {
-                return (None, Vec::new());
-            };
+        forward_work: &mut Vec<(String, Frame)>,
+    ) {
+        let seal_notification = self.seal_and_create_on_full(stream_id);
 
-        // Send async notification to SM (fire-and-forget).
-        if end_offset > 0 {
-            if let Some(ref tx) = self.seal_tx {
-                let _ = tx.try_send(SealRequest {
-                    stream_id,
-                    sealed_extent_id,
-                    end_offset,
-                    new_extent_id,
-                    epoch,
-                });
-            }
-        }
-
-        // Retry the append on the new extent.
-        // Re-acquire read lock and find the new extent.
+        // Retry on the new extent.
         if let Some(stream_ref) = self.streams.get(&stream_id) {
-            if let Some(new_extent) = stream_ref.find_extent(new_extent_id) {
-                let (result, _extent_full, forward_work) = self.do_append_and_respond(
-                    new_extent,
-                    request_id,
-                    stream_id,
-                    new_extent_id,
-                    payload,
-                    response_tx,
-                );
-                // Update ReplicaInfo to point to new extent_id.
-                if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
-                    ri.extent_id = new_extent_id;
-                }
-                return (result, forward_work);
-            }
+            let (_, _, retry_forward) = self.do_append_and_respond(
+                &stream_ref,
+                request_id,
+                stream_id,
+                payload,
+                response_tx,
+            );
+            forward_work.extend(retry_forward);
         }
-        (None, Vec::new())
+
+        if let Some(notif) = seal_notification {
+            self.send_seal_notification(stream_id, &notif);
+        }
+    }
+
+    /// Seal the active extent and create a new one. Used on ExtentFull.
+    ///
+    /// Acquires DashMap write lock on the stream. Returns the seal notification
+    /// if a seal+create occurred, or None if already sealed / stream not found.
+    fn seal_and_create_on_full(
+        &self,
+        stream_id: StreamId,
+    ) -> Option<crate::stream::SealNotification> {
+        if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+            let notif = stream_mut.seal_and_create_next();
+            // Update ReplicaInfo to point to new extent_id.
+            if let Some(ref n) = notif {
+                if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
+                    ri.extent_id = n.new_extent_id;
+                }
+            }
+            notif
+        } else {
+            None
+        }
+    }
+
+    /// Send an async EXTENT_SEALED_NOTIFY to SM (fire-and-forget).
+    fn send_seal_notification(
+        &self,
+        stream_id: StreamId,
+        notif: &crate::stream::SealNotification,
+    ) {
+        if let Some(ref tx) = self.seal_tx {
+            let _ = tx.try_send(SealRequest {
+                stream_id,
+                sealed_extent_id: notif.sealed_extent_id,
+                end_offset: notif.end_offset,
+                new_extent_id: notif.new_extent_id,
+                epoch: notif.epoch,
+            });
+        }
     }
 
     /// Optimized batch append: all frames share the same stream_id/extent_id.
@@ -990,39 +977,25 @@ impl ExtentNodeStore {
             }
         };
 
-        // Single extent lookup.
-        let extent = match stream_ref.find_extent(extent_id) {
-            Some(e) => e,
-            None => {
+        // Single sealed check on the active extent.
+        if let Some(extent) = stream_ref.find_extent(extent_id) {
+            if extent.is_sealed() {
                 for frame in frames {
                     responses.push(Frame::error_response(
                         frame.request_id(),
-                        ErrorCode::InternalError,
-                        &format!("extent {:?} not found", extent_id),
+                        ErrorCode::ExtentSealed,
+                        "extent is sealed",
                         ExtentId(0),
                     ));
                 }
                 return responses;
             }
-        };
-
-        // Single sealed check.
-        if extent.is_sealed() {
-            for frame in frames {
-                responses.push(Frame::error_response(
-                    frame.request_id(),
-                    ErrorCode::ExtentSealed,
-                    "extent is sealed",
-                    ExtentId(0),
-                ));
-            }
-            return responses;
         }
 
         let batch_len = frames.len() as u64;
 
-        // Single leader election: fetch_add(batch_len).
-        let prev = extent.in_flight().fetch_add(batch_len, Ordering::Acquire);
+        // Single leader election: fetch_add(batch_len) on the stream's in_flight.
+        let prev = stream_ref.in_flight().fetch_add(batch_len, Ordering::Acquire);
 
         if prev > 0 {
             // SLOW PATH: active writer exists. Push all as AppendJobs.
@@ -1030,11 +1003,10 @@ impl ExtentNodeStore {
                 let job = AppendJob {
                     request_id: frame.request_id(),
                     stream_id,
-                    extent_id,
                     payload: frame.payload.clone().unwrap_or_default(),
                     response_tx: response_tx.cloned(),
                 };
-                let _ = extent.job_tx().send(job);
+                let _ = stream_ref.job_tx().send(job);
             }
             drop(stream_ref);
             return responses; // All deferred — empty responses.
@@ -1050,6 +1022,7 @@ impl ExtentNodeStore {
             offset: Offset,
             byte_pos: u64,
             payload_len: usize,
+            extent_id: ExtentId,
         }
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
         let mut extent_full = false;
@@ -1076,14 +1049,15 @@ impl ExtentNodeStore {
                 continue;
             }
 
-            match extent.append_inner(payload.clone()) {
-                Ok(result) => {
+            match stream_ref.try_append_active(payload.clone()) {
+                Ok((result, eid)) => {
                     entries.push(BatchEntry {
                         request_id,
                         payload_for_forward,
                         offset: result.offset,
                         byte_pos: result.byte_pos,
                         payload_len,
+                        extent_id: eid,
                     });
                 }
                 Err(StorageError::ExtentSealed(_)) => {
@@ -1127,30 +1101,40 @@ impl ExtentNodeStore {
 
         if entries.is_empty() {
             // All appends failed — decrement and possibly drain followers.
-            let remaining = extent.in_flight().fetch_sub(batch_len, Ordering::Release);
+            let remaining = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
             if remaining > batch_len {
-                let (batch_forward, _failed) = self.drain_append_batch(extent, extent_full);
+                let batch_forward = self.drain_append_batch(&stream_ref, stream_id);
                 forward_work.extend(batch_forward);
             }
             drop(stream_ref);
             if extent_full {
                 // Autonomous extent creation for batch path — retry all failed frames.
-                for ff in failed_frames {
-                    let (_, retry_forward) = self.handle_extent_full_and_retry(
-                        stream_id,
-                        extent_id,
-                        ff.request_id,
-                        ff.payload,
-                        response_tx.cloned(),
-                    );
-                    forward_work.extend(retry_forward);
+                let seal_notification = self.seal_and_create_on_full(stream_id);
+                if let Some(stream_ref2) = self.streams.get(&stream_id) {
+                    for ff in &failed_frames {
+                        let (_, _, retry_forward) = self.do_append_and_respond(
+                            &stream_ref2,
+                            ff.request_id,
+                            stream_id,
+                            ff.payload.clone(),
+                            response_tx.cloned(),
+                        );
+                        forward_work.extend(retry_forward);
+                    }
+                }
+                if let Some(notif) = seal_notification {
+                    self.send_seal_notification(stream_id, &notif);
                 }
             }
             self.flush_forward_work(forward_work).await;
             return responses;
         }
 
-        let extent_start_offset = extent.start_offset.0;
+        // Resolve extent_start_offset from the first entry's extent.
+        let extent_start_offset = stream_ref
+            .find_extent(entries[0].extent_id)
+            .map(|e| e.start_offset.0)
+            .unwrap_or(0);
 
         // Update metrics counters in bulk.
         let total_bytes: u64 = entries.iter().map(|e| e.payload_len as u64).sum();
@@ -1208,7 +1192,7 @@ impl ExtentNodeStore {
                                 let frame = Frame::new(
                                     VariableHeader::Forward {
                                         stream_id,
-                                        extent_id,
+                                        extent_id: entry.extent_id,
                                         start_offset: Offset(extent_start_offset),
                                         offset: entry.offset,
                                         byte_pos: entry.byte_pos,
@@ -1264,9 +1248,9 @@ impl ExtentNodeStore {
         drop(replica_ref);
 
         // Check if followers arrived while we were appending.
-        let remaining = extent.in_flight().fetch_sub(batch_len, Ordering::Release);
+        let remaining = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
         if remaining > batch_len {
-            let (batch_forward, _failed) = self.drain_append_batch(extent, extent_full);
+            let batch_forward = self.drain_append_batch(&stream_ref, stream_id);
             forward_work.extend(batch_forward);
         }
 
@@ -1275,15 +1259,21 @@ impl ExtentNodeStore {
 
         if extent_full {
             // Autonomous extent creation for batch path (end of batch) — retry failed frames.
-            for ff in failed_frames {
-                let (_, retry_forward) = self.handle_extent_full_and_retry(
-                    stream_id,
-                    extent_id,
-                    ff.request_id,
-                    ff.payload,
-                    response_tx.cloned(),
-                );
-                forward_work.extend(retry_forward);
+            let seal_notification = self.seal_and_create_on_full(stream_id);
+            if let Some(stream_ref2) = self.streams.get(&stream_id) {
+                for ff in &failed_frames {
+                    let (_, _, retry_forward) = self.do_append_and_respond(
+                        &stream_ref2,
+                        ff.request_id,
+                        stream_id,
+                        ff.payload.clone(),
+                        response_tx.cloned(),
+                    );
+                    forward_work.extend(retry_forward);
+                }
+            }
+            if let Some(notif) = seal_notification {
+                self.send_seal_notification(stream_id, &notif);
             }
         }
 
@@ -1625,6 +1615,27 @@ impl ExtentNodeStore {
                 );
             }
         };
+
+        // Wait for any active stream-level writer to finish before sealing.
+        // With DashMap get_mut, no new shared refs can be acquired, but an
+        // existing writer may have already started (in_flight > 0).
+        {
+            let mut spin_count = 0u32;
+            loop {
+                let inflight = stream_ref.in_flight().load(Ordering::Acquire);
+                if inflight == 0 {
+                    break;
+                }
+                if spin_count < 6 {
+                    for _ in 0..(1 << spin_count) {
+                        std::hint::spin_loop();
+                    }
+                } else {
+                    std::thread::yield_now();
+                }
+                spin_count += 1;
+            }
+        }
 
         match stream_ref.seal(extent_id, committed_offset) {
             Some((start_offset, end_offset)) => {

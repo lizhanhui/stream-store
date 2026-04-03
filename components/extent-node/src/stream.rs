@@ -1,8 +1,12 @@
+use std::sync::atomic::{AtomicU64, Ordering};
+
 use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{ExtentId, ExtentState, Offset, StreamId};
+use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::extent::{AppendResult, Extent, DEFAULT_ARENA_CAPACITY};
+use crate::store::AppendJob;
 
 /// A stream: an ordered, append-only sequence of messages backed by a list of extents.
 ///
@@ -17,7 +21,11 @@ use crate::extent::{AppendResult, Extent, DEFAULT_ARENA_CAPACITY};
 /// Stream-level mutation (`seal`, adding new extents) still requires `&mut self`
 /// because these operations change the extent list. In the ExtentNodeStore, this is
 /// handled at a higher level (DashMap per-stream write lock or equivalent).
-#[derive(Debug)]
+///
+/// Pipelined group commit is coordinated at the stream level via `in_flight`,
+/// `job_tx`, and `job_rx`. This ensures extent transitions (seal + create) are
+/// handled transparently by the stream-level leader without callers needing to
+/// know about individual extent boundaries.
 pub struct Stream {
     pub id: StreamId,
     extents: Vec<Extent>,
@@ -29,17 +37,27 @@ pub struct Stream {
     next_extent_id: ExtentId,
     /// Arena capacity for autonomously created extents (bytes).
     arena_capacity: usize,
+    /// Leader election counter for pipelined group commit (stream-level).
+    /// 0 = idle. The leader owns the entire stream, handling extent transitions inline.
+    in_flight: AtomicU64,
+    /// Channel for followers to submit append jobs to the active writer.
+    job_tx: Sender<AppendJob>,
+    job_rx: Receiver<AppendJob>,
 }
 
 impl Stream {
     /// Create a new stream with no extents. Extents are added via `register_extent()`.
     pub fn new(id: StreamId) -> Self {
+        let (job_tx, job_rx) = unbounded();
         Self {
             id,
             extents: Vec::new(),
             epoch: 0,
             next_extent_id: ExtentId(0),
             arena_capacity: DEFAULT_ARENA_CAPACITY,
+            in_flight: AtomicU64::new(0),
+            job_tx,
+            job_rx,
         }
     }
 
@@ -241,6 +259,70 @@ impl Stream {
     /// Find an extent by its ID.
     pub fn find_extent(&self, extent_id: ExtentId) -> Option<&Extent> {
         self.extents.iter().find(|e| e.id == extent_id)
+    }
+
+    /// Return the stream-level in_flight counter (for pipelined group commit).
+    pub(crate) fn in_flight(&self) -> &AtomicU64 {
+        &self.in_flight
+    }
+
+    /// Return a reference to the job sender channel.
+    pub(crate) fn job_tx(&self) -> &Sender<AppendJob> {
+        &self.job_tx
+    }
+
+    /// Return a reference to the job receiver channel.
+    pub(crate) fn job_rx(&self) -> &Receiver<AppendJob> {
+        &self.job_rx
+    }
+
+    /// Append to the active extent (single-writer, called by stream-level leader).
+    ///
+    /// Returns `Ok((result, extent_id))` on success, or `Err(ExtentFull)` when the
+    /// caller should seal + create + retry.
+    pub fn try_append_active(&self, payload: Bytes) -> Result<(AppendResult, ExtentId), StorageError> {
+        let extent = self.extents.last().ok_or_else(|| {
+            StorageError::Internal(format!("stream {:?}: no active extent", self.id))
+        })?;
+        let result = extent.append_inner(payload)?;
+        Ok((result, extent.id))
+    }
+
+    /// Seal the active extent and create a new one. Returns seal notification.
+    ///
+    /// Must be called under exclusive access (`&mut self`, i.e., DashMap `get_mut`).
+    pub fn seal_and_create_next(&mut self) -> Option<SealNotification> {
+        let active_id = self.active_extent_id()?;
+        let (_, end_offset) = self.seal(active_id, None)?;
+        let (new_id, _) = self.create_next_extent();
+        Some(SealNotification {
+            sealed_extent_id: active_id,
+            end_offset,
+            new_extent_id: new_id,
+            epoch: self.epoch,
+        })
+    }
+}
+
+/// Information about an extent that was sealed during an append.
+#[derive(Debug, Clone)]
+pub struct SealNotification {
+    pub sealed_extent_id: ExtentId,
+    pub end_offset: u64,
+    pub new_extent_id: ExtentId,
+    pub epoch: u32,
+}
+
+impl std::fmt::Debug for Stream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Stream")
+            .field("id", &self.id)
+            .field("extents", &self.extents)
+            .field("epoch", &self.epoch)
+            .field("next_extent_id", &self.next_extent_id)
+            .field("arena_capacity", &self.arena_capacity)
+            .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
+            .finish()
     }
 }
 
