@@ -2,7 +2,11 @@
 //!
 //! Launches a full cluster (1 StreamManager + 3 ExtentNodes), then spawns 10 client tasks
 //! that each create their own stream (RF=2) and append 1 KiB records for 5 seconds.
-//! When an extent fills up, the client seals and continues on the new extent.
+//!
+//! Extent-full transitions are handled autonomously by the Primary ExtentNode within the
+//! current epoch -- the client never sees ExtentSealed errors. The Primary seals the full
+//! extent, creates a new one (same replica set, same epoch), and retries the append
+//! transparently. Clients just keep appending.
 //!
 //! Reports aggregate throughput: ops/sec and MB/sec.
 //!
@@ -19,8 +23,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StorageClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::errors::StorageError;
-use common::types::ExtentId;
 use extent_node::ExtentNode;
 use sqlx::mysql::MySqlPoolOptions;
 use stream_manager::StreamManager;
@@ -31,7 +33,7 @@ const NUM_CLIENTS: usize = 10;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const BENCH_DURATION: Duration = Duration::from_secs(5);
 const REPLICATION_FACTOR: u16 = 2;
-const ARENA_CAPACITY: usize = 4 * 1024 * 1024; // 4 MiB — triggers frequent seals
+const ARENA_CAPACITY: usize = 4 * 1024 * 1024; // 4 MiB -- triggers frequent seals
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
@@ -39,7 +41,7 @@ async fn main() {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    // ── 1. Clean database ──
+    // -- 1. Clean database --
     let stream_manager_config = StreamManagerConfig {
         bind_ip: "127.0.0.1".into(),
         port: 0,
@@ -48,12 +50,12 @@ async fn main() {
     clean_database(&stream_manager_config.mysql_url()).await;
     info!("[setup] Database cleaned");
 
-    // ── 2. Start StreamManager ──
+    // -- 2. Start StreamManager --
     let stream_manager_addr = StreamManager::start(stream_manager_config).await;
     let stream_manager_addr_socket = stream_manager_addr.addr();
     info!("[setup] StreamManager started on {stream_manager_addr_socket}");
 
-    // ── 3. Start 3 ExtentNodes ──
+    // -- 3. Start 3 ExtentNodes --
     let mut extent_nodes = vec![];
     for i in 0..3 {
         let extent_node_config = ExtentNodeConfig {
@@ -69,12 +71,12 @@ async fn main() {
         extent_nodes.push(extent_node);
     }
 
-    // ── 4. Wait for heartbeat registration ──
+    // -- 4. Wait for heartbeat registration --
     info!("[setup] Waiting for ExtentNode registration...");
     tokio::time::sleep(Duration::from_secs(3)).await;
     info!("[setup] Registration complete");
 
-    // ── 5. Spawn client tasks ──
+    // -- 5. Spawn client tasks --
     let stream_manager_addr_str = stream_manager_addr_socket.to_string();
     let start = Instant::now();
 
@@ -86,17 +88,17 @@ async fn main() {
         }));
     }
 
-    // ── 6. Collect results ──
+    // -- 6. Collect results --
     let mut total_appends: u64 = 0;
     let mut total_bytes: u64 = 0;
-    let mut total_seals: u64 = 0;
+    let mut total_errors: u64 = 0;
 
     for handle in handles {
         match handle.await {
             Ok(result) => {
                 total_appends += result.total_appends;
                 total_bytes += result.total_bytes;
-                total_seals += result.seal_count;
+                total_errors += result.error_count;
             }
             Err(e) => {
                 warn!("[error] Client task panicked: {e}");
@@ -110,7 +112,7 @@ async fn main() {
         extent_node.stop().await;
     }
 
-    // ── 7. Report ──
+    // -- 7. Report --
     info!("=== Benchmark Results ===");
     info!("Duration:      {elapsed:.2} seconds");
     info!("Clients:       {NUM_CLIENTS}");
@@ -130,7 +132,7 @@ async fn main() {
         "Throughput:    {:.2} MB/sec",
         (total_bytes as f64 / 1_000_000.0) / elapsed
     );
-    info!("Total seals:   {total_seals}");
+    info!("Errors:        {total_errors}");
 }
 
 /// Drop all tables for a clean slate (same pattern as client-example).
@@ -160,10 +162,15 @@ async fn clean_database(mysql_url: &str) {
 struct ClientResult {
     total_appends: u64,
     total_bytes: u64,
-    seal_count: u64,
+    error_count: u64,
 }
 
-/// Single client task: create stream, append in a tight loop, seal-and-new on ExtentSealed.
+/// Single client task: create stream, append in a tight loop.
+///
+/// Extent-full transitions are transparent -- the Primary handles seal-and-new
+/// autonomously within the current epoch. The client just keeps appending with
+/// the same stream_id and extent_id; the server accepts appends on whatever the
+/// current active extent is.
 async fn client_task(
     client_id: usize,
     stream_manager_addr: String,
@@ -173,27 +180,24 @@ async fn client_task(
     let deadline = Instant::now() + duration;
     let mut total_appends: u64 = 0;
     let mut total_bytes: u64 = 0;
-    let mut seal_count: u64 = 0;
+    let mut error_count: u64 = 0;
 
     // Connect to StreamManager and create stream.
-    let mut stream_manager_client = StorageClient::connect(&stream_manager_addr)
+    let stream_manager_client = StorageClient::connect(&stream_manager_addr)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: StreamManager connect failed: {e}"));
 
-    let (stream_id, initial_extent_id, initial_primary_addr) = stream_manager_client
+    let (stream_id, extent_id, initial_primary_addr) = stream_manager_client
         .create_stream(&format!("bench-stream-{client_id}"), REPLICATION_FACTOR)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: create_stream failed: {e}"));
 
-    let mut extent_id = initial_extent_id;
-    let mut primary_addr = initial_primary_addr;
-
     // Connect to primary ExtentNode.
-    let mut extent_node_client = StorageClient::connect(&primary_addr)
+    let extent_node_client = StorageClient::connect(&initial_primary_addr)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: ExtentNode connect failed: {e}"));
 
-    // Append loop.
+    // Append loop -- extent-full is handled transparently by the Primary.
     while Instant::now() < deadline {
         match extent_node_client
             .append(stream_id, extent_id, payload.clone())
@@ -203,30 +207,9 @@ async fn client_task(
                 total_appends += 1;
                 total_bytes += PAYLOAD_SIZE as u64;
             }
-            Err(StorageError::ExtentSealed(_)) => {
-                // Seal the current extent via StreamManager and get a new one.
-                let (new_extent_id_raw, new_primary_addr) = stream_manager_client
-                    .seal(stream_id, extent_id, None)
-                    .await
-                    .unwrap_or_else(|e| panic!("client {client_id}: seal failed: {e}"));
-
-                extent_id = ExtentId(new_extent_id_raw);
-                primary_addr = new_primary_addr;
-                seal_count += 1;
-
-                // Reconnect to the (potentially different) primary.
-                extent_node_client =
-                    StorageClient::connect(&primary_addr)
-                        .await
-                        .unwrap_or_else(|e| {
-                            panic!(
-                                "client {client_id}: ExtentNode reconnect after seal failed: {e}"
-                            )
-                        });
-            }
             Err(e) => {
-                warn!("client {client_id}: unexpected append error: {e}");
-                break;
+                warn!("client {client_id}: append error: {e}");
+                error_count += 1;
             }
         }
     }
@@ -234,6 +217,6 @@ async fn client_task(
     ClientResult {
         total_appends,
         total_bytes,
-        seal_count,
+        error_count,
     }
 }

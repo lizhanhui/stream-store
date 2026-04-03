@@ -8,10 +8,12 @@
 //! With pipelining enabled, each sender keeps up to `PIPELINE_DEPTH` appends in-flight
 //! concurrently on a single connection, dramatically improving throughput.
 //!
-//! When an extent fills up, each client independently seals via StreamManager — the
-//! StreamManager's `seal_and_allocate_transaction` is idempotent: the first seal triggers
-//! allocation of a new extent, and subsequent seals for the same extent simply return the
-//! already-allocated successor.
+//! Extent-full transitions are handled **autonomously by the Primary ExtentNode** within
+//! the current epoch (epoch-based seal-and-new). The client never sees ExtentSealed errors
+//! during normal operation -- the Primary seals the full extent, creates a new one with the
+//! next sequential ID (same replica set, same epoch), and retries the triggering append
+//! transparently. Stream Manager is notified asynchronously via fire-and-forget
+//! EXTENT_SEALED_NOTIFY. Clients just keep appending; extent transitions are invisible.
 //!
 //! **Prerequisites**: MySQL running at the default StreamManagerConfig URL.
 //!
@@ -27,16 +29,15 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StorageClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::errors::StorageError;
 use common::types::ExtentId;
 use extent_node::ExtentNode;
 use sqlx::mysql::MySqlPoolOptions;
 use stream_manager::StreamManager;
-use tokio::sync::{RwLock, Semaphore, mpsc};
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-// ── Benchmark Parameters ─────────────────────────────────────────────────────
+// -- Benchmark Parameters -----------------------------------------------------
 
 const BENCH_DURATION: Duration = Duration::from_secs(5);
 const NUM_SENDERS: usize = 4;
@@ -45,7 +46,7 @@ const REPLICATION_FACTOR: u16 = 2;
 const ARENA_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB
 const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
 
-// ── Main ─────────────────────────────────────────────────────────────────────
+// -- Main ---------------------------------------------------------------------
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
@@ -53,7 +54,7 @@ async fn main() {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    // ── 1. Clean database ────────────────────────────────────────────────────
+    // -- 1. Clean database ----------------------------------------------------
     let stream_manager_config = StreamManagerConfig {
         bind_ip: "127.0.0.1".into(),
         port: 0,
@@ -62,12 +63,12 @@ async fn main() {
     clean_database(&stream_manager_config.mysql_url()).await;
     info!("[setup] Database cleaned");
 
-    // ── 2. Start StreamManager ───────────────────────────────────────────────
+    // -- 2. Start StreamManager -----------------------------------------------
     let stream_manager = StreamManager::start(stream_manager_config).await;
     let stream_manager_addr = stream_manager.addr().to_string();
     info!("[setup] StreamManager started on {stream_manager_addr}");
 
-    // ── 3. Start 3 ExtentNodes ───────────────────────────────────────────────
+    // -- 3. Start 3 ExtentNodes -----------------------------------------------
     let mut extent_nodes = vec![];
     for i in 0..3 {
         let config = ExtentNodeConfig {
@@ -82,12 +83,12 @@ async fn main() {
         extent_nodes.push(node);
     }
 
-    // ── 4. Wait for heartbeat registration ───────────────────────────────────
+    // -- 4. Wait for heartbeat registration -----------------------------------
     info!("[setup] Waiting for ExtentNode registration...");
     tokio::time::sleep(Duration::from_secs(3)).await;
     info!("[setup] Registration complete");
 
-    // ── 5. Create a single stream via StreamManager ──────────────────────────
+    // -- 5. Create a single stream via StreamManager --------------------------
     let sm_client = StorageClient::connect(&stream_manager_addr)
         .await
         .expect("connect to StreamManager");
@@ -100,18 +101,16 @@ async fn main() {
         stream_id, initial_extent_id, initial_primary_addr
     );
 
-    // ── 6. Spawn sender tasks ────────────────────────────────────────────────
+    // -- 6. Spawn sender tasks ------------------------------------------------
     let start = Instant::now();
 
     let mut handles = Vec::with_capacity(NUM_SENDERS);
     for sender_id in 0..NUM_SENDERS {
-        let sm_addr = stream_manager_addr.clone();
         let primary_addr = initial_primary_addr.clone();
 
         handles.push(tokio::spawn(async move {
             sender_task(
                 sender_id,
-                sm_addr,
                 stream_id,
                 initial_extent_id,
                 primary_addr,
@@ -121,10 +120,10 @@ async fn main() {
         }));
     }
 
-    // ── 7. Collect results ───────────────────────────────────────────────────
+    // -- 7. Collect results ---------------------------------------------------
     let mut total_appends: u64 = 0;
     let mut total_bytes: u64 = 0;
-    let mut total_seals: u64 = 0;
+    let mut total_errors: u64 = 0;
     let mut all_latencies: Vec<Duration> = Vec::new();
 
     for handle in handles {
@@ -132,7 +131,7 @@ async fn main() {
             Ok(result) => {
                 total_appends += result.total_appends;
                 total_bytes += result.total_bytes;
-                total_seals += result.seal_count;
+                total_errors += result.error_count;
                 all_latencies.extend(result.latencies);
             }
             Err(e) => {
@@ -143,12 +142,12 @@ async fn main() {
 
     let elapsed = start.elapsed();
 
-    // ── 8. Shutdown ──────────────────────────────────────────────────────────
+    // -- 8. Shutdown ----------------------------------------------------------
     for node in extent_nodes {
         node.stop().await;
     }
 
-    // ── 9. Report ────────────────────────────────────────────────────────────
+    // -- 9. Report ------------------------------------------------------------
     all_latencies.sort();
 
     let elapsed_secs = elapsed.as_secs_f64();
@@ -173,7 +172,7 @@ async fn main() {
     );
     println!("  Throughput:      {ops_per_sec:.0} ops/sec");
     println!("  Throughput:      {mb_per_sec:.2} MB/sec");
-    println!("  Total seals:     {total_seals}");
+    println!("  Errors:          {total_errors}");
     println!("───────────────────────────────────────────────────────────────");
 
     if !all_latencies.is_empty() {
@@ -191,56 +190,39 @@ async fn main() {
     println!();
 }
 
-// ── Helpers ──────────────────────────────────────────────────────────────────
+// -- Helpers ------------------------------------------------------------------
 
 /// Per-sender result.
 struct SenderResult {
     total_appends: u64,
     total_bytes: u64,
-    seal_count: u64,
+    error_count: u64,
     latencies: Vec<Duration>,
 }
 
-/// Shared sender state protected by RwLock for extent rotation.
-struct SenderState {
-    extent_id: ExtentId,
-    en_client: Arc<StorageClient>,
-}
-
-/// Single sender task: connect to the current primary, pipeline appends with up to
+/// Single sender task: connect to the primary, pipeline appends with up to
 /// PIPELINE_DEPTH in-flight requests, measure per-append latency.
 ///
-/// On ExtentSealed, seal via StreamManager and reconnect to the new primary.
-/// Uses RwLock to coordinate extent rotation across concurrent in-flight tasks.
+/// Extent-full transitions are transparent -- the Primary handles seal-and-new
+/// autonomously within the current epoch. The client just keeps appending with
+/// the same stream_id and extent_id; the server accepts appends on whatever the
+/// current active extent is.
 async fn sender_task(
     sender_id: usize,
-    stream_manager_addr: String,
     stream_id: common::types::StreamId,
-    initial_extent_id: ExtentId,
-    initial_primary_addr: String,
+    extent_id: ExtentId,
+    primary_addr: String,
     duration: Duration,
 ) -> SenderResult {
     let payload = Bytes::from(vec![0xABu8; PAYLOAD_SIZE]);
     let deadline = Instant::now() + duration;
 
-    // Each sender gets its own StreamManager connection for seal RPCs.
-    let sm_client = Arc::new(
-        StorageClient::connect(&stream_manager_addr)
-            .await
-            .unwrap_or_else(|e| panic!("sender {sender_id}: SM connect failed: {e}")),
-    );
-
-    // Connect to the initial primary.
+    // Connect to the primary ExtentNode.
     let en_client = Arc::new(
-        StorageClient::connect(&initial_primary_addr)
+        StorageClient::connect(&primary_addr)
             .await
             .unwrap_or_else(|e| panic!("sender {sender_id}: EN connect failed: {e}")),
     );
-
-    let state = Arc::new(RwLock::new(SenderState {
-        extent_id: initial_extent_id,
-        en_client,
-    }));
 
     // Semaphore to cap in-flight requests.
     let semaphore = Arc::new(Semaphore::new(PIPELINE_DEPTH));
@@ -251,8 +233,7 @@ async fn sender_task(
     // Spawn append tasks until deadline.
     let spawner = {
         let semaphore = Arc::clone(&semaphore);
-        let state = Arc::clone(&state);
-        let sm_client = Arc::clone(&sm_client);
+        let en_client = Arc::clone(&en_client);
         let result_tx = result_tx.clone();
 
         tokio::spawn(async move {
@@ -260,14 +241,19 @@ async fn sender_task(
                 // Acquire semaphore permit to limit pipeline depth.
                 let permit = semaphore.clone().acquire_owned().await.unwrap();
 
-                let state = Arc::clone(&state);
-                let sm_client = Arc::clone(&sm_client);
+                let en_client = Arc::clone(&en_client);
                 let payload = payload.clone();
                 let result_tx = result_tx.clone();
 
                 tokio::spawn(async move {
-                    let outcome =
-                        do_append(sender_id, stream_id, &state, &sm_client, payload).await;
+                    let t0 = Instant::now();
+                    let outcome = match en_client.append(stream_id, extent_id, payload).await {
+                        Ok(_) => AppendOutcome::Ok(t0.elapsed()),
+                        Err(e) => {
+                            warn!("sender {sender_id}: append error: {e}");
+                            AppendOutcome::Error
+                        }
+                    };
                     let _ = result_tx.send(outcome);
                     drop(permit);
                 });
@@ -281,7 +267,7 @@ async fn sender_task(
     // Collect results.
     let mut total_appends: u64 = 0;
     let mut total_bytes: u64 = 0;
-    let mut seal_count: u64 = 0;
+    let mut error_count: u64 = 0;
     let mut latencies = Vec::with_capacity(65536);
 
     while let Some(outcome) = result_rx.recv().await {
@@ -291,11 +277,8 @@ async fn sender_task(
                 total_appends += 1;
                 total_bytes += PAYLOAD_SIZE as u64;
             }
-            AppendOutcome::Sealed => {
-                seal_count += 1;
-            }
             AppendOutcome::Error => {
-                // Logged inside do_append; skip.
+                error_count += 1;
             }
         }
     }
@@ -305,79 +288,14 @@ async fn sender_task(
     SenderResult {
         total_appends,
         total_bytes,
-        seal_count,
+        error_count,
         latencies,
     }
 }
 
 enum AppendOutcome {
     Ok(Duration),
-    Sealed,
     Error,
-}
-
-/// Perform a single pipelined append. On ExtentSealed, handle rotation.
-async fn do_append(
-    sender_id: usize,
-    stream_id: common::types::StreamId,
-    state: &Arc<RwLock<SenderState>>,
-    sm_client: &Arc<StorageClient>,
-    payload: Bytes,
-) -> AppendOutcome {
-    // Read lock: get current client + extent_id.
-    let (client, extent_id) = {
-        let s = state.read().await;
-        (Arc::clone(&s.en_client), s.extent_id)
-    };
-
-    let t0 = Instant::now();
-    match client.append(stream_id, extent_id, payload).await {
-        Ok(_) => AppendOutcome::Ok(t0.elapsed()),
-        Err(StorageError::ExtentSealed(_)) => {
-            // Need to rotate extent. Acquire write lock.
-            let mut s = state.write().await;
-
-            // Check if another task already rotated past this extent.
-            if s.extent_id != extent_id {
-                // Already rotated — just report as sealed (the append was lost, that's ok for bench).
-                return AppendOutcome::Sealed;
-            }
-
-            // We're responsible for sealing.
-            let (new_extent_id_raw, new_primary_addr) =
-                match sm_client.seal(stream_id, extent_id, None).await {
-                    Ok(result) => result,
-                    Err(e) => {
-                        warn!("sender {sender_id}: seal failed: {e}");
-                        return AppendOutcome::Error;
-                    }
-                };
-
-            let new_extent_id = ExtentId(new_extent_id_raw);
-            info!(
-                "sender {sender_id}: sealed extent {:?} → new {:?} @ {}",
-                extent_id, new_extent_id, new_primary_addr
-            );
-
-            // Reconnect to the (potentially different) primary.
-            let new_client = match StorageClient::connect(&new_primary_addr).await {
-                Ok(c) => Arc::new(c),
-                Err(e) => {
-                    warn!("sender {sender_id}: reconnect after seal failed: {e}");
-                    return AppendOutcome::Error;
-                }
-            };
-
-            s.extent_id = new_extent_id;
-            s.en_client = new_client;
-
-            AppendOutcome::Sealed
-        }
-        Err(e) => {
-            warn!("sender {sender_id}: unexpected append error: {e}");
-            AppendOutcome::Error
-        }
-    }
 }
 
 /// Drop all tables for a clean slate.
