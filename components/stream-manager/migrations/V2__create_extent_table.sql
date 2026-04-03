@@ -4,6 +4,7 @@ CREATE TABLE extent (
     start_offset  BIGINT NOT NULL,
     end_offset    BIGINT NOT NULL DEFAULT 0,
     state         TINYINT NOT NULL DEFAULT 1,
+    epoch         INT NOT NULL DEFAULT 0,
     s3_key        VARCHAR(1024),
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     sealed_at     TIMESTAMP NULL,
