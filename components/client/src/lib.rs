@@ -204,7 +204,7 @@ impl StorageClient {
             return Err(match error_code {
                 Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id()),
                 Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id()),
-                Some(ErrorCode::EpochStale) => StorageError::EpochStale(resp.stream_id()),
+                Some(ErrorCode::EpochStale) => StorageError::EpochStale(resp.stream_id(), resp.epoch()),
                 _ => StorageError::Internal(msg),
             });
         }
