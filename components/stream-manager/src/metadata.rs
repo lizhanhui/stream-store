@@ -602,6 +602,7 @@ impl MetadataStore {
                 extent_id: ext.extent_id.0,
                 start_offset: ext.start_offset,
                 end_offset: ext.end_offset,
+                epoch: 0,
                 state: ext.state,
                 replicas,
             });
@@ -638,6 +639,7 @@ impl MetadataStore {
                     extent_id: ext.extent_id.0,
                     start_offset: ext.start_offset,
                     end_offset: ext.end_offset,
+                    epoch: 0,
                     state: ext.state,
                     replicas,
                 }))
@@ -685,6 +687,7 @@ impl MetadataStore {
                 extent_id: ext.extent_id.0,
                 start_offset: ext.start_offset,
                 end_offset: ext.end_offset,
+                epoch: 0,
                 state: ext.state,
                 replicas,
             }));
@@ -715,6 +718,7 @@ impl MetadataStore {
                     extent_id: ext.extent_id.0,
                     start_offset: ext.start_offset,
                     end_offset: ext.end_offset,
+                    epoch: 0,
                     state: ext.state,
                     replicas,
                 }))

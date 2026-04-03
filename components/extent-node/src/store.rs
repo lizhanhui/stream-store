@@ -161,17 +161,20 @@ impl AckQueue {
     }
 }
 
-/// Request from the Primary to proactively seal a stream and trigger new extent allocation.
-/// Emitted when the arena is full (ExtentFull). Sent to a background task that forwards
-/// the Seal request to Stream Manager, avoiding an error storm where every client
-/// independently races to trigger seal-and-new.
+/// Notification emitted after the Primary autonomously creates a new extent on extent-full.
+/// Sent to a background task that forwards an EXTENT_SEALED_NOTIFY to Stream Manager,
+/// allowing SM to update its metadata asynchronously (not on the critical path).
 #[derive(Debug, Clone)]
 pub struct SealRequest {
     pub stream_id: StreamId,
-    pub extent_id: ExtentId,
-    /// Committed offset = end_offset (the next writable offset).
-    /// Stream Manager trusts this value from the primary EN.
-    pub offset: u64,
+    /// The extent that was sealed.
+    pub sealed_extent_id: ExtentId,
+    /// Committed offset = end_offset (exclusive upper bound) of the sealed extent.
+    pub end_offset: u64,
+    /// The newly created extent that replaced the sealed one.
+    pub new_extent_id: ExtentId,
+    /// Epoch under which the seal and creation occurred.
+    pub epoch: u32,
 }
 
 // ── Replica info ─────────────────────────────────────────────────────────────
@@ -352,6 +355,24 @@ impl RequestHandler for ExtentNodeStore {
                 },
                 None,
             )),
+            Opcode::ReportExtents => Some(Frame::error_response(
+                frame.request_id(),
+                ErrorCode::InternalError,
+                "not yet implemented",
+                ExtentId(0),
+            )),
+            Opcode::ReportExtentsResp | Opcode::ExtentSealedNotify => {
+                warn!(
+                    opcode = ?frame.opcode(),
+                    "EN received unexpected opcode that should not be sent to ExtentNode"
+                );
+                Some(Frame::error_response(
+                    frame.request_id(),
+                    ErrorCode::InternalError,
+                    "unexpected opcode",
+                    ExtentId(0),
+                ))
+            }
             _ => Some(Frame::error_response(
                 frame.request_id(),
                 ErrorCode::InternalError,
@@ -394,14 +415,16 @@ impl ExtentNodeStore {
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
     fn handle_register_extent(&self, frame: Frame) -> Frame {
         // Extract stream_id, extent_id, role, replication_factor from the variable header.
-        let (stream_id, extent_id, role, replication_factor) = match &frame.variable_header {
+        let (stream_id, extent_id, role, replication_factor, epoch) = match &frame.variable_header
+        {
             VariableHeader::RegisterExtent {
                 stream_id,
                 extent_id,
                 role,
                 replication_factor,
+                epoch,
                 ..
-            } => (*stream_id, *extent_id, *role, *replication_factor),
+            } => (*stream_id, *extent_id, *role, *replication_factor, *epoch),
             _ => {
                 return Frame::error_response(
                     frame.request_id(),
@@ -432,14 +455,14 @@ impl ExtentNodeStore {
         let _start_offset = if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
             if stream_mut.find_extent(extent_id).is_none() {
                 let so = stream_mut.max_offset();
-                stream_mut.register_extent(extent_id, so, self.arena_capacity);
+                stream_mut.register_extent(extent_id, so, self.arena_capacity, epoch);
                 so
             } else {
                 stream_mut.max_offset()
             }
         } else {
             let mut stream = Stream::new(stream_id);
-            stream.register_extent(extent_id, Offset(0), self.arena_capacity);
+            stream.register_extent(extent_id, Offset(0), self.arena_capacity, epoch);
             self.streams.insert(stream_id, stream);
             Offset(0)
         };
@@ -574,7 +597,7 @@ impl ExtentNodeStore {
             request_id,
             stream_id,
             extent_id,
-            payload,
+            payload.clone(),
             response_tx.cloned(),
         );
 
@@ -586,11 +609,25 @@ impl ExtentNodeStore {
             forward_work.extend(batch_forward_work);
         }
 
-        // Drop stream guard before proactive seal (needs write lock).
+        // Drop stream guard before extent-full handling (needs write lock).
         drop(stream_ref);
 
         if extent_full {
-            self.trigger_proactive_seal(stream_id, extent_id);
+            // Autonomous extent creation: seal, create new extent, retry the append.
+            // The error was already sent to the client via response_tx in do_append_and_respond.
+            // We seal and create the new extent so the NEXT append succeeds transparently.
+            // TODO(epoch): In a future iteration, intercept ExtentFull BEFORE sending
+            // the error to retry the triggering append transparently. For now, the first
+            // client that hits extent-full gets an error but all subsequent clients succeed
+            // immediately (the new extent is already created).
+            let (_retry_result, retry_forward_work) = self.handle_extent_full_and_retry(
+                stream_id,
+                extent_id,
+                request_id,
+                payload,
+                response_tx.cloned(),
+            );
+            forward_work.extend(retry_forward_work);
         }
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
@@ -838,29 +875,84 @@ impl ExtentNodeStore {
         all_forward_work
     }
 
-    /// Trigger a proactive seal when an extent is full.
-    /// Best-effort, non-blocking. The seal itself happens outside the hot path.
-    fn trigger_proactive_seal(&self, stream_id: StreamId, extent_id: ExtentId) {
-        // Try to seal the extent (needs write lock on stream).
-        let (seal_extent_id, offset) =
+    /// Handle extent-full by autonomously sealing and creating a new extent.
+    ///
+    /// Called by the leader when append_inner returns ExtentFull. The leader:
+    /// 1. Acquires write lock on the stream
+    /// 2. Seals the current extent locally
+    /// 3. Creates a new extent (same epoch, same replica set)
+    /// 4. Retries the append on the new extent
+    /// 5. Sends async EXTENT_SEALED_NOTIFY to SM (fire-and-forget)
+    ///
+    /// Returns `(new_extent, new_extent_id, forward_work)` for the retried append,
+    /// or None if the seal/retry fails.
+    fn handle_extent_full_and_retry(
+        &self,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        request_id: u32,
+        payload: Bytes,
+        response_tx: Option<mpsc::Sender<Frame>>,
+    ) -> (Option<Frame>, Vec<(String, Frame)>) {
+        // Acquire write lock and seal + create new extent.
+        let (sealed_extent_id, end_offset, new_extent_id, epoch) =
             if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-                let active_extent_id = stream_mut.active_extent_id().unwrap_or(ExtentId(0));
-                match stream_mut.seal(active_extent_id, None) {
-                    Some((_start_offset, end_offset)) => (active_extent_id, end_offset),
-                    None => (active_extent_id, 0),
+                let active_id = stream_mut.active_extent_id().unwrap_or(extent_id);
+                match stream_mut.seal(active_id, None) {
+                    Some((_start_offset, end_offset)) => {
+                        let (new_id, _new_start) = stream_mut.create_next_extent();
+                        let epoch = stream_mut.epoch();
+                        (active_id, end_offset, new_id, epoch)
+                    }
+                    None => {
+                        // Already sealed (concurrent seal) — try to use whatever is active.
+                        if let Some(current_active) = stream_mut.active_extent_id() {
+                            // Another thread already sealed and created a new extent.
+                            let epoch = stream_mut.epoch();
+                            (extent_id, 0, current_active, epoch)
+                        } else {
+                            // No active extent — cannot recover.
+                            return (None, Vec::new());
+                        }
+                    }
                 }
             } else {
-                (extent_id, 0)
+                return (None, Vec::new());
             };
 
-        // Notify background task to send Seal to Stream Manager.
-        if let Some(ref tx) = self.seal_tx {
-            let _ = tx.try_send(SealRequest {
-                stream_id,
-                extent_id: seal_extent_id,
-                offset,
-            });
+        // Send async notification to SM (fire-and-forget).
+        if end_offset > 0 {
+            if let Some(ref tx) = self.seal_tx {
+                let _ = tx.try_send(SealRequest {
+                    stream_id,
+                    sealed_extent_id,
+                    end_offset,
+                    new_extent_id,
+                    epoch,
+                });
+            }
         }
+
+        // Retry the append on the new extent.
+        // Re-acquire read lock and find the new extent.
+        if let Some(stream_ref) = self.streams.get(&stream_id) {
+            if let Some(new_extent) = stream_ref.find_extent(new_extent_id) {
+                let (result, _extent_full, forward_work) = self.do_append_and_respond(
+                    new_extent,
+                    request_id,
+                    stream_id,
+                    new_extent_id,
+                    payload,
+                    response_tx,
+                );
+                // Update ReplicaInfo to point to new extent_id.
+                if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
+                    ri.extent_id = new_extent_id;
+                }
+                return (result, forward_work);
+            }
+        }
+        (None, Vec::new())
     }
 
     /// Optimized batch append: all frames share the same stream_id/extent_id.
@@ -1043,7 +1135,14 @@ impl ExtentNodeStore {
             }
             drop(stream_ref);
             if extent_full {
-                self.trigger_proactive_seal(stream_id, extent_id);
+                // Autonomous extent creation for batch path.
+                let _ = self.handle_extent_full_and_retry(
+                    stream_id,
+                    extent_id,
+                    0,
+                    Bytes::new(),
+                    None,
+                );
             }
             self.flush_forward_work(forward_work).await;
             return responses;
@@ -1173,7 +1272,15 @@ impl ExtentNodeStore {
         drop(stream_ref);
 
         if extent_full {
-            self.trigger_proactive_seal(stream_id, extent_id);
+            // Autonomous extent creation for batch path (end of batch).
+            let (_, retry_forward) = self.handle_extent_full_and_retry(
+                stream_id,
+                extent_id,
+                0,
+                Bytes::new(),
+                None,
+            );
+            forward_work.extend(retry_forward);
         }
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
@@ -1244,7 +1351,7 @@ impl ExtentNodeStore {
             None => {
                 // Forward arrived before RegisterExtent — lazy extent creation.
                 let mut stream = Stream::new(stream_id);
-                stream.register_extent(extent_id, start_offset, self.arena_capacity);
+                stream.register_extent(extent_id, start_offset, self.arena_capacity, 0);
                 self.streams.insert(stream_id, stream);
 
                 self.next_stream_id
@@ -1288,7 +1395,7 @@ impl ExtentNodeStore {
                 drop(stream_ref);
                 if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
                     if stream_mut.find_extent(extent_id).is_none() {
-                        stream_mut.register_extent(extent_id, start_offset, self.arena_capacity);
+                        stream_mut.register_extent(extent_id, start_offset, self.arena_capacity, 0);
                         info!(
                             "Lazy extent creation on forward (existing stream): stream={:?}, extent={:?}, start_offset={:?}",
                             stream_id, extent_id, start_offset,
@@ -1448,6 +1555,7 @@ impl ExtentNodeStore {
                             offset: Offset(so),
                             new_extent_id: None,
                             primary_addr: None,
+                            epoch: None,
                         },
                         None,
                     );
@@ -1475,6 +1583,7 @@ impl ExtentNodeStore {
                         offset: Offset(end_offset),
                         new_extent_id: None,
                         primary_addr: None,
+                        epoch: None,
                     },
                     None,
                 )
@@ -1497,6 +1606,7 @@ impl ExtentNodeStore {
                         offset: Offset(end_offset),
                         new_extent_id: None,
                         primary_addr: None,
+                        epoch: None,
                     },
                     None,
                 )
@@ -1525,6 +1635,7 @@ mod tests {
                         extent_id: ExtentId(1),
                         role: 0,
                         replication_factor: 1,
+                        epoch: 0,
                     },
                     Some(payload),
                 ),
@@ -1697,6 +1808,7 @@ mod tests {
                         extent_id: ExtentId(100),
                         role: 0,
                         replication_factor: 2,
+                        epoch: 0,
                     },
                     Some(payload),
                 ),
@@ -1739,6 +1851,7 @@ mod tests {
                         extent_id: ExtentId(100),
                         role: 1,
                         replication_factor: 2,
+                        epoch: 0,
                     },
                     Some(payload),
                 ),
@@ -1776,6 +1889,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         role: 0,
                         replication_factor: 1,
+                        epoch: 0,
                     },
                     Some(payload),
                 ),
@@ -1834,6 +1948,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         role: 0,
                         replication_factor: 3,
+                        epoch: 0,
                     },
                     Some(payload),
                 ),
@@ -1914,6 +2029,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         role: 1,
                         replication_factor: 2,
+                        epoch: 0,
                     },
                     Some(payload),
                 ),
@@ -2512,6 +2628,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         role: 1,
                         replication_factor: 2,
+                        epoch: 0,
                     },
                     Some(payload),
                 ),
@@ -2554,6 +2671,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         offset: Some(Offset(4)),
                         start_offset: None,
+                        epoch: None,
                     },
                     None,
                 ),
@@ -2651,6 +2769,7 @@ mod tests {
                         extent_id: ExtentId(1),
                         offset: None,
                         start_offset: None,
+                        epoch: None,
                     },
                     None,
                 ),
@@ -2671,6 +2790,7 @@ mod tests {
                         extent_id: ExtentId(1),
                         offset: None,
                         start_offset: None,
+                        epoch: None,
                     },
                     None,
                 ),

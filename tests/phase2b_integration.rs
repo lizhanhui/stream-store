@@ -79,6 +79,7 @@ async fn register_extent(
                 extent_id: ExtentId(extent_id),
                 role,
                 replication_factor,
+                epoch: 0,
             },
             Some(payload),
         ))

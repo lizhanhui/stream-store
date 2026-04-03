@@ -9,12 +9,12 @@ use std::sync::Arc;
 
 use common::config::{ExtentNodeConfig, resolve_advertise_ip};
 use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::downstream::DownstreamPool;
-use crate::store::ExtentNodeStore;
+use crate::store::{ExtentNodeStore, SealRequest};
 use crate::stream_manager_client::StreamManagerClient;
 
 /// A running ExtentNode with lifecycle management.
@@ -34,6 +34,48 @@ pub struct ExtentNode {
 }
 
 impl ExtentNode {
+    /// Background task that receives SealRequest notifications and sends
+    /// EXTENT_SEALED_NOTIFY frames to Stream Manager.
+    ///
+    /// Fire-and-forget: if the SM connection fails, the notification is logged
+    /// and dropped. SM will reconcile during the next epoch bump.
+    async fn seal_notify_task(mut seal_rx: mpsc::Receiver<SealRequest>, sm_addr: String) {
+        use common::types::Offset;
+        use rpc::frame::{Frame, VariableHeader};
+
+        while let Some(req) = seal_rx.recv().await {
+            if sm_addr.is_empty() {
+                continue;
+            }
+            // Send EXTENT_SEALED_NOTIFY to SM via a fire-and-forget connection.
+            match client::StorageClient::connect(&sm_addr).await {
+                Ok(client) => {
+                    let frame = Frame::new(
+                        VariableHeader::ExtentSealedNotify {
+                            stream_id: req.stream_id,
+                            epoch: req.epoch,
+                            sealed_extent_id: req.sealed_extent_id,
+                            end_offset: Offset(req.end_offset),
+                            new_extent_id: req.new_extent_id,
+                        },
+                        None,
+                    );
+                    if let Err(e) = client.send_frame_no_response(frame).await {
+                        warn!(
+                            "Failed to send ExtentSealedNotify to SM for stream {:?}: {e}",
+                            req.stream_id
+                        );
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to connect to SM for ExtentSealedNotify: {e}"
+                    );
+                }
+            }
+        }
+    }
+
     /// Query available and total system memory via sysinfo.
     pub(crate) fn get_memory_info() -> (u64, u64) {
         use sysinfo::System;
@@ -66,7 +108,19 @@ impl ExtentNode {
         // Create store first (OnceLock for downstream breaks circular dep).
         let mut store_inner = ExtentNodeStore::new();
         store_inner.set_arena_capacity(config.extent_arena_capacity);
+
+        // Wire up the seal notification channel for autonomous extent creation.
+        // The receiver task sends EXTENT_SEALED_NOTIFY frames to Stream Manager.
+        let (seal_tx, seal_rx) = mpsc::channel::<SealRequest>(64);
+        store_inner.set_seal_tx(seal_tx);
+
         let store = Arc::new(store_inner);
+
+        // Spawn background task for EXTENT_SEALED_NOTIFY notifications to SM.
+        let sm_addr_for_notify = config.stream_manager_addr.clone();
+        task_handles.push(tokio::spawn(
+            Self::seal_notify_task(seal_rx, sm_addr_for_notify),
+        ));
 
         // Create DownstreamPool with back-reference to store (for inline watermark processing).
         let downstream = Arc::new(DownstreamPool::new(Arc::clone(&store)));
