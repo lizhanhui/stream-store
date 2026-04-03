@@ -41,6 +41,7 @@ async fn seal_extent_node_static(
                 extent_id,
                 offset: committed_offset.map(Offset),
                 start_offset,
+                epoch: None,
             },
             None,
         ))
@@ -125,6 +126,7 @@ impl StreamManagerStore {
                         extent_id: eid,
                         role: 0, // Primary
                         replication_factor: rf,
+                        epoch: 0,
                     },
                     Some(payload),
                 ))
@@ -195,6 +197,7 @@ impl StreamManagerStore {
                                     extent_id: eid,
                                     role,
                                     replication_factor: rf,
+                                    epoch: 0,
                                 },
                                 Some(payload),
                             ))
@@ -291,24 +294,35 @@ impl RequestHandler for StreamManagerStore {
         frame: Frame,
         _response_tx: Option<&tokio::sync::mpsc::Sender<Frame>>,
     ) -> Option<Frame> {
-        let response = match frame.opcode() {
-            Opcode::Connect => self.handle_connect(frame).await,
-            Opcode::Heartbeat => self.handle_heartbeat(frame).await,
-            Opcode::Disconnect => self.handle_disconnect(frame).await,
-            Opcode::CreateStream => self.handle_create_stream(frame).await,
-            Opcode::Seal => self.handle_seal(frame).await,
-            Opcode::QueryOffset => self.handle_query_offset(frame).await,
-            Opcode::DescribeStream => self.handle_describe_stream(frame).await,
-            Opcode::DescribeExtent => self.handle_describe_extent(frame).await,
-            Opcode::Seek => self.handle_seek(frame).await,
-            _ => Frame::error_response(
-                frame.request_id(),
-                ErrorCode::InternalError,
-                &format!("StreamManager: unsupported opcode {:?}", frame.opcode()),
-                ExtentId(0),
-            ),
-        };
-        Some(response)
+        match frame.opcode() {
+            // Fire-and-forget: no response frame
+            Opcode::ExtentSealedNotify => {
+                self.handle_extent_sealed_notify(frame).await;
+                None
+            }
+            // Request-response opcodes
+            _ => {
+                let response = match frame.opcode() {
+                    Opcode::Connect => self.handle_connect(frame).await,
+                    Opcode::Heartbeat => self.handle_heartbeat(frame).await,
+                    Opcode::Disconnect => self.handle_disconnect(frame).await,
+                    Opcode::CreateStream => self.handle_create_stream(frame).await,
+                    Opcode::Seal => self.handle_seal(frame).await,
+                    Opcode::QueryOffset => self.handle_query_offset(frame).await,
+                    Opcode::DescribeStream => self.handle_describe_stream(frame).await,
+                    Opcode::DescribeExtent => self.handle_describe_extent(frame).await,
+                    Opcode::Seek => self.handle_seek(frame).await,
+                    Opcode::ReportExtents => self.handle_report_extents(frame).await,
+                    _ => Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::InternalError,
+                        &format!("StreamManager: unsupported opcode {:?}", frame.opcode()),
+                        ExtentId(0),
+                    ),
+                };
+                Some(response)
+            }
+        }
     }
 }
 
@@ -520,6 +534,7 @@ impl StreamManagerStore {
                     offset: Offset(0),
                     new_extent_id: Some(new_extent_id),
                     primary_addr: Some(Bytes::copy_from_slice(primary_addr.as_bytes())),
+                    epoch: None,
                 },
                 None,
             ),
@@ -1012,5 +1027,42 @@ impl StreamManagerStore {
                 )
             }
         }
+    }
+
+    /// ExtentSealedNotify: fire-and-forget notification from Primary EN after autonomous seal.
+    ///
+    /// The Primary EN has already sealed the old extent and created a new one locally.
+    /// SM logs the event for now; future work will reconcile metadata.
+    async fn handle_extent_sealed_notify(&self, frame: Frame) {
+        if let VariableHeader::ExtentSealedNotify {
+            stream_id,
+            epoch,
+            sealed_extent_id,
+            end_offset,
+            new_extent_id,
+        } = &frame.variable_header
+        {
+            info!(
+                "ExtentSealedNotify: stream={:?}, epoch={}, sealed_extent={:?}, end_offset={}, new_extent={:?}",
+                stream_id, epoch, sealed_extent_id, end_offset.0, new_extent_id
+            );
+        } else {
+            warn!(
+                "handle_extent_sealed_notify called with unexpected header: {:?}",
+                frame.opcode()
+            );
+        }
+    }
+
+    /// ReportExtents: SM queries an EN for all extents it holds for a stream (recovery path).
+    ///
+    /// Not yet implemented — returns an error response.
+    async fn handle_report_extents(&self, frame: Frame) -> Frame {
+        Frame::error_response(
+            frame.request_id(),
+            ErrorCode::InternalError,
+            "ReportExtents not yet implemented",
+            ExtentId(0),
+        )
     }
 }

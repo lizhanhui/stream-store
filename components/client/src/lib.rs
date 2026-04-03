@@ -182,6 +182,17 @@ impl StorageClient {
         self.send_request(frame).await
     }
 
+    /// Send a raw frame without waiting for a response (fire-and-forget).
+    /// Used for async notifications like EXTENT_SEALED_NOTIFY.
+    pub async fn send_frame_no_response(&self, frame: Frame) -> Result<(), StorageError> {
+        self.inner
+            .write_tx
+            .send(frame)
+            .await
+            .map_err(|e| StorageError::Internal(format!("send failed: {e}")))?;
+        Ok(())
+    }
+
     fn check_error(resp: &Frame) -> Result<(), StorageError> {
         if resp.opcode() == Opcode::Error {
             let error_code = ErrorCode::from_u16(resp.error_code());
@@ -397,6 +408,7 @@ impl StorageClient {
                 extent_id,
                 offset: committed_offset.map(Offset),
                 start_offset: None,
+                epoch: None,
             },
             None,
         );

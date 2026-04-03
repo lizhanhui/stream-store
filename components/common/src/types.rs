@@ -23,6 +23,11 @@ pub const FLAG_START_OFFSET_PRESENT: u8 = 0x02;
 /// When set (SM→Client): variable header includes new_extent_id + primary_addr.
 pub const FLAG_NEW_EXTENT_PRESENT: u8 = 0x01;
 
+/// Flag bit on SEAL / SEAL_ACK indicating the frame carries an epoch field.
+/// Used for epoch-based seal (client seals by epoch rather than extent_id)
+/// and for SM responses that include the new epoch after an epoch bump.
+pub const FLAG_EPOCH_PRESENT: u8 = 0x04;
+
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);
@@ -68,6 +73,13 @@ pub enum Opcode {
     RegisterExtent = 0x15,
     RegisterExtentAck = 0x16,
     Watermark = 0x17,
+    /// Async notification from Primary EN to SM after autonomous extent creation.
+    /// Fire-and-forget: SM updates metadata, no response needed.
+    ExtentSealedNotify = 0x18,
+    /// SM queries an EN for all extents it holds for a stream (recovery path).
+    ReportExtents = 0x19,
+    /// EN response to ReportExtents with extent state for reconciliation.
+    ReportExtentsResp = 0x1A,
 
     // -- Cluster management (0x20-0x2F): StreamManager -> ExtentNode/Client --
     StreamManagerMembershipChange = 0x20,
@@ -108,6 +120,9 @@ impl Opcode {
             0x15 => Some(Opcode::RegisterExtent),
             0x16 => Some(Opcode::RegisterExtentAck),
             0x17 => Some(Opcode::Watermark),
+            0x18 => Some(Opcode::ExtentSealedNotify),
+            0x19 => Some(Opcode::ReportExtents),
+            0x1A => Some(Opcode::ReportExtentsResp),
             // Cluster management
             0x20 => Some(Opcode::StreamManagerMembershipChange),
             // Management
@@ -199,6 +214,7 @@ pub struct ExtentInfo {
     pub start_offset: u64,
     pub end_offset: u64,
     pub state: ExtentState,
+    pub epoch: u32,
     pub replicas: Vec<ReplicaDetail>,
 }
 

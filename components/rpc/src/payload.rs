@@ -223,17 +223,17 @@ pub fn parse_create_stream_payload(payload: &[u8]) -> Option<(String, u16)> {
 /// ```text
 /// [num_extents:u32]
 ///   per extent:
-///     [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+///     [extent_id:u32][start_offset:u64][end_offset:u64][state:u8][epoch:u32]
 ///     [num_replicas:u16]
 ///       per replica:
 ///         [addr_len:u16][addr_bytes][role:u8][is_alive:u8]
 /// ```
 pub fn encode_extent_info_vec(extents: &[ExtentInfo]) -> Bytes {
-    // Pre-compute capacity: 4 (num_extents) + per extent: 4+8+8+1+2 = 23 + replica data
+    // Pre-compute capacity: 4 (num_extents) + per extent: 4+8+8+1+4+2 = 27 + replica data
     let extent_size: usize = extents
         .iter()
         .map(|ext| {
-            23 + ext
+            27 + ext
                 .replicas
                 .iter()
                 .map(|r| 2 + r.node_addr.len() + 1 + 1)
@@ -247,6 +247,7 @@ pub fn encode_extent_info_vec(extents: &[ExtentInfo]) -> Bytes {
         buf.put_u64(ext.start_offset);
         buf.put_u64(ext.end_offset);
         buf.put_u8(ext.state.as_u8());
+        buf.put_u32(ext.epoch);
         buf.put_u16(ext.replicas.len() as u16);
         for r in &ext.replicas {
             buf.put_u16(r.node_addr.len() as u16);
@@ -269,8 +270,8 @@ pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<ExtentInfo>> {
 
     let mut extents = Vec::with_capacity(num_extents);
     for _ in 0..num_extents {
-        // Need at least 4+8+8+1+2 = 23 bytes for extent header
-        if payload.len() < pos + 23 {
+        // Need at least 4+8+8+1+4+2 = 27 bytes for extent header
+        if payload.len() < pos + 27 {
             return None;
         }
         let extent_id = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?);
@@ -281,6 +282,8 @@ pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<ExtentInfo>> {
         pos += 8;
         let state = ExtentState::from_u8(payload[pos]).unwrap_or(ExtentState::Unspecified);
         pos += 1;
+        let epoch = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?);
+        pos += 4;
         let num_replicas = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
         pos += 2;
 
@@ -312,6 +315,7 @@ pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<ExtentInfo>> {
             start_offset,
             end_offset,
             state,
+            epoch,
             replicas,
         });
     }
@@ -447,6 +451,7 @@ mod tests {
                 start_offset: 200,
                 end_offset: 300,
                 state: ExtentState::Sealed,
+                epoch: 0,
                 replicas: vec![
                     ReplicaDetail {
                         node_addr: "127.0.0.1:9801".to_string(),
@@ -465,6 +470,7 @@ mod tests {
                 start_offset: 300,
                 end_offset: 300,
                 state: ExtentState::Active,
+                epoch: 0,
                 replicas: vec![ReplicaDetail {
                     node_addr: "127.0.0.1:9803".to_string(),
                     role: 0,
@@ -485,6 +491,7 @@ mod tests {
             start_offset: 0,
             end_offset: 50,
             state: ExtentState::Flushed,
+            epoch: 0,
             replicas: vec![],
         }];
 

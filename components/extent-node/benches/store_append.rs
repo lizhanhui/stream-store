@@ -42,6 +42,7 @@ async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u64, extent_i
                     extent_id: ExtentId(extent_id),
                     role: 0,
                     replication_factor: 1,
+                    epoch: 0,
                 },
                 Some(payload),
             ),
