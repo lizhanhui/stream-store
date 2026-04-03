@@ -27,9 +27,18 @@ The unit of replication and the unit of S3 flush. A stream is composed of an ord
 
 When a trigger fires (size threshold, time interval, node failure, or **extent full**):
 
-A single `SEAL` opcode (0x05) covers all trigger sources. `Flags` bit 0 (`FLAG_OFFSET_PRESENT`) distinguishes whether the caller provides the resolved end offset:
+For **extent full**: handled autonomously by the Primary Extent Node within the current epoch — see "ExtentFull handling" below. Stream Manager is not involved.
 
-**Client Seal** (`FLAG_OFFSET_PRESENT = 0`):
+For **client timeout or failure recovery**: the `SEAL` opcode (0x05) is used. `Flags` distinguish the seal variant:
+
+**Client Seal (`FLAG_EPOCH_PRESENT = 1`)**:
+1. Client sends `Seal(stream_id, epoch)` to Stream Manager (client seals by epoch, not extent_id).
+2. Stream Manager looks up the Primary for that epoch and forwards the Seal.
+3. Primary seals its current active extent and responds with `(extent_id, end_offset)`.
+4. Stream Manager reconciles metadata, bumps epoch, allocates a new replica set.
+5. Stream Manager responds to client with the new extent info and new epoch.
+
+**Client Seal (`FLAG_OFFSET_PRESENT = 0`, legacy extent-based)**:
 1. Client sends `Seal(stream_id, extent_id)` to Stream Manager.
 2. Stream Manager sends `Seal` RPC to **each Extent Node holding a replica** (Primary and all Secondaries). Each Extent Node stops accepting appends and responds with its local commit length.
 3. Stream Manager determines the committed offset: if the Primary responded, its quorum offset is used (most accurate). Otherwise, SM computes the committed offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
@@ -50,12 +59,28 @@ Both paths share the same downstream procedure in Stream Manager: seal in MySQL 
 
 **Lazy Secondary Extent Creation**: Secondaries create extents on-demand when they receive the **first Forward frame** from the Primary, rather than requiring `RegisterExtent` to arrive first. The Forward frame (opcode 0x0B) carries all information the secondary needs (`stream_id`, `extent_id`, `start_offset`, `offset`, `byte_pos` in the variable header; arena capacity is a node-level config). This eliminates the race where a secondary receives forwards before `RegisterExtent` arrives, and reduces the seal-and-new critical path to a single SM↔Primary round-trip. `RegisterExtent` to secondaries is still sent as a fire-and-forget hint for arena pre-allocation, but is **not required for correctness**.
 
-**ExtentFull handling**: When the Primary's arena is exhausted, it takes two actions:
+**ExtentFull handling — Epoch-Based Autonomous Extent Creation**: When the Primary's arena is exhausted, the transition is handled **entirely within the Extent Node** — Stream Manager is not on the critical path. The system uses a **stream epoch** model:
 
-1. **Returns `ErrorCode::ExtentFull` (5)** to the client whose append triggered the overflow. This client knows to retry after obtaining the new extent from Stream Manager.
-2. **Proactively seals the extent and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` to Stream Manager** in the background. The `offset` is the committed end_offset that Stream Manager trusts without querying replicas. Stream Manager updates metadata, fire-and-forgets Seal RPCs to secondary ExtentNodes, allocates a new extent, waits for the new Primary's `RegisterExtentAck`, and responds -- all before most clients even see the error.
+1. **Stream Epoch**: Each stream has an epoch. Within an epoch, the replica set (Primary + Secondaries) is fixed. SM only bumps the epoch on failure recovery or rebalancing.
 
-This avoids an error storm where every concurrent client independently discovers the extent is full and races to trigger seal-and-new. Only the Primary initiates the seal -- once. Subsequent clients that arrive after the local seal see `ExtentSealed` and call `DescribeStream(count=1)` to get the new extent, which is already being allocated.
+2. **Autonomous Creation**: When the Primary's active extent fills up, the **stream-level leader** (pipelined group commit) handles the transition inline:
+   - Seals the current extent locally (atomic `limit` store)
+   - Creates a new extent with the next sequential ID (same replica set, same epoch)
+   - Retries the triggering append on the new extent — **the client never sees an error**
+   - Asynchronously notifies Stream Manager via `EXTENT_SEALED_NOTIFY` (fire-and-forget)
+   - Secondaries learn about the new extent via lazy creation on the first Forward frame
+
+3. **Stream-Level Leader Election**: The pipelined group commit leader election (`in_flight` counter + follower channel) operates at the **Stream level**, not the Extent level. This means:
+   - Only one thread writes to any extent in a stream at any time
+   - Extent transitions happen within the leader's turn — no re-election, no race
+   - Followers queued during the transition are processed on the new extent after it's created
+   - Message ordering is preserved by construction (single writer + FIFO channel)
+
+4. **SM Metadata Catch-Up**: Stream Manager receives `EXTENT_SEALED_NOTIFY` notifications and updates MySQL metadata asynchronously. If notifications are lost, SM reconciles at the next epoch bump.
+
+5. **Epoch Bump**: SM bumps the epoch when the replica set needs to change (node failure, rebalancing). SM sends `Seal(stream_id, epoch)` to the Primary, waits for it to seal, reconciles metadata, then allocates a new epoch with a new replica set.
+
+This eliminates the SM round-trip (1 EN↔SM RTT + MySQL transaction + 1 SM↔EN RTT) from the extent-full critical path, reducing it to a local seal + arena allocation (~microseconds).
 
 **Consistency** is resolved on the sealed extent (backward-looking). **Availability** is provided by the new extent (forward-looking). The system never blocks writes to achieve consistency.
 
@@ -644,14 +669,14 @@ Fields:
 
 ##### 0xFF ERROR (Any -> Any)
 
-Error response. Variable header carries the error code and the relevant extent ID (for ExtentFull/ExtentSealed errors so the client can identify which extent triggered the error without a round-trip).
+Error response. Variable header carries the error code and the relevant extent ID (for ExtentSealed errors so the client can identify which extent triggered the error without a round-trip).
 
 ```
 Fixed Header (8B)
 Variable Header:
   [request_id   : u32]    -- correlates with the request that caused the error
   [error_code   : u16]    -- 0=Ok, 1=UnknownStream, 2=InvalidOffset,
-                              3=ExtentSealed, 4=InternalError, 5=ExtentFull
+                              3=ExtentSealed, 4=InternalError
   [extent_id    : u32]    -- relevant extent (0 when not applicable)
 Payload:
   [payload_len  : u32]
@@ -808,9 +833,9 @@ CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)
 - **Hot data** (active/sealed-in-memory extents): Read from any replica.
 - **Cold data** (flushed extents): Read from S3 via read cache.
 
-### Extent-Node Concurrency: Pipelined Group Commit
+### Extent-Node Concurrency: Stream-Level Pipelined Group Commit
 
-The active extent on each Extent Node uses a **pipelined group commit** pattern to maximize append throughput under high concurrency. Instead of multiple writers contending on atomic cursors (which causes cache-line bouncing), a **leader election** delegates all writes to a single active writer per extent.
+Each stream on an Extent Node uses a **pipelined group commit** pattern to maximize append throughput under high concurrency. Instead of multiple writers contending on atomic cursors (which causes cache-line bouncing), a **leader election at the stream level** delegates all writes to a single active writer per stream. This means the leader can transparently handle extent-full transitions (seal + create new extent + retry) within its own turn — no re-election needed.
 
 #### Arena Layout
 
@@ -831,47 +856,58 @@ Extent Arena (pre-allocated contiguous buffer, configurable size):
   record_count    : AtomicU64 — number of records (sequence counter)
   committed_seq   : AtomicU64 — all records with seq < committed_seq are readable
   committed_bytes : AtomicU64 — byte position up to which all records are fully written
+
+Stream-level (not per-extent):
   in_flight       : AtomicU64 — leader election counter (0 = idle)
   job_tx/job_rx   : crossbeam unbounded channel for follower delegation
 ```
 
-#### Append Path (Pipelined Group Commit)
+#### Append Path (Stream-Level Pipelined Group Commit)
 
 ```
-Writer A arrives: in_flight.fetch_add(1) → prev=0 → LEADER
-  ├─ append_inner(payload_A) — plain load/store on cursors
+Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → LEADER
+  ├─ try_append_active(payload_A)
+  │   ├─ append_inner on active extent → OK
+  │   └─ return (AppendResult, extent_id)
   ├─ broadcast Forward (if RF≥2) or send AppendAck (if RF=1)
   ├─ in_flight.fetch_sub(1) → remaining=3 → drain batch
   │
   │  Writer B arrives: in_flight.fetch_add(1) → prev=1 → FOLLOWER
-  │  ├─ push AppendJob to job_tx
+  │  ├─ push AppendJob to stream.job_tx
   │  └─ return None (deferred)
   │
   │  Writer C arrives: in_flight.fetch_add(1) → prev=2 → FOLLOWER
-  │  ├─ push AppendJob to job_tx
+  │  ├─ push AppendJob to stream.job_tx
   │  └─ return None (deferred)
   │
   └─ drain loop:
-     ├─ recv jobs [B, C] from job_rx
-     ├─ append_inner(payload_B), send ACK/Forward for B
-     ├─ append_inner(payload_C), send ACK/Forward for C
+     ├─ recv jobs [B, C] from stream.job_rx
+     ├─ try_append_active(payload_B) → ExtentFull!
+     │   ├─ seal current extent, create_next_extent()
+     │   ├─ retry append on new extent → OK
+     │   └─ return (AppendResult, new_extent_id, SealNotification)
+     ├─ send Forward for B with new_extent_id
+     ├─ try_append_active(payload_C) → OK (on new extent)
+     ├─ send Forward for C with new_extent_id
      ├─ in_flight.fetch_sub(2) → remaining=0 → done
      └─ break
 ```
 
 Detailed steps:
 
-1. **Leader election**: `in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the thread is the **active writer** (fast path). If `prev > 0`, an active writer exists — push `AppendJob` to the channel and return immediately (slow path).
+1. **Stream-level leader election**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the thread is the **active writer** for the entire stream (fast path). If `prev > 0`, an active writer exists — push `AppendJob` to the stream's channel and return immediately (slow path).
 
-2. **Single-writer append** (`append_inner`): The leader uses plain `load`/`store` on `write_cursor` and `record_count` (no `fetch_add`). Same memcpy as before. Direct `store` of `committed_bytes`, index entry, and `committed_seq` — no spin-wait needed since there's only one writer.
+2. **Single-writer append** (`try_append_active` → `append_inner`): The leader uses plain `load`/`store` on `write_cursor` and `record_count` (no `fetch_add`). Same memcpy as before. Direct `store` of `committed_bytes`, index entry, and `committed_seq` — no spin-wait needed since there's only one writer.
 
-3. **Replication / ACK**: After append, the leader checks `ReplicaInfo`:
+3. **Extent-full transition** (inline, within leader's turn): If `append_inner` returns `ExtentFull`, the leader drops the shared DashMap ref, acquires an exclusive ref, calls `seal_and_create_next()`, re-acquires shared ref, retries. All within the same leader turn — no re-election, no race. Followers queued during the transition are processed on the new extent.
+
+4. **Replication / ACK**: After append, the leader checks `ReplicaInfo`:
    - **RF=1 / standalone / no replica**: Send immediate `AppendAck` via `response_tx`.
-   - **RF≥2 Primary**: Broadcast `Forward` to all secondaries, queue `PendingAck`.
+   - **RF≥2 Primary**: Broadcast `Forward` to all secondaries with the **actual extent_id** the record landed on (may differ from the client's request if transition happened), queue `PendingAck`.
 
-4. **Batch drain**: After own append, `in_flight.fetch_sub(1, Release)`. If `remaining > 1`, drain `job_rx` and process each follower's payload through the same append + replicate path. `in_flight.fetch_sub(batch_size, Release)` after each batch. Loop until `remaining ≤ batch_size`.
+5. **Batch drain**: After own append, `in_flight.fetch_sub(1, Release)`. If `remaining > 1`, drain `stream.job_rx` and process each follower's payload through `try_append_active` (which handles extent-full inline). `in_flight.fetch_sub(batch_size, Release)` after each batch. Loop until `remaining ≤ batch_size`.
 
-5. **Follower return**: Followers return `None` immediately. Their ACK (or error) is sent via `response_tx` by the leader.
+6. **Follower return**: Followers return `None` immediately. Their ACK (or error) is sent via `response_tx` by the leader.
 
 #### Atomic Ordering Analysis
 
@@ -1127,7 +1163,7 @@ read(stream, offset=1050, count=10)
 | Object storage API | S3-compatible | Widest ecosystem (AWS, MinIO, Ceph, Alibaba OSS S3-compat) |
 | Replication protocol | Broadcast replication with quorum ACK | O(1) hop latency (vs O(N) for chain), tolerates minority failures, simple parallel fan-out |
 | Durability before S3 | Pure in-memory N-way (default 2-way) | Low latency; single-node failure tolerated; S3 flush bounds risk |
-| Extent concurrency | Pipelined group commit with leader election, lock-free arena with internal compressed index for O(1) reads | Single active writer eliminates cache-line bouncing; followers delegate via channel; batch drain amortizes cost; no mutex on hot path |
+| Stream concurrency | Stream-level pipelined group commit with leader election, lock-free arena with internal compressed index for O(1) reads | Single active writer per stream eliminates cache-line bouncing; extent-full transition is inline (no re-election); followers delegate via channel; batch drain amortizes cost; no mutex on hot path |
 | Multi-dispatch | Shared data + index streams | Storage efficient; avoids body duplication across subscribers |
 | Stream Manager metadata store | MySQL (sqlx) | Reuses existing infra; metadata ops are infrequent (per-extent, not per-message) |
 | Consistency model | Seal-and-new (WAS) | Separates consistency (sealed extent) from availability (new extent) |
