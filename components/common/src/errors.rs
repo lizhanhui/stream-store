@@ -1,4 +1,4 @@
-use crate::types::{ExtentId, Offset, StreamId};
+use crate::types::{Epoch, ExtentId, Offset, StreamId};
 
 /// Errors returned by the storage system.
 #[derive(Debug, thiserror::Error)]
@@ -28,8 +28,8 @@ pub enum StorageError {
     #[error("extent full: {0:?}")]
     ExtentFull(ExtentId),
 
-    #[error("epoch stale: stream {0:?}")]
-    EpochStale(StreamId),
+    #[error("epoch stale: stream {0:?}, epoch {1:?}")]
+    EpochStale(StreamId, Epoch),
 
     #[error("internal error: {0}")]
     Internal(String),
