@@ -1,5 +1,4 @@
 use std::alloc::{Layout, alloc, dealloc};
-use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -8,9 +7,6 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{ExtentId, ExtentState, Offset};
-use crossbeam_channel::{Receiver, Sender, unbounded};
-
-use crate::store::AppendJob;
 
 /// Default arena capacity: 64 MB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
@@ -165,21 +161,10 @@ pub struct Extent {
     ///   with `ExtentSealed`.
     limit: AtomicU64,
 
-    /// Leader election counter for pipelined group commit.
-    /// 0 = idle. After fetch_add: 1 = sole writer (fast path), >1 = followers waiting.
-    /// Also used by `seal()` to wait for the active writer to drain.
-    in_flight: AtomicU64,
-
     /// Internal index mapping sequence number → byte position (compressed u32).
     /// Entry i holds the byte_pos for the i-th record appended to this extent.
     /// Capacity = arena_capacity / MIN_RECORD_SIZE.
     index: Box<[AtomicU32]>,
-
-    /// Channel for followers to submit append jobs to the active writer.
-    /// Wrapped in `UnsafeCell<Option<…>>` so we can drop them at seal time
-    /// to free the internal channel allocation. See accessor methods below.
-    job_tx: UnsafeCell<Option<Sender<AppendJob>>>,
-    job_rx: UnsafeCell<Option<Receiver<AppendJob>>>,
 }
 
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
@@ -217,8 +202,6 @@ impl Extent {
         }
         let index = index_entries.into_boxed_slice();
 
-        let (job_tx, job_rx) = unbounded();
-
         Self {
             id,
             start_offset,
@@ -230,60 +213,18 @@ impl Extent {
             committed_seq: AtomicU64::new(0),
             committed_bytes: AtomicU64::new(0),
             limit: AtomicU64::new(LIMIT_OPEN),
-            in_flight: AtomicU64::new(0),
             index,
-            job_tx: UnsafeCell::new(Some(job_tx)),
-            job_rx: UnsafeCell::new(Some(job_rx)),
         }
     }
 
     /// Append a message. Returns the assigned logical offset and the byte
     /// position within the arena.
     ///
-    /// This method uses the extent-level leader election (`in_flight` counter)
-    /// to ensure only one thread calls `append_inner()` at a time. Other
-    /// threads spin-wait until the leader finishes, then retry.
-    ///
-    /// In production, the store layer performs its own leader election and
-    /// calls `append_inner()` directly, bypassing this method.
+    /// In production, the store layer performs stream-level leader election and
+    /// calls `append_inner()` directly. This method is a convenience wrapper
+    /// for unit tests where single-threaded access is guaranteed.
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
-        loop {
-            let prev = self.in_flight.fetch_add(1, Ordering::Acquire);
-            if prev == 0 {
-                // I'm the leader — do the append.
-                let result = self.append_inner(payload);
-                // Release leadership. Remaining count = in_flight - 1.
-                let remaining = self.in_flight.fetch_sub(1, Ordering::Release);
-                // If others are waiting, we need to let them retry.
-                // They'll see in_flight decrement and loop again.
-                // But first, drain any that accumulated: they need to decrement
-                // their own in_flight and retry. We just need to release.
-                if remaining > 1 {
-                    // Other threads are spinning — they decremented on their own path.
-                    // Nothing to do here; they'll decrement and retry.
-                }
-                return result;
-            } else {
-                // Another leader is active. Decrement and spin-wait, then retry.
-                self.in_flight.fetch_sub(1, Ordering::Release);
-                // Brief spin-wait for the leader to finish.
-                let mut spin = 0u32;
-                loop {
-                    if self.in_flight.load(Ordering::Acquire) == 0 {
-                        break;
-                    }
-                    if spin < 6 {
-                        for _ in 0..(1 << spin) {
-                            std::hint::spin_loop();
-                        }
-                    } else {
-                        std::thread::yield_now();
-                    }
-                    spin += 1;
-                }
-                // Retry from the top.
-            }
-        }
+        self.append_inner(payload)
     }
 
     /// Single-writer append: plain loads/stores on cursors.
@@ -504,9 +445,8 @@ impl Extent {
     /// forwarded appends up to the primary's committed offset.
     ///
     /// If `None` (primary sealing itself), we set `limit` to the current
-    /// `record_count`. With pipelined group commit, the store layer ensures
-    /// all in-flight work is drained before calling seal, so we simply wait
-    /// for `in_flight == 0` to ensure the active writer has finished.
+    /// `record_count`. The caller (stream-level leader) must ensure all in-flight
+    /// work is drained before calling seal.
     pub fn seal(&self, committed_offset: Option<u64>) -> u64 {
         if let Some(offset) = committed_offset {
             // Secondary path: SM provides the authoritative committed offset.
@@ -517,15 +457,7 @@ impl Extent {
                 Ordering::Release,
                 Ordering::Acquire,
             ) {
-                Ok(_) => {
-                    // Free the job channel — no more appends possible after seal.
-                    // SAFETY: in_flight == 0 guarantees no concurrent access.
-                    unsafe {
-                        (*self.job_tx.get()).take();
-                        (*self.job_rx.get()).take();
-                    }
-                    self.start_offset.0 + count
-                }
+                Ok(_) => self.start_offset.0 + count,
                 Err(limit) => self.start_offset.0 + limit,
             }
         } else {
@@ -547,36 +479,11 @@ impl Extent {
                 }
             }
 
-            // Step 2: Wait for the active writer (if any) to finish draining.
-            // With group commit, in_flight > 0 means a leader is currently
-            // processing appends. Wait for it to finish.
-            let mut spin_count = 0u32;
-            loop {
-                let inflight = self.in_flight.load(Ordering::Acquire);
-                if inflight == 0 {
-                    break;
-                }
-                if spin_count < 6 {
-                    for _ in 0..(1 << spin_count) {
-                        std::hint::spin_loop();
-                    }
-                } else {
-                    std::thread::yield_now();
-                }
-                spin_count += 1;
-            }
-
-            // Step 3: Read the true final record_count and update limit.
+            // Step 2: Read the true final record_count and update limit.
+            // The caller ensures no writer is active (stream-level in_flight == 0).
             let final_count = self.record_count.load(Ordering::Acquire);
             if final_count > preliminary {
                 self.limit.store(final_count, Ordering::Release);
-            }
-
-            // Free the job channel — no more appends possible after seal.
-            // SAFETY: in_flight == 0 guarantees no concurrent access.
-            unsafe {
-                (*self.job_tx.get()).take();
-                (*self.job_rx.get()).take();
             }
 
             self.start_offset.0 + final_count
@@ -640,24 +547,6 @@ impl Extent {
         self.capacity
     }
 
-    /// Return the in_flight counter reference (for store-level leader election).
-    pub(crate) fn in_flight(&self) -> &AtomicU64 {
-        &self.in_flight
-    }
-
-    /// Return a reference to the job sender channel.
-    /// SAFETY: job_tx is `Some` from construction until `seal()` drops it.
-    /// Callers only invoke this while `in_flight > 0` (before seal completes).
-    pub(crate) fn job_tx(&self) -> &Sender<AppendJob> {
-        unsafe { (*self.job_tx.get()).as_ref().unwrap_unchecked() }
-    }
-
-    /// Return a reference to the job receiver channel.
-    /// SAFETY: same invariant as `job_tx`.
-    pub(crate) fn job_rx(&self) -> &Receiver<AppendJob> {
-        unsafe { (*self.job_rx.get()).as_ref().unwrap_unchecked() }
-    }
-
     /// Return a contiguous `Bytes` view of all committed record data in the arena.
     /// Useful for S3 flush -- the sealed extent can be uploaded as a single blob
     /// (after prepending header and appending footer/index).
@@ -686,7 +575,6 @@ impl std::fmt::Debug for Extent {
                 &self.committed_bytes.load(Ordering::Relaxed),
             )
             .field("limit", &self.limit.load(Ordering::Relaxed))
-            .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
             .finish()
     }
 }
@@ -801,58 +689,6 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_appends() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let ext = Arc::new(Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024));
-        let num_threads = 8;
-        let appends_per_thread = 1000;
-
-        let handles: Vec<_> = (0..num_threads)
-            .map(|t| {
-                let ext = Arc::clone(&ext);
-                thread::spawn(move || {
-                    let mut results = Vec::new();
-                    for i in 0..appends_per_thread {
-                        let msg = format!("t{t}-m{i}");
-                        let r = ext.append(Bytes::from(msg)).unwrap();
-                        results.push(r);
-                    }
-                    results
-                })
-            })
-            .collect();
-
-        let mut all_results: Vec<AppendResult> = Vec::new();
-        for h in handles {
-            all_results.extend(h.join().unwrap());
-        }
-
-        // All offsets should be unique and form a contiguous range.
-        all_results.sort_by_key(|r| r.offset.0);
-        let total = num_threads * appends_per_thread;
-        assert_eq!(all_results.len(), total);
-        for i in 0..total {
-            assert_eq!(all_results[i].offset.0, i as u64, "offset {} is wrong", i);
-        }
-
-        // All records should be readable via their byte_pos.
-        assert_eq!(ext.message_count(), total as u64);
-        for r in &all_results {
-            let msgs = ext.read(r.byte_pos, 1).unwrap();
-            assert_eq!(msgs.len(), 1);
-            assert!(!msgs[0].is_empty());
-            let s = std::str::from_utf8(&msgs[0]).unwrap();
-            assert!(s.starts_with('t'));
-        }
-
-        // Also verify sequential read from byte 0 returns all records.
-        let all_msgs = ext.read(0, total as u32).unwrap();
-        assert_eq!(all_msgs.len(), total);
-    }
-
-    #[test]
     fn index_lookup_basic() {
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
 
@@ -884,48 +720,6 @@ mod tests {
 
         // Internal index uses seq (0-based within extent), not global offset.
         assert_eq!(ext.index_lookup(0), Some(r0.byte_pos));
-    }
-
-    #[test]
-    fn concurrent_appends_index_consistent() {
-        use std::sync::Arc;
-        use std::thread;
-
-        let ext = Arc::new(Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024));
-        let num_threads = 8;
-        let appends_per_thread = 1000;
-
-        let handles: Vec<_> = (0..num_threads)
-            .map(|t| {
-                let ext = Arc::clone(&ext);
-                thread::spawn(move || {
-                    let mut results = Vec::new();
-                    for i in 0..appends_per_thread {
-                        let msg = format!("t{t}-m{i}");
-                        let r = ext.append(Bytes::from(msg)).unwrap();
-                        results.push(r);
-                    }
-                    results
-                })
-            })
-            .collect();
-
-        let mut all_results: Vec<AppendResult> = Vec::new();
-        for h in handles {
-            all_results.extend(h.join().unwrap());
-        }
-
-        // Verify every appended record has a consistent index entry.
-        all_results.sort_by_key(|r| r.offset.0);
-        let total = num_threads * appends_per_thread;
-        for i in 0..total {
-            let seq = all_results[i].offset.0;
-            let expected_byte_pos = all_results[i].byte_pos;
-            let actual = ext
-                .index_lookup(seq)
-                .expect(&format!("seq {} should be set", seq));
-            assert_eq!(actual, expected_byte_pos, "index mismatch at seq {}", seq);
-        }
     }
 
     #[test]
@@ -1050,90 +844,4 @@ mod tests {
         assert!(!ext.accepts_post_seal_writes());
     }
 
-    /// Proves that seal(None) is atomic with concurrent appenders:
-    /// after seal returns, limit == committed_seq == record_count.
-    /// No phantom writes, no orphaned data.
-    #[test]
-    fn seal_is_atomic_with_concurrent_appends() {
-        use std::sync::{Arc, Barrier};
-        use std::thread;
-
-        // Run multiple iterations to exercise the race window.
-        for _ in 0..50 {
-            let ext = Arc::new(Extent::with_capacity(
-                ExtentId(1),
-                Offset(0),
-                4 * 1024 * 1024,
-            ));
-            let num_appenders = 8;
-            let appends_per_thread = 500;
-
-            // Barrier so all appenders and the sealer start simultaneously.
-            let barrier = Arc::new(Barrier::new(num_appenders + 1));
-
-            // Spawn appender threads — they race with the seal.
-            let appender_handles: Vec<_> = (0..num_appenders)
-                .map(|t| {
-                    let ext = Arc::clone(&ext);
-                    let barrier = Arc::clone(&barrier);
-                    thread::spawn(move || {
-                        barrier.wait();
-                        let mut count = 0u64;
-                        for i in 0..appends_per_thread {
-                            let msg = format!("t{t}-m{i}");
-                            match ext.append(Bytes::from(msg)) {
-                                Ok(_) => count += 1,
-                                Err(StorageError::ExtentSealed(_)) => break,
-                                Err(e) => panic!("unexpected error: {e}"),
-                            }
-                        }
-                        count
-                    })
-                })
-                .collect();
-
-            // Seal from the main thread — races with appenders.
-            barrier.wait();
-            // Let appenders run briefly before sealing.
-            std::hint::spin_loop();
-            let seal_offset = ext.seal(None);
-
-            // Collect total successful appends from all threads.
-            let total_appended: u64 = appender_handles
-                .into_iter()
-                .map(|h| h.join().unwrap())
-                .sum();
-
-            // Key invariants — the entire point of atomic seal:
-            let final_limit = ext.limit.load(Ordering::Acquire);
-            let final_committed = ext.committed_seq.load(Ordering::Acquire);
-            let final_record_count = ext.record_count.load(Ordering::Acquire);
-
-            assert_eq!(
-                final_limit, final_committed,
-                "limit must equal committed_seq (no phantom writes)"
-            );
-            assert_eq!(
-                final_limit, final_record_count,
-                "limit must equal record_count (all in-flight writers finished)"
-            );
-            assert_eq!(
-                seal_offset,
-                ext.start_offset.0 + final_limit,
-                "seal return value must match final limit"
-            );
-            assert_eq!(
-                total_appended, final_limit,
-                "total successful appends must match sealed limit"
-            );
-
-            // Every committed record's index entry must be set — no orphaned data.
-            for seq in 0..final_committed {
-                assert!(
-                    ext.index_lookup(seq).is_some(),
-                    "index entry for seq {seq} must be set"
-                );
-            }
-        }
-    }
 }
