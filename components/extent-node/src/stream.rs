@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
-use common::types::{ExtentId, ExtentState, Offset, StreamId};
+use common::types::{Epoch, ExtentId, ExtentState, Offset, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
 use crate::extent::{AppendResult, Extent, DEFAULT_ARENA_CAPACITY};
@@ -31,7 +31,7 @@ pub struct Stream {
     extents: Vec<Extent>,
     /// Current epoch assigned by Stream Manager. Within an epoch, the replica set
     /// is fixed and the Primary can autonomously create extents on extent-full.
-    epoch: u32,
+    epoch: Epoch,
     /// Next extent ID for autonomous creation within the current epoch.
     /// Initialized to `first_extent_id + 1` when SM sends RegisterExtent.
     next_extent_id: ExtentId,
@@ -52,7 +52,7 @@ impl Stream {
         Self {
             id,
             extents: Vec::new(),
-            epoch: 0,
+            epoch: Epoch(0),
             next_extent_id: ExtentId(0),
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             in_flight: AtomicU64::new(0),
@@ -68,7 +68,7 @@ impl Stream {
         id: ExtentId,
         start_offset: Offset,
         capacity: usize,
-        epoch: u32,
+        epoch: Epoch,
     ) {
         self.epoch = epoch;
         self.arena_capacity = capacity;
@@ -224,7 +224,7 @@ impl Stream {
     }
 
     /// Current epoch of this stream.
-    pub fn epoch(&self) -> u32 {
+    pub fn epoch(&self) -> Epoch {
         self.epoch
     }
 
@@ -310,7 +310,7 @@ pub struct SealNotification {
     pub sealed_extent_id: ExtentId,
     pub end_offset: u64,
     pub new_extent_id: ExtentId,
-    pub epoch: u32,
+    pub epoch: Epoch,
 }
 
 impl std::fmt::Debug for Stream {
@@ -334,7 +334,7 @@ mod tests {
     /// Helper: create a stream with one active extent (simulating RegisterExtent from SM).
     fn new_stream_with_extent(id: StreamId) -> Stream {
         let mut stream = Stream::new(id);
-        stream.register_extent(ExtentId(0), Offset(0), DEFAULT_ARENA_CAPACITY, 0);
+        stream.register_extent(ExtentId(0), Offset(0), DEFAULT_ARENA_CAPACITY, Epoch(0));
         stream
     }
 
@@ -448,7 +448,7 @@ mod tests {
 
         // Register a new extent (simulating SM sending RegisterExtent).
         let second_extent_id = ExtentId(1);
-        stream.register_extent(second_extent_id, Offset(3), DEFAULT_ARENA_CAPACITY, 0);
+        stream.register_extent(second_extent_id, Offset(3), DEFAULT_ARENA_CAPACITY, Epoch(0));
         assert!(stream.is_mutable());
         assert_eq!(stream.max_offset(), Offset(3)); // new extent is empty
 
@@ -479,7 +479,7 @@ mod tests {
 
         // Register a new extent and append.
         let second_extent_id = ExtentId(1);
-        stream.register_extent(second_extent_id, Offset(1), DEFAULT_ARENA_CAPACITY, 0);
+        stream.register_extent(second_extent_id, Offset(1), DEFAULT_ARENA_CAPACITY, Epoch(0));
         let r = stream
             .append(second_extent_id, Bytes::from_static(b"b"))
             .unwrap();

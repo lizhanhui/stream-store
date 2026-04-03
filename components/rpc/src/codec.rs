@@ -31,7 +31,7 @@ mod tests {
     use super::*;
     use crate::frame::VariableHeader;
     use bytes::Bytes;
-    use common::types::{ExtentId, StreamId};
+    use common::types::{Epoch, ExtentId, StreamId};
 
     #[test]
     fn codec_round_trip() {
@@ -40,7 +40,7 @@ mod tests {
             VariableHeader::Append {
                 request_id: 1,
                 stream_id: StreamId(10),
-                epoch: 0,
+                epoch: Epoch(0),
             },
             Some(Bytes::from_static(b"test payload")),
         );

@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
-use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use dashmap::DashMap;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
@@ -39,8 +39,7 @@ pub struct PendingAck {
     pub assigned_offset: u64,
     /// The extent the record landed on (for diagnostics in AppendAck).
     pub extent_id: ExtentId,
-    /// The epoch at append time (for diagnostics in AppendAck).
-    pub epoch: u32,
+    pub epoch: Epoch,
     /// When this PendingAck was created, for timeout expiry.
     pub created_at: Instant,
 }
@@ -178,8 +177,7 @@ pub struct SealRequest {
     pub end_offset: u64,
     /// The newly created extent that replaced the sealed one.
     pub new_extent_id: ExtentId,
-    /// Epoch under which the seal and creation occurred.
-    pub epoch: u32,
+    pub epoch: Epoch,
 }
 
 // ── Replica info ─────────────────────────────────────────────────────────────
@@ -548,11 +546,11 @@ impl ExtentNodeStore {
 
         // Epoch validation: reject if the client's epoch doesn't match the stream's.
         let epoch = stream_ref.epoch();
-        if client_epoch != 0 && client_epoch != epoch {
+        if client_epoch != Epoch(0) && client_epoch != epoch {
             return Some(Frame::error_response(
                 frame.request_id(),
                 ErrorCode::EpochStale,
-                &format!("epoch stale: client={}, current={}", client_epoch, epoch),
+                &format!("epoch stale: client={:?}, current={:?}", client_epoch, epoch),
                 ExtentId(0),
             ));
         }
@@ -659,7 +657,7 @@ impl ExtentNodeStore {
         stream: &Stream,
         request_id: u32,
         stream_id: StreamId,
-        epoch: u32,
+        epoch: Epoch,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
     ) -> (Option<Frame>, bool, Vec<(String, Frame)>) {
@@ -901,7 +899,7 @@ impl ExtentNodeStore {
         &self,
         request_id: u32,
         stream_id: StreamId,
-        epoch: u32,
+        epoch: Epoch,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
         forward_work: &mut Vec<(String, Frame)>,
@@ -1358,7 +1356,7 @@ impl ExtentNodeStore {
             None => {
                 // Forward arrived before RegisterExtent — lazy extent creation.
                 let mut stream = Stream::new(stream_id);
-                stream.register_extent(extent_id, start_offset, self.arena_capacity, 0);
+                stream.register_extent(extent_id, start_offset, self.arena_capacity, Epoch(0));
                 self.streams.insert(stream_id, stream);
 
                 self.next_stream_id
@@ -1402,7 +1400,7 @@ impl ExtentNodeStore {
                 drop(stream_ref);
                 if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
                     if stream_mut.find_extent(extent_id).is_none() {
-                        stream_mut.register_extent(extent_id, start_offset, self.arena_capacity, 0);
+                        stream_mut.register_extent(extent_id, start_offset, self.arena_capacity, Epoch(0));
                         info!(
                             "Lazy extent creation on forward (existing stream): stream={:?}, extent={:?}, start_offset={:?}",
                             stream_id, extent_id, start_offset,
@@ -1716,7 +1714,7 @@ mod tests {
                         extent_id: ExtentId(1),
                         role: 0,
                         replication_factor: 1,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload),
                 ),
@@ -1739,7 +1737,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: sid,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(Bytes::from_static(b"hello")),
                 ),
@@ -1761,7 +1759,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 1,
                         stream_id: StreamId(999),
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(Bytes::from_static(b"fail")),
                 ),
@@ -1784,7 +1782,7 @@ mod tests {
                         VariableHeader::Append {
                             request_id: 10 + i,
                             stream_id: sid,
-                            epoch: 0,
+                            epoch: Epoch(0),
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),
@@ -1889,7 +1887,7 @@ mod tests {
                         extent_id: ExtentId(100),
                         role: 0,
                         replication_factor: 2,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload),
                 ),
@@ -1932,7 +1930,7 @@ mod tests {
                         extent_id: ExtentId(100),
                         role: 1,
                         replication_factor: 2,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload),
                 ),
@@ -1970,7 +1968,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         role: 0,
                         replication_factor: 1,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload),
                 ),
@@ -1986,7 +1984,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: StreamId(10),
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(Bytes::from_static(b"hello standalone")),
                 ),
@@ -2029,7 +2027,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         role: 0,
                         replication_factor: 3,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload),
                 ),
@@ -2045,7 +2043,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: StreamId(10),
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(Bytes::from_static(b"broadcast msg")),
                 ),
@@ -2110,7 +2108,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         role: 1,
                         replication_factor: 2,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload),
                 ),
@@ -2155,7 +2153,7 @@ mod tests {
                 request_id: i as u32,
                 stream_id: StreamId(10),
                 extent_id: ExtentId(0),
-                epoch: 0,
+                epoch: Epoch(0),
                 response_tx: resp_tx.clone(),
                 assigned_offset: i,
                 created_at: Instant::now(),
@@ -2207,7 +2205,7 @@ mod tests {
             request_id: 42,
             stream_id: StreamId(10),
             extent_id: ExtentId(0),
-            epoch: 0,
+            epoch: Epoch(0),
             response_tx: resp_tx.clone(),
             assigned_offset: 0,
             created_at: Instant::now() - REPLICATION_TIMEOUT - Duration::from_secs(1),
@@ -2218,7 +2216,7 @@ mod tests {
             request_id: 43,
             stream_id: StreamId(10),
             extent_id: ExtentId(0),
-            epoch: 0,
+            epoch: Epoch(0),
             response_tx: resp_tx.clone(),
             assigned_offset: 1,
             created_at: Instant::now(),
@@ -2283,7 +2281,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    epoch: 0,
+                                    epoch: Epoch(0),
                                 },
                                 Some(Bytes::from(payload_data.clone())),
                             ),
@@ -2466,7 +2464,7 @@ mod tests {
                             VariableHeader::Append {
                                 request_id: j,
                                 stream_id: sid,
-                                epoch: 0,
+                                epoch: Epoch(0),
                             },
                             Some(Bytes::from(format!("pre-{j}"))),
                         ),
@@ -2494,7 +2492,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    epoch: 0,
+                                    epoch: Epoch(0),
                                 },
                                 Some(Bytes::from_static(b"write-payload")),
                             ),
@@ -2620,7 +2618,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    epoch: 0,
+                                    epoch: Epoch(0),
                                 },
                                 Some(Bytes::from(format!("t{task_idx}-m{seq}"))),
                             ),
@@ -2715,7 +2713,7 @@ mod tests {
                         extent_id: ExtentId(50),
                         role: 1,
                         replication_factor: 2,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload),
                 ),
@@ -2835,7 +2833,7 @@ mod tests {
                         VariableHeader::Append {
                             request_id: 10 + i,
                             stream_id: sid,
-                            epoch: 0,
+                            epoch: Epoch(0),
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),

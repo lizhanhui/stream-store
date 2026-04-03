@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use client::StorageClient;
+use common::types::Epoch;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
@@ -203,7 +204,7 @@ async fn sender_task(
 
                 tokio::spawn(async move {
                     let t0 = Instant::now();
-                    let outcome = match en_client.append(stream_id, 0, payload).await {
+                    let outcome = match en_client.append(stream_id, Epoch(0), payload).await {
                         Ok(_) => AppendOutcome::Ok(t0.elapsed()),
                         Err(e) => {
                             warn!("sender {sender_id}: append error: {e}");

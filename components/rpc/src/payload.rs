@@ -1,7 +1,7 @@
 //! Wire-format payload encoding/decoding helpers used by ExtentNode, StreamManager, and clients.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::types::{ExtentInfo, ExtentState, NodeMetrics, ReplicaDetail};
+use common::types::{Epoch, ExtentInfo, ExtentState, NodeMetrics, ReplicaDetail};
 
 /// Build a Connect payload: [node_id_len:u16][node_id][addr_len:u16][addr][interval_ms:u32]
 pub fn build_connect_payload(node_id: &str, addr: &str, interval_ms: u32) -> Bytes {
@@ -247,7 +247,7 @@ pub fn encode_extent_info_vec(extents: &[ExtentInfo]) -> Bytes {
         buf.put_u64(ext.start_offset);
         buf.put_u64(ext.end_offset);
         buf.put_u8(ext.state.as_u8());
-        buf.put_u32(ext.epoch);
+        buf.put_u32(ext.epoch.0);
         buf.put_u16(ext.replicas.len() as u16);
         for r in &ext.replicas {
             buf.put_u16(r.node_addr.len() as u16);
@@ -282,7 +282,7 @@ pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<ExtentInfo>> {
         pos += 8;
         let state = ExtentState::from_u8(payload[pos]).unwrap_or(ExtentState::Unspecified);
         pos += 1;
-        let epoch = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?);
+        let epoch = Epoch(u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?));
         pos += 4;
         let num_replicas = u16::from_be_bytes([payload[pos], payload[pos + 1]]) as usize;
         pos += 2;
@@ -451,7 +451,7 @@ mod tests {
                 start_offset: 200,
                 end_offset: 300,
                 state: ExtentState::Sealed,
-                epoch: 0,
+                epoch: Epoch(0),
                 replicas: vec![
                     ReplicaDetail {
                         node_addr: "127.0.0.1:9801".to_string(),
@@ -470,7 +470,7 @@ mod tests {
                 start_offset: 300,
                 end_offset: 300,
                 state: ExtentState::Active,
-                epoch: 0,
+                epoch: Epoch(0),
                 replicas: vec![ReplicaDetail {
                     node_addr: "127.0.0.1:9803".to_string(),
                     role: 0,
@@ -491,7 +491,7 @@ mod tests {
             start_offset: 0,
             end_offset: 50,
             state: ExtentState::Flushed,
-            epoch: 0,
+            epoch: Epoch(0),
             replicas: vec![],
         }];
 

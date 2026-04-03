@@ -36,6 +36,12 @@ pub struct StreamId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExtentId(pub u32);
 
+/// Stream epoch. Identifies a replica set assignment. Bumped by Stream Manager
+/// on node failure or rebalancing; within an epoch the Primary can autonomously
+/// create extents on extent-full without SM involvement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Epoch(pub u32);
+
 /// Logical offset within a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Offset(pub u64);
@@ -214,7 +220,7 @@ pub struct ExtentInfo {
     pub start_offset: u64,
     pub end_offset: u64,
     pub state: ExtentState,
-    pub epoch: u32,
+    pub epoch: Epoch,
     pub replicas: Vec<ReplicaDetail>,
 }
 
