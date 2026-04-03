@@ -526,7 +526,9 @@ impl ExtentNodeStore {
         response_tx: Option<&mpsc::Sender<Frame>>,
     ) -> Option<Frame> {
         let stream_id = frame.stream_id();
-        let extent_id = frame.extent_id();
+        // Note: frame.extent_id() is intentionally ignored. In the epoch-based model,
+        // the client's extent_id may be stale; try_append_active() routes to the
+        // current active extent.
 
         // Get the stream entry (per-stream lock, not global).
         let stream_ref = match self.streams.get(&stream_id) {
@@ -541,19 +543,11 @@ impl ExtentNodeStore {
             }
         };
 
-        // Reject early if the active extent is already sealed.
-        if let Some(extent) = stream_ref.find_extent(extent_id) {
-            if extent.is_sealed() {
-                return Some(Frame::error_response(
-                    frame.request_id(),
-                    ErrorCode::ExtentSealed,
-                    "extent is sealed",
-                    ExtentId(0),
-                ));
-            }
-        }
-
         // Leader election: fetch_add(1, Acquire) on the stream's in_flight counter.
+        // Note: no early extent_id validation here. In the epoch-based model, the client's
+        // extent_id may be stale (the Primary has already moved to a new extent via
+        // autonomous seal-and-new). try_append_active() always routes to the current
+        // active extent regardless of what extent_id the client sent.
         let prev = stream_ref.in_flight().fetch_add(1, Ordering::Acquire);
 
         if prev > 0 {
@@ -958,7 +952,6 @@ impl ExtentNodeStore {
         response_tx: Option<&mpsc::Sender<Frame>>,
     ) -> Vec<Frame> {
         let stream_id = frames[0].stream_id();
-        let extent_id = frames[0].extent_id();
         let mut responses = Vec::new();
 
         // Single DashMap.get(streams).
@@ -977,20 +970,8 @@ impl ExtentNodeStore {
             }
         };
 
-        // Single sealed check on the active extent.
-        if let Some(extent) = stream_ref.find_extent(extent_id) {
-            if extent.is_sealed() {
-                for frame in frames {
-                    responses.push(Frame::error_response(
-                        frame.request_id(),
-                        ErrorCode::ExtentSealed,
-                        "extent is sealed",
-                        ExtentId(0),
-                    ));
-                }
-                return responses;
-            }
-        }
+        // No early extent_id validation. In the epoch-based model, the client's extent_id
+        // may be stale. try_append_active() routes to the current active extent.
 
         let batch_len = frames.len() as u64;
 
