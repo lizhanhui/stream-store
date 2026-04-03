@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::types::{ExtentId, StreamId};
+use common::types::{Epoch, ExtentId, StreamId};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use extent_node::store::ExtentNodeStore;
 use rpc::frame::{Frame, VariableHeader};
@@ -42,7 +42,7 @@ async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u64, extent_i
                     extent_id: ExtentId(extent_id),
                     role: 0,
                     replication_factor: 1,
-                    epoch: 0,
+                    epoch: Epoch(0),
                 },
                 Some(payload),
             ),
@@ -76,7 +76,7 @@ fn bench_store_append_single(c: &mut Criterion) {
                     VariableHeader::Append {
                         request_id: seq,
                         stream_id: StreamId(1),
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload.clone()),
                 );
@@ -143,7 +143,7 @@ fn bench_store_append_concurrent(c: &mut Criterion) {
                                                     request_id: (t as u64 * ops_per_thread + seq)
                                                         as u32,
                                                     stream_id: StreamId(1),
-                                                    epoch: 0,
+                                                    epoch: Epoch(0),
                                                 },
                                                 Some(p.clone()),
                                             );

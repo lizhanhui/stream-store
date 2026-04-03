@@ -4,7 +4,7 @@ use std::time::Duration;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
 use common::errors::StorageError;
-use common::types::{ErrorCode, ExtentId, Offset, Opcode, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use futures_util::future;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{
@@ -126,7 +126,7 @@ impl StreamManagerStore {
                         extent_id: eid,
                         role: 0, // Primary
                         replication_factor: rf,
-                        epoch: 0,
+                        epoch: Epoch(0),
                     },
                     Some(payload),
                 ))
@@ -197,7 +197,7 @@ impl StreamManagerStore {
                                     extent_id: eid,
                                     role,
                                     replication_factor: rf,
-                                    epoch: 0,
+                                    epoch: Epoch(0),
                                 },
                                 Some(payload),
                             ))
@@ -262,7 +262,7 @@ impl StreamManagerStore {
 
         let extent_id = self
             .store
-            .allocate_extent(stream_id, start_offset, &replicas, 0)
+            .allocate_extent(stream_id, start_offset, &replicas, Epoch(0))
             .await?;
 
         info!(
@@ -833,7 +833,7 @@ impl StreamManagerStore {
         // Transactional seal + allocate (idempotent for already-sealed extents).
         let seal_result = self
             .store
-            .seal_and_allocate_transaction(stream_id, extent_id, end_offset, &new_replicas, 0)
+            .seal_and_allocate_transaction(stream_id, extent_id, end_offset, &new_replicas, Epoch(0))
             .await?;
 
         let (new_extent_id, primary_addr) = match seal_result {
@@ -1049,10 +1049,10 @@ impl StreamManagerStore {
         &self,
         request_id: u32,
         stream_id: StreamId,
-        epoch: u32,
+        epoch: Epoch,
     ) -> Frame {
         info!(
-            "Epoch-based seal: stream={:?}, epoch={}",
+            "Epoch-based seal: stream={:?}, epoch={:?}",
             stream_id, epoch
         );
 
@@ -1208,7 +1208,7 @@ impl StreamManagerStore {
         } = &frame.variable_header
         {
             info!(
-                "ExtentSealedNotify: stream={:?}, epoch={}, sealed_extent={:?}, end_offset={}, new_extent={:?}",
+                "ExtentSealedNotify: stream={:?}, epoch={:?}, sealed_extent={:?}, end_offset={}, new_extent={:?}",
                 stream_id, epoch, sealed_extent_id, end_offset.0, new_extent_id
             );
             if let Err(e) = self

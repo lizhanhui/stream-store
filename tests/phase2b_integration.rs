@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::types::{ExtentId, Offset, Opcode, StreamId};
+use common::types::{Epoch, ExtentId, Offset, Opcode, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::build_register_extent_payload;
 
@@ -79,7 +79,7 @@ async fn register_extent(
                 extent_id: ExtentId(extent_id),
                 role,
                 replication_factor,
-                epoch: 0,
+                epoch: Epoch(0),
             },
             Some(payload),
         ))
@@ -133,7 +133,7 @@ async fn broadcast_replication_rf2() {
         let r = client
             .append(
                 StreamId(stream_id),
-                0, // epoch
+                Epoch(0), // epoch
                 Bytes::from(format!("msg-{i}")),
             )
             .await
@@ -213,7 +213,7 @@ async fn broadcast_replication_rf3() {
         let r = client
             .append(
                 StreamId(stream_id),
-                0, // epoch
+                Epoch(0), // epoch
                 Bytes::from(format!("rf3-msg-{i}")),
             )
             .await
@@ -275,7 +275,7 @@ async fn multi_stream_shared_downstream() {
         client
             .append(
                 StreamId(stream_a),
-                0, // epoch
+                Epoch(0), // epoch
                 Bytes::from(format!("a-msg-{i}")),
             )
             .await
@@ -287,7 +287,7 @@ async fn multi_stream_shared_downstream() {
         client
             .append(
                 StreamId(stream_b),
-                0, // epoch
+                Epoch(0), // epoch
                 Bytes::from(format!("b-msg-{i}")),
             )
             .await
@@ -345,7 +345,7 @@ async fn broadcast_replication_rf1_immediate_ack() {
         let r = client
             .append(
                 StreamId(stream_id),
-                0, // epoch
+                Epoch(0), // epoch
                 Bytes::from(format!("rf1-msg-{i}")),
             )
             .await

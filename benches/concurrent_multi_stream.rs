@@ -23,6 +23,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StorageClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
+use common::types::Epoch;
 use extent_node::ExtentNode;
 use sqlx::mysql::MySqlPoolOptions;
 use stream_manager::StreamManager;
@@ -200,7 +201,7 @@ async fn client_task(
     // Append loop -- extent-full is handled transparently by the Primary.
     while Instant::now() < deadline {
         match extent_node_client
-            .append(stream_id, 0, payload.clone())
+            .append(stream_id, Epoch(0), payload.clone())
             .await
         {
             Ok(_) => {

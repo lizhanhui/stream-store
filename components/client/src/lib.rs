@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use bytes::{Buf, Bytes};
 use common::config::{RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
 use common::errors::StorageError;
-use common::types::{ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId};
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
@@ -27,8 +27,7 @@ pub struct AppendResult {
     pub offset: Offset,
     /// The extent the record was written to (server-assigned, for diagnostics).
     pub extent_id: ExtentId,
-    /// The epoch at the time of the append (for diagnostics).
-    pub epoch: u32,
+    pub epoch: Epoch,
 }
 
 type PendingMap = HashMap<u32, oneshot::Sender<Result<Frame, StorageError>>>;
@@ -254,7 +253,7 @@ impl StorageClient {
     pub async fn append(
         &self,
         stream_id: StreamId,
-        epoch: u32,
+        epoch: Epoch,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
         let req = Frame::new(

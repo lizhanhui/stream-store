@@ -1,5 +1,5 @@
 use common::errors::StorageError;
-use common::types::{ExtentId, ExtentInfo, ExtentState, NodeState, ReplicaDetail, StreamId};
+use common::types::{Epoch, ExtentId, ExtentInfo, ExtentState, NodeState, ReplicaDetail, StreamId};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{Acquire, MySqlPool, Row};
 use tracing::info;
@@ -26,7 +26,7 @@ pub struct ExtentRow {
     pub start_offset: u64,
     pub end_offset: u64,
     pub state: ExtentState,
-    pub epoch: u32,
+    pub epoch: Epoch,
 }
 
 /// A row from the `extent_replica` table.
@@ -182,7 +182,7 @@ impl MetadataStore {
         stream_id: StreamId,
         start_offset: u64,
         nodes: &[(String, u8)],
-        epoch: u32,
+        epoch: Epoch,
     ) -> Result<ExtentId, StorageError> {
         if nodes.is_empty() {
             return Err(StorageError::Internal(
@@ -233,7 +233,7 @@ impl MetadataStore {
         .bind(start_offset as i64)
         .bind(start_offset as i64) // end_offset = start_offset for new active extent
         .bind(ExtentState::Active.as_u8())
-        .bind(epoch as i32)
+        .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("insert extent: {e}")))?;
@@ -291,7 +291,7 @@ impl MetadataStore {
         extent_id: ExtentId,
         end_offset: u64,
         nodes: &[(String, u8)],
-        epoch: u32,
+        epoch: Epoch,
     ) -> Result<SealResult, StorageError> {
         let mut conn = self
             .pool
@@ -414,7 +414,7 @@ impl MetadataStore {
         .bind(new_start_offset as i64)
         .bind(new_start_offset as i64) // end_offset = start_offset for new active extent
         .bind(ExtentState::Active.as_u8())
-        .bind(epoch as i32)
+        .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("insert extent: {e}")))?;
@@ -529,7 +529,7 @@ impl MetadataStore {
             start_offset: r.get::<i64, _>("start_offset") as u64,
             end_offset: r.get::<i64, _>("end_offset") as u64,
             state: ExtentState::from_u8(state_val).unwrap_or(ExtentState::Unspecified),
-            epoch: r.get::<i32, _>("epoch") as u32,
+            epoch: Epoch(r.get::<i32, _>("epoch") as u32),
         }
     }
 
@@ -821,17 +821,17 @@ impl MetadataStore {
     // ── Epoch operations ──
 
     /// Get the current epoch for a stream.
-    pub async fn get_stream_epoch(&self, stream_id: StreamId) -> Result<u32, StorageError> {
+    pub async fn get_stream_epoch(&self, stream_id: StreamId) -> Result<Epoch, StorageError> {
         let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ?")
             .bind(stream_id.0 as i64)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_epoch: {e}")))?;
-        Ok(row.get::<i32, _>("epoch") as u32)
+        Ok(Epoch(row.get::<i32, _>("epoch") as u32))
     }
 
     /// Bump the epoch for a stream. Returns the new epoch.
-    pub async fn bump_epoch(&self, stream_id: StreamId) -> Result<u32, StorageError> {
+    pub async fn bump_epoch(&self, stream_id: StreamId) -> Result<Epoch, StorageError> {
         sqlx::query("UPDATE stream SET epoch = epoch + 1 WHERE stream_id = ?")
             .bind(stream_id.0 as i64)
             .execute(&self.pool)
@@ -854,7 +854,7 @@ impl MetadataStore {
     pub async fn record_extent_sealed(
         &self,
         stream_id: StreamId,
-        epoch: u32,
+        epoch: Epoch,
         sealed_extent_id: ExtentId,
         end_offset: u64,
         new_extent_id: ExtentId,
@@ -877,7 +877,7 @@ impl MetadataStore {
             .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
 
         if let Some(row) = row {
-            let current_epoch = row.get::<i32, _>("epoch") as u32;
+            let current_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
             if epoch != current_epoch {
                 // Stale notification from an old epoch — skip.
                 tx.commit()
@@ -916,7 +916,7 @@ impl MetadataStore {
         .bind(end_offset as i64)  // new extent starts where old one ended
         .bind(end_offset as i64)  // end_offset = start_offset for active
         .bind(ExtentState::Active.as_u8())
-        .bind(epoch as i32)
+        .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("insert new extent: {e}")))?;
@@ -959,7 +959,7 @@ impl MetadataStore {
     pub async fn reconcile_extents(
         &self,
         stream_id: StreamId,
-        epoch: u32,
+        epoch: Epoch,
         extents: &[(ExtentId, u64, u64, ExtentState)], // (extent_id, start_offset, end_offset, state)
     ) -> Result<(), StorageError> {
         let mut conn = self
@@ -999,7 +999,7 @@ impl MetadataStore {
             .bind(*start_offset as i64)
             .bind(*end_offset as i64)
             .bind(db_state.as_u8())
-            .bind(epoch as i32)
+            .bind(epoch.0 as i32)
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("reconcile extent: {e}")))?;

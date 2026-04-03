@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::metadata::MetadataStore;
+use common::types::Epoch;
 use tokio::sync::{Mutex, broadcast};
 use tracing::{error, info, warn};
 
@@ -86,7 +87,7 @@ async fn check_expired_nodes(
                 Ok(target) => {
                     let replicas = vec![(target.addr.clone(), 0u8)];
                     let new_extent = store
-                        .allocate_extent(extent.stream_id, new_start_offset, &replicas, 0)
+                        .allocate_extent(extent.stream_id, new_start_offset, &replicas, Epoch(0))
                         .await?;
                     info!(
                         "replacement extent {:?} allocated on {} for stream {:?}",

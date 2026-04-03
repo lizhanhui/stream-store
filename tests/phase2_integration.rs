@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use common::config::StreamManagerConfig;
-use common::types::{ExtentId, ExtentState, NodeMetrics, Offset};
+use common::types::{Epoch, ExtentId, ExtentState, NodeMetrics, Offset};
 
 /// Initialize tracing for tests. Uses try_init() so it's safe when multiple tests
 /// run in the same process. Override log level via RUST_LOG env var.
@@ -166,7 +166,7 @@ async fn stream_manager_integration() {
 
         for i in 0u64..5 {
             en_client
-                .append(stream_id, 0, Bytes::from(format!("msg-{i}")))
+                .append(stream_id, Epoch(0), Bytes::from(format!("msg-{i}")))
                 .await
                 .unwrap();
         }
@@ -196,7 +196,7 @@ async fn stream_manager_integration() {
             en_client2
                 .append(
                     stream_id,
-                    0, // epoch
+                    Epoch(0), // epoch
                     Bytes::from(format!("msg2-{i}")),
                 )
                 .await
