@@ -235,14 +235,14 @@ Grouped by category with gaps for future growth.
 
 ##### 0x01 APPEND (Client -> Primary)
 
-Append a message to a data stream. Client-only operation; replication uses the dedicated Forward opcode (0x0B).
+Append a message to a data stream. The client targets a stream by `(stream_id, epoch)` — the epoch identifies the replica set. The Primary routes the append to the current active extent; the client does not choose which extent to write to. If the epoch is stale (the replica set was reassigned via an epoch bump), the server returns `EpochStale`. Client-only operation; replication uses the dedicated Forward opcode (0x0B).
 
 ```
 Fixed Header (8B)
 Variable Header:
   [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
-  [extent_id    : u32]    -- target extent (for server-side validation)
+  [epoch        : u32]    -- target epoch (0 = accept any epoch)
 Payload:
   [payload_len  : u32]    -- length of message bytes
   [payload      : bytes]  -- message body (application data)
@@ -250,14 +250,15 @@ Payload:
 
 ##### 0x02 APPEND_ACK (Primary -> Client)
 
-Confirms a successful append after quorum ACK is achieved.
+Confirms a successful append after quorum ACK is achieved. The response includes the epoch and extent_id the record landed on for diagnostics — the client can verify the epoch matches and log which extent was used.
 
 ```
 Fixed Header (8B)
 Variable Header:
   [request_id   : u32]    -- correlates with original APPEND request
   [stream_id    : u64]    -- stream that was appended to
-  [extent_id    : u32]    -- extent that was appended to
+  [epoch        : u32]    -- epoch at append time (diagnostics)
+  [extent_id    : u32]    -- extent that was appended to (diagnostics)
   [offset       : u64]    -- assigned logical sequence number
 No Payload.
 ```
@@ -676,7 +677,7 @@ Fixed Header (8B)
 Variable Header:
   [request_id   : u32]    -- correlates with the request that caused the error
   [error_code   : u16]    -- 0=Ok, 1=UnknownStream, 2=InvalidOffset,
-                              3=ExtentSealed, 4=InternalError
+                              3=ExtentSealed, 4=InternalError, 5=EpochStale
   [extent_id    : u32]    -- relevant extent (0 when not applicable)
 Payload:
   [payload_len  : u32]

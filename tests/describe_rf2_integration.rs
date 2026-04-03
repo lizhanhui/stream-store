@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StorageClient;
 use common::config::StreamManagerConfig;
-use common::types::{ExtentId, ExtentState, NodeMetrics, Offset};
+use common::types::{ExtentState, NodeMetrics, Offset};
 
 use extent_node::downstream::DownstreamPool;
 use extent_node::store::ExtentNodeStore;
@@ -170,7 +170,7 @@ async fn describe_stream_rf2_integration() {
         en_client
             .append(
                 stream_id,
-                first_extent_id,
+                0, // epoch
                 Bytes::from(format!("rf2-msg-{i}")),
             )
             .await
@@ -219,7 +219,7 @@ async fn describe_stream_rf2_integration() {
         en_client2
             .append(
                 stream_id,
-                ExtentId(second_extent_id),
+                0, // epoch
                 Bytes::from(format!("rf2-seal-msg-{i}")),
             )
             .await

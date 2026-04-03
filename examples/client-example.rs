@@ -124,7 +124,7 @@ async fn main() {
     info!("[5] Appending {} messages to stream...", messages.len());
     for msg in &messages {
         let offset = extent_node_client
-            .append(stream_id, extent_id, Bytes::from(msg.clone()))
+            .append(stream_id, 0, Bytes::from(msg.clone()))
             .await
             .expect("append failed");
         info!("    Appended \"{}\" at offset {}", msg, offset.offset.0);
@@ -182,7 +182,7 @@ async fn main() {
     );
     for msg in &new_messages {
         let offset = extent_node_client_2
-            .append(stream_id, new_extent_id, Bytes::from(msg.clone()))
+            .append(stream_id, 0, Bytes::from(msg.clone()))
             .await
             .expect("append after seal failed");
         info!("    Appended \"{}\" at offset {}", msg, offset.offset.0);

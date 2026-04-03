@@ -40,7 +40,7 @@ mod tests {
             VariableHeader::Append {
                 request_id: 1,
                 stream_id: StreamId(10),
-                extent_id: ExtentId(5),
+                epoch: 0,
             },
             Some(Bytes::from_static(b"test payload")),
         );

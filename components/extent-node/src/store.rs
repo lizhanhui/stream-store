@@ -37,6 +37,10 @@ pub struct PendingAck {
     pub response_tx: mpsc::Sender<Frame>,
     /// The offset assigned to this append.
     pub assigned_offset: u64,
+    /// The extent the record landed on (for diagnostics in AppendAck).
+    pub extent_id: ExtentId,
+    /// The epoch at append time (for diagnostics in AppendAck).
+    pub epoch: u32,
     /// When this PendingAck was created, for timeout expiry.
     pub created_at: Instant,
 }
@@ -122,7 +126,8 @@ impl AckQueue {
                         VariableHeader::AppendAck {
                             request_id: ack.request_id,
                             stream_id: ack.stream_id,
-                            extent_id: ExtentId(0),
+                            epoch: ack.epoch,
+                            extent_id: ack.extent_id,
                             offset: Offset(ack.assigned_offset),
                         },
                         None,
@@ -526,9 +531,7 @@ impl ExtentNodeStore {
         response_tx: Option<&mpsc::Sender<Frame>>,
     ) -> Option<Frame> {
         let stream_id = frame.stream_id();
-        // Note: frame.extent_id() is intentionally ignored. In the epoch-based model,
-        // the client's extent_id may be stale; try_append_active() routes to the
-        // current active extent.
+        let client_epoch = frame.epoch();
 
         // Get the stream entry (per-stream lock, not global).
         let stream_ref = match self.streams.get(&stream_id) {
@@ -543,11 +546,19 @@ impl ExtentNodeStore {
             }
         };
 
+        // Epoch validation: reject if the client's epoch doesn't match the stream's.
+        let epoch = stream_ref.epoch();
+        if client_epoch != 0 && client_epoch != epoch {
+            return Some(Frame::error_response(
+                frame.request_id(),
+                ErrorCode::EpochStale,
+                &format!("epoch stale: client={}, current={}", client_epoch, epoch),
+                ExtentId(0),
+            ));
+        }
+
         // Leader election: fetch_add(1, Acquire) on the stream's in_flight counter.
-        // Note: no early extent_id validation here. In the epoch-based model, the client's
-        // extent_id may be stale (the Primary has already moved to a new extent via
-        // autonomous seal-and-new). try_append_active() always routes to the current
-        // active extent regardless of what extent_id the client sent.
+        // try_append_active() always routes to the current active extent.
         let prev = stream_ref.in_flight().fetch_add(1, Ordering::Acquire);
 
         if prev > 0 {
@@ -574,6 +585,7 @@ impl ExtentNodeStore {
             &stream_ref,
             request_id,
             stream_id,
+            epoch,
             payload.clone(),
             response_tx.cloned(),
         );
@@ -592,6 +604,7 @@ impl ExtentNodeStore {
                 &stream_ref,
                 request_id,
                 stream_id,
+                epoch,
                 payload,
                 response_tx.cloned(),
             );
@@ -646,6 +659,7 @@ impl ExtentNodeStore {
         stream: &Stream,
         request_id: u32,
         stream_id: StreamId,
+        epoch: u32,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
     ) -> (Option<Frame>, bool, Vec<(String, Frame)>) {
@@ -708,7 +722,8 @@ impl ExtentNodeStore {
                     VariableHeader::AppendAck {
                         request_id,
                         stream_id,
-                        extent_id: ExtentId(0),
+                        epoch,
+                        extent_id,
                         offset,
                     },
                     None,
@@ -727,7 +742,8 @@ impl ExtentNodeStore {
                         VariableHeader::AppendAck {
                             request_id,
                             stream_id,
-                            extent_id: ExtentId(0),
+                            epoch,
+                            extent_id,
                             offset,
                         },
                         None,
@@ -768,6 +784,8 @@ impl ExtentNodeStore {
                             stream_id,
                             response_tx: resp_tx.clone(),
                             assigned_offset: offset.0,
+                            extent_id,
+                            epoch,
                             created_at: Instant::now(),
                         });
                     }
@@ -781,7 +799,8 @@ impl ExtentNodeStore {
                     VariableHeader::AppendAck {
                         request_id,
                         stream_id,
-                        extent_id: ExtentId(0),
+                        epoch,
+                        extent_id,
                         offset,
                     },
                     None,
@@ -810,6 +829,7 @@ impl ExtentNodeStore {
         stream: &Stream,
         _stream_id: StreamId,
     ) -> Vec<(String, Frame)> {
+        let epoch = stream.epoch();
         let mut all_forward_work = Vec::new();
         loop {
             let mut batch: Vec<AppendJob> = Vec::new();
@@ -838,6 +858,7 @@ impl ExtentNodeStore {
                     stream,
                     job.request_id,
                     job.stream_id,
+                    epoch,
                     job.payload.clone(),
                     job.response_tx.clone(),
                 );
@@ -850,6 +871,7 @@ impl ExtentNodeStore {
                     self.handle_extent_full_for_job(
                         job.request_id,
                         job.stream_id,
+                        epoch,
                         job.payload,
                         job.response_tx,
                         &mut all_forward_work,
@@ -879,6 +901,7 @@ impl ExtentNodeStore {
         &self,
         request_id: u32,
         stream_id: StreamId,
+        epoch: u32,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
         forward_work: &mut Vec<(String, Frame)>,
@@ -891,6 +914,7 @@ impl ExtentNodeStore {
                 &stream_ref,
                 request_id,
                 stream_id,
+                epoch,
                 payload,
                 response_tx,
             );
@@ -972,6 +996,7 @@ impl ExtentNodeStore {
 
         // No early extent_id validation. In the epoch-based model, the client's extent_id
         // may be stale. try_append_active() routes to the current active extent.
+        let epoch = stream_ref.epoch();
 
         let batch_len = frames.len() as u64;
 
@@ -1097,6 +1122,7 @@ impl ExtentNodeStore {
                             &stream_ref2,
                             ff.request_id,
                             stream_id,
+                            epoch,
                             ff.payload.clone(),
                             response_tx.cloned(),
                         );
@@ -1134,7 +1160,8 @@ impl ExtentNodeStore {
                         VariableHeader::AppendAck {
                             request_id: entry.request_id,
                             stream_id,
-                            extent_id: ExtentId(0),
+                            epoch,
+                            extent_id: entry.extent_id,
                             offset: entry.offset,
                         },
                         None,
@@ -1154,7 +1181,8 @@ impl ExtentNodeStore {
                             VariableHeader::AppendAck {
                                 request_id: entry.request_id,
                                 stream_id,
-                                extent_id: ExtentId(0),
+                                epoch,
+                                extent_id: entry.extent_id,
                                 offset: entry.offset,
                             },
                             None,
@@ -1198,6 +1226,8 @@ impl ExtentNodeStore {
                                 stream_id,
                                 response_tx: resp_tx.clone(),
                                 assigned_offset: entry.offset.0,
+                                extent_id: entry.extent_id,
+                                epoch,
                                 created_at: now,
                             });
                         }
@@ -1211,7 +1241,8 @@ impl ExtentNodeStore {
                         VariableHeader::AppendAck {
                             request_id: entry.request_id,
                             stream_id,
-                            extent_id: ExtentId(0),
+                            epoch,
+                            extent_id: entry.extent_id,
                             offset: entry.offset,
                         },
                         None,
@@ -1247,6 +1278,7 @@ impl ExtentNodeStore {
                         &stream_ref2,
                         ff.request_id,
                         stream_id,
+                        epoch,
                         ff.payload.clone(),
                         response_tx.cloned(),
                     );
@@ -1707,7 +1739,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: sid,
-                        extent_id: ExtentId(1),
+                        epoch: 0,
                     },
                     Some(Bytes::from_static(b"hello")),
                 ),
@@ -1729,7 +1761,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 1,
                         stream_id: StreamId(999),
-                        extent_id: ExtentId(0),
+                        epoch: 0,
                     },
                     Some(Bytes::from_static(b"fail")),
                 ),
@@ -1752,7 +1784,7 @@ mod tests {
                         VariableHeader::Append {
                             request_id: 10 + i,
                             stream_id: sid,
-                            extent_id: ExtentId(1),
+                            epoch: 0,
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),
@@ -1954,7 +1986,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: StreamId(10),
-                        extent_id: ExtentId(50),
+                        epoch: 0,
                     },
                     Some(Bytes::from_static(b"hello standalone")),
                 ),
@@ -2013,7 +2045,7 @@ mod tests {
                     VariableHeader::Append {
                         request_id: 2,
                         stream_id: StreamId(10),
-                        extent_id: ExtentId(50),
+                        epoch: 0,
                     },
                     Some(Bytes::from_static(b"broadcast msg")),
                 ),
@@ -2122,6 +2154,8 @@ mod tests {
             ack_queue.pending.push_back(PendingAck {
                 request_id: i as u32,
                 stream_id: StreamId(10),
+                extent_id: ExtentId(0),
+                epoch: 0,
                 response_tx: resp_tx.clone(),
                 assigned_offset: i,
                 created_at: Instant::now(),
@@ -2172,6 +2206,8 @@ mod tests {
         ack_queue.pending.push_back(PendingAck {
             request_id: 42,
             stream_id: StreamId(10),
+            extent_id: ExtentId(0),
+            epoch: 0,
             response_tx: resp_tx.clone(),
             assigned_offset: 0,
             created_at: Instant::now() - REPLICATION_TIMEOUT - Duration::from_secs(1),
@@ -2181,6 +2217,8 @@ mod tests {
         ack_queue.pending.push_back(PendingAck {
             request_id: 43,
             stream_id: StreamId(10),
+            extent_id: ExtentId(0),
+            epoch: 0,
             response_tx: resp_tx.clone(),
             assigned_offset: 1,
             created_at: Instant::now(),
@@ -2245,7 +2283,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    extent_id: ExtentId(1),
+                                    epoch: 0,
                                 },
                                 Some(Bytes::from(payload_data.clone())),
                             ),
@@ -2428,7 +2466,7 @@ mod tests {
                             VariableHeader::Append {
                                 request_id: j,
                                 stream_id: sid,
-                                extent_id: ExtentId(1),
+                                epoch: 0,
                             },
                             Some(Bytes::from(format!("pre-{j}"))),
                         ),
@@ -2456,7 +2494,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    extent_id: ExtentId(1),
+                                    epoch: 0,
                                 },
                                 Some(Bytes::from_static(b"write-payload")),
                             ),
@@ -2582,7 +2620,7 @@ mod tests {
                                 VariableHeader::Append {
                                     request_id: seq as u32,
                                     stream_id: sid,
-                                    extent_id: ExtentId(1),
+                                    epoch: 0,
                                 },
                                 Some(Bytes::from(format!("t{task_idx}-m{seq}"))),
                             ),
@@ -2797,7 +2835,7 @@ mod tests {
                         VariableHeader::Append {
                             request_id: 10 + i,
                             stream_id: sid,
-                            extent_id: ExtentId(1),
+                            epoch: 0,
                         },
                         Some(Bytes::from(format!("msg{i}"))),
                     ),

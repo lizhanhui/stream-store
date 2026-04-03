@@ -28,6 +28,9 @@ pub enum StorageError {
     #[error("extent full: {0:?}")]
     ExtentFull(ExtentId),
 
+    #[error("epoch stale: stream {0:?}")]
+    EpochStale(StreamId),
+
     #[error("internal error: {0}")]
     Internal(String),
 }
