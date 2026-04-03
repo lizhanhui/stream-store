@@ -355,12 +355,7 @@ impl RequestHandler for ExtentNodeStore {
                 },
                 None,
             )),
-            Opcode::ReportExtents => Some(Frame::error_response(
-                frame.request_id(),
-                ErrorCode::InternalError,
-                "not yet implemented",
-                ExtentId(0),
-            )),
+            Opcode::ReportExtents => Some(self.handle_report_extents(frame)),
             Opcode::ReportExtentsResp | Opcode::ExtentSealedNotify => {
                 warn!(
                     opcode = ?frame.opcode(),
@@ -603,10 +598,13 @@ impl ExtentNodeStore {
 
         // Check if followers arrived while we were appending.
         let remaining = extent.in_flight().fetch_sub(1, Ordering::Release);
+        let mut failed_follower_jobs = Vec::new();
         if remaining > 1 {
             // Followers are waiting — drain the batch.
-            let batch_forward_work = self.drain_append_batch(extent, extent_full);
+            let (batch_forward_work, batch_failed) =
+                self.drain_append_batch(extent, extent_full);
             forward_work.extend(batch_forward_work);
+            failed_follower_jobs = batch_failed;
         }
 
         // Drop stream guard before extent-full handling (needs write lock).
@@ -614,13 +612,8 @@ impl ExtentNodeStore {
 
         if extent_full {
             // Autonomous extent creation: seal, create new extent, retry the append.
-            // The error was already sent to the client via response_tx in do_append_and_respond.
-            // We seal and create the new extent so the NEXT append succeeds transparently.
-            // TODO(epoch): In a future iteration, intercept ExtentFull BEFORE sending
-            // the error to retry the triggering append transparently. For now, the first
-            // client that hits extent-full gets an error but all subsequent clients succeed
-            // immediately (the new extent is already created).
-            let (_retry_result, retry_forward_work) = self.handle_extent_full_and_retry(
+            // The client never sees ExtentFull — we retry transparently on the new extent.
+            let (retry_result, retry_forward_work) = self.handle_extent_full_and_retry(
                 stream_id,
                 extent_id,
                 request_id,
@@ -628,6 +621,22 @@ impl ExtentNodeStore {
                 response_tx.cloned(),
             );
             forward_work.extend(retry_forward_work);
+
+            // Retry failed follower jobs on the new extent too.
+            for job in failed_follower_jobs {
+                let (_, job_forward) = self.handle_extent_full_and_retry(
+                    job.stream_id,
+                    job.extent_id,
+                    job.request_id,
+                    job.payload,
+                    job.response_tx,
+                );
+                forward_work.extend(job_forward);
+            }
+
+            // Flush forward work and return the retry result as the response.
+            self.flush_forward_work(forward_work).await;
+            return retry_result;
         }
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
@@ -675,17 +684,9 @@ impl ExtentNodeStore {
                 return (Some(err), false, Vec::new());
             }
             Err(StorageError::ExtentFull(_)) => {
-                let err = Frame::error_response(
-                    request_id,
-                    ErrorCode::ExtentFull,
-                    "extent arena is full, seal initiated",
-                    extent_id,
-                );
-                if let Some(ref tx) = response_tx {
-                    let _ = tx.try_send(err);
-                    return (None, true, Vec::new());
-                }
-                return (Some(err), true, Vec::new());
+                // Don't send error to client — the caller will seal, create a new extent,
+                // and retry the append transparently. Return extent_full=true.
+                return (None, true, Vec::new());
             }
             Err(e) => {
                 let err = Frame::error_response(
@@ -812,8 +813,16 @@ impl ExtentNodeStore {
     ///
     /// Called by the active writer after its own append when `in_flight > 1`.
     /// Loops until all followers have been processed.
-    fn drain_append_batch(&self, extent: &Extent, mut extent_full: bool) -> Vec<(String, Frame)> {
+    ///
+    /// Returns `(forward_work, failed_jobs)`: forward_work is Forward frames to flush;
+    /// failed_jobs are AppendJobs that hit ExtentFull and need retry on a new extent.
+    fn drain_append_batch(
+        &self,
+        extent: &Extent,
+        mut extent_full: bool,
+    ) -> (Vec<(String, Frame)>, Vec<AppendJob>) {
         let mut all_forward_work = Vec::new();
+        let mut failed_jobs = Vec::new();
         loop {
             let mut batch: Vec<AppendJob> = Vec::new();
 
@@ -834,18 +843,12 @@ impl ExtentNodeStore {
                 }
             }
 
-            // Process each job. Fast-fail with ExtentFull when the extent is
-            // already known to be full; otherwise attempt the append normally.
-            for job in &batch {
+            // Process each job. When extent_full, collect jobs for retry instead of erroring.
+            let batch_len = batch.len();
+            for job in batch {
                 if extent_full {
-                    if let Some(ref tx) = job.response_tx {
-                        let _ = tx.try_send(Frame::error_response(
-                            job.request_id,
-                            ErrorCode::ExtentFull,
-                            "extent is full",
-                            job.extent_id,
-                        ));
-                    }
+                    // Don't send error — collect for transparent retry on new extent.
+                    failed_jobs.push(job);
                 } else {
                     let (_, job_full, forward_work) = self.do_append_and_respond(
                         extent,
@@ -858,6 +861,8 @@ impl ExtentNodeStore {
                     all_forward_work.extend(forward_work);
                     if job_full {
                         extent_full = true;
+                        // This job also failed — collect for retry.
+                        failed_jobs.push(job);
                     }
                 }
             }
@@ -865,14 +870,14 @@ impl ExtentNodeStore {
             // Decrement in_flight by the batch size.
             let remaining = extent
                 .in_flight()
-                .fetch_sub(batch.len() as u64, Ordering::Release);
-            if remaining <= batch.len() as u64 {
+                .fetch_sub(batch_len as u64, Ordering::Release);
+            if remaining <= batch_len as u64 {
                 // No more followers waiting.
                 break;
             }
             // More followers arrived during processing — loop again.
         }
-        all_forward_work
+        (all_forward_work, failed_jobs)
     }
 
     /// Handle extent-full by autonomously sealing and creating a new extent.
@@ -1130,7 +1135,7 @@ impl ExtentNodeStore {
             // All appends failed — decrement and possibly drain followers.
             let remaining = extent.in_flight().fetch_sub(batch_len, Ordering::Release);
             if remaining > batch_len {
-                let batch_forward = self.drain_append_batch(extent, extent_full);
+                let (batch_forward, _failed) = self.drain_append_batch(extent, extent_full);
                 forward_work.extend(batch_forward);
             }
             drop(stream_ref);
@@ -1264,7 +1269,7 @@ impl ExtentNodeStore {
         // Check if followers arrived while we were appending.
         let remaining = extent.in_flight().fetch_sub(batch_len, Ordering::Release);
         if remaining > batch_len {
-            let batch_forward = self.drain_append_batch(extent, extent_full);
+            let (batch_forward, _failed) = self.drain_append_batch(extent, extent_full);
             forward_work.extend(batch_forward);
         }
 
@@ -1513,6 +1518,59 @@ impl ExtentNodeStore {
                 offset: stream_ref.max_offset(),
             },
             None,
+        )
+    }
+
+    /// Handle REPORT_EXTENTS: SM queries this EN for all extents it holds for a stream.
+    /// Used during crash recovery so SM can discover extents it doesn't know about.
+    fn handle_report_extents(&self, frame: Frame) -> Frame {
+        let (stream_id, epoch) = match &frame.variable_header {
+            VariableHeader::ReportExtents {
+                stream_id, epoch, ..
+            } => (*stream_id, *epoch),
+            _ => {
+                return Frame::error_response(
+                    frame.request_id(),
+                    ErrorCode::InternalError,
+                    "invalid ReportExtents frame",
+                    ExtentId(0),
+                );
+            }
+        };
+
+        let stream_ref = match self.streams.get(&stream_id) {
+            Some(s) => s,
+            None => {
+                // Stream not found — return empty response.
+                return Frame::new(
+                    VariableHeader::ReportExtentsResp {
+                        request_id: frame.request_id(),
+                        stream_id,
+                        epoch,
+                    },
+                    Some(Bytes::from(0u32.to_be_bytes().to_vec())), // num_extents = 0
+                );
+            }
+        };
+
+        let report = stream_ref.extent_report();
+        // Encode payload: [num_extents:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+        let mut buf = BytesMut::with_capacity(4 + report.len() * (4 + 8 + 8 + 1));
+        buf.put_u32(report.len() as u32);
+        for (eid, start, end, state) in &report {
+            buf.put_u32(eid.0);
+            buf.put_u64(start.0);
+            buf.put_u64(*end);
+            buf.put_u8(state.as_u8());
+        }
+
+        Frame::new(
+            VariableHeader::ReportExtentsResp {
+                request_id: frame.request_id(),
+                stream_id,
+                epoch: stream_ref.epoch(),
+            },
+            Some(buf.freeze()),
         )
     }
 

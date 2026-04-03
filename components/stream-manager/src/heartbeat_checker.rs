@@ -86,7 +86,7 @@ async fn check_expired_nodes(
                 Ok(target) => {
                     let replicas = vec![(target.addr.clone(), 0u8)];
                     let new_extent = store
-                        .allocate_extent(extent.stream_id, new_start_offset, &replicas)
+                        .allocate_extent(extent.stream_id, new_start_offset, &replicas, 0)
                         .await?;
                     info!(
                         "replacement extent {:?} allocated on {} for stream {:?}",
