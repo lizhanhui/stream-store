@@ -230,6 +230,11 @@ pub struct ReplicaDetail {
 }
 
 /// Error codes sent in Error response frames.
+///
+/// Note: `ExtentFull` (formerly 5) was removed from the wire protocol — in the
+/// epoch-based seal model the server handles extent rotation internally, so
+/// clients never observe that condition.  The internal `StorageError::ExtentFull`
+/// still exists for extent-node-local use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ErrorCode {
@@ -238,9 +243,6 @@ pub enum ErrorCode {
     InvalidOffset = 2,
     ExtentSealed = 3,
     InternalError = 4,
-    /// The extent's arena is full. Client should trigger seal-and-new
-    /// via Stream Manager, then retry the append on the new extent.
-    ExtentFull = 5,
 }
 
 impl ErrorCode {
@@ -251,7 +253,6 @@ impl ErrorCode {
             2 => Some(ErrorCode::InvalidOffset),
             3 => Some(ErrorCode::ExtentSealed),
             4 => Some(ErrorCode::InternalError),
-            5 => Some(ErrorCode::ExtentFull),
             _ => None,
         }
     }

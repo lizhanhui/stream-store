@@ -169,7 +169,7 @@ struct SenderState {
 /// Single sender task: connect to the current primary, pipeline appends with up to
 /// PIPELINE_DEPTH in-flight requests, measure per-append latency.
 ///
-/// On ExtentFull/ExtentSealed, seal via StreamManager and reconnect to the new primary.
+/// On ExtentSealed, seal via StreamManager and reconnect to the new primary.
 /// Uses RwLock to coordinate extent rotation across concurrent in-flight tasks.
 async fn sender_task(
     sender_id: usize,
@@ -275,7 +275,7 @@ enum AppendOutcome {
     Error,
 }
 
-/// Perform a single pipelined append. On ExtentFull/ExtentSealed, handle rotation.
+/// Perform a single pipelined append. On ExtentSealed, handle rotation.
 async fn do_append(
     sender_id: usize,
     stream_id: common::types::StreamId,
@@ -292,7 +292,7 @@ async fn do_append(
     let t0 = Instant::now();
     match client.append(stream_id, extent_id, payload).await {
         Ok(_) => AppendOutcome::Ok(t0.elapsed()),
-        Err(StorageError::ExtentFull(_)) | Err(StorageError::ExtentSealed(_)) => {
+        Err(StorageError::ExtentSealed(_)) => {
             // Need to rotate extent. Acquire write lock.
             let mut s = state.write().await;
 

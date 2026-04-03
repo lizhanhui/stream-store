@@ -1054,6 +1054,13 @@ impl ExtentNodeStore {
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
         let mut extent_full = false;
 
+        // Frames that hit ExtentFull — collected for transparent retry on new extent.
+        struct FailedFrame {
+            request_id: u32,
+            payload: Bytes,
+        }
+        let mut failed_frames: Vec<FailedFrame> = Vec::new();
+
         for frame in frames {
             let request_id = frame.request_id();
             let payload = frame.payload.clone().unwrap_or_default();
@@ -1061,22 +1068,15 @@ impl ExtentNodeStore {
             let payload_for_forward = payload.clone();
 
             if extent_full {
-                // Fast-fail remaining frames.
-                let err = Frame::error_response(
+                // Collect for retry on new extent instead of sending ExtentFull error.
+                failed_frames.push(FailedFrame {
                     request_id,
-                    ErrorCode::ExtentFull,
-                    "extent arena is full, seal initiated",
-                    extent_id,
-                );
-                if let Some(tx) = response_tx {
-                    let _ = tx.try_send(err);
-                } else {
-                    responses.push(err);
-                }
+                    payload,
+                });
                 continue;
             }
 
-            match extent.append_inner(payload) {
+            match extent.append_inner(payload.clone()) {
                 Ok(result) => {
                     entries.push(BatchEntry {
                         request_id,
@@ -1101,17 +1101,11 @@ impl ExtentNodeStore {
                 }
                 Err(StorageError::ExtentFull(_)) => {
                     extent_full = true;
-                    let err = Frame::error_response(
+                    // Don't send error — collect for transparent retry.
+                    failed_frames.push(FailedFrame {
                         request_id,
-                        ErrorCode::ExtentFull,
-                        "extent arena is full, seal initiated",
-                        extent_id,
-                    );
-                    if let Some(tx) = response_tx {
-                        let _ = tx.try_send(err);
-                    } else {
-                        responses.push(err);
-                    }
+                        payload,
+                    });
                 }
                 Err(e) => {
                     let err = Frame::error_response(
@@ -1140,14 +1134,17 @@ impl ExtentNodeStore {
             }
             drop(stream_ref);
             if extent_full {
-                // Autonomous extent creation for batch path.
-                let _ = self.handle_extent_full_and_retry(
-                    stream_id,
-                    extent_id,
-                    0,
-                    Bytes::new(),
-                    None,
-                );
+                // Autonomous extent creation for batch path — retry all failed frames.
+                for ff in failed_frames {
+                    let (_, retry_forward) = self.handle_extent_full_and_retry(
+                        stream_id,
+                        extent_id,
+                        ff.request_id,
+                        ff.payload,
+                        response_tx.cloned(),
+                    );
+                    forward_work.extend(retry_forward);
+                }
             }
             self.flush_forward_work(forward_work).await;
             return responses;
@@ -1277,15 +1274,17 @@ impl ExtentNodeStore {
         drop(stream_ref);
 
         if extent_full {
-            // Autonomous extent creation for batch path (end of batch).
-            let (_, retry_forward) = self.handle_extent_full_and_retry(
-                stream_id,
-                extent_id,
-                0,
-                Bytes::new(),
-                None,
-            );
-            forward_work.extend(retry_forward);
+            // Autonomous extent creation for batch path (end of batch) — retry failed frames.
+            for ff in failed_frames {
+                let (_, retry_forward) = self.handle_extent_full_and_retry(
+                    stream_id,
+                    extent_id,
+                    ff.request_id,
+                    ff.payload,
+                    response_tx.cloned(),
+                );
+                forward_work.extend(retry_forward);
+            }
         }
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).

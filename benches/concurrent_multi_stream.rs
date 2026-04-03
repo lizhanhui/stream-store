@@ -163,7 +163,7 @@ struct ClientResult {
     seal_count: u64,
 }
 
-/// Single client task: create stream, append in a tight loop, seal-and-new on ExtentFull.
+/// Single client task: create stream, append in a tight loop, seal-and-new on ExtentSealed.
 async fn client_task(
     client_id: usize,
     stream_manager_addr: String,
@@ -203,7 +203,7 @@ async fn client_task(
                 total_appends += 1;
                 total_bytes += PAYLOAD_SIZE as u64;
             }
-            Err(StorageError::ExtentFull(_)) | Err(StorageError::ExtentSealed(_)) => {
+            Err(StorageError::ExtentSealed(_)) => {
                 // Seal the current extent via StreamManager and get a new one.
                 let (new_extent_id_raw, new_primary_addr) = stream_manager_client
                     .seal(stream_id, extent_id, None)

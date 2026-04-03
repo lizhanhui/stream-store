@@ -406,7 +406,7 @@ impl Frame {
 
     /// Create an error response frame.
     ///
-    /// For ExtentFull/ExtentSealed errors, pass the relevant extent_id so the
+    /// For ExtentSealed errors, pass the relevant extent_id so the
     /// client can identify which extent triggered the error without a round-trip.
     pub fn error_response(
         request_id: u32,
@@ -1653,7 +1653,7 @@ mod tests {
 
     #[test]
     fn error_response_frame() {
-        let frame = Frame::error_response(42, ErrorCode::ExtentFull, "arena full", ExtentId(7));
+        let frame = Frame::error_response(42, ErrorCode::ExtentSealed, "extent sealed", ExtentId(7));
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);
@@ -1661,9 +1661,9 @@ mod tests {
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.opcode(), Opcode::Error);
         assert_eq!(decoded.request_id(), 42);
-        assert_eq!(decoded.error_code(), ErrorCode::ExtentFull as u16);
+        assert_eq!(decoded.error_code(), ErrorCode::ExtentSealed as u16);
         assert_eq!(decoded.extent_id(), ExtentId(7));
-        assert_eq!(decoded.payload, Some(Bytes::from_static(b"arena full")));
+        assert_eq!(decoded.payload, Some(Bytes::from_static(b"extent sealed")));
     }
 
     #[test]
