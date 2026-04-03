@@ -200,7 +200,6 @@ impl StorageClient {
                 String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
             return Err(match error_code {
                 Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id()),
-                Some(ErrorCode::ExtentFull) => StorageError::ExtentFull(resp.extent_id()),
                 Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id()),
                 _ => StorageError::Internal(msg),
             });
