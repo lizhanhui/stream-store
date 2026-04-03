@@ -19,12 +19,16 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::warn;
 
-/// Result of a successful append: the logical offset assigned to this record.
-/// The server-side index stream handles byte position tracking internally.
+/// Result of a successful append: the logical offset assigned to this record,
+/// plus the extent and epoch the record landed on (for diagnostics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
     /// Logical offset assigned to this record.
     pub offset: Offset,
+    /// The extent the record was written to (server-assigned, for diagnostics).
+    pub extent_id: ExtentId,
+    /// The epoch at the time of the append (for diagnostics).
+    pub epoch: u32,
 }
 
 type PendingMap = HashMap<u32, oneshot::Sender<Result<Frame, StorageError>>>;
@@ -201,6 +205,7 @@ impl StorageClient {
             return Err(match error_code {
                 Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id()),
                 Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id()),
+                Some(ErrorCode::EpochStale) => StorageError::EpochStale(resp.stream_id()),
                 _ => StorageError::Internal(msg),
             });
         }
@@ -240,18 +245,23 @@ impl StorageClient {
         Ok((resp.stream_id(), resp.extent_id(), addr))
     }
 
-    /// Append a message to a stream. Returns the assigned offset.
+    /// Append a message to a stream. Returns the assigned offset and diagnostics.
+    ///
+    /// The `epoch` parameter identifies which replica set the client is targeting.
+    /// If the epoch is stale (the Primary has been reassigned via an epoch bump),
+    /// the server returns `EpochStale` and the client should re-discover via
+    /// `describe_stream`.
     pub async fn append(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
+        epoch: u32,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
         let req = Frame::new(
             VariableHeader::Append {
                 request_id: self.alloc_request_id(),
                 stream_id,
-                extent_id,
+                epoch,
             },
             Some(payload),
         );
@@ -260,6 +270,8 @@ impl StorageClient {
 
         Ok(AppendResult {
             offset: resp.offset(),
+            extent_id: resp.extent_id(),
+            epoch: resp.epoch(),
         })
     }
 

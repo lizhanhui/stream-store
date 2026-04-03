@@ -29,7 +29,6 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StorageClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::ExtentId;
 use extent_node::ExtentNode;
 use sqlx::mysql::MySqlPoolOptions;
 use stream_manager::StreamManager;
@@ -112,7 +111,6 @@ async fn main() {
             sender_task(
                 sender_id,
                 stream_id,
-                initial_extent_id,
                 primary_addr,
                 BENCH_DURATION,
             )
@@ -205,12 +203,11 @@ struct SenderResult {
 ///
 /// Extent-full transitions are transparent -- the Primary handles seal-and-new
 /// autonomously within the current epoch. The client just keeps appending with
-/// the same stream_id and extent_id; the server accepts appends on whatever the
+/// the same stream_id; the server accepts appends on whatever the
 /// current active extent is.
 async fn sender_task(
     sender_id: usize,
     stream_id: common::types::StreamId,
-    extent_id: ExtentId,
     primary_addr: String,
     duration: Duration,
 ) -> SenderResult {
@@ -247,7 +244,7 @@ async fn sender_task(
 
                 tokio::spawn(async move {
                     let t0 = Instant::now();
-                    let outcome = match en_client.append(stream_id, extent_id, payload).await {
+                    let outcome = match en_client.append(stream_id, 0, payload).await {
                         Ok(_) => AppendOutcome::Ok(t0.elapsed()),
                         Err(e) => {
                             warn!("sender {sender_id}: append error: {e}");

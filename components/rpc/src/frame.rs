@@ -28,11 +28,12 @@ pub enum VariableHeader {
     Append {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
+        epoch: u32,
     },
     AppendAck {
         request_id: u32,
         stream_id: StreamId,
+        epoch: u32,
         extent_id: ExtentId,
         offset: Offset,
     },
@@ -332,8 +333,7 @@ impl Frame {
     /// Get the extent_id for this frame (ExtentId(0) for opcodes without extent_id).
     pub fn extent_id(&self) -> ExtentId {
         match &self.variable_header {
-            VariableHeader::Append { extent_id, .. }
-            | VariableHeader::AppendAck { extent_id, .. }
+            VariableHeader::AppendAck { extent_id, .. }
             | VariableHeader::Read { extent_id, .. }
             | VariableHeader::Seal { extent_id, .. }
             | VariableHeader::SealAck { extent_id, .. }
@@ -344,6 +344,18 @@ impl Frame {
             | VariableHeader::DescribeExtent { extent_id, .. }
             | VariableHeader::Error { extent_id, .. } => *extent_id,
             _ => ExtentId(0),
+        }
+    }
+
+    /// Get the epoch for this frame (0 for opcodes without epoch).
+    pub fn epoch(&self) -> u32 {
+        match &self.variable_header {
+            VariableHeader::Append { epoch, .. }
+            | VariableHeader::AppendAck { epoch, .. } => *epoch,
+            VariableHeader::Seal { epoch, .. }
+            | VariableHeader::SealAck { epoch, .. } => epoch.unwrap_or(0),
+            VariableHeader::RegisterExtent { epoch, .. } => *epoch,
+            _ => 0,
         }
     }
 
@@ -438,10 +450,10 @@ impl Frame {
     /// Variable header size in bytes for this frame's opcode+flags.
     fn variable_header_len(&self) -> usize {
         match &self.variable_header {
-            // request_id(4) + stream_id(8) + extent_id(4)
+            // request_id(4) + stream_id(8) + epoch(4)
             VariableHeader::Append { .. } => 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + extent_id(4) + offset(8)
-            VariableHeader::AppendAck { .. } => 4 + 8 + 4 + 8,
+            // request_id(4) + stream_id(8) + epoch(4) + extent_id(4) + offset(8)
+            VariableHeader::AppendAck { .. } => 4 + 8 + 4 + 4 + 8,
             // request_id(4) + stream_id(8) + extent_id(4) + offset(8) + count(4)
             VariableHeader::Read { .. } => 4 + 8 + 4 + 8 + 4,
             // request_id(4) + stream_id(8) + offset(8) + count(4)
@@ -570,20 +582,22 @@ impl Frame {
             VariableHeader::Append {
                 request_id,
                 stream_id,
-                extent_id,
+                epoch,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
-                dst.put_u32(extent_id.0);
+                dst.put_u32(*epoch);
             }
             VariableHeader::AppendAck {
                 request_id,
                 stream_id,
+                epoch,
                 extent_id,
                 offset,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
+                dst.put_u32(*epoch);
                 dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
             }
@@ -891,13 +905,13 @@ impl Frame {
             Opcode::Append => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
-                let extent_id = ExtentId(body.get_u32());
+                let epoch = body.get_u32();
                 let payload = Self::read_payload(body);
                 Ok((
                     VariableHeader::Append {
                         request_id,
                         stream_id,
-                        extent_id,
+                        epoch,
                     },
                     payload,
                 ))
@@ -905,12 +919,14 @@ impl Frame {
             Opcode::AppendAck => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
+                let epoch = body.get_u32();
                 let extent_id = ExtentId(body.get_u32());
                 let offset = Offset(body.get_u64());
                 Ok((
                     VariableHeader::AppendAck {
                         request_id,
                         stream_id,
+                        epoch,
                         extent_id,
                         offset,
                     },
@@ -1339,7 +1355,7 @@ mod tests {
             VariableHeader::Append {
                 request_id: 42,
                 stream_id: StreamId(100),
-                extent_id: ExtentId(5),
+                epoch: 0,
             },
             Some(Bytes::from_static(b"hello world")),
         )
@@ -1355,7 +1371,7 @@ mod tests {
         assert_eq!(frame.opcode(), decoded.opcode());
         assert_eq!(frame.request_id(), decoded.request_id());
         assert_eq!(frame.stream_id(), decoded.stream_id());
-        assert_eq!(frame.extent_id(), decoded.extent_id());
+        assert_eq!(frame.epoch(), decoded.epoch());
         assert_eq!(frame.payload, decoded.payload);
         assert!(buf.is_empty());
     }
@@ -1491,6 +1507,7 @@ mod tests {
             VariableHeader::AppendAck {
                 request_id: 10,
                 stream_id: StreamId(1),
+                epoch: 3,
                 extent_id: ExtentId(2),
                 offset: Offset(42),
             },
@@ -1503,6 +1520,7 @@ mod tests {
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.offset(), Offset(42));
         assert_eq!(decoded.stream_id(), StreamId(1));
+        assert_eq!(decoded.epoch(), 3);
         assert_eq!(decoded.extent_id(), ExtentId(2));
     }
 

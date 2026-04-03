@@ -243,6 +243,7 @@ pub enum ErrorCode {
     InvalidOffset = 2,
     ExtentSealed = 3,
     InternalError = 4,
+    EpochStale = 5,
 }
 
 impl ErrorCode {
@@ -253,6 +254,7 @@ impl ErrorCode {
             2 => Some(ErrorCode::InvalidOffset),
             3 => Some(ErrorCode::ExtentSealed),
             4 => Some(ErrorCode::InternalError),
+            5 => Some(ErrorCode::EpochStale),
             _ => None,
         }
     }

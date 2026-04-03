@@ -76,7 +76,7 @@ fn bench_store_append_single(c: &mut Criterion) {
                     VariableHeader::Append {
                         request_id: seq,
                         stream_id: StreamId(1),
-                        extent_id: ExtentId(1),
+                        epoch: 0,
                     },
                     Some(payload.clone()),
                 );
@@ -143,7 +143,7 @@ fn bench_store_append_concurrent(c: &mut Criterion) {
                                                     request_id: (t as u64 * ops_per_thread + seq)
                                                         as u32,
                                                     stream_id: StreamId(1),
-                                                    extent_id: ExtentId(1),
+                                                    epoch: 0,
                                                 },
                                                 Some(p.clone()),
                                             );
