@@ -62,7 +62,7 @@ async fn main() {
         let extent_node_config = ExtentNodeConfig {
             bind_ip: "127.0.0.1".into(),
             port: 0,
-            stream_manager_addr: stream_manager_addr_socket.to_string(),
+            stream_manager_addrs: vec![stream_manager_addr_socket.to_string()],
             extent_arena_capacity: ARENA_CAPACITY,
             ..Default::default()
         };

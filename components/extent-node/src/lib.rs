@@ -109,7 +109,7 @@ impl ExtentNode {
             Arc::clone(&store),
             node_id,
             advertise_addr,
-            config.stream_manager_addr.clone(),
+            config.stream_manager_addrs.clone(),
             config.heartbeat_interval_ms,
             Duration::from_millis(config.connect_timeout_ms),
             Duration::from_millis(config.request_timeout_ms),

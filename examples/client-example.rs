@@ -82,7 +82,7 @@ async fn main() {
         let extent_node_config = ExtentNodeConfig {
             bind_ip: "127.0.0.1".into(),
             port: 0,
-            stream_manager_addr: stream_manager_addr.to_string(),
+            stream_manager_addrs: vec![stream_manager_addr.to_string()],
             ..Default::default()
         };
         let node = extent_node::ExtentNode::start(extent_node_config).await;

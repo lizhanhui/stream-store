@@ -179,7 +179,9 @@ All Extent Nodes, S3 Flusher, and S3 Reader run as Extent Node processes. Stream
 
 **Stream Manager Clustering**: Stream Manager is designed to be fully stateless — all persistent state lives in MySQL, and no in-memory caches are maintained. Multiple SM nodes can run concurrently against the same database. Any SM can handle any client request (CreateStream, Seal, Describe, Seek, QueryOffset) by reading/writing MySQL directly. Node metrics for load-aware placement are persisted to the `node_metrics` table on every heartbeat.
 
-A DB-based leadership lease (`stream_manager_leadership` table) ensures that only one SM at a time runs proactive operations: the heartbeat checker (dead node detection) and failover (epoch bump, seal-and-allocate replacement extents). The `bump_epoch` function uses a compare-and-swap guard (`WHERE epoch = ?`) to prevent double-bumps if leadership transfers mid-failover. See [SM High Availability](sm.md) for the full multi-SM deployment analysis.
+A DB-based leadership lease (`stream_manager_leadership` table) ensures that only one SM at a time runs proactive operations: the heartbeat checker (dead node detection) and failover (epoch bump, seal-and-allocate replacement extents). The `bump_epoch` function uses a compare-and-swap guard (`WHERE epoch = ?`) to prevent double-bumps if leadership transfers mid-failover.
+
+**EN Multi-SM Failover**: Each Extent Node is configured with a list of SM addresses (`stream_manager_addrs`). On connection failure, the EN advances to the next address in round-robin order, ensuring automatic failover when an SM node goes down.
 
 ### Components
 

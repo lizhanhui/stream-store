@@ -63,7 +63,7 @@ impl StreamManagerClient {
         store: Arc<ExtentNodeStore>,
         node_id: String,
         advertise_addr: String,
-        stream_manager_addr: String,
+        stream_manager_addrs: Vec<String>,
         heartbeat_interval_ms: u32,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
@@ -76,7 +76,7 @@ impl StreamManagerClient {
                 store,
                 node_id,
                 advertise_addr,
-                stream_manager_addr,
+                stream_manager_addrs,
                 heartbeat_interval_ms,
                 shutdown_rx,
                 rpc_connect_timeout,
@@ -114,24 +114,26 @@ impl StreamManagerClient {
         }
     }
 
-    /// Reconnection loop. Runs until shutdown signal.
+    /// Reconnection loop. Tries SM addresses in round-robin order on failure.
     async fn run_loop(
         store: Arc<ExtentNodeStore>,
         node_id: String,
         advertise_addr: String,
-        stream_manager_addr: String,
+        stream_manager_addrs: Vec<String>,
         heartbeat_interval_ms: u32,
         mut shutdown_rx: oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
         mut update_rx: mpsc::Receiver<ExtentUpdate>,
     ) {
+        let mut addr_index: usize = 0;
         loop {
+            let addr = &stream_manager_addrs[addr_index % stream_manager_addrs.len()];
             match Self::connect_and_heartbeat(
                 &store,
                 &node_id,
                 &advertise_addr,
-                &stream_manager_addr,
+                addr,
                 heartbeat_interval_ms,
                 &mut shutdown_rx,
                 rpc_connect_timeout,
@@ -146,12 +148,15 @@ impl StreamManagerClient {
                     return;
                 }
                 Ok(false) => {
-                    info!("StreamManager connection closed gracefully");
+                    info!("StreamManager connection to {addr} closed gracefully");
                 }
                 Err(e) => {
-                    warn!("StreamManager connection error: {e}; will retry in 5s");
+                    warn!("StreamManager connection to {addr} failed: {e}");
                 }
             }
+
+            // Advance to next SM address for the next attempt.
+            addr_index += 1;
 
             // Wait before reconnecting, but also listen for shutdown.
             tokio::select! {

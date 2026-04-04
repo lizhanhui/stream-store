@@ -16,8 +16,9 @@ port = 9801
 # Set explicitly in multi-homed environments.
 # advertise_ip = "192.168.1.100"
 
-# StreamManager address for registration and heartbeat
-stream_manager_addr = "127.0.0.1:9800"
+# StreamManager address(es) for registration and heartbeat.
+# The EN tries each address in round-robin order on connection failure.
+stream_manager_addrs = ["127.0.0.1:9800"]
 
 # Heartbeat interval (ms)
 heartbeat_interval_ms = 5000

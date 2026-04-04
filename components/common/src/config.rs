@@ -45,8 +45,9 @@ pub struct ExtentNodeConfig {
     /// If empty and `bind_ip` is `0.0.0.0`, auto-detects the primary non-loopback
     /// interface IP. Set explicitly in multi-homed environments.
     pub advertise_ip: String,
-    /// StreamManager address to connect to for registration and heartbeat.
-    pub stream_manager_addr: String,
+    /// StreamManager address(es) for registration and heartbeat.
+    /// The EN tries each address in round-robin order on connection failure.
+    pub stream_manager_addrs: Vec<String>,
     /// Heartbeat interval in milliseconds. StreamManager uses 1.5x as dead-node timeout.
     pub heartbeat_interval_ms: u32,
     /// Arena capacity in bytes for each extent. Defaults to 64 MiB.
@@ -67,7 +68,7 @@ impl Default for ExtentNodeConfig {
             bind_ip: "0.0.0.0".to_string(),
             port: 9801,
             advertise_ip: String::new(),
-            stream_manager_addr: "127.0.0.1:9800".to_string(),
+            stream_manager_addrs: vec!["127.0.0.1:9800".to_string()],
             heartbeat_interval_ms: 5000,
             extent_arena_capacity: 64 * 1024 * 1024, // 64 MiB
             replication_timeout_ms: DEFAULT_REPLICATION_TIMEOUT_MS,
