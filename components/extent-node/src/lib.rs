@@ -6,6 +6,7 @@ pub mod stream_manager_client;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::config::{ExtentNodeConfig, resolve_advertise_ip};
 use tokio::net::TcpListener;
@@ -117,6 +118,7 @@ impl ExtentNode {
         // Create store first (OnceLock for downstream breaks circular dep).
         let mut store_inner = ExtentNodeStore::new();
         store_inner.set_arena_capacity(config.extent_arena_capacity);
+        store_inner.set_replication_timeout(Duration::from_millis(config.replication_timeout_ms));
 
         // Wire up the seal notification channel for autonomous extent creation.
         // The receiver task sends NOTIFY_SEALED_EXTENT frames to Stream Manager.
@@ -161,6 +163,8 @@ impl ExtentNode {
             advertise_addr,
             config.stream_manager_addr.clone(),
             config.heartbeat_interval_ms,
+            Duration::from_millis(config.rpc_connect_timeout_ms),
+            Duration::from_millis(config.rpc_request_timeout_ms),
         );
 
         // Spawn accept loop.

@@ -21,13 +21,10 @@ use crate::stream::Stream;
 
 // ── Broadcast replication types ──────────────────────────────────────────────
 
-/// Timeout for replication quorum. PendingAcks older than this are expired
-/// with an error response to the client, preventing unbounded accumulation
-/// when a secondary dies and quorum_offset() returns None forever.
-///
-/// 500ms is generous for memory-based replication where the Primary→Secondary
-/// forward + watermark ACK round-trip is sub-millisecond (network RTT < 10ms).
-const REPLICATION_TIMEOUT: Duration = Duration::from_millis(500);
+/// Default replication timeout used when no config is provided (e.g., in tests).
+const DEFAULT_REPLICATION_TIMEOUT: Duration = Duration::from_millis(
+    common::config::DEFAULT_REPLICATION_TIMEOUT_MS,
+);
 
 /// A pending client ACK waiting for quorum replication.
 #[derive(Debug)]
@@ -59,14 +56,21 @@ pub struct AckQueue {
     pub secondary_acked: HashMap<String, u64>,
     /// Number of secondary ACKs needed for quorum.
     pub required_secondary_acks: u32,
+    /// Timeout for expiring stale PendingAcks.
+    replication_timeout: Duration,
 }
 
 impl AckQueue {
     pub fn new(required_secondary_acks: u32) -> Self {
+        Self::with_timeout(required_secondary_acks, DEFAULT_REPLICATION_TIMEOUT)
+    }
+
+    pub fn with_timeout(required_secondary_acks: u32, replication_timeout: Duration) -> Self {
         Self {
             pending: VecDeque::new(),
             secondary_acked: HashMap::new(),
             required_secondary_acks,
+            replication_timeout,
         }
     }
 
@@ -117,7 +121,7 @@ impl AckQueue {
     /// frames back to the client connections.
     ///
     /// After the normal quorum drain, sweeps the front of the queue for expired
-    /// entries (older than REPLICATION_TIMEOUT) and sends error responses.
+    /// entries (older than the configured replication timeout) and sends error responses.
     pub fn drain_quorum(&mut self) {
         let qo = self.quorum_offset();
         if let Some(qo) = qo {
@@ -142,11 +146,11 @@ impl AckQueue {
             }
         }
 
-        // Timeout sweep: expire PendingAcks older than REPLICATION_TIMEOUT.
+        // Timeout sweep: expire PendingAcks older than the configured replication timeout.
         // Queue is ordered by creation time, so stop at the first non-expired entry.
         let now = Instant::now();
         while let Some(front) = self.pending.front() {
-            if now.duration_since(front.created_at) > REPLICATION_TIMEOUT {
+            if now.duration_since(front.created_at) > self.replication_timeout {
                 let ack = self.pending.pop_front().unwrap();
                 warn!(
                     request_id = ack.request_id,
@@ -266,6 +270,8 @@ pub struct ExtentNodeStore {
     /// Per-stream ACK queues for the Primary (only used when this node is Primary for a stream).
     /// Fine-grained per-stream locking.
     pub ack_queues: DashMap<StreamId, AckQueue>,
+    /// Configurable timeout for replication quorum ACK expiry.
+    replication_timeout: Duration,
     // -- Metrics counters (reset on each heartbeat snapshot) --
     /// Total appends since last snapshot (atomic, no lock needed).
     append_count: AtomicU64,
@@ -284,9 +290,15 @@ impl ExtentNodeStore {
             downstream: OnceLock::new(),
             seal_tx: None,
             ack_queues: DashMap::new(),
+            replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
             append_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
         }
+    }
+
+    /// Set the replication timeout (from config). Called once at startup.
+    pub fn set_replication_timeout(&mut self, timeout: Duration) {
+        self.replication_timeout = timeout;
     }
 
     /// Set the downstream connection pool for broadcast replication.
@@ -514,7 +526,7 @@ impl ExtentNodeStore {
         if ri.is_primary() {
             self.ack_queues
                 .entry(stream_id)
-                .or_insert_with(|| AckQueue::new(ri.required_secondary_acks()));
+                .or_insert_with(|| AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout));
         }
 
         self.replicas.insert(stream_id, ri);
@@ -799,7 +811,7 @@ impl ExtentNodeStore {
                         let mut ack_queue = self
                             .ack_queues
                             .entry(stream_id)
-                            .or_insert_with(|| AckQueue::new(ri.required_secondary_acks()));
+                            .or_insert_with(|| AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout));
                         ack_queue.pending.push_back(PendingAck {
                             request_id,
                             stream_id,
@@ -1257,7 +1269,7 @@ impl ExtentNodeStore {
                         let mut ack_queue = self
                             .ack_queues
                             .entry(stream_id)
-                            .or_insert_with(|| AckQueue::new(ri.required_secondary_acks()));
+                            .or_insert_with(|| AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout));
                         let now = Instant::now();
                         for entry in &entries {
                             ack_queue.pending.push_back(PendingAck {
@@ -2239,7 +2251,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_ack_timeout() {
-        // Verify that PendingAcks expire after REPLICATION_TIMEOUT.
+        // Verify that PendingAcks expire after the configured replication timeout.
         let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(100);
 
         let mut ack_queue = AckQueue::new(1); // need 1 secondary ACK
@@ -2252,7 +2264,7 @@ mod tests {
             epoch: Epoch(0),
             response_tx: resp_tx.clone(),
             assigned_offset: 0,
-            created_at: Instant::now() - REPLICATION_TIMEOUT - Duration::from_secs(1),
+            created_at: Instant::now() - DEFAULT_REPLICATION_TIMEOUT - Duration::from_secs(1),
         });
 
         // Queue a second PendingAck that is NOT expired.

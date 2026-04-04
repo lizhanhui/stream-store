@@ -24,3 +24,13 @@ heartbeat_interval_ms = 5000
 
 # Arena capacity per extent (bytes). Default: 64 MiB
 extent_arena_capacity = 67108864
+
+# Replication quorum ACK timeout (ms). PendingAcks older than this are expired
+# with an error to the client. Default: 500
+# replication_timeout_ms = 500
+
+# RPC TCP connect timeout (ms). Default: 500
+# rpc_connect_timeout_ms = 500
+
+# RPC request-response timeout for SM-facing calls (ms). Default: 2000
+# rpc_request_timeout_ms = 2000

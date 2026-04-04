@@ -19,3 +19,9 @@ default_replication_factor = 2
 
 # Heartbeat checker interval (ms)
 heartbeat_check_interval_ms = 3000
+
+# RPC TCP connect timeout for ExtentNode calls (ms). Default: 500
+# rpc_connect_timeout_ms = 500
+
+# RPC request-response timeout for ExtentNode calls (ms). Default: 2000
+# rpc_request_timeout_ms = 2000

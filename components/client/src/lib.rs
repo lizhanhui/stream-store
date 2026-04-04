@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use common::config::{DEFAULT_RPC_CONNECT_TIMEOUT, DEFAULT_SM_RPC_REQUEST_TIMEOUT};
+use common::config::{DEFAULT_RPC_CONNECT_TIMEOUT_MS, DEFAULT_SM_RPC_REQUEST_TIMEOUT_MS};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId};
 use futures_util::{SinkExt, StreamExt};
@@ -44,6 +45,7 @@ struct Inner {
 /// All public methods take `&self`, enabling shared ownership via `Arc`.
 pub struct StorageClient {
     inner: Arc<Inner>,
+    request_timeout: Duration,
     _reader_handle: JoinHandle<()>,
     _writer_handle: JoinHandle<()>,
 }
@@ -56,9 +58,23 @@ impl Drop for StorageClient {
 }
 
 impl StorageClient {
-    /// Connect to a storage service endpoint.
+    /// Connect to a storage service endpoint with default timeouts.
     pub async fn connect(addr: &str) -> Result<Self, StorageError> {
-        let stream = tokio::time::timeout(DEFAULT_RPC_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        Self::connect_with_timeouts(
+            addr,
+            Duration::from_millis(DEFAULT_RPC_CONNECT_TIMEOUT_MS),
+            Duration::from_millis(DEFAULT_SM_RPC_REQUEST_TIMEOUT_MS),
+        )
+        .await
+    }
+
+    /// Connect to a storage service endpoint with custom timeouts.
+    pub async fn connect_with_timeouts(
+        addr: &str,
+        connect_timeout: Duration,
+        request_timeout: Duration,
+    ) -> Result<Self, StorageError> {
+        let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| StorageError::Internal(format!("connect timeout to {addr}")))??;
         stream
@@ -84,6 +100,7 @@ impl StorageClient {
 
         Ok(Self {
             inner,
+            request_timeout,
             _reader_handle: reader_handle,
             _writer_handle: writer_handle,
         })
@@ -165,7 +182,7 @@ impl StorageClient {
         }
 
         // Wait for response with timeout.
-        match tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(self.request_timeout, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_recv_err)) => {
                 // Sender was dropped (reader task died).

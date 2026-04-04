@@ -12,7 +12,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::config::{DEFAULT_RPC_CONNECT_TIMEOUT, DEFAULT_SM_RPC_REQUEST_TIMEOUT};
 use common::errors::StorageError;
 use common::types::NodeMetrics;
 use common::types::Opcode;
@@ -60,6 +59,8 @@ impl StreamManagerClient {
         advertise_addr: String,
         stream_manager_addr: String,
         heartbeat_interval_ms: u32,
+        rpc_connect_timeout: Duration,
+        rpc_request_timeout: Duration,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -71,6 +72,8 @@ impl StreamManagerClient {
                 stream_manager_addr,
                 heartbeat_interval_ms,
                 shutdown_rx,
+                rpc_connect_timeout,
+                rpc_request_timeout,
             )
             .await;
         });
@@ -111,6 +114,8 @@ impl StreamManagerClient {
         stream_manager_addr: String,
         heartbeat_interval_ms: u32,
         mut shutdown_rx: oneshot::Receiver<()>,
+        rpc_connect_timeout: Duration,
+        rpc_request_timeout: Duration,
     ) {
         loop {
             match Self::connect_and_heartbeat(
@@ -120,6 +125,8 @@ impl StreamManagerClient {
                 &stream_manager_addr,
                 heartbeat_interval_ms,
                 &mut shutdown_rx,
+                rpc_connect_timeout,
+                rpc_request_timeout,
             )
             .await
             {
@@ -159,9 +166,11 @@ impl StreamManagerClient {
         stream_manager_addr: &str,
         heartbeat_interval_ms: u32,
         shutdown_rx: &mut oneshot::Receiver<()>,
+        rpc_connect_timeout: Duration,
+        rpc_request_timeout: Duration,
     ) -> Result<bool, StorageError> {
         let stream =
-            tokio::time::timeout(DEFAULT_RPC_CONNECT_TIMEOUT, TcpStream::connect(stream_manager_addr))
+            tokio::time::timeout(rpc_connect_timeout, TcpStream::connect(stream_manager_addr))
                 .await
                 .map_err(|_| {
                     StorageError::Internal(format!("connect timeout to {stream_manager_addr}"))
@@ -178,11 +187,11 @@ impl StreamManagerClient {
             VariableHeader::Connect { request_id: 0 },
             Some(connect_payload),
         );
-        tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, framed.send(connect_frame))
+        tokio::time::timeout(rpc_request_timeout, framed.send(connect_frame))
             .await
             .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))??;
 
-        match tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, framed.next()).await {
+        match tokio::time::timeout(rpc_request_timeout, framed.next()).await {
             Ok(Some(Ok(resp))) if resp.opcode() == Opcode::ConnectAck => {
                 info!("registered with StreamManager");
             }
@@ -275,11 +284,11 @@ impl StreamManagerClient {
             );
             request_id = request_id.wrapping_add(1);
 
-            tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, framed.send(hb_frame))
+            tokio::time::timeout(rpc_request_timeout, framed.send(hb_frame))
                 .await
                 .map_err(|_| StorageError::Internal("timeout sending Heartbeat".into()))??;
 
-            match tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, framed.next()).await {
+            match tokio::time::timeout(rpc_request_timeout, framed.next()).await {
                 Ok(Some(Ok(resp))) if resp.opcode() == Opcode::Heartbeat => {
                     // Heartbeat acknowledged.
                 }
