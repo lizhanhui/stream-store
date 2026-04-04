@@ -12,11 +12,11 @@ use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
 use std::sync::Arc;
+use futures_util::SinkExt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::downstream::DownstreamPool;
-use crate::extent::DEFAULT_ARENA_CAPACITY;
 use crate::stream::Stream;
 
 // ── Broadcast replication types ──────────────────────────────────────────────
@@ -260,9 +260,6 @@ pub struct ExtentNodeStore {
     streams: DashMap<StreamId, Stream>,
     /// Monotonic stream ID generator (atomic, no lock needed).
     next_stream_id: AtomicU64,
-    /// Arena capacity for new extents (bytes). Configurable per ExtentNode.
-    /// Set once at startup, read-only thereafter.
-    arena_capacity: usize,
     /// Replication info per stream_id (registered via RegisterExtent).
     /// Fine-grained per-stream locking.
     replicas: DashMap<StreamId, ReplicaInfo>,
@@ -290,7 +287,6 @@ impl ExtentNodeStore {
         Self {
             streams: DashMap::new(),
             next_stream_id: AtomicU64::new(1),
-            arena_capacity: DEFAULT_ARENA_CAPACITY,
             replicas: DashMap::new(),
             downstream: OnceLock::new(),
             update_tx: None,
@@ -311,12 +307,6 @@ impl ExtentNodeStore {
     /// Uses OnceLock to break the circular dependency: store needs pool, pool needs store.
     pub fn set_downstream(&self, pool: Arc<DownstreamPool>) {
         self.downstream.set(pool).ok();
-    }
-
-    /// Set the arena capacity for new extents (bytes).
-    /// Called once during startup before any requests are processed.
-    pub fn set_arena_capacity(&mut self, capacity: usize) {
-        self.arena_capacity = capacity;
     }
 
     /// Set the seal request channel (called during ExtentNode bootstrap).
@@ -390,7 +380,16 @@ impl RequestHandler for ExtentNodeStore {
     ) -> Option<Frame> {
         match frame.opcode() {
             Opcode::Append => self.handle_append(frame, response_tx).await,
-            Opcode::Forward => Some(self.handle_forward(frame)),
+            Opcode::Forward => {
+                // Both Forward and ForwardInitExtent share opcode 0x0B.
+                match &frame.variable_header {
+                    VariableHeader::ForwardInitExtent { .. } => {
+                        self.handle_forward_init_extent(frame);
+                        None // fire-and-forget, no response
+                    }
+                    _ => Some(self.handle_forward(frame)),
+                }
+            }
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
             Opcode::Seal => Some(self.handle_seal(frame)),
@@ -462,15 +461,16 @@ impl ExtentNodeStore {
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
     fn handle_register_extent(&self, frame: Frame) -> Frame {
         // Extract stream_id, extent_id, role, replication_factor from the variable header.
-        let (stream_id, extent_id, role, replication_factor, epoch) = match &frame.variable_header {
+        let (stream_id, extent_id, role, replication_factor, epoch, extent_capacity) = match &frame.variable_header {
             VariableHeader::RegisterExtent {
                 stream_id,
                 extent_id,
                 role,
                 replication_factor,
                 epoch,
+                extent_capacity,
                 ..
-            } => (*stream_id, *extent_id, *role, *replication_factor, *epoch),
+            } => (*stream_id, *extent_id, *role, *replication_factor, *epoch, *extent_capacity),
             _ => {
                 return Frame::error_response(
                     frame.request_id(),
@@ -501,7 +501,7 @@ impl ExtentNodeStore {
         let _start_offset = if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
             if stream_mut.find_extent(extent_id).is_none() {
                 let so = stream_mut.max_offset();
-                stream_mut.register_extent(extent_id, so, self.arena_capacity, epoch);
+                stream_mut.register_extent(extent_id, so, extent_capacity, epoch);
                 so
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
@@ -511,7 +511,7 @@ impl ExtentNodeStore {
             }
         } else {
             let mut stream = Stream::new(stream_id);
-            stream.register_extent(extent_id, Offset(0), self.arena_capacity, epoch);
+            stream.register_extent(extent_id, Offset(0), extent_capacity, epoch);
             self.streams.insert(stream_id, stream);
             Offset(0)
         };
@@ -649,6 +649,8 @@ impl ExtentNodeStore {
             drop(stream_ref);
             let seal_notification = self.seal_and_create_on_full(stream_id);
             // Re-acquire read ref and retry the append.
+            // The new extent's needs_init_forward flag is set, so do_append_and_respond
+            // will prepend ForwardInitExtent in the same forward_work batch.
             let stream_ref = match self.streams.get(&stream_id) {
                 Some(s) => s,
                 None => return None,
@@ -760,7 +762,7 @@ impl ExtentNodeStore {
         };
 
         let offset = append_result.offset;
-        let extent_start_offset = stream
+        let _extent_start_offset = stream
             .find_extent(extent_id)
             .map(|e| e.start_offset.0)
             .unwrap_or(0);
@@ -822,7 +824,6 @@ impl ExtentNodeStore {
                                     stream_id,
                                     extent_id,
                                     epoch,
-                                    start_offset: Offset(extent_start_offset),
                                     offset,
                                     byte_pos: append_result.byte_pos,
                                 },
@@ -956,8 +957,8 @@ impl ExtentNodeStore {
                 drop(stream_ref);
 
                 let seal_notification = self.seal_and_create_on_full(stream_id);
-                if let Some(notif) = seal_notification {
-                    all_seal_notifications.push(notif);
+                if let Some(ref notif) = seal_notification {
+                    all_seal_notifications.push(notif.clone());
                 }
 
                 // Re-acquire read guard to retry the failed job and remaining jobs on the new extent.
@@ -1194,6 +1195,8 @@ impl ExtentNodeStore {
             if extent_full {
                 // Autonomous extent creation for batch path — retry all failed frames.
                 let seal_notification = self.seal_and_create_on_full(stream_id);
+                // do_append_and_respond will check the new extent's needs_init_forward flag
+                // and prepend ForwardInitExtent in the same forward_work batch.
                 if let Some(stream_ref2) = self.streams.get(&stream_id) {
                     for ff in &failed_frames {
                         let (_, _, retry_forward) = self.do_append_and_respond(
@@ -1216,7 +1219,7 @@ impl ExtentNodeStore {
         }
 
         // Resolve extent_start_offset from the first entry's extent.
-        let extent_start_offset = stream_ref
+        let _extent_start_offset = stream_ref
             .find_extent(entries[0].extent_id)
             .map(|e| e.start_offset.0)
             .unwrap_or(0);
@@ -1281,7 +1284,6 @@ impl ExtentNodeStore {
                                         stream_id,
                                         extent_id: entry.extent_id,
                                         epoch,
-                                        start_offset: Offset(extent_start_offset),
                                         offset: entry.offset,
                                         byte_pos: entry.byte_pos,
                                     },
@@ -1356,6 +1358,8 @@ impl ExtentNodeStore {
         if extent_full {
             // Autonomous extent creation for batch path (end of batch) — retry failed frames.
             let seal_notification = self.seal_and_create_on_full(stream_id);
+            // do_append_and_respond will check the new extent's needs_init_forward flag
+            // and prepend ForwardInitExtent in the same forward_work batch.
             if let Some(stream_ref2) = self.streams.get(&stream_id) {
                 for ff in &failed_frames {
                     let (_, _, retry_forward) = self.do_append_and_respond(
@@ -1389,45 +1393,125 @@ impl ExtentNodeStore {
         if forward_work.is_empty() {
             return;
         }
-        if let Some(pool) = self.downstream.get() {
-            // Group by destination address for efficient batching.
-            let mut by_addr: HashMap<&str, Vec<&Frame>> = HashMap::new();
-            for (addr, frame) in &forward_work {
-                by_addr.entry(addr.as_str()).or_default().push(frame);
-            }
-            for (addr, frames) in by_addr {
-                if frames.len() == 1 {
-                    pool.forward(addr, frames[0].clone()).await;
-                } else {
-                    let owned: Vec<Frame> = frames.into_iter().cloned().collect();
-                    pool.forward_batch(addr, &owned).await;
+        let pool = match self.downstream.get() {
+            Some(p) => p,
+            None => return,
+        };
+        // Group by destination address for efficient batching.
+        let mut by_addr: HashMap<&str, Vec<&Frame>> = HashMap::new();
+        for (addr, frame) in &forward_work {
+            by_addr.entry(addr.as_str()).or_default().push(frame);
+        }
+        for (addr, frames) in by_addr {
+            let writer = match pool.get_or_create_writer(addr).await {
+                Some(w) => w,
+                None => continue,
+            };
+            let mut guard = writer.lock().await;
+
+            // Under the Mutex: check if any Forward frame targets an extent that
+            // needs ForwardInitExtent. Send init frames first to guarantee ordering.
+            for f in &frames {
+                if let VariableHeader::Forward {
+                    stream_id,
+                    extent_id,
+                    epoch,
+                    ..
+                } = &f.variable_header
+                {
+                    if let Some(stream_ref) = self.streams.get(stream_id) {
+                        if let Some(ext) = stream_ref.find_extent(*extent_id) {
+                            if ext.take_init_forward() {
+                                let init = Frame::new(
+                                    VariableHeader::ForwardInitExtent {
+                                        stream_id: *stream_id,
+                                        extent_id: *extent_id,
+                                        epoch: *epoch,
+                                        start_offset: ext.start_offset,
+                                        extent_capacity: stream_ref.arena_capacity(),
+                                    },
+                                    None,
+                                );
+                                let _ = guard.feed(init).await;
+                            }
+                        }
+                    }
                 }
+            }
+
+            // Write all Forward frames.
+            for frame in &frames {
+                if let Err(e) = guard.feed((*frame).clone()).await {
+                    warn!("send to secondary {addr} failed: {e}");
+                    break;
+                }
+            }
+            if let Err(e) = guard.flush().await {
+                warn!("flush to secondary {addr} failed: {e}");
             }
         }
     }
 
-    /// Handle Forward (0x0B) — dedicated opcode for Primary→Secondary replication.
+    /// Handle ForwardInitExtent (0x0B, flag=0x01) — init-extent notification.
     ///
-    /// The Forward frame carries all metadata (stream_id, extent_id, start_offset,
-    /// offset, byte_pos) so the secondary writes each record at the exact same
-    /// arena position as the primary, enabling bit-for-bit identical replicas.
+    /// Creates the stream (if needed) and registers the extent with the provided
+    /// start_offset and extent_capacity. Fire-and-forget: no response.
+    fn handle_forward_init_extent(&self, frame: Frame) {
+        let (stream_id, extent_id, epoch, start_offset, extent_capacity) =
+            match &frame.variable_header {
+                VariableHeader::ForwardInitExtent {
+                    stream_id,
+                    extent_id,
+                    epoch,
+                    start_offset,
+                    extent_capacity,
+                } => (*stream_id, *extent_id, *epoch, *start_offset, *extent_capacity),
+                _ => return,
+            };
+
+        if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+            if stream_mut.find_extent(extent_id).is_none() {
+                let so = stream_mut.max_offset();
+                stream_mut.register_extent(extent_id, so, extent_capacity, epoch);
+                info!(
+                    "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}",
+                    stream_id, extent_id, start_offset, extent_capacity,
+                );
+            }
+        } else {
+            let mut stream = Stream::new(stream_id);
+            stream.register_extent(extent_id, start_offset, extent_capacity, epoch);
+            self.streams.insert(stream_id, stream);
+            self.next_stream_id
+                .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
+            info!(
+                "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}",
+                stream_id, extent_id, start_offset, extent_capacity,
+            );
+        }
+    }
+
+    /// Handle Forward (0x0B, flag=0x00) — per-record primary→secondary replication.
+    ///
+    /// The Forward frame carries (stream_id, extent_id, epoch, offset, byte_pos)
+    /// so the secondary writes each record at the exact same arena position as
+    /// the primary. The stream/extent must already exist (created by a prior
+    /// ForwardInitExtent or RegisterExtent).
     ///
     /// Returns a cumulative Watermark with the highest written offset.
     fn handle_forward(&self, frame: Frame) -> Frame {
-        let (stream_id, extent_id, epoch, start_offset, offset, byte_pos) =
+        let (stream_id, extent_id, _epoch, offset, byte_pos) =
             match &frame.variable_header {
                 VariableHeader::Forward {
                     stream_id,
                     extent_id,
                     epoch,
-                    start_offset,
                     offset,
                     byte_pos,
                 } => (
                     *stream_id,
                     *extent_id,
                     *epoch,
-                    *start_offset,
                     *offset,
                     *byte_pos,
                 ),
@@ -1442,31 +1526,60 @@ impl ExtentNodeStore {
                 }
             };
 
-        // Compute seq from offset and start_offset.
-        let seq = offset.0 - start_offset.0;
-
-        // Get or lazily create the stream/extent.
+        // Look up the stream — must exist (created by ForwardInitExtent or RegisterExtent).
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
             None => {
-                // Forward arrived before RegisterExtent — lazy extent creation.
-                let mut stream = Stream::new(stream_id);
-                stream.register_extent(extent_id, start_offset, self.arena_capacity, epoch);
-                self.streams.insert(stream_id, stream);
-
-                self.next_stream_id
-                    .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
-
-                info!(
-                    "Lazy extent creation on forward: stream={}, extent={}, start_offset={}",
-                    stream_id, extent_id, start_offset,
+                warn!(
+                    "Forward for unknown stream {}, extent {} — missing ForwardInitExtent?",
+                    stream_id, extent_id,
                 );
-
-                self.streams.get(&stream_id).unwrap()
+                return Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset: Offset(0),
+                    },
+                    None,
+                );
             }
         };
 
-        // Try replicate. If extent not found, lazily create it and retry.
+        // Compute seq from the extent's start_offset.
+        let extent = match stream_ref.find_extent(extent_id) {
+            Some(e) => e,
+            None => {
+                warn!(
+                    "Forward for unknown extent {} on stream {} — missing ForwardInitExtent?",
+                    extent_id, stream_id,
+                );
+                let max_offset = stream_ref.max_offset();
+                drop(stream_ref);
+                return Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset: max_offset,
+                    },
+                    None,
+                );
+            }
+        };
+        let seq = offset.0 - extent.start_offset.0;
+        drop(stream_ref);
+
+        // Re-acquire read ref for replicate.
+        let stream_ref = match self.streams.get(&stream_id) {
+            Some(s) => s,
+            None => {
+                return Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset: Offset(0),
+                    },
+                    None,
+                );
+            }
+        };
+
         let replicate_result = stream_ref.replicate(
             extent_id,
             seq,
@@ -1490,50 +1603,20 @@ impl ExtentNodeStore {
                     None,
                 );
             }
-            Err(_) => {
-                // Extent not found — lazily create and retry.
+            Err(e) => {
+                warn!(
+                    "Forward replicate failed for stream={}, extent={}: {}",
+                    stream_id, extent_id, e,
+                );
+                let max_offset = stream_ref.max_offset();
                 drop(stream_ref);
-                if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-                    if stream_mut.find_extent(extent_id).is_none() {
-                        stream_mut.register_extent(
-                            extent_id,
-                            start_offset,
-                            self.arena_capacity,
-                            epoch,
-                        );
-                        info!(
-                            "Lazy extent creation on forward (existing stream): stream={}, extent={}, start_offset={}",
-                            stream_id, extent_id, start_offset,
-                        );
-                    }
-                    match stream_mut.replicate(
-                        extent_id,
-                        seq,
-                        byte_pos,
-                        frame.payload.clone().unwrap_or_default(),
-                    ) {
-                        Ok(r) => r.offset,
-                        Err(_) => {
-                            let max_offset = stream_mut.max_offset();
-                            drop(stream_mut);
-                            return Frame::new(
-                                VariableHeader::Watermark {
-                                    stream_id,
-                                    offset: max_offset,
-                                },
-                                None,
-                            );
-                        }
-                    }
-                } else {
-                    return Frame::new(
-                        VariableHeader::Watermark {
-                            stream_id,
-                            offset: Offset(0),
-                        },
-                        None,
-                    );
-                }
+                return Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id,
+                        offset: max_offset,
+                    },
+                    None,
+                );
             }
         };
 
@@ -1797,6 +1880,7 @@ impl ExtentNodeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::extent::DEFAULT_ARENA_CAPACITY;
 
     /// Register a stream on the ExtentNode via RegisterExtent (RF=1, Primary, no secondaries).
     /// This is the production path: StreamManager assigns a stream_id and sends RegisterExtent.
@@ -1815,6 +1899,7 @@ mod tests {
                         role: 0,
                         replication_factor: 1,
                         epoch: Epoch(0),
+                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -1988,6 +2073,7 @@ mod tests {
                         role: 0,
                         replication_factor: 2,
                         epoch: Epoch(0),
+                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2031,6 +2117,7 @@ mod tests {
                         role: 1,
                         replication_factor: 2,
                         epoch: Epoch(0),
+                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2069,6 +2156,7 @@ mod tests {
                         role: 0,
                         replication_factor: 1,
                         epoch: Epoch(0),
+                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2128,6 +2216,7 @@ mod tests {
                         role: 0,
                         replication_factor: 3,
                         epoch: Epoch(0),
+                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2209,6 +2298,7 @@ mod tests {
                         role: 1,
                         replication_factor: 2,
                         epoch: Epoch(0),
+                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2225,7 +2315,6 @@ mod tests {
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
                         epoch: Epoch(0),
-                        start_offset: Offset(0),
                         offset: Offset(0),
                         byte_pos: 0,
                     },
@@ -2815,6 +2904,7 @@ mod tests {
                         role: 1,
                         replication_factor: 2,
                         epoch: Epoch(0),
+                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2834,7 +2924,6 @@ mod tests {
                             stream_id: StreamId(10),
                             extent_id: ExtentId(50),
                             epoch: Epoch(0),
-                            start_offset: Offset(0),
                             offset: Offset(i as u64),
                             byte_pos,
                         },
@@ -2880,7 +2969,6 @@ mod tests {
                             stream_id: StreamId(10),
                             extent_id: ExtentId(50),
                             epoch: Epoch(0),
-                            start_offset: Offset(0),
                             offset: Offset(i as u64),
                             byte_pos,
                         },
@@ -2906,7 +2994,6 @@ mod tests {
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
                         epoch: Epoch(0),
-                        start_offset: Offset(0),
                         offset: Offset(4),
                         byte_pos: 32,
                     },

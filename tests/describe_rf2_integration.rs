@@ -152,7 +152,7 @@ async fn describe_stream_rf2_integration() {
     );
 
     let (stream_id, first_extent_id, _epoch, primary_addr) =
-        stream_manager.create_stream(&stream_name, 2).await.unwrap();
+        stream_manager.create_stream(&stream_name, 2, 0).await.unwrap();
 
     assert!(stream_id.0 > 0);
     // Primary should be one of the two registered ENs.

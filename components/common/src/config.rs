@@ -50,8 +50,6 @@ pub struct ExtentNodeConfig {
     pub stream_manager_addrs: Vec<String>,
     /// Heartbeat interval in milliseconds. StreamManager uses 1.5x as dead-node timeout.
     pub heartbeat_interval_ms: u32,
-    /// Arena capacity in bytes for each extent. Defaults to 64 MiB.
-    pub extent_arena_capacity: usize,
     /// Timeout (ms) for replication quorum ACK. PendingAcks older than this are
     /// expired with an error to the client. Defaults to 500ms.
     pub replication_timeout_ms: u64,
@@ -70,7 +68,6 @@ impl Default for ExtentNodeConfig {
             advertise_ip: String::new(),
             stream_manager_addrs: vec!["127.0.0.1:9800".to_string()],
             heartbeat_interval_ms: 5000,
-            extent_arena_capacity: 64 * 1024 * 1024, // 64 MiB
             replication_timeout_ms: DEFAULT_REPLICATION_TIMEOUT_MS,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,

@@ -191,7 +191,7 @@ async fn client_task(
         .unwrap_or_else(|e| panic!("client {client_id}: StreamManager connect failed: {e}"));
 
     let (stream_id, _extent_id, _epoch, initial_primary_addr) = stream_manager_client
-        .create_stream(&format!("bench-stream-{client_id}"), REPLICATION_FACTOR)
+        .create_stream(&format!("bench-stream-{client_id}"), REPLICATION_FACTOR, 0)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: create_stream failed: {e}"));
 

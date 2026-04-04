@@ -2,14 +2,14 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, ExtentState, Offset};
 
 /// Default arena capacity: 64 MB.
-pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
+pub const DEFAULT_ARENA_CAPACITY: u32 = 64 * 1024 * 1024;
 
 /// Sentinel for unwritten index entries.
 /// We use 0 so the index can be allocated with `alloc_zeroed` (OS provides
@@ -21,14 +21,14 @@ const INDEX_UNSET: u32 = 0;
 
 /// Sentinel value for `limit`: extent is not sealed.
 const LIMIT_OPEN: u64 = u64::MAX;
-const MIN_RECORD_SIZE: usize = 5;
+const MIN_RECORD_SIZE: u32 = 5;
 
 /// Owns the raw heap allocation for an extent's arena buffer.
 /// Wrapped in `Arc` so that `Bytes` slices keep the buffer alive
 /// even after the `Extent` is dropped.
 struct ArenaBuffer {
     ptr: NonNull<u8>,
-    capacity: usize,
+    capacity: u32,
     layout: Layout,
 }
 
@@ -51,7 +51,7 @@ impl Drop for ArenaBuffer {
 struct OwnedArenaSlice {
     _arena: Arc<ArenaBuffer>,
     ptr: *const u8,
-    len: usize,
+    len: u32,
 }
 
 // SAFETY: The underlying memory is owned by Arc<ArenaBuffer> which is Send+Sync.
@@ -65,7 +65,7 @@ impl Deref for OwnedArenaSlice {
     fn deref(&self) -> &[u8] {
         // SAFETY: ptr is valid for len bytes as long as _arena is alive,
         // and _arena is kept alive by the Arc clone in this struct.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len as usize) }
     }
 }
 
@@ -143,7 +143,7 @@ pub struct Extent {
     /// Derived write pointer into the arena (for append writes).
     buf: *mut u8,
     /// Total capacity of the arena in bytes.
-    capacity: usize,
+    capacity: u32,
 
     /// Byte position of the next free slot. Updated by the single active writer.
     write_cursor: AtomicU64,
@@ -173,6 +173,10 @@ pub struct Extent {
     /// Entry i holds the byte_pos for the i-th record appended to this extent.
     /// Capacity = arena_capacity / MIN_RECORD_SIZE.
     index: Box<[AtomicU32]>,
+
+    /// When true, the primary must prepend a ForwardInitExtent frame before the
+    /// first Forward batch for this extent. Cleared atomically on first use.
+    init_forward: AtomicBool,
 }
 
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
@@ -191,10 +195,10 @@ impl Extent {
     pub fn with_capacity(
         id: ExtentId,
         start_offset: Offset,
-        capacity: usize,
+        capacity: u32,
         epoch: Epoch,
     ) -> Self {
-        let layout = Layout::from_size_align(capacity, 8).expect("invalid layout");
+        let layout = Layout::from_size_align(capacity as usize, 8).expect("invalid layout");
         // SAFETY: layout is valid, nonzero size.
         let ptr = unsafe { alloc(layout) };
         if ptr.is_null() {
@@ -211,7 +215,7 @@ impl Extent {
         // Allocate the index with alloc_zeroed: the OS provides pre-zeroed pages
         // (MAP_ANONYMOUS) at near-zero cost, avoiding a 13M+ iteration init loop
         // that caused ~80ms stalls. INDEX_UNSET == 0, so zeroed memory is correct.
-        let index_capacity = capacity / MIN_RECORD_SIZE;
+        let index_capacity  = (capacity / MIN_RECORD_SIZE) as usize;
         let index = {
             let index_layout = Layout::from_size_align(
                 index_capacity * std::mem::size_of::<AtomicU32>(),
@@ -246,7 +250,14 @@ impl Extent {
             committed_bytes: AtomicU64::new(0),
             limit: AtomicU64::new(LIMIT_OPEN),
             index,
+            init_forward: AtomicBool::new(true),
         }
+    }
+
+    /// Atomically check and clear the `init_forward` flag.
+    /// Returns `true` if the flag was set (i.e., caller should prepend ForwardInitExtent).
+    pub fn take_init_forward(&self) -> bool {
+        self.init_forward.swap(false, Ordering::AcqRel)
     }
 
     /// Append a message. Returns the assigned logical offset and the byte
@@ -577,7 +588,7 @@ impl Extent {
     }
 
     /// Arena capacity in bytes.
-    pub fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> u32 {
         self.capacity
     }
 

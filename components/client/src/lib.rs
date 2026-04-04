@@ -233,19 +233,21 @@ impl StorageClient {
     }
 
     /// Create a new stream on the StreamManager.
-    /// Payload carries stream name and per-stream replication factor.
+    /// Payload carries stream name, per-stream replication factor, and per-stream extent capacity.
     /// If replication_factor=0, the StreamManager uses its default.
+    /// If extent_capacity=0, the StreamManager uses its default (64 MiB).
     /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
     pub async fn create_stream(
         &self,
         name: &str,
         replication_factor: u16,
+        extent_capacity: u32,
     ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
                 request_id: self.alloc_request_id(),
             },
-            Some(build_create_stream_payload(name, replication_factor)),
+            Some(build_create_stream_payload(name, replication_factor, extent_capacity)),
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;

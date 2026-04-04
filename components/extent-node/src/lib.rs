@@ -68,7 +68,6 @@ impl ExtentNode {
 
         // Create store first (OnceLock for downstream breaks circular dep).
         let mut store_inner = ExtentNodeStore::new();
-        store_inner.set_arena_capacity(config.extent_arena_capacity);
         store_inner.set_replication_timeout(Duration::from_millis(config.replication_timeout_ms));
 
         // Wire up the extent update channel for autonomous extent creation

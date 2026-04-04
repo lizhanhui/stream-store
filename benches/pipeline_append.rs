@@ -43,7 +43,7 @@ const BENCH_DURATION: Duration = Duration::from_secs(5);
 const NUM_SENDERS: usize = 4;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u16 = 2;
-const ARENA_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB
+const ARENA_CAPACITY: u32 = 64 * 1024 * 1024; // 64 MiB
 const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
 
 // -- Main ---------------------------------------------------------------------
@@ -75,7 +75,6 @@ async fn main() {
             bind_ip: "127.0.0.1".into(),
             port: 0,
             stream_manager_addrs: vec![stream_manager_addr.clone()],
-            extent_arena_capacity: ARENA_CAPACITY,
             ..Default::default()
         };
         let node = ExtentNode::start(config).await;
@@ -93,7 +92,7 @@ async fn main() {
         .await
         .expect("connect to StreamManager");
     let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = sm_client
-        .create_stream("bench-pipeline", REPLICATION_FACTOR)
+        .create_stream("bench-pipeline", REPLICATION_FACTOR, ARENA_CAPACITY)
         .await
         .expect("create_stream");
     info!(

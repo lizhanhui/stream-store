@@ -2,8 +2,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_EPOCH_PRESENT, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
-    FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC,
-    Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    FLAG_FORWARD_APPEND, FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT,
+    FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.
@@ -112,6 +112,8 @@ pub enum VariableHeader {
         replication_factor: u16,
         /// Stream epoch for this extent registration.
         epoch: Epoch,
+        /// Per-stream extent arena capacity in bytes.
+        extent_capacity: u32,
     },
     RegisterExtentAck {
         request_id: u32,
@@ -151,17 +153,27 @@ pub enum VariableHeader {
         stream_id: StreamId,
         epoch: Epoch,
     },
-    /// Dedicated forward opcode (0x0B) for Primary→Secondary replication.
-    /// Carries all metadata including byte_pos so the secondary writes
-    /// each record at the exact same arena position as the primary.
+    /// Per-record replication (Forward, flag=0x00).
+    /// Carries byte_pos so the secondary writes each record at the exact same
+    /// arena position as the primary.
     /// Fire-and-forget: no request_id; secondary responds with cumulative Watermark.
     Forward {
         stream_id: StreamId,
         extent_id: ExtentId,
         epoch: Epoch,
-        start_offset: Offset,
         offset: Offset,
         byte_pos: u64,
+    },
+    /// Init-extent notification (Forward, flag=0x01). No payload, no response.
+    /// Sent once by primary when it starts using a new extent,
+    /// before any Forward frames for that extent. Carries extent metadata
+    /// so the secondary can create the extent with the correct capacity.
+    ForwardInitExtent {
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        epoch: Epoch,
+        start_offset: Offset,
+        extent_capacity: u32,
     },
     StreamManagerMembershipChange,
     DescribeStream {
@@ -290,6 +302,7 @@ impl Frame {
             | VariableHeader::Error { request_id, .. } => *request_id,
             VariableHeader::Watermark { .. }
             | VariableHeader::Forward { .. }
+            | VariableHeader::ForwardInitExtent { .. }
             | VariableHeader::UpdateExtentSealed { .. }
             | VariableHeader::UpdateExtentProgress { .. }
             | VariableHeader::StreamManagerMembershipChange => 0,
@@ -312,6 +325,7 @@ impl Frame {
             | VariableHeader::RegisterExtent { stream_id, .. }
             | VariableHeader::Watermark { stream_id, .. }
             | VariableHeader::Forward { stream_id, .. }
+            | VariableHeader::ForwardInitExtent { stream_id, .. }
             | VariableHeader::UpdateExtentSealed { stream_id, .. }
             | VariableHeader::UpdateExtentProgress { stream_id, .. }
             | VariableHeader::ReportExtents { stream_id, .. }
@@ -354,6 +368,7 @@ impl Frame {
             | VariableHeader::RegisterExtentAck { extent_id, .. }
             | VariableHeader::RegisterExtent { extent_id, .. }
             | VariableHeader::Forward { extent_id, .. }
+            | VariableHeader::ForwardInitExtent { extent_id, .. }
             | VariableHeader::DescribeExtent { extent_id, .. }
             | VariableHeader::Error { extent_id, .. } => *extent_id,
             _ => ExtentId(0),
@@ -372,7 +387,8 @@ impl Frame {
             VariableHeader::RegisterExtent { epoch, .. } => *epoch,
             VariableHeader::UpdateExtentSealed { epoch, .. }
             | VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
-            VariableHeader::Forward { epoch, .. } => *epoch,
+            VariableHeader::Forward { epoch, .. }
+            | VariableHeader::ForwardInitExtent { epoch, .. } => *epoch,
             VariableHeader::ReportExtents { epoch, .. }
             | VariableHeader::ReportExtentsResp { epoch, .. } => *epoch,
             _ => Epoch(0),
@@ -437,6 +453,8 @@ impl Frame {
             }
             VariableHeader::UpdateExtentSealed { .. } => FLAG_EXTENT_SEALED,
             VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
+            VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
+            VariableHeader::ForwardInitExtent { .. } => FLAG_FORWARD_INIT_EXTENT,
             _ => 0,
         };
         self.header.flags | computed
@@ -528,8 +546,8 @@ impl Frame {
             | VariableHeader::Disconnect { .. }
             | VariableHeader::DisconnectAck { .. }
             | VariableHeader::Heartbeat { .. } => 4,
-            // request_id(4) + stream_id(8) + extent_id(4) + role(1) + replication_factor(2)
-            VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4,
+            // request_id(4) + stream_id(8) + extent_id(4) + role(1) + replication_factor(2) + epoch(4) + extent_capacity(4)
+            VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4 + 4,
             // request_id(4) + stream_id(8) + extent_id(4)
             VariableHeader::RegisterExtentAck { .. } => 4 + 8 + 4,
             // stream_id(8) + offset(8) -- no request_id
@@ -542,8 +560,10 @@ impl Frame {
             VariableHeader::ReportExtents { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + epoch(4)
             VariableHeader::ReportExtentsResp { .. } => 4 + 8 + 4,
-            // stream_id(8) + extent_id(4) + epoch(4) + start_offset(8) + offset(8) + byte_pos(8) -- no request_id
-            VariableHeader::Forward { .. } => 8 + 4 + 4 + 8 + 8 + 8,
+            // stream_id(8) + extent_id(4) + epoch(4) + offset(8) + byte_pos(8)
+            VariableHeader::Forward { .. } => 8 + 4 + 4 + 8 + 8,
+            // stream_id(8) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4)
+            VariableHeader::ForwardInitExtent { .. } => 8 + 4 + 4 + 8 + 4,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
             // request_id(4) + stream_id(8) + count(4)
@@ -739,6 +759,7 @@ impl Frame {
                 role,
                 replication_factor,
                 epoch,
+                extent_capacity,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
@@ -746,6 +767,7 @@ impl Frame {
                 dst.put_u8(*role);
                 dst.put_u16(*replication_factor);
                 dst.put_u32(epoch.0);
+                dst.put_u32(*extent_capacity);
             }
             VariableHeader::ConnectAck { request_id }
             | VariableHeader::DisconnectAck { request_id } => {
@@ -768,16 +790,27 @@ impl Frame {
                 stream_id,
                 extent_id,
                 epoch,
-                start_offset,
                 offset,
                 byte_pos,
             } => {
                 dst.put_u64(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
-                dst.put_u64(start_offset.0);
                 dst.put_u64(offset.0);
                 dst.put_u64(*byte_pos);
+            }
+            VariableHeader::ForwardInitExtent {
+                stream_id,
+                extent_id,
+                epoch,
+                start_offset,
+                extent_capacity,
+            } => {
+                dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u32(epoch.0);
+                dst.put_u64(start_offset.0);
+                dst.put_u32(*extent_capacity);
             }
             VariableHeader::StreamManagerMembershipChange => {
                 // no variable header fields, just payload
@@ -1142,6 +1175,7 @@ impl Frame {
                 let role = body.get_u8();
                 let replication_factor = body.get_u16();
                 let epoch = Epoch(body.get_u32());
+                let extent_capacity = body.get_u32();
                 let payload = Self::read_payload(body);
                 Ok((
                     VariableHeader::RegisterExtent {
@@ -1151,6 +1185,7 @@ impl Frame {
                         role,
                         replication_factor,
                         epoch,
+                        extent_capacity,
                     },
                     payload,
                 ))
@@ -1185,21 +1220,40 @@ impl Frame {
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
-                let start_offset = Offset(body.get_u64());
-                let offset = Offset(body.get_u64());
-                let byte_pos = body.get_u64();
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::Forward {
-                        stream_id,
-                        extent_id,
-                        epoch,
-                        start_offset,
-                        offset,
-                        byte_pos,
-                    },
-                    payload,
-                ))
+                match flags {
+                    FLAG_FORWARD_APPEND => {
+                        let offset = Offset(body.get_u64());
+                        let byte_pos = body.get_u64();
+                        let payload = Self::read_payload(body);
+                        Ok((
+                            VariableHeader::Forward {
+                                stream_id,
+                                extent_id,
+                                epoch,
+                                offset,
+                                byte_pos,
+                            },
+                            payload,
+                        ))
+                    }
+                    FLAG_FORWARD_INIT_EXTENT => {
+                        let start_offset = Offset(body.get_u64());
+                        let extent_capacity = body.get_u32();
+                        Ok((
+                            VariableHeader::ForwardInitExtent {
+                                stream_id,
+                                extent_id,
+                                epoch,
+                                start_offset,
+                                extent_capacity,
+                            },
+                            None,
+                        ))
+                    }
+                    _ => Err(StorageError::Internal(format!(
+                        "unknown Forward flag: {flags:#x}"
+                    ))),
+                }
             }
             Opcode::StreamManagerMembershipChange => {
                 let payload = Self::read_payload(body);
@@ -1401,7 +1455,8 @@ impl VariableHeader {
             | VariableHeader::UpdateExtentProgress { .. } => Opcode::UpdateExtent,
             VariableHeader::ReportExtents { .. } => Opcode::ReportExtents,
             VariableHeader::ReportExtentsResp { .. } => Opcode::ReportExtentsResp,
-            VariableHeader::Forward { .. } => Opcode::Forward,
+            VariableHeader::Forward { .. }
+            | VariableHeader::ForwardInitExtent { .. } => Opcode::Forward,
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
             VariableHeader::DescribeStream { .. } => Opcode::DescribeStream,
             VariableHeader::DescribeStreamResp { .. } => Opcode::DescribeStreamResp,

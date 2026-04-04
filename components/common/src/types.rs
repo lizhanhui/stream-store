@@ -35,6 +35,11 @@ pub const FLAG_EXTENT_SEALED: u8 = 0x00;
 /// Flag on UPDATE_EXTENT: progress report for an active extent.
 pub const FLAG_EXTENT_PROGRESS: u8 = 0x01;
 
+/// Flag on FORWARD: normal per-record replication.
+pub const FLAG_FORWARD_APPEND: u8 = 0x00;
+/// Flag on FORWARD: init-extent notification (new extent metadata).
+pub const FLAG_FORWARD_INIT_EXTENT: u8 = 0x01;
+
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);

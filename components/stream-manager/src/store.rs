@@ -15,6 +15,9 @@ use rpc::payload::{
 use server::handler::RequestHandler;
 use tracing::{error, info, warn};
 
+/// Default extent capacity: 64 MiB.
+const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
+
 /// Seal an ExtentNode's extent and return the committed end_offset.
 ///
 /// This is a free function (not a method) so that it can be called from async tasks
@@ -324,6 +327,7 @@ impl StreamManagerStore {
         secondary_addrs: &[&str],
         replication_factor: u16,
         epoch: Epoch,
+        extent_capacity: u32,
     ) -> Result<(), StorageError> {
         let payload = build_register_extent_payload(secondary_addrs);
         let addr = primary_addr.to_string();
@@ -331,6 +335,7 @@ impl StreamManagerStore {
         let eid = extent_id;
         let rf = replication_factor;
         let ep = epoch;
+        let ec = extent_capacity;
 
         let result = tokio::time::timeout(Duration::from_millis(500), async {
             let client = client::StorageClient::connect(&addr).await.map_err(|e| {
@@ -348,6 +353,7 @@ impl StreamManagerStore {
                         role: 0, // Primary
                         replication_factor: rf,
                         epoch: ep,
+                        extent_capacity: ec,
                     },
                     Some(payload),
                 ))
@@ -399,6 +405,7 @@ impl StreamManagerStore {
         secondary_addrs: &[String],
         replication_factor: u16,
         epoch: Epoch,
+        extent_capacity: u32,
     ) {
         for (i, addr) in secondary_addrs.iter().enumerate() {
             let role = (i + 1) as u8; // 1, 2, ...
@@ -407,6 +414,7 @@ impl StreamManagerStore {
             let eid = extent_id;
             let rf = replication_factor;
             let ep = epoch;
+            let ec = extent_capacity;
 
             tokio::spawn(async move {
                 let payload = build_register_extent_payload(&[]); // secondaries get no downstream addrs
@@ -421,6 +429,7 @@ impl StreamManagerStore {
                                     role,
                                     replication_factor: rf,
                                     epoch: ep,
+                                    extent_capacity: ec,
                                 },
                                 Some(payload),
                             ))
@@ -470,6 +479,7 @@ impl StreamManagerStore {
         start_offset: u64,
         replication_factor: usize,
         epoch: Epoch,
+        extent_capacity: u32,
     ) -> Result<(ExtentId, String), StorageError> {
         let nodes = self.allocator.pick_nodes(replication_factor).await?;
 
@@ -499,12 +509,12 @@ impl StreamManagerStore {
         let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
         let rf = node_addrs.len() as u16;
 
-        self.register_primary(stream_id, extent_id, primary_addr, &secondary_addrs, rf, epoch)
+        self.register_primary(stream_id, extent_id, primary_addr, &secondary_addrs, rf, epoch, extent_capacity)
             .await
             .unwrap_or_else(|e| {
                 warn!("register_primary failed for initial extent {}: {e}; client will discover on first append", extent_id);
             });
-        self.notify_secondaries(stream_id, extent_id, &node_addrs[1..], rf, epoch);
+        self.notify_secondaries(stream_id, extent_id, &node_addrs[1..], rf, epoch, extent_capacity);
 
         Ok((extent_id, node_addrs[0].clone()))
     }
@@ -664,20 +674,21 @@ impl StreamManagerStore {
     }
 
     /// CreateStream: create stream in metadata, allocate initial extent replica set, notify ExtentNodes.
-    /// Payload = [name_len:u16][stream_name][replication_factor:u16]
+    /// Payload = [name_len:u16][stream_name][replication_factor:u16][extent_capacity:u32]
     ///
     /// If replication_factor=0 in the payload, the server's default_replication_factor is used.
+    /// If extent_capacity=0, the default of 64 MiB is used.
     ///
     /// Response payload: [addr_len:u16][primary_addr]
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
         let payload = frame.payload.as_deref().unwrap_or_default();
-        let (stream_name, replication_factor) = match parse_create_stream_payload(payload) {
-            Some((name, rf)) => (name, rf),
+        let (stream_name, replication_factor, extent_capacity) = match parse_create_stream_payload(payload) {
+            Some((name, rf, ec)) => (name, rf, ec),
             None => {
                 return Frame::error_response(
                     frame.request_id(),
                     ErrorCode::InternalError,
-                    "invalid CreateStream payload: expected [name_len:u16][name][replication_factor:u16]",
+                    "invalid CreateStream payload: expected [name_len:u16][name][replication_factor:u16][extent_capacity:u32]",
                     ExtentId(0),
                 );
             }
@@ -690,16 +701,23 @@ impl StreamManagerStore {
             replication_factor as usize
         };
 
+        // Use default 64 MiB if client sends extent_capacity=0.
+        let extent_capacity = if extent_capacity == 0 {
+            DEFAULT_EXTENT_CAPACITY
+        } else {
+            extent_capacity
+        };
+
         let result = async {
-            // 1. Create stream in metadata with per-stream replication factor.
-            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u16).await?;
+            // 1. Create stream in metadata with per-stream replication factor and extent capacity.
+            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u16, extent_capacity).await?;
 
             // 2. Allocate first extent replica set and notify ExtentNodes.
             let (extent_id, primary_addr) =
-                self.allocate_and_notify_replica_set(stream_id, 0, replication_factor, Epoch(0)).await?;
+                self.allocate_and_notify_replica_set(stream_id, 0, replication_factor, Epoch(0), extent_capacity).await?;
 
             info!(
-                "stream {stream_name} created: stream_id={}, extent_id={}, primary={primary_addr}",
+                "stream {stream_name} created: stream_id={}, extent_id={}, primary={primary_addr}, extent_capacity={extent_capacity}",
                 stream_id, extent_id
             );
 
@@ -1049,6 +1067,7 @@ impl StreamManagerStore {
         // Pick nodes for new extent replica set using per-stream replication factor.
         let replication_factor =
             self.store.get_stream_replication_factor(stream_id).await? as usize;
+        let extent_capacity = self.store.get_stream_extent_capacity(stream_id).await?;
         let nodes = self.allocator.pick_nodes(replication_factor).await?;
 
         let new_replicas: Vec<(String, u8)> = nodes
@@ -1086,6 +1105,7 @@ impl StreamManagerStore {
                         &secondary_addrs,
                         rf,
                         epoch,
+                        extent_capacity,
                     )
                     .await
                 {
@@ -1096,7 +1116,7 @@ impl StreamManagerStore {
                 }
 
                 // notify extent secondary nodes in fire-and-forget way
-                self.notify_secondaries(stream_id, new_extent_id, &node_addrs[1..], rf, epoch);
+                self.notify_secondaries(stream_id, new_extent_id, &node_addrs[1..], rf, epoch, extent_capacity);
 
                 (new_extent_id, primary_addr)
             }

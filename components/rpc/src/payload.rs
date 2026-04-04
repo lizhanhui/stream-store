@@ -190,31 +190,34 @@ pub fn parse_register_extent_payload(payload: &[u8]) -> Option<Vec<String>> {
     Some(replica_addrs)
 }
 
-/// Build a CreateStream payload: [name_len:u16][stream_name][replication_factor:u16]
-pub fn build_create_stream_payload(name: &str, replication_factor: u16) -> Bytes {
-    let mut buf = BytesMut::with_capacity(2 + name.len() + 2);
+/// Build a CreateStream payload: [name_len:u16][stream_name][replication_factor:u16][extent_capacity:u32]
+pub fn build_create_stream_payload(name: &str, replication_factor: u16, extent_capacity: u32) -> Bytes {
+    let mut buf = BytesMut::with_capacity(2 + name.len() + 2 + 4);
     buf.put_u16(name.len() as u16);
     buf.extend_from_slice(name.as_bytes());
     buf.put_u16(replication_factor);
+    buf.put_u32(extent_capacity);
     buf.freeze()
 }
 
-/// Parse a CreateStream payload: [name_len:u16][stream_name][replication_factor:u16]
+/// Parse a CreateStream payload: [name_len:u16][stream_name][replication_factor:u16][extent_capacity:u32]
 ///
-/// Returns `(stream_name, replication_factor)`.
-pub fn parse_create_stream_payload(payload: &[u8]) -> Option<(String, u16)> {
+/// Returns `(stream_name, replication_factor, extent_capacity)`.
+pub fn parse_create_stream_payload(payload: &[u8]) -> Option<(String, u16, u32)> {
     if payload.len() < 2 {
         return None;
     }
     let name_len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
     let pos = 2;
-    if payload.len() < pos + name_len + 2 {
+    if payload.len() < pos + name_len + 2 + 4 {
         return None;
     }
     let name = String::from_utf8_lossy(&payload[pos..pos + name_len]).to_string();
     let rf_pos = pos + name_len;
     let replication_factor = u16::from_be_bytes([payload[rf_pos], payload[rf_pos + 1]]);
-    Some((name, replication_factor))
+    let ec_pos = rf_pos + 2;
+    let extent_capacity = u32::from_be_bytes(payload[ec_pos..ec_pos + 4].try_into().ok()?);
+    Some((name, replication_factor, extent_capacity))
 }
 
 /// Encode a Vec<ExtentInfo> into a response payload.
@@ -420,20 +423,21 @@ mod tests {
 
     #[test]
     fn create_stream_payload_roundtrip() {
-        let payload = build_create_stream_payload("my-stream", 3);
-        let (name, replication_factor) = parse_create_stream_payload(&payload).unwrap();
+        let payload = build_create_stream_payload("my-stream", 3, 67_108_864);
+        let (name, replication_factor, extent_capacity) = parse_create_stream_payload(&payload).unwrap();
         assert_eq!(name, "my-stream");
         assert_eq!(replication_factor, 3);
+        assert_eq!(extent_capacity, 67_108_864);
     }
 
     #[test]
     fn create_stream_payload_too_short() {
         assert!(parse_create_stream_payload(&[]).is_none());
         assert!(parse_create_stream_payload(&[0x00]).is_none());
-        // name_len=3, "abc" but missing replication_factor bytes
+        // name_len=3, "abc" but missing replication_factor and extent_capacity bytes
         assert!(parse_create_stream_payload(&[0x00, 0x03, 0x61, 0x62, 0x63]).is_none());
-        // name_len=3, "abc" + only 1 byte for replication_factor
-        assert!(parse_create_stream_payload(&[0x00, 0x03, 0x61, 0x62, 0x63, 0x00]).is_none());
+        // name_len=3, "abc" + replication_factor but missing extent_capacity
+        assert!(parse_create_stream_payload(&[0x00, 0x03, 0x61, 0x62, 0x63, 0x00, 0x02]).is_none());
     }
 
     #[test]

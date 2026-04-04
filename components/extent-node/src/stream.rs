@@ -36,7 +36,7 @@ pub struct Stream {
     /// Initialized to `first_extent_id + 1` when SM sends RegisterExtent.
     next_extent_id: ExtentId,
     /// Arena capacity for autonomously created extents (bytes).
-    arena_capacity: usize,
+    arena_capacity: u32,
     /// Leader election counter for pipelined group commit (stream-level).
     /// 0 = idle. The leader owns the entire stream, handling extent transitions inline.
     in_flight: AtomicU64,
@@ -67,7 +67,7 @@ impl Stream {
         &mut self,
         id: ExtentId,
         start_offset: Offset,
-        capacity: usize,
+        capacity: u32,
         epoch: Epoch,
     ) {
         self.epoch = epoch;
@@ -75,6 +75,11 @@ impl Stream {
         self.next_extent_id = ExtentId(id.0 + 1);
         self.extents
             .push(Extent::with_capacity(id, start_offset, capacity, epoch));
+    }
+
+    /// Return the arena capacity configured for this stream.
+    pub fn arena_capacity(&self) -> u32 {
+        self.arena_capacity
     }
 
     /// Append a message to the specified extent. Returns the assigned

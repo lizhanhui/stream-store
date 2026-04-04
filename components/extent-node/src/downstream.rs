@@ -121,7 +121,7 @@ impl DownstreamPool {
     }
 
     /// Get an existing writer or create a new connection.
-    async fn get_or_create_writer(
+    pub async fn get_or_create_writer(
         &self,
         addr: &str,
     ) -> Option<Arc<Mutex<FramedWrite<OwnedWriteHalf, FrameCodec>>>> {

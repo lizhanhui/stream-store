@@ -62,7 +62,6 @@ mod tests {
                 stream_id: StreamId(10),
                 extent_id: ExtentId(5),
                 epoch: Epoch(0),
-                start_offset: Offset(0),
                 offset: Offset(3),
                 byte_pos: 42,
             },

@@ -80,6 +80,7 @@ async fn register_extent(
                 role,
                 replication_factor,
                 epoch: Epoch(0),
+                extent_capacity: 64 * 1024 * 1024,
             },
             Some(payload),
         ))
