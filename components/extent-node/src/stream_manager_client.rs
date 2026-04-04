@@ -93,7 +93,14 @@ impl StreamManagerClient {
         let task_handle = self.task_handle;
         // _shutdown_tx is dropped here when `self` is consumed.
         drop(self._shutdown_tx);
-        let _ = task_handle.await;
+        // Wait for the task to finish, but cap at 5 seconds to avoid blocking
+        // shutdown if the task is stuck in an RPC or reconnect wait.
+        match tokio::time::timeout(Duration::from_secs(5), task_handle).await {
+            Ok(_) => {}
+            Err(_) => {
+                warn!("StreamManagerClient stop timed out after 5s; abandoning task");
+            }
+        }
     }
 
     /// Reconnection loop. Runs until shutdown signal.

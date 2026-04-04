@@ -3,10 +3,10 @@ use std::net::Ipv4Addr;
 use std::time::Duration;
 
 /// Timeout for establishing an RPC TCP connection.
-pub const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+pub const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Timeout for a single RPC request-response round trip.
-pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Base server configuration (shared fields).
 #[derive(Debug, Clone, Deserialize)]

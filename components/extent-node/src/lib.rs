@@ -26,11 +26,13 @@ pub struct ExtentNode {
     addr: SocketAddr,
     /// Shutdown signal sender — sending triggers graceful stop of non-heartbeat tasks.
     shutdown_tx: broadcast::Sender<()>,
-    /// JoinHandles for spawned background tasks (accept loop).
+    /// JoinHandles for spawned background tasks (accept loop, seal notify).
     task_handles: Vec<JoinHandle<()>>,
     /// RAII client managing the StreamManager connection lifecycle.
     /// Sends Disconnect on drop; call `stop()` for guaranteed delivery.
     stream_manager_client: StreamManagerClient,
+    /// Downstream connection pool — needs explicit shutdown to abort reader tasks.
+    downstream: Arc<DownstreamPool>,
 }
 
 impl ExtentNode {
@@ -39,11 +41,18 @@ impl ExtentNode {
     ///
     /// Fire-and-forget: if the SM connection fails, the notification is logged
     /// and dropped. SM will reconcile during the next epoch bump.
-    async fn seal_notify_task(mut seal_rx: mpsc::Receiver<SealRequest>, sm_addr: String) {
+    async fn seal_notify_task(
+        mut seal_rx: mpsc::Receiver<SealRequest>,
+        sm_addr: String,
+        mut shutdown_rx: broadcast::Receiver<()>,
+    ) {
         use common::types::Offset;
         use rpc::frame::{Frame, VariableHeader};
 
-        while let Some(req) = seal_rx.recv().await {
+        while let Some(req) = tokio::select! {
+            req = seal_rx.recv() => req,
+            _ = shutdown_rx.recv() => None,
+        } {
             if sm_addr.is_empty() {
                 continue;
             }
@@ -118,14 +127,15 @@ impl ExtentNode {
 
         // Spawn background task for NOTIFY_SEALED_EXTENT notifications to SM.
         let sm_addr_for_notify = config.stream_manager_addr.clone();
+        let seal_shutdown_rx = shutdown_tx.subscribe();
         task_handles.push(tokio::spawn(
-            Self::seal_notify_task(seal_rx, sm_addr_for_notify),
+            Self::seal_notify_task(seal_rx, sm_addr_for_notify, seal_shutdown_rx),
         ));
 
         // Create DownstreamPool with back-reference to store (for inline watermark processing).
         let downstream = Arc::new(DownstreamPool::new(Arc::clone(&store)));
         // Wire pool into store.
-        store.set_downstream(downstream);
+        store.set_downstream(Arc::clone(&downstream));
 
         // Resolve advertise_addr: auto-detect IP if bind_ip is 0.0.0.0 and advertise_ip not set.
         // If port was 0 (OS-assigned), use the actual bound port instead.
@@ -171,6 +181,7 @@ impl ExtentNode {
             shutdown_tx,
             task_handles,
             stream_manager_client,
+            downstream,
         }
     }
 
@@ -182,11 +193,13 @@ impl ExtentNode {
     /// Gracefully stop the ExtentNode: signal all tasks and await their completion.
     pub async fn stop(self) {
         info!("ExtentNode stopping...");
-        // 1. Signal non-heartbeat tasks (accept loop).
+        // 1. Signal non-heartbeat tasks (accept loop, seal notify).
         let _ = self.shutdown_tx.send(());
-        // 2. Stop StreamManagerClient (sends Disconnect, awaits task).
+        // 2. Abort downstream reader tasks (they block on TCP reads indefinitely).
+        self.downstream.shutdown().await;
+        // 3. Stop StreamManagerClient (sends Disconnect, awaits task).
         self.stream_manager_client.stop().await;
-        // 3. Await remaining task handles.
+        // 4. Await remaining task handles.
         for handle in self.task_handles {
             let _ = handle.await;
         }
