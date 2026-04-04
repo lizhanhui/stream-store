@@ -108,7 +108,7 @@ async fn main() {
         .expect("failed to create stream");
 
     info!(
-        "[4] Created stream \"example-stream\" (replication_factor=2): stream_id={:?}, extent_id={:?}, primary={primary_addr}",
+        "[4] Created stream \"example-stream\" (replication_factor=2): stream_id={}, extent_id={}, primary={primary_addr}",
         stream_id, extent_id
     );
 
@@ -232,7 +232,7 @@ async fn main() {
         .expect("query_offset on StreamManager failed");
 
     info!(
-        "[11] Sealed extent {:?} -> new extent_id={final_extent_id}, primary={final_addr}",
+        "[11] Sealed extent {} -> new extent_id={final_extent_id}, primary={final_addr}",
         new_extent_id
     );
     info!(

@@ -80,7 +80,7 @@ async fn check_expired_nodes(
 
         for extent in &active_extents {
             info!(
-                "failover: sealing extent {:?} on dead node {} (stream {:?})",
+                "failover: sealing extent {} on dead node {} (stream {})",
                 extent.extent_id, node.node_id, extent.stream_id
             );
 
@@ -90,13 +90,13 @@ async fn check_expired_nodes(
                 .resolve_committed_offset(
                     extent.stream_id,
                     extent.extent_id,
-                    extent.start_offset as u64,
+                    extent.start_offset,
                 )
                 .await
             {
                 Ok(offset) => {
                     info!(
-                        "failover: resolved committed offset={offset} for extent {:?} stream {:?}",
+                        "failover: resolved committed offset={offset} for extent {} stream {}",
                         extent.extent_id, extent.stream_id
                     );
                     offset
@@ -105,11 +105,11 @@ async fn check_expired_nodes(
                     // All replicas unreachable — fall back to metadata end_offset.
                     // This may lose data but is the best we can do.
                     warn!(
-                        "failover: resolve_committed_offset failed for extent {:?} stream {:?}: {e}; \
+                        "failover: resolve_committed_offset failed for extent {} stream {}: {e}; \
                          falling back to metadata end_offset={}",
                         extent.extent_id, extent.stream_id, extent.end_offset
                     );
-                    extent.end_offset as u64
+                    extent.end_offset
                 }
             };
 
@@ -129,13 +129,13 @@ async fn check_expired_nodes(
             {
                 Ok((new_extent_id, primary_addr)) => {
                     info!(
-                        "failover: replacement extent {:?} allocated on {primary_addr} for stream {:?} (epoch={:?})",
+                        "failover: replacement extent {} allocated on {primary_addr} for stream {} (epoch={})",
                         new_extent_id, extent.stream_id, new_epoch
                     );
                 }
                 Err(e) => {
                     warn!(
-                        "failover: seal_allocate_register failed for stream {:?}: {e}",
+                        "failover: seal_allocate_register failed for stream {}: {e}",
                         extent.stream_id
                     );
                 }

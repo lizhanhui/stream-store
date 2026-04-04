@@ -370,7 +370,7 @@ impl StreamManagerClient {
                     },
                     None,
                 ),
-                format!("UpdateExtentSealed stream={stream_id:?}"),
+                format!("UpdateExtentSealed stream={stream_id}"),
             ),
             ExtentUpdate::Progress {
                 stream_id,
@@ -387,7 +387,7 @@ impl StreamManagerClient {
                     },
                     None,
                 ),
-                format!("UpdateExtentProgress stream={stream_id:?}"),
+                format!("UpdateExtentProgress stream={stream_id}"),
             ),
         };
         match tokio::time::timeout(rpc_request_timeout, framed.send(frame)).await {

@@ -22,9 +22,8 @@ use crate::stream::Stream;
 // ── Broadcast replication types ──────────────────────────────────────────────
 
 /// Default replication timeout used when no config is provided (e.g., in tests).
-const DEFAULT_REPLICATION_TIMEOUT: Duration = Duration::from_millis(
-    common::config::DEFAULT_REPLICATION_TIMEOUT_MS,
-);
+const DEFAULT_REPLICATION_TIMEOUT: Duration =
+    Duration::from_millis(common::config::DEFAULT_REPLICATION_TIMEOUT_MS);
 
 /// A pending client ACK waiting for quorum replication.
 #[derive(Debug)]
@@ -154,7 +153,7 @@ impl AckQueue {
                 let ack = self.pending.pop_front().unwrap();
                 warn!(
                     request_id = ack.request_id,
-                    stream_id = ?ack.stream_id,
+                    stream_id = %ack.stream_id,
                     offset = ack.assigned_offset,
                     "PendingAck expired after replication timeout",
                 );
@@ -463,8 +462,7 @@ impl ExtentNodeStore {
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
     fn handle_register_extent(&self, frame: Frame) -> Frame {
         // Extract stream_id, extent_id, role, replication_factor from the variable header.
-        let (stream_id, extent_id, role, replication_factor, epoch) = match &frame.variable_header
-        {
+        let (stream_id, extent_id, role, replication_factor, epoch) = match &frame.variable_header {
             VariableHeader::RegisterExtent {
                 stream_id,
                 extent_id,
@@ -534,7 +532,7 @@ impl ExtentNodeStore {
             replica_addrs.join(", ")
         };
         info!(
-            "RegisterExtent: stream={:?}, extent={:?}, role={role_name}, rf={}, secondaries=[{addrs_info}]",
+            "RegisterExtent: stream={}, extent={}, role={role_name}, rf={}, secondaries=[{addrs_info}]",
             stream_id, extent_id, replication_factor,
         );
 
@@ -548,9 +546,9 @@ impl ExtentNodeStore {
 
         // If this node is Primary, initialize an AckQueue.
         if ri.is_primary() {
-            self.ack_queues
-                .entry(stream_id)
-                .or_insert_with(|| AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout));
+            self.ack_queues.entry(stream_id).or_insert_with(|| {
+                AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout)
+            });
         }
 
         self.replicas.insert(stream_id, ri);
@@ -592,7 +590,7 @@ impl ExtentNodeStore {
                 return Some(Frame::error_response(
                     frame.request_id(),
                     ErrorCode::UnknownStream,
-                    &format!("stream {:?} not found", stream_id),
+                    &format!("stream {} not found", stream_id),
                     ExtentId(0),
                 ));
             }
@@ -604,7 +602,10 @@ impl ExtentNodeStore {
             return Some(Frame::error_response(
                 frame.request_id(),
                 ErrorCode::EpochStale,
-                &format!("epoch stale: client={:?}, current={:?}", client_epoch, epoch),
+                &format!(
+                    "epoch stale: client={}, current={}",
+                    client_epoch, epoch
+                ),
                 ExtentId(0),
             ));
         }
@@ -759,7 +760,8 @@ impl ExtentNodeStore {
         };
 
         let offset = append_result.offset;
-        let extent_start_offset = stream.find_extent(extent_id)
+        let extent_start_offset = stream
+            .find_extent(extent_id)
             .map(|e| e.start_offset.0)
             .unwrap_or(0);
 
@@ -832,10 +834,12 @@ impl ExtentNodeStore {
 
                     // Queue deferred ACK.
                     if let Some(ref resp_tx) = response_tx {
-                        let mut ack_queue = self
-                            .ack_queues
-                            .entry(stream_id)
-                            .or_insert_with(|| AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout));
+                        let mut ack_queue = self.ack_queues.entry(stream_id).or_insert_with(|| {
+                            AckQueue::with_timeout(
+                                ri.required_secondary_acks(),
+                                self.replication_timeout,
+                            )
+                        });
                         ack_queue.pending.push_back(PendingAck {
                             request_id,
                             stream_id,
@@ -1020,11 +1024,7 @@ impl ExtentNodeStore {
     }
 
     /// Send an async UPDATE_EXTENT (Sealed) to SM (fire-and-forget).
-    fn send_extent_update(
-        &self,
-        stream_id: StreamId,
-        notif: &crate::stream::SealNotification,
-    ) {
+    fn send_extent_update(&self, stream_id: StreamId, notif: &crate::stream::SealNotification) {
         if let Some(ref tx) = self.update_tx {
             let _ = tx.try_send(ExtentUpdate::Sealed {
                 stream_id,
@@ -1057,7 +1057,7 @@ impl ExtentNodeStore {
                     responses.push(Frame::error_response(
                         frame.request_id(),
                         ErrorCode::UnknownStream,
-                        &format!("stream {:?} not found", stream_id),
+                        &format!("stream {} not found", stream_id),
                         ExtentId(0),
                     ));
                 }
@@ -1072,7 +1072,9 @@ impl ExtentNodeStore {
         let batch_len = frames.len() as u64;
 
         // Single leader election: fetch_add(batch_len) on the stream's in_flight.
-        let prev = stream_ref.in_flight().fetch_add(batch_len, Ordering::Acquire);
+        let prev = stream_ref
+            .in_flight()
+            .fetch_add(batch_len, Ordering::Acquire);
 
         if prev > 0 {
             // SLOW PATH: active writer exists. Push all as AppendJobs.
@@ -1178,7 +1180,9 @@ impl ExtentNodeStore {
 
         if entries.is_empty() {
             // All appends failed — decrement and possibly drain followers.
-            let remaining = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
+            let remaining = stream_ref
+                .in_flight()
+                .fetch_sub(batch_len, Ordering::Release);
             drop(stream_ref); // ← release read guard BEFORE drain
             if remaining > batch_len {
                 let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
@@ -1290,10 +1294,12 @@ impl ExtentNodeStore {
 
                     // Single DashMap.get_mut(ack_queues) — push all PendingAcks at once.
                     if let Some(resp_tx) = response_tx {
-                        let mut ack_queue = self
-                            .ack_queues
-                            .entry(stream_id)
-                            .or_insert_with(|| AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout));
+                        let mut ack_queue = self.ack_queues.entry(stream_id).or_insert_with(|| {
+                            AckQueue::with_timeout(
+                                ri.required_secondary_acks(),
+                                self.replication_timeout,
+                            )
+                        });
                         let now = Instant::now();
                         for entry in &entries {
                             ack_queue.pending.push_back(PendingAck {
@@ -1335,7 +1341,9 @@ impl ExtentNodeStore {
         drop(replica_ref);
 
         // Check if followers arrived while we were appending.
-        let remaining = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
+        let remaining = stream_ref
+            .in_flight()
+            .fetch_sub(batch_len, Ordering::Release);
         drop(stream_ref); // ← release read guard BEFORE drain
         if remaining > batch_len {
             let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
@@ -1406,25 +1414,33 @@ impl ExtentNodeStore {
     ///
     /// Returns a cumulative Watermark with the highest written offset.
     fn handle_forward(&self, frame: Frame) -> Frame {
-        let (stream_id, extent_id, epoch, start_offset, offset, byte_pos) = match &frame.variable_header {
-            VariableHeader::Forward {
-                stream_id,
-                extent_id,
-                epoch,
-                start_offset,
-                offset,
-                byte_pos,
-            } => (*stream_id, *extent_id, *epoch, *start_offset, *offset, *byte_pos),
-            _ => {
-                return Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id: frame.stream_id(),
-                        offset: Offset(0),
-                    },
-                    None,
-                );
-            }
-        };
+        let (stream_id, extent_id, epoch, start_offset, offset, byte_pos) =
+            match &frame.variable_header {
+                VariableHeader::Forward {
+                    stream_id,
+                    extent_id,
+                    epoch,
+                    start_offset,
+                    offset,
+                    byte_pos,
+                } => (
+                    *stream_id,
+                    *extent_id,
+                    *epoch,
+                    *start_offset,
+                    *offset,
+                    *byte_pos,
+                ),
+                _ => {
+                    return Frame::new(
+                        VariableHeader::Watermark {
+                            stream_id: frame.stream_id(),
+                            offset: Offset(0),
+                        },
+                        None,
+                    );
+                }
+            };
 
         // Compute seq from offset and start_offset.
         let seq = offset.0 - start_offset.0;
@@ -1442,7 +1458,7 @@ impl ExtentNodeStore {
                     .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
 
                 info!(
-                    "Lazy extent creation on forward: stream={:?}, extent={:?}, start_offset={:?}",
+                    "Lazy extent creation on forward: stream={}, extent={}, start_offset={}",
                     stream_id, extent_id, start_offset,
                 );
 
@@ -1479,9 +1495,14 @@ impl ExtentNodeStore {
                 drop(stream_ref);
                 if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
                     if stream_mut.find_extent(extent_id).is_none() {
-                        stream_mut.register_extent(extent_id, start_offset, self.arena_capacity, epoch);
+                        stream_mut.register_extent(
+                            extent_id,
+                            start_offset,
+                            self.arena_capacity,
+                            epoch,
+                        );
                         info!(
-                            "Lazy extent creation on forward (existing stream): stream={:?}, extent={:?}, start_offset={:?}",
+                            "Lazy extent creation on forward (existing stream): stream={}, extent={}, start_offset={}",
                             stream_id, extent_id, start_offset,
                         );
                     }
@@ -1541,7 +1562,7 @@ impl ExtentNodeStore {
                 return Frame::error_response(
                     frame.request_id(),
                     ErrorCode::UnknownStream,
-                    &format!("stream {:?} not found", stream_id),
+                    &format!("stream {} not found", stream_id),
                     ExtentId(0),
                 );
             }
@@ -1584,7 +1605,7 @@ impl ExtentNodeStore {
                 return Frame::error_response(
                     frame.request_id(),
                     ErrorCode::UnknownStream,
-                    &format!("stream {:?} not found", stream_id),
+                    &format!("stream {} not found", stream_id),
                     ExtentId(0),
                 );
             }
@@ -1681,7 +1702,7 @@ impl ExtentNodeStore {
                 // start_offset to indicate zero committed records for quorum.
                 if let Some(so) = start_offset {
                     info!(
-                        "seal for absent stream {:?} extent {:?}: responding with start_offset={so}",
+                        "seal for absent stream {} extent {}: responding with start_offset={so}",
                         stream_id, extent_id
                     );
                     return Frame::new(
@@ -1700,7 +1721,7 @@ impl ExtentNodeStore {
                 return Frame::error_response(
                     frame.request_id(),
                     ErrorCode::UnknownStream,
-                    &format!("stream {:?} not found", stream_id),
+                    &format!("stream {} not found", stream_id),
                     ExtentId(0),
                 );
             }
@@ -1730,7 +1751,7 @@ impl ExtentNodeStore {
         match stream_ref.seal(extent_id, committed_offset) {
             Some((start_offset, end_offset)) => {
                 info!(
-                    "sealed extent {:?} for stream {:?}, start_offset={start_offset}, end_offset={end_offset}",
+                    "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={end_offset}",
                     extent_id, stream_id
                 );
                 Frame::new(
@@ -1753,7 +1774,7 @@ impl ExtentNodeStore {
                 // sealed (extent-full path), it must report its committed offset.
                 let end_offset = stream_ref.sealed_end_offset(extent_id);
                 info!(
-                    "extent {:?} for stream {:?} already sealed, returning end_offset={end_offset} idempotently",
+                    "extent {} for stream {} already sealed, returning end_offset={end_offset} idempotently",
                     extent_id, stream_id
                 );
                 Frame::new(

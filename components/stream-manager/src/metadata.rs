@@ -344,7 +344,7 @@ impl MetadataStore {
 
         let row = row.ok_or_else(|| {
             StorageError::Internal(format!(
-                "extent not found: stream={:?}, extent={:?}",
+                "extent not found: stream={}, extent={}",
                 stream_id, extent_id
             ))
         })?;
@@ -367,7 +367,7 @@ impl MetadataStore {
 
             let successor = successor.ok_or_else(|| {
                 StorageError::Internal(format!(
-                    "extent {:?} is sealed but no successor found for stream {:?}",
+                    "extent {} is sealed but no successor found for stream {}",
                     extent_id, stream_id
                 ))
             })?;

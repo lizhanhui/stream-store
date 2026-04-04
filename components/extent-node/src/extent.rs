@@ -188,7 +188,12 @@ impl Extent {
     }
 
     /// Create a new active extent with the specified capacity in bytes.
-    pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: usize, epoch: Epoch) -> Self {
+    pub fn with_capacity(
+        id: ExtentId,
+        start_offset: Offset,
+        capacity: usize,
+        epoch: Epoch,
+    ) -> Self {
         let layout = Layout::from_size_align(capacity, 8).expect("invalid layout");
         // SAFETY: layout is valid, nonzero size.
         let ptr = unsafe { alloc(layout) };
@@ -223,11 +228,7 @@ impl Extent {
             // all zeroed. AtomicU32 is repr-compatible with u32. We reconstruct the Vec
             // from the raw parts so it can be converted to Box<[AtomicU32]>.
             unsafe {
-                Vec::from_raw_parts(
-                    index_ptr as *mut AtomicU32,
-                    index_capacity,
-                    index_capacity,
-                )
+                Vec::from_raw_parts(index_ptr as *mut AtomicU32, index_capacity, index_capacity)
             }
             .into_boxed_slice()
         };
@@ -877,5 +878,4 @@ mod tests {
         // Sealed with local count, committed_seq == limit → false.
         assert!(!ext.accepts_post_seal_writes());
     }
-
 }

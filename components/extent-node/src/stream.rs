@@ -5,7 +5,7 @@ use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, ExtentState, Offset, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-use crate::extent::{AppendResult, Extent, DEFAULT_ARENA_CAPACITY};
+use crate::extent::{AppendResult, DEFAULT_ARENA_CAPACITY, Extent};
 use crate::store::AppendJob;
 
 /// A stream: an ordered, append-only sequence of messages backed by a list of extents.
@@ -91,7 +91,7 @@ impl Stream {
     ) -> Result<AppendResult, StorageError> {
         let extent = self.find_extent(extent_id).ok_or_else(|| {
             StorageError::Internal(format!(
-                "stream {:?}: extent {:?} not found",
+                "stream {}: extent {} not found",
                 self.id, extent_id
             ))
         })?;
@@ -111,7 +111,7 @@ impl Stream {
     ) -> Result<AppendResult, StorageError> {
         let extent = self.find_extent(extent_id).ok_or_else(|| {
             StorageError::Internal(format!(
-                "stream {:?}: extent {:?} not found",
+                "stream {}: extent {} not found",
                 self.id, extent_id
             ))
         })?;
@@ -132,7 +132,7 @@ impl Stream {
     ) -> Result<Vec<Bytes>, StorageError> {
         let extent = self.find_extent(extent_id).ok_or_else(|| {
             StorageError::Internal(format!(
-                "stream {:?}: extent {:?} not found",
+                "stream {}: extent {} not found",
                 self.id, extent_id
             ))
         })?;
@@ -218,8 +218,12 @@ impl Stream {
             .unwrap_or(Offset(0));
         let new_id = self.next_extent_id;
         self.next_extent_id = ExtentId(new_id.0 + 1);
-        self.extents
-            .push(Extent::with_capacity(new_id, end_offset, self.arena_capacity, self.epoch));
+        self.extents.push(Extent::with_capacity(
+            new_id,
+            end_offset,
+            self.arena_capacity,
+            self.epoch,
+        ));
         (new_id, end_offset)
     }
 
@@ -291,9 +295,12 @@ impl Stream {
     ///
     /// Returns `Ok((result, extent_id))` on success, or `Err(ExtentFull)` when the
     /// caller should seal + create + retry.
-    pub fn try_append_active(&self, payload: Bytes) -> Result<(AppendResult, ExtentId), StorageError> {
+    pub fn try_append_active(
+        &self,
+        payload: Bytes,
+    ) -> Result<(AppendResult, ExtentId), StorageError> {
         let extent = self.extents.last().ok_or_else(|| {
-            StorageError::Internal(format!("stream {:?}: no active extent", self.id))
+            StorageError::Internal(format!("stream {}: no active extent", self.id))
         })?;
         let result = extent.append_inner(payload)?;
         Ok((result, extent.id))
@@ -459,7 +466,12 @@ mod tests {
 
         // Register a new extent (simulating SM sending RegisterExtent).
         let second_extent_id = ExtentId(1);
-        stream.register_extent(second_extent_id, Offset(3), DEFAULT_ARENA_CAPACITY, Epoch(0));
+        stream.register_extent(
+            second_extent_id,
+            Offset(3),
+            DEFAULT_ARENA_CAPACITY,
+            Epoch(0),
+        );
         assert!(stream.is_mutable());
         assert_eq!(stream.max_offset(), Offset(3)); // new extent is empty
 
@@ -490,7 +502,12 @@ mod tests {
 
         // Register a new extent and append.
         let second_extent_id = ExtentId(1);
-        stream.register_extent(second_extent_id, Offset(1), DEFAULT_ARENA_CAPACITY, Epoch(0));
+        stream.register_extent(
+            second_extent_id,
+            Offset(1),
+            DEFAULT_ARENA_CAPACITY,
+            Epoch(0),
+        );
         let r = stream
             .append(second_extent_id, Bytes::from_static(b"b"))
             .unwrap();

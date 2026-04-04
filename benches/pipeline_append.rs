@@ -97,7 +97,7 @@ async fn main() {
         .await
         .expect("create_stream");
     info!(
-        "[setup] Stream {:?} created: extent={:?}, primary={}",
+        "[setup] Stream {} created: extent={}, primary={}",
         stream_id, initial_extent_id, initial_primary_addr
     );
 
@@ -109,13 +109,7 @@ async fn main() {
         let primary_addr = initial_primary_addr.clone();
 
         handles.push(tokio::spawn(async move {
-            sender_task(
-                sender_id,
-                stream_id,
-                primary_addr,
-                BENCH_DURATION,
-            )
-            .await
+            sender_task(sender_id, stream_id, primary_addr, BENCH_DURATION).await
         }));
     }
 

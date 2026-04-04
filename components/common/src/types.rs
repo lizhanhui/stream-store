@@ -1,3 +1,5 @@
+use std::fmt::{Display, Formatter, Result};
+
 /// Magic byte identifying our wire protocol.
 pub const MAGIC: u8 = 0xEF;
 
@@ -37,9 +39,21 @@ pub const FLAG_EXTENT_PROGRESS: u8 = 0x01;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);
 
+impl Display for StreamId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Unique identifier for an extent within a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExtentId(pub u32);
+
+impl Display for ExtentId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Stream epoch. Identifies a replica set assignment. Bumped by Stream Manager
 /// on node failure or rebalancing; within an epoch the Primary can autonomously
@@ -47,13 +61,31 @@ pub struct ExtentId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Epoch(pub u32);
 
+impl Display for Epoch {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Logical offset within a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Offset(pub u64);
 
+impl Display for Offset {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Unique identifier for an ExtentNode node (typically its listen address).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct NodeId(pub String);
+
+impl Display for NodeId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "{}", self.0)
+    }
+}
 
 /// Wire protocol operation codes, grouped by category with gaps for future growth.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

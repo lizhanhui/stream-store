@@ -6,7 +6,9 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use common::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SM_REQUEST_TIMEOUT_MS};
 use common::errors::StorageError;
-use common::types::{Epoch, ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId};
+use common::types::{
+    Epoch, ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId,
+};
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
@@ -221,7 +223,9 @@ impl StorageClient {
             return Err(match error_code {
                 Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id()),
                 Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id()),
-                Some(ErrorCode::EpochStale) => StorageError::EpochStale(resp.stream_id(), resp.epoch()),
+                Some(ErrorCode::EpochStale) => {
+                    StorageError::EpochStale(resp.stream_id(), resp.epoch())
+                }
                 _ => StorageError::Internal(msg),
             });
         }

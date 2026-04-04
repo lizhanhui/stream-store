@@ -366,8 +366,9 @@ impl Frame {
             VariableHeader::Append { epoch, .. }
             | VariableHeader::AppendAck { epoch, .. }
             | VariableHeader::CreateStreamResp { epoch, .. } => *epoch,
-            VariableHeader::Seal { epoch, .. }
-            | VariableHeader::SealAck { epoch, .. } => epoch.unwrap_or(Epoch(0)),
+            VariableHeader::Seal { epoch, .. } | VariableHeader::SealAck { epoch, .. } => {
+                epoch.unwrap_or(Epoch(0))
+            }
             VariableHeader::RegisterExtent { epoch, .. } => *epoch,
             VariableHeader::UpdateExtentSealed { epoch, .. }
             | VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
@@ -420,7 +421,11 @@ impl Frame {
                 }
                 f
             }
-            VariableHeader::SealAck { new_extent_id, epoch, .. } => {
+            VariableHeader::SealAck {
+                new_extent_id,
+                epoch,
+                ..
+            } => {
                 let mut f = 0u8;
                 if new_extent_id.is_some() {
                     f |= FLAG_NEW_EXTENT_PRESENT;
@@ -1734,7 +1739,8 @@ mod tests {
 
     #[test]
     fn error_response_frame() {
-        let frame = Frame::error_response(42, ErrorCode::ExtentSealed, "extent sealed", ExtentId(7));
+        let frame =
+            Frame::error_response(42, ErrorCode::ExtentSealed, "extent sealed", ExtentId(7));
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);

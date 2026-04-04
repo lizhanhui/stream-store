@@ -187,7 +187,7 @@ pub fn detect_local_ip() -> Option<String> {
         .filter_map(|ifa| {
             let addr = ifa.address?;
             let inet = addr.as_sockaddr_in()?;
-            let ip = Ipv4Addr::from(inet.ip());
+            let ip = inet.ip();
             if !ip.is_loopback() && !ip.is_unspecified() {
                 Some(ip)
             } else {
