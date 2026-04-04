@@ -23,6 +23,7 @@ use futures_util::SinkExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
@@ -39,6 +40,8 @@ use crate::store::ExtentNodeStore;
 pub struct DownstreamPool {
     /// Per-address TCP writers. Outer Mutex for the map, inner Mutex per writer.
     connections: Mutex<HashMap<String, Arc<Mutex<FramedWrite<OwnedWriteHalf, FrameCodec>>>>>,
+    /// JoinHandles for spawned reader tasks so we can abort them on shutdown.
+    reader_handles: Mutex<Vec<JoinHandle<()>>>,
     /// Back-reference to the store for inline watermark processing.
     store: Arc<ExtentNodeStore>,
 }
@@ -48,8 +51,22 @@ impl DownstreamPool {
     pub fn new(store: Arc<ExtentNodeStore>) -> Self {
         Self {
             connections: Mutex::new(HashMap::new()),
+            reader_handles: Mutex::new(Vec::new()),
             store,
         }
+    }
+
+    /// Shut down the pool: abort all reader tasks and clear connections.
+    pub async fn shutdown(&self) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut rh = self.reader_handles.lock().await;
+            std::mem::take(&mut *rh)
+        };
+        for handle in handles {
+            handle.abort();
+        }
+        let mut conns = self.connections.lock().await;
+        conns.clear();
     }
 
     /// Forward a single frame to a secondary address.
@@ -186,9 +203,13 @@ impl DownstreamPool {
         // Spawn reader task that handles Watermarks INLINE (no channel hop).
         let store = Arc::clone(&self.store);
         let addr_owned = addr.to_string();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             downstream_reader_inline(addr_owned, read_half, store).await;
         });
+        {
+            let mut rh = self.reader_handles.lock().await;
+            rh.push(handle);
+        }
 
         info!("connected to secondary ExtentNode at {addr}");
         Ok(framed_write)
