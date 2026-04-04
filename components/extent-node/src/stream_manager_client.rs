@@ -2,7 +2,8 @@
 //!
 //! [`StreamManagerClient`] manages the full lifecycle of the connection to
 //! StreamManager: TCP connect, Connect handshake, periodic Heartbeat,
-//! reconnection on failure, and graceful Disconnect on drop.
+//! NOTIFY_SEALED_EXTENT notifications, reconnection on failure, and graceful
+//! Disconnect on drop.
 //!
 //! Created via [`StreamManagerClient::spawn`], which starts an internal
 //! background task. When the value is dropped, the background task receives
@@ -13,24 +14,23 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use common::errors::StorageError;
-use common::types::NodeMetrics;
-use common::types::Opcode;
+use common::types::{NodeMetrics, Offset, Opcode};
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{build_connect_payload, build_disconnect_payload, build_heartbeat_payload};
 use tokio::net::TcpStream;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
 
 use crate::ExtentNode;
-use crate::store::ExtentNodeStore;
+use crate::store::{ExtentNodeStore, SealRequest};
 
 /// Manages the full lifecycle of the connection to StreamManager:
-/// TCP connect, Connect handshake, periodic Heartbeat, reconnection on failure,
-/// and graceful Disconnect on drop (RAII).
+/// TCP connect, Connect handshake, periodic Heartbeat, NOTIFY_SEALED_EXTENT
+/// notifications, reconnection on failure, and graceful Disconnect on drop (RAII).
 ///
 /// Created via [`StreamManagerClient::spawn`], which starts an internal background
 /// task. When the `StreamManagerClient` value is dropped, the background task
@@ -53,6 +53,10 @@ impl StreamManagerClient {
     /// The task immediately attempts to connect to StreamManager and enters
     /// the reconnection loop. Returns a handle that, when dropped, triggers
     /// graceful Disconnect.
+    ///
+    /// `seal_rx` receives NOTIFY_SEALED_EXTENT requests from the store's
+    /// autonomous extent creation path. These are multiplexed onto the same
+    /// SM connection alongside heartbeats.
     pub fn spawn(
         store: Arc<ExtentNodeStore>,
         node_id: String,
@@ -61,6 +65,7 @@ impl StreamManagerClient {
         heartbeat_interval_ms: u32,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
+        seal_rx: mpsc::Receiver<SealRequest>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -74,6 +79,7 @@ impl StreamManagerClient {
                 shutdown_rx,
                 rpc_connect_timeout,
                 rpc_request_timeout,
+                seal_rx,
             )
             .await;
         });
@@ -116,6 +122,7 @@ impl StreamManagerClient {
         mut shutdown_rx: oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
+        mut seal_rx: mpsc::Receiver<SealRequest>,
     ) {
         loop {
             match Self::connect_and_heartbeat(
@@ -127,6 +134,7 @@ impl StreamManagerClient {
                 &mut shutdown_rx,
                 rpc_connect_timeout,
                 rpc_request_timeout,
+                &mut seal_rx,
             )
             .await
             {
@@ -168,6 +176,7 @@ impl StreamManagerClient {
         shutdown_rx: &mut oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
+        seal_rx: &mut mpsc::Receiver<SealRequest>,
     ) -> Result<bool, StorageError> {
         let stream =
             tokio::time::timeout(rpc_connect_timeout, TcpStream::connect(stream_manager_addr))
@@ -217,9 +226,18 @@ impl StreamManagerClient {
         let mut request_id = 1u32;
 
         loop {
-            // Sleep until the next heartbeat, but also watch for shutdown.
+            // Sleep until the next heartbeat, but also watch for shutdown and seal notifications.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
+                Some(req) = seal_rx.recv() => {
+                    // NOTIFY_SEALED_EXTENT: send on the existing connection (fire-and-forget).
+                    Self::send_seal_notification(&mut framed, req, rpc_request_timeout).await;
+                    // Drain any additional queued notifications to batch them.
+                    while let Ok(req) = seal_rx.try_recv() {
+                        Self::send_seal_notification(&mut framed, req, rpc_request_timeout).await;
+                    }
+                    continue;
+                }
                 _ = &mut *shutdown_rx => {
                     // Graceful shutdown: send Disconnect before closing.
                     info!("shutdown signal received; sending Disconnect to StreamManager");
@@ -306,6 +324,40 @@ impl StreamManagerClient {
                         "timeout waiting for Heartbeat response".into(),
                     ));
                 }
+            }
+        }
+    }
+
+    /// Send a single NOTIFY_SEALED_EXTENT frame on the SM connection.
+    /// Fire-and-forget: logs and drops on failure.
+    async fn send_seal_notification(
+        framed: &mut Framed<TcpStream, FrameCodec>,
+        req: SealRequest,
+        rpc_request_timeout: Duration,
+    ) {
+        let frame = Frame::new(
+            VariableHeader::NotifySealedExtent {
+                stream_id: req.stream_id,
+                epoch: req.epoch,
+                sealed_extent_id: req.sealed_extent_id,
+                end_offset: Offset(req.end_offset),
+                new_extent_id: req.new_extent_id,
+            },
+            None,
+        );
+        match tokio::time::timeout(rpc_request_timeout, framed.send(frame)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                warn!(
+                    "failed to send NotifySealedExtent for stream {:?}: {e}",
+                    req.stream_id
+                );
+            }
+            Err(_) => {
+                warn!(
+                    "timeout sending NotifySealedExtent for stream {:?}",
+                    req.stream_id
+                );
             }
         }
     }

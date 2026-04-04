@@ -12,7 +12,7 @@ use common::config::{ExtentNodeConfig, resolve_advertise_ip};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::downstream::DownstreamPool;
 use crate::store::{ExtentNodeStore, SealRequest};
@@ -27,7 +27,7 @@ pub struct ExtentNode {
     addr: SocketAddr,
     /// Shutdown signal sender — sending triggers graceful stop of non-heartbeat tasks.
     shutdown_tx: broadcast::Sender<()>,
-    /// JoinHandles for spawned background tasks (accept loop, seal notify).
+    /// JoinHandles for spawned background tasks (accept loop).
     task_handles: Vec<JoinHandle<()>>,
     /// RAII client managing the StreamManager connection lifecycle.
     /// Sends Disconnect on drop; call `stop()` for guaranteed delivery.
@@ -37,55 +37,6 @@ pub struct ExtentNode {
 }
 
 impl ExtentNode {
-    /// Background task that receives SealRequest notifications and sends
-    /// NOTIFY_SEALED_EXTENT frames to Stream Manager.
-    ///
-    /// Fire-and-forget: if the SM connection fails, the notification is logged
-    /// and dropped. SM will reconcile during the next epoch bump.
-    async fn seal_notify_task(
-        mut seal_rx: mpsc::Receiver<SealRequest>,
-        sm_addr: String,
-        mut shutdown_rx: broadcast::Receiver<()>,
-    ) {
-        use common::types::Offset;
-        use rpc::frame::{Frame, VariableHeader};
-
-        while let Some(req) = tokio::select! {
-            req = seal_rx.recv() => req,
-            _ = shutdown_rx.recv() => None,
-        } {
-            if sm_addr.is_empty() {
-                continue;
-            }
-            // Send NOTIFY_SEALED_EXTENT to SM via a fire-and-forget connection.
-            match client::StorageClient::connect(&sm_addr).await {
-                Ok(client) => {
-                    let frame = Frame::new(
-                        VariableHeader::NotifySealedExtent {
-                            stream_id: req.stream_id,
-                            epoch: req.epoch,
-                            sealed_extent_id: req.sealed_extent_id,
-                            end_offset: Offset(req.end_offset),
-                            new_extent_id: req.new_extent_id,
-                        },
-                        None,
-                    );
-                    if let Err(e) = client.send_frame_no_response(frame).await {
-                        warn!(
-                            "Failed to send NotifySealedExtent to SM for stream {:?}: {e}",
-                            req.stream_id
-                        );
-                    }
-                }
-                Err(e) => {
-                    warn!(
-                        "Failed to connect to SM for NotifySealedExtent: {e}"
-                    );
-                }
-            }
-        }
-    }
-
     /// Query available and total system memory via sysinfo.
     pub(crate) fn get_memory_info() -> (u64, u64) {
         use sysinfo::System;
@@ -121,18 +72,12 @@ impl ExtentNode {
         store_inner.set_replication_timeout(Duration::from_millis(config.replication_timeout_ms));
 
         // Wire up the seal notification channel for autonomous extent creation.
-        // The receiver task sends NOTIFY_SEALED_EXTENT frames to Stream Manager.
+        // The receiver is passed to StreamManagerClient which multiplexes seal
+        // notifications onto the existing heartbeat connection.
         let (seal_tx, seal_rx) = mpsc::channel::<SealRequest>(64);
         store_inner.set_seal_tx(seal_tx);
 
         let store = Arc::new(store_inner);
-
-        // Spawn background task for NOTIFY_SEALED_EXTENT notifications to SM.
-        let sm_addr_for_notify = config.stream_manager_addr.clone();
-        let seal_shutdown_rx = shutdown_tx.subscribe();
-        task_handles.push(tokio::spawn(
-            Self::seal_notify_task(seal_rx, sm_addr_for_notify, seal_shutdown_rx),
-        ));
 
         // Create DownstreamPool with back-reference to store (for inline watermark processing).
         let downstream = Arc::new(DownstreamPool::new(Arc::clone(&store)));
@@ -157,6 +102,8 @@ impl ExtentNode {
         };
 
         // Spawn StreamManagerClient (RAII: sends Disconnect when dropped).
+        // The seal_rx channel is passed here so NOTIFY_SEALED_EXTENT frames
+        // are sent on the same connection as heartbeats.
         let stream_manager_client = StreamManagerClient::spawn(
             Arc::clone(&store),
             node_id,
@@ -165,6 +112,7 @@ impl ExtentNode {
             config.heartbeat_interval_ms,
             Duration::from_millis(config.connect_timeout_ms),
             Duration::from_millis(config.request_timeout_ms),
+            seal_rx,
         );
 
         // Spawn accept loop.
@@ -197,7 +145,7 @@ impl ExtentNode {
     /// Gracefully stop the ExtentNode: signal all tasks and await their completion.
     pub async fn stop(self) {
         info!("ExtentNode stopping...");
-        // 1. Signal non-heartbeat tasks (accept loop, seal notify).
+        // 1. Signal non-heartbeat tasks (accept loop).
         let _ = self.shutdown_tx.send(());
         // 2. Abort downstream reader tasks (they block on TCP reads indefinitely).
         self.downstream.shutdown().await;
