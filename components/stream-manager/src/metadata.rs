@@ -843,7 +843,7 @@ impl MetadataStore {
 
     /// Record an extent sealed notification from a Primary EN (autonomous extent creation).
     ///
-    /// This is the lightweight metadata update for EXTENT_SEALED_NOTIFY:
+    /// This is the lightweight metadata update for NOTIFY_SEALED_EXTENT:
     /// 1. Seal the old extent (set end_offset, state=Sealed).
     /// 2. Insert the new extent row (state=Active, same epoch).
     /// 3. Update stream_sequence to reflect the new extent ID.

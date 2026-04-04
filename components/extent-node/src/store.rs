@@ -166,7 +166,7 @@ impl AckQueue {
 }
 
 /// Notification emitted after the Primary autonomously creates a new extent on extent-full.
-/// Sent to a background task that forwards an EXTENT_SEALED_NOTIFY to Stream Manager,
+/// Sent to a background task that forwards an NOTIFY_SEALED_EXTENT to Stream Manager,
 /// allowing SM to update its metadata asynchronously (not on the critical path).
 #[derive(Debug, Clone)]
 pub struct SealRequest {
@@ -358,7 +358,7 @@ impl RequestHandler for ExtentNodeStore {
                 None,
             )),
             Opcode::ReportExtents => Some(self.handle_report_extents(frame)),
-            Opcode::ReportExtentsResp | Opcode::ExtentSealedNotify => {
+            Opcode::ReportExtentsResp | Opcode::NotifySealedExtent => {
                 warn!(
                     opcode = ?frame.opcode(),
                     "EN received unexpected opcode that should not be sent to ExtentNode"
@@ -455,6 +455,9 @@ impl ExtentNodeStore {
                 stream_mut.register_extent(extent_id, so, self.arena_capacity, epoch);
                 so
             } else {
+                // Extent already exists (lazy creation from Forward), but update epoch
+                // from authoritative source (RegisterExtent carries the real epoch).
+                stream_mut.set_epoch(epoch);
                 stream_mut.max_offset()
             }
         } else {
@@ -761,6 +764,7 @@ impl ExtentNodeStore {
                                 VariableHeader::Forward {
                                     stream_id,
                                     extent_id,
+                                    epoch,
                                     start_offset: Offset(extent_start_offset),
                                     offset,
                                     byte_pos: append_result.byte_pos,
@@ -946,7 +950,7 @@ impl ExtentNodeStore {
         }
     }
 
-    /// Send an async EXTENT_SEALED_NOTIFY to SM (fire-and-forget).
+    /// Send an async NOTIFY_SEALED_EXTENT to SM (fire-and-forget).
     fn send_seal_notification(
         &self,
         stream_id: StreamId,
@@ -1200,6 +1204,7 @@ impl ExtentNodeStore {
                                     VariableHeader::Forward {
                                         stream_id,
                                         extent_id: entry.extent_id,
+                                        epoch,
                                         start_offset: Offset(extent_start_offset),
                                         offset: entry.offset,
                                         byte_pos: entry.byte_pos,
@@ -1328,14 +1333,15 @@ impl ExtentNodeStore {
     ///
     /// Returns a cumulative Watermark with the highest written offset.
     fn handle_forward(&self, frame: Frame) -> Frame {
-        let (stream_id, extent_id, start_offset, offset, byte_pos) = match &frame.variable_header {
+        let (stream_id, extent_id, epoch, start_offset, offset, byte_pos) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
                 extent_id,
+                epoch,
                 start_offset,
                 offset,
                 byte_pos,
-            } => (*stream_id, *extent_id, *start_offset, *offset, *byte_pos),
+            } => (*stream_id, *extent_id, *epoch, *start_offset, *offset, *byte_pos),
             _ => {
                 return Frame::new(
                     VariableHeader::Watermark {
@@ -1356,7 +1362,7 @@ impl ExtentNodeStore {
             None => {
                 // Forward arrived before RegisterExtent — lazy extent creation.
                 let mut stream = Stream::new(stream_id);
-                stream.register_extent(extent_id, start_offset, self.arena_capacity, Epoch(0));
+                stream.register_extent(extent_id, start_offset, self.arena_capacity, epoch);
                 self.streams.insert(stream_id, stream);
 
                 self.next_stream_id
@@ -1400,7 +1406,7 @@ impl ExtentNodeStore {
                 drop(stream_ref);
                 if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
                     if stream_mut.find_extent(extent_id).is_none() {
-                        stream_mut.register_extent(extent_id, start_offset, self.arena_capacity, Epoch(0));
+                        stream_mut.register_extent(extent_id, start_offset, self.arena_capacity, epoch);
                         info!(
                             "Lazy extent creation on forward (existing stream): stream={:?}, extent={:?}, start_offset={:?}",
                             stream_id, extent_id, start_offset,
@@ -2124,6 +2130,7 @@ mod tests {
                     VariableHeader::Forward {
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
+                        epoch: Epoch(0),
                         start_offset: Offset(0),
                         offset: Offset(0),
                         byte_pos: 0,
@@ -2732,6 +2739,7 @@ mod tests {
                         VariableHeader::Forward {
                             stream_id: StreamId(10),
                             extent_id: ExtentId(50),
+                            epoch: Epoch(0),
                             start_offset: Offset(0),
                             offset: Offset(i as u64),
                             byte_pos,
@@ -2777,6 +2785,7 @@ mod tests {
                         VariableHeader::Forward {
                             stream_id: StreamId(10),
                             extent_id: ExtentId(50),
+                            epoch: Epoch(0),
                             start_offset: Offset(0),
                             offset: Offset(i as u64),
                             byte_pos,
@@ -2802,6 +2811,7 @@ mod tests {
                     VariableHeader::Forward {
                         stream_id: StreamId(10),
                         extent_id: ExtentId(50),
+                        epoch: Epoch(0),
                         start_offset: Offset(0),
                         offset: Offset(4),
                         byte_pos: 32,

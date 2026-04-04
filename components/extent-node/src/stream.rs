@@ -228,6 +228,11 @@ impl Stream {
         self.epoch
     }
 
+    /// Update the epoch (e.g., when RegisterExtent arrives for an already lazily-created extent).
+    pub fn set_epoch(&mut self, epoch: Epoch) {
+        self.epoch = epoch;
+    }
+
     /// Get a list of all extents for this stream (used for REPORT_EXTENTS).
     pub fn extent_report(&self) -> Vec<(ExtentId, Offset, u64, ExtentState)> {
         self.extents

@@ -102,7 +102,7 @@ async fn main() {
         .await
         .expect("failed to connect to StreamManager");
 
-    let (stream_id, extent_id, primary_addr) = stream_manager_client
+    let (stream_id, extent_id, _epoch, primary_addr) = stream_manager_client
         .create_stream("example-stream", 2)
         .await
         .expect("failed to create stream");

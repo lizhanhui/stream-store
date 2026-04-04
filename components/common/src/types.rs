@@ -81,7 +81,7 @@ pub enum Opcode {
     Watermark = 0x17,
     /// Async notification from Primary EN to SM after autonomous extent creation.
     /// Fire-and-forget: SM updates metadata, no response needed.
-    ExtentSealedNotify = 0x18,
+    NotifySealedExtent = 0x18,
     /// SM queries an EN for all extents it holds for a stream (recovery path).
     ReportExtents = 0x19,
     /// EN response to ReportExtents with extent state for reconciliation.
@@ -126,7 +126,7 @@ impl Opcode {
             0x15 => Some(Opcode::RegisterExtent),
             0x16 => Some(Opcode::RegisterExtentAck),
             0x17 => Some(Opcode::Watermark),
-            0x18 => Some(Opcode::ExtentSealedNotify),
+            0x18 => Some(Opcode::NotifySealedExtent),
             0x19 => Some(Opcode::ReportExtents),
             0x1A => Some(Opcode::ReportExtentsResp),
             // Cluster management

@@ -186,7 +186,7 @@ impl StorageClient {
     }
 
     /// Send a raw frame without waiting for a response (fire-and-forget).
-    /// Used for async notifications like EXTENT_SEALED_NOTIFY.
+    /// Used for async notifications like NOTIFY_SEALED_EXTENT.
     pub async fn send_frame_no_response(&self, frame: Frame) -> Result<(), StorageError> {
         self.inner
             .write_tx
@@ -214,12 +214,12 @@ impl StorageClient {
     /// Create a new stream on the StreamManager.
     /// Payload carries stream name and per-stream replication factor.
     /// If replication_factor=0, the StreamManager uses its default.
-    /// Returns (StreamId, ExtentId, ExtentNode address for the first extent).
+    /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
     pub async fn create_stream(
         &self,
         name: &str,
         replication_factor: u16,
-    ) -> Result<(StreamId, ExtentId, String), StorageError> {
+    ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
                 request_id: self.alloc_request_id(),
@@ -241,7 +241,7 @@ impl StorageClient {
                 StorageError::Internal("invalid CreateStreamResp primary_addr payload".into())
             })?;
 
-        Ok((resp.stream_id(), resp.extent_id(), addr))
+        Ok((resp.stream_id(), resp.extent_id(), resp.epoch(), addr))
     }
 
     /// Append a message to a stream. Returns the assigned offset and diagnostics.
@@ -444,6 +444,58 @@ impl StorageClient {
                 .map(|b| String::from_utf8_lossy(b).to_string())
                 .unwrap_or_default();
             Ok((new_eid, addr))
+        } else {
+            Err(StorageError::Internal(
+                "unexpected variable header in SealAck".into(),
+            ))
+        }
+    }
+
+    /// Seal a stream by epoch on the StreamManager and allocate a new one.
+    ///
+    /// The client identifies the stream by `(stream_id, epoch)` — the SM looks up
+    /// the active extent at that epoch, seals it, bumps epoch, and allocates a new
+    /// extent on a (potentially different) replica set.
+    ///
+    /// Returns (new_extent_id, new_primary_addr, new_epoch).
+    pub async fn seal_by_epoch(
+        &self,
+        stream_id: StreamId,
+        epoch: Epoch,
+    ) -> Result<(u32, String, Option<Epoch>), StorageError> {
+        let req = Frame::new(
+            VariableHeader::Seal {
+                request_id: self.alloc_request_id(),
+                stream_id,
+                extent_id: ExtentId(0), // not used for epoch-based seal
+                offset: None,
+                start_offset: None,
+                epoch: Some(epoch),
+            },
+            None,
+        );
+        let resp = self.send_request(req).await?;
+        Self::check_error(&resp)?;
+        if resp.opcode() != Opcode::SealAck {
+            return Err(StorageError::Internal(format!(
+                "expected SealAck, got {:?}",
+                resp.opcode()
+            )));
+        }
+
+        if let VariableHeader::SealAck {
+            new_extent_id,
+            primary_addr,
+            epoch: new_epoch,
+            ..
+        } = &resp.variable_header
+        {
+            let new_eid = new_extent_id.map(|e| e.0).unwrap_or(0);
+            let addr = primary_addr
+                .as_ref()
+                .map(|b| String::from_utf8_lossy(b).to_string())
+                .unwrap_or_default();
+            Ok((new_eid, addr, *new_epoch))
         } else {
             Err(StorageError::Internal(
                 "unexpected variable header in SealAck".into(),
