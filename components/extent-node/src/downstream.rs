@@ -22,8 +22,7 @@ use tokio_util::codec::FramedRead;
 use futures_util::SinkExt;
 use tokio::net::TcpStream;
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::Mutex;
-use tokio::task::JoinHandle;
+use tokio::sync::{Mutex, broadcast};
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
@@ -40,8 +39,8 @@ use crate::store::ExtentNodeStore;
 pub struct DownstreamPool {
     /// Per-address TCP writers. Outer Mutex for the map, inner Mutex per writer.
     connections: Mutex<HashMap<String, Arc<Mutex<FramedWrite<OwnedWriteHalf, FrameCodec>>>>>,
-    /// JoinHandles for spawned reader tasks so we can abort them on shutdown.
-    reader_handles: Mutex<Vec<JoinHandle<()>>>,
+    /// Shutdown signal for reader tasks. Each spawned reader subscribes to this.
+    shutdown_tx: broadcast::Sender<()>,
     /// Back-reference to the store for inline watermark processing.
     store: Arc<ExtentNodeStore>,
 }
@@ -49,22 +48,17 @@ pub struct DownstreamPool {
 impl DownstreamPool {
     /// Create a new pool with a back-reference to the store.
     pub fn new(store: Arc<ExtentNodeStore>) -> Self {
+        let (shutdown_tx, _) = broadcast::channel(1);
         Self {
             connections: Mutex::new(HashMap::new()),
-            reader_handles: Mutex::new(Vec::new()),
+            shutdown_tx,
             store,
         }
     }
 
-    /// Shut down the pool: abort all reader tasks and clear connections.
+    /// Shut down the pool: signal all reader tasks and clear connections.
     pub async fn shutdown(&self) {
-        let handles: Vec<JoinHandle<()>> = {
-            let mut rh = self.reader_handles.lock().await;
-            std::mem::take(&mut *rh)
-        };
-        for handle in handles {
-            handle.abort();
-        }
+        let _ = self.shutdown_tx.send(());
         let mut conns = self.connections.lock().await;
         conns.clear();
     }
@@ -201,15 +195,13 @@ impl DownstreamPool {
         let framed_write = FramedWrite::new(write_half, FrameCodec);
 
         // Spawn reader task that handles Watermarks INLINE (no channel hop).
+        // Receives a shutdown signal to exit gracefully instead of being aborted.
         let store = Arc::clone(&self.store);
         let addr_owned = addr.to_string();
-        let handle = tokio::spawn(async move {
-            downstream_reader_inline(addr_owned, read_half, store).await;
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        tokio::spawn(async move {
+            downstream_reader_inline(addr_owned, read_half, store, shutdown_rx).await;
         });
-        {
-            let mut rh = self.reader_handles.lock().await;
-            rh.push(handle);
-        }
 
         info!("connected to secondary ExtentNode at {addr}");
         Ok(framed_write)
@@ -221,16 +213,27 @@ impl DownstreamPool {
 /// Reads cumulative Watermark ACKs and processes them INLINE:
 /// directly updates the per-stream AckQueue and drains quorum,
 /// eliminating the WatermarkEvent channel hop.
+///
+/// Exits gracefully when the shutdown signal is received.
 async fn downstream_reader_inline(
     addr: String,
     read_half: OwnedReadHalf,
     store: Arc<ExtentNodeStore>,
+    mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let mut framed_read = FramedRead::new(read_half, FrameCodec);
 
-    while let Some(result) = framed_read.next().await {
+    loop {
+        let result = tokio::select! {
+            frame = framed_read.next() => frame,
+            _ = shutdown_rx.recv() => {
+                info!("secondary {addr} reader received shutdown signal");
+                break;
+            }
+        };
+
         match result {
-            Ok(frame) => {
+            Some(Ok(frame)) => {
                 if frame.opcode() == Opcode::Watermark {
                     let stream_id = frame.stream_id();
                     let acked_offset = frame.offset().0;
@@ -252,10 +255,11 @@ async fn downstream_reader_inline(
                     );
                 }
             }
-            Err(e) => {
+            Some(Err(e)) => {
                 error!("secondary {addr} read error: {e}");
                 return;
             }
+            None => break, // connection closed
         }
     }
 
