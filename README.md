@@ -86,7 +86,7 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
 ### Process Types
 
 - **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests.
-- **Stream Manager** -- Metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Includes load-aware extent placement and heartbeat-based failure detection.
+- **Stream Manager** -- Stateless metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Fully stateless design (no in-memory caches) allows multiple SM nodes to run against the same database for high availability. Includes load-aware extent placement, heartbeat-based failure detection, and DB-based leadership lease for failover coordination.
 
 ## Project Structure
 
@@ -156,6 +156,7 @@ cargo bench
 |-------|-------------|--------|
 | 1 | Single-node with lock-free extent, APPEND/READ/QUERY_OFFSET | Done |
 | 2 | Broadcast replication, quorum ACK, Stream Manager (MySQL), seal-and-new | Done |
+| 2.5 | Stateless multi-active SM with DB-based leader lease, CAS-fenced failover | Done |
 | 3 | S3 flush/read, S3 Reader/Flusher, LRU read cache | Planned |
 | 4 | Multi-Dispatch (data + index streams) | Planned |
 
