@@ -24,7 +24,10 @@ use crate::stream::Stream;
 /// Timeout for replication quorum. PendingAcks older than this are expired
 /// with an error response to the client, preventing unbounded accumulation
 /// when a secondary dies and quorum_offset() returns None forever.
-const REPLICATION_TIMEOUT: Duration = Duration::from_secs(5);
+///
+/// 500ms is generous for memory-based replication where the Primary→Secondary
+/// forward + watermark ACK round-trip is sub-millisecond (network RTT < 10ms).
+const REPLICATION_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// A pending client ACK waiting for quorum replication.
 #[derive(Debug)]

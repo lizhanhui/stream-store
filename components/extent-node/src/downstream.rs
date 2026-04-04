@@ -184,11 +184,11 @@ impl DownstreamPool {
         // Disable Nagle's algorithm for low-latency small frames.
         stream.set_nodelay(true)?;
 
-        // Set TCP keepalive to detect half-open connections.
+        // Set TCP keepalive to detect half-open connections quickly.
         let sock_ref = SockRef::from(&stream);
         let keepalive = TcpKeepalive::new()
-            .with_time(Duration::from_secs(10))
-            .with_interval(Duration::from_secs(5));
+            .with_time(Duration::from_secs(5))
+            .with_interval(Duration::from_secs(2));
         sock_ref.set_tcp_keepalive(&keepalive)?;
 
         let (read_half, write_half) = stream.into_split();

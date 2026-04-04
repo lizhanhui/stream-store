@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use bytes::{Buf, Bytes};
-use common::config::{RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
+use common::config::{DEFAULT_RPC_CONNECT_TIMEOUT, DEFAULT_SM_RPC_REQUEST_TIMEOUT};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId};
 use futures_util::{SinkExt, StreamExt};
@@ -58,7 +58,7 @@ impl Drop for StorageClient {
 impl StorageClient {
     /// Connect to a storage service endpoint.
     pub async fn connect(addr: &str) -> Result<Self, StorageError> {
-        let stream = tokio::time::timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(addr))
+        let stream = tokio::time::timeout(DEFAULT_RPC_CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
             .map_err(|_| StorageError::Internal(format!("connect timeout to {addr}")))??;
         stream
@@ -165,7 +165,7 @@ impl StorageClient {
         }
 
         // Wait for response with timeout.
-        match tokio::time::timeout(RPC_REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_recv_err)) => {
                 // Sender was dropped (reader task died).

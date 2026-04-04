@@ -12,7 +12,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::config::{RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT};
+use common::config::{DEFAULT_RPC_CONNECT_TIMEOUT, DEFAULT_SM_RPC_REQUEST_TIMEOUT};
 use common::errors::StorageError;
 use common::types::NodeMetrics;
 use common::types::Opcode;
@@ -95,7 +95,7 @@ impl StreamManagerClient {
         drop(self._shutdown_tx);
         // Wait for the task to finish, but cap at 5 seconds to avoid blocking
         // shutdown if the task is stuck in an RPC or reconnect wait.
-        match tokio::time::timeout(Duration::from_secs(5), task_handle).await {
+        match tokio::time::timeout(Duration::from_secs(2), task_handle).await {
             Ok(_) => {}
             Err(_) => {
                 warn!("StreamManagerClient stop timed out after 5s; abandoning task");
@@ -138,7 +138,7 @@ impl StreamManagerClient {
 
             // Wait before reconnecting, but also listen for shutdown.
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 _ = &mut shutdown_rx => {
                     info!("heartbeat loop received shutdown signal during reconnect wait");
                     return;
@@ -161,7 +161,7 @@ impl StreamManagerClient {
         shutdown_rx: &mut oneshot::Receiver<()>,
     ) -> Result<bool, StorageError> {
         let stream =
-            tokio::time::timeout(RPC_CONNECT_TIMEOUT, TcpStream::connect(stream_manager_addr))
+            tokio::time::timeout(DEFAULT_RPC_CONNECT_TIMEOUT, TcpStream::connect(stream_manager_addr))
                 .await
                 .map_err(|_| {
                     StorageError::Internal(format!("connect timeout to {stream_manager_addr}"))
@@ -178,11 +178,11 @@ impl StreamManagerClient {
             VariableHeader::Connect { request_id: 0 },
             Some(connect_payload),
         );
-        tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.send(connect_frame))
+        tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, framed.send(connect_frame))
             .await
             .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))??;
 
-        match tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.next()).await {
+        match tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, framed.next()).await {
             Ok(Some(Ok(resp))) if resp.opcode() == Opcode::ConnectAck => {
                 info!("registered with StreamManager");
             }
@@ -220,7 +220,7 @@ impl StreamManagerClient {
                         return Ok(true);
                     }
                     // Wait for DisconnectAck (best-effort, with a short timeout).
-                    match tokio::time::timeout(Duration::from_secs(2), framed.next()).await {
+                    match tokio::time::timeout(Duration::from_millis(500), framed.next()).await {
                         Ok(Some(Ok(resp))) if resp.opcode() == Opcode::DisconnectAck => {
                             info!("received DisconnectAck from StreamManager");
                         }
@@ -275,11 +275,11 @@ impl StreamManagerClient {
             );
             request_id = request_id.wrapping_add(1);
 
-            tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.send(hb_frame))
+            tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, framed.send(hb_frame))
                 .await
                 .map_err(|_| StorageError::Internal("timeout sending Heartbeat".into()))??;
 
-            match tokio::time::timeout(RPC_REQUEST_TIMEOUT, framed.next()).await {
+            match tokio::time::timeout(DEFAULT_SM_RPC_REQUEST_TIMEOUT, framed.next()).await {
                 Ok(Some(Ok(resp))) if resp.opcode() == Opcode::Heartbeat => {
                     // Heartbeat acknowledged.
                 }

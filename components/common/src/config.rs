@@ -2,11 +2,15 @@ use serde::Deserialize;
 use std::net::Ipv4Addr;
 use std::time::Duration;
 
-/// Timeout for establishing an RPC TCP connection.
-pub const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+/// Default timeout for establishing an RPC TCP connection (LAN, RTT < 10ms).
+pub const DEFAULT_RPC_CONNECT_TIMEOUT: Duration = Duration::from_millis(500);
 
-/// Timeout for a single RPC request-response round trip.
-pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+/// Default timeout for a single RPC request-response round trip.
+/// Covers EN-to-EN operations (sub-ms) with generous headroom.
+pub const DEFAULT_RPC_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// Default timeout for SM-facing RPC requests that may involve MySQL transactions.
+pub const DEFAULT_SM_RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Base server configuration (shared fields).
 #[derive(Debug, Clone, Deserialize)]
@@ -109,7 +113,7 @@ impl Default for StreamManagerConfig {
         Self {
             bind_ip: "0.0.0.0".to_string(),
             port: 9800,
-            mysql_host: "localhost".to_string(),
+            mysql_host: "tx.dev".to_string(),
             mysql_port: 3306,
             mysql_username: "root".to_string(),
             mysql_password: "password".to_string(),

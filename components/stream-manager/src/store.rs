@@ -244,7 +244,7 @@ impl StreamManagerStore {
 
             // Query the Primary EN for all extents at this epoch.
             let en_extents = match tokio::time::timeout(
-                Duration::from_secs(3),
+                Duration::from_secs(2),
                 report_extents_from_node_static(&primary_addr, *stream_id, *epoch),
             )
             .await
@@ -337,7 +337,7 @@ impl StreamManagerStore {
         let rf = replication_factor;
         let ep = epoch;
 
-        let result = tokio::time::timeout(Duration::from_secs(1), async {
+        let result = tokio::time::timeout(Duration::from_millis(500), async {
             let client = client::StorageClient::connect(&addr).await.map_err(|e| {
                 StorageError::Internal(format!(
                     "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
