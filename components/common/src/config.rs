@@ -122,6 +122,9 @@ pub struct StreamManagerConfig {
     pub connect_timeout_ms: u64,
     /// Timeout (ms) for RPC request-response round trips to ExtentNodes. Defaults to 2000ms.
     pub request_timeout_ms: u64,
+    /// Leadership lease duration in seconds. Only the lease holder runs the heartbeat
+    /// checker and failover. Defaults to 10s (renewed every heartbeat_check_interval).
+    pub leadership_lease_duration_secs: u32,
 }
 
 impl Default for StreamManagerConfig {
@@ -138,6 +141,7 @@ impl Default for StreamManagerConfig {
             heartbeat_check_interval_ms: 3000,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
+            leadership_lease_duration_secs: 10,
         }
     }
 }

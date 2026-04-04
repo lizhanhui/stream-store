@@ -302,6 +302,8 @@ async fn clean_database(mysql_url: &str) {
         "extent",
         "stream_sequence",
         "stream",
+        "node_metrics",
+        "stream_manager_leadership",
         "node",
         "refinery_schema_history",
     ] {

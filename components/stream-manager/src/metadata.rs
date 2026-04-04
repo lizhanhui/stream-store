@@ -1,5 +1,9 @@
+use std::collections::HashMap;
+
 use common::errors::StorageError;
-use common::types::{Epoch, ExtentId, ExtentInfo, ExtentState, NodeState, ReplicaDetail, StreamId};
+use common::types::{
+    Epoch, ExtentId, ExtentInfo, ExtentState, NodeMetrics, NodeState, ReplicaDetail, StreamId,
+};
 use sqlx::mysql::MySqlPoolOptions;
 use sqlx::{Acquire, MySqlPool, Row};
 use tracing::info;
@@ -835,6 +839,67 @@ impl MetadataStore {
         Ok(())
     }
 
+    // ── Node metrics persistence ──
+
+    /// Persist runtime metrics for a node (called on every heartbeat).
+    pub async fn persist_node_metrics(
+        &self,
+        node_id: &str,
+        metrics: &NodeMetrics,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT INTO node_metrics \
+             (node_id, available_memory_bytes, total_memory_bytes, \
+              appends_per_sec, active_extent_count, bytes_written_per_sec) \
+             VALUES (?, ?, ?, ?, ?, ?) \
+             ON DUPLICATE KEY UPDATE \
+               available_memory_bytes = VALUES(available_memory_bytes), \
+               total_memory_bytes = VALUES(total_memory_bytes), \
+               appends_per_sec = VALUES(appends_per_sec), \
+               active_extent_count = VALUES(active_extent_count), \
+               bytes_written_per_sec = VALUES(bytes_written_per_sec)",
+        )
+        .bind(node_id)
+        .bind(metrics.available_memory_bytes)
+        .bind(metrics.total_memory_bytes)
+        .bind(metrics.appends_per_sec)
+        .bind(metrics.active_extent_count)
+        .bind(metrics.bytes_written_per_sec)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("persist_node_metrics: {e}")))?;
+        Ok(())
+    }
+
+    /// Load all node metrics from the database (for load-aware placement).
+    pub async fn get_all_node_metrics(
+        &self,
+    ) -> Result<HashMap<String, NodeMetrics>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT node_id, available_memory_bytes, total_memory_bytes, \
+                    appends_per_sec, active_extent_count, bytes_written_per_sec \
+             FROM node_metrics",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("get_all_node_metrics: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                let node_id: String = r.get("node_id");
+                let metrics = NodeMetrics {
+                    available_memory_bytes: r.get::<u64, _>("available_memory_bytes"),
+                    total_memory_bytes: r.get::<u64, _>("total_memory_bytes"),
+                    appends_per_sec: r.get::<u32, _>("appends_per_sec"),
+                    active_extent_count: r.get::<u32, _>("active_extent_count"),
+                    bytes_written_per_sec: r.get::<u64, _>("bytes_written_per_sec"),
+                };
+                (node_id, metrics)
+            })
+            .collect())
+    }
+
     /// Map a sqlx Row to a NodeRow.
     fn map_node_row(r: sqlx::mysql::MySqlRow) -> NodeRow {
         let state_val = r.get::<i8, _>("state") as u8;
@@ -859,14 +924,87 @@ impl MetadataStore {
     }
 
     /// Bump the epoch for a stream. Returns the new epoch.
+    ///
+    /// Uses compare-and-swap: only increments if the current epoch matches
+    /// `expected`. Returns an error if a concurrent bump was detected.
     pub async fn bump_epoch(&self, stream_id: StreamId) -> Result<Epoch, StorageError> {
-        sqlx::query("UPDATE stream SET epoch = epoch + 1 WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("bump_epoch: {e}")))?;
+        let current = self.get_stream_epoch(stream_id).await?;
 
-        self.get_stream_epoch(stream_id).await
+        let result = sqlx::query(
+            "UPDATE stream SET epoch = epoch + 1 WHERE stream_id = ? AND epoch = ?",
+        )
+        .bind(stream_id.0 as i64)
+        .bind(current.0 as i32)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("bump_epoch: {e}")))?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::Internal(
+                "epoch CAS failed: concurrent bump detected".into(),
+            ));
+        }
+
+        Ok(Epoch(current.0 + 1))
+    }
+
+    // ── Leadership lease operations ──
+
+    /// Try to acquire the leadership lease. Returns true if acquired.
+    ///
+    /// Succeeds if the lease is expired or already held by this node.
+    pub async fn try_acquire_leadership(
+        &self,
+        node_id: &str,
+        lease_duration_secs: u32,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "UPDATE stream_manager_leadership \
+             SET node_id = ?, lease_until = DATE_ADD(NOW(), INTERVAL ? SECOND) \
+             WHERE id = 1 AND (lease_until < NOW() OR node_id = ?)",
+        )
+        .bind(node_id)
+        .bind(lease_duration_secs)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("acquire_leadership: {e}")))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Renew the leadership lease. Returns true if renewed (caller still holds it).
+    pub async fn renew_leadership(
+        &self,
+        node_id: &str,
+        lease_duration_secs: u32,
+    ) -> Result<bool, StorageError> {
+        let result = sqlx::query(
+            "UPDATE stream_manager_leadership \
+             SET lease_until = DATE_ADD(NOW(), INTERVAL ? SECOND) \
+             WHERE id = 1 AND node_id = ?",
+        )
+        .bind(lease_duration_secs)
+        .bind(node_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("renew_leadership: {e}")))?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Release the leadership lease (graceful shutdown).
+    pub async fn release_leadership(&self, node_id: &str) -> Result<(), StorageError> {
+        sqlx::query(
+            "UPDATE stream_manager_leadership \
+             SET node_id = '', lease_until = '2000-01-01 00:00:00' \
+             WHERE id = 1 AND node_id = ?",
+        )
+        .bind(node_id)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("release_leadership: {e}")))?;
+        Ok(())
     }
 
     /// Record an extent sealed notification from a Primary EN (autonomous extent creation).

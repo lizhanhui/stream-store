@@ -10,11 +10,10 @@ use std::time::Duration;
 use crate::metadata::MetadataStore;
 use common::config::StreamManagerConfig;
 use tokio::net::TcpListener;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::info;
 
-use crate::allocator::Allocator;
 use crate::heartbeat_checker::run_heartbeat_checker;
 use crate::store::StreamManagerStore;
 
@@ -37,7 +36,7 @@ impl StreamManager {
     ///
     /// 1. Connect to MySQL and run migrations.
     /// 2. Bind the TCP listener and determine the actual bound address.
-    /// 3. Start the heartbeat checker background task.
+    /// 3. Start the heartbeat checker background task (with leadership lease).
     /// 4. Spawn the accept loop.
     ///
     /// Returns a `StreamManager` handle for lifecycle management.
@@ -61,35 +60,36 @@ impl StreamManager {
             .expect("failed to get StreamManager local address");
         info!("StreamManager server bound on {local_addr}");
 
-        let allocator = Arc::new(Mutex::new(Allocator::new()));
-
-        // 3. Create StreamManagerStore (shared between request handler and heartbeat checker).
+        // 3. Create StreamManagerStore (stateless — all state lives in MySQL).
         let stream_manager_store = Arc::new(StreamManagerStore::new(
             store,
-            allocator,
             config.default_replication_factor,
         ));
 
-        // 4. Reconcile metadata with EN state (catch up on missed NOTIFY_SEALED_EXTENT
+        // 4. Reconcile metadata with EN state (catch up on missed UPDATE_EXTENT
         //    notifications from any prior SM downtime).
         stream_manager_store.reconcile_on_startup().await;
 
-        // 5. Start heartbeat checker in background (uses StreamManagerStore for
-        //    proper seal-and-new orchestration on node failure).
+        // 5. Start heartbeat checker with leadership lease (only the leader
+        //    runs failover; all SMs compete for the lease).
         let heartbeat_sm_store = Arc::clone(&stream_manager_store);
+        let node_id = local_addr.to_string();
         let heartbeat_check_interval =
             Duration::from_millis(config.heartbeat_check_interval_ms as u64);
+        let lease_duration_secs = config.leadership_lease_duration_secs;
         let heartbeat_shutdown = shutdown_tx.subscribe();
         task_handles.push(tokio::spawn(async move {
             run_heartbeat_checker(
                 heartbeat_sm_store,
+                node_id,
                 heartbeat_check_interval,
+                lease_duration_secs,
                 heartbeat_shutdown,
             )
             .await;
         }));
 
-        // 5. Spawn accept loop.
+        // 6. Spawn accept loop.
         let server_shutdown = shutdown_tx.subscribe();
         task_handles.push(tokio::spawn(async move {
             server::Server::builder("StreamManager")

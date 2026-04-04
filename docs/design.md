@@ -177,7 +177,9 @@ RF=3 (optional, quorum = Primary + 1 Secondary):
 
 All Extent Nodes, S3 Flusher, and S3 Reader run as Extent Node processes. Stream Manager nodes run as separate Stream Manager processes. Client applications communicate with the Rust storage service via a custom TCP protocol.
 
-**Stream Manager Clustering**: Stream Manager is peer-based -- all Stream Manager nodes are equivalent and can handle any request. MySQL provides transactional metadata coordination (the database is the single source of truth), so no Stream Manager-level leader election or consensus is needed. Stream Manager nodes register themselves in the database and broadcast membership changes to Extent Nodes and clients via `STREAM_MANAGER_MEMBERSHIP_CHANGE` frames.
+**Stream Manager Clustering**: Stream Manager is designed to be fully stateless — all persistent state lives in MySQL, and no in-memory caches are maintained. Multiple SM nodes can run concurrently against the same database. Any SM can handle any client request (CreateStream, Seal, Describe, Seek, QueryOffset) by reading/writing MySQL directly. Node metrics for load-aware placement are persisted to the `node_metrics` table on every heartbeat.
+
+A DB-based leadership lease (`stream_manager_leadership` table) ensures that only one SM at a time runs proactive operations: the heartbeat checker (dead node detection) and failover (epoch bump, seal-and-allocate replacement extents). The `bump_epoch` function uses a compare-and-swap guard (`WHERE epoch = ?`) to prevent double-bumps if leadership transfers mid-failover. See [SM High Availability](sm.md) for the full multi-SM deployment analysis.
 
 ### Components
 
@@ -1180,7 +1182,63 @@ CREATE TABLE stream_offset (
     updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (subscription_id, stream_id)
 );
+
+CREATE TABLE node_metrics (
+    node_id                VARCHAR(256) PRIMARY KEY,
+    available_memory_bytes BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    total_memory_bytes     BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    appends_per_sec        INT UNSIGNED NOT NULL DEFAULT 0,
+    active_extent_count    INT UNSIGNED NOT NULL DEFAULT 0,
+    bytes_written_per_sec  BIGINT UNSIGNED NOT NULL DEFAULT 0,
+    updated_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE stream_manager_leadership (
+    id          INT PRIMARY KEY DEFAULT 1,       -- single-row table
+    node_id     VARCHAR(256) NOT NULL DEFAULT '', -- current leader's listen address
+    lease_until DATETIME NOT NULL                 -- lease expiry (DB server time)
+);
 ```
+
+### Stream Manager High Availability
+
+The Stream Manager is fully stateless — all durable state lives in MySQL. This enables multi-active SM deployments for high availability.
+
+#### Stateless Design
+
+- **No in-memory caches**: Node metrics for load-aware placement are persisted to `node_metrics` on every heartbeat and read from DB on each allocation.
+- **All reads go to MySQL**: Streams, extents, replicas, node liveness — queried from DB for every operation.
+- **Any SM handles any request**: Client requests (CreateStream, Seal, Describe, Seek) are routed to any available SM.
+
+#### Leadership Lease
+
+A single-row `stream_manager_leadership` table provides leader election:
+
+- **Acquire**: `UPDATE ... SET node_id = ?, lease_until = NOW() + interval WHERE lease_until < NOW() OR node_id = ?`
+- **Renew**: `UPDATE ... SET lease_until = NOW() + interval WHERE node_id = ?`
+- **Release**: `UPDATE ... SET node_id = '' WHERE node_id = ?` (graceful shutdown)
+
+Only the leader runs the heartbeat checker (dead node detection + failover). Default lease duration: 10 seconds, renewed every 3 seconds (heartbeat check interval).
+
+#### Consistency Guarantees
+
+| Operation | Safety Mechanism |
+|-----------|------------------|
+| Concurrent seals | `SELECT ... FOR UPDATE` on extent row |
+| Concurrent epoch bumps | CAS guard: `UPDATE ... WHERE epoch = ?` |
+| Concurrent node registration | Upsert: `INSERT ... ON DUPLICATE KEY UPDATE` |
+| Concurrent heartbeat | Last-write-wins: `last_heartbeat = NOW()` |
+| Double failover | Leader-only + fenced `bump_epoch` + idempotent `seal_and_allocate` |
+
+#### Failover Sequence
+
+1. Active SM holds leadership lease, runs heartbeat checker.
+2. SM crashes (or lease expires after 10s).
+3. Another SM detects expired lease on next check interval, acquires it.
+4. New leader runs heartbeat checker, detects expired ENs, executes failover.
+5. ENs reconnect to any available SM (via VIP or address list).
+
+No data is lost because all durable state lives in MySQL. The failover window (during which no heartbeat checker runs and no new streams can be created) is bounded by `lease_duration + heartbeat_check_interval`.
 
 ### Offset Translation
 

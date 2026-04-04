@@ -1,6 +1,6 @@
-use std::sync::Arc;
 use std::time::Duration;
 
+use crate::allocator::Allocator;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
 use common::errors::StorageError;
@@ -13,10 +13,7 @@ use rpc::payload::{
     parse_string_payload,
 };
 use server::handler::RequestHandler;
-use tokio::sync::Mutex;
 use tracing::{error, info, warn};
-
-use crate::allocator::Allocator;
 
 /// Seal an ExtentNode's extent and return the committed end_offset.
 ///
@@ -134,22 +131,19 @@ async fn report_extents_from_node_static(
 /// The Stream Manager's request handler.
 pub struct StreamManagerStore {
     store: MetadataStore,
-    allocator: Arc<Mutex<Allocator>>,
+    allocator: Allocator,
     /// Default replication factor used when a client sends replication_factor=0
     /// (meaning "use server default"). Per-stream replication factor is stored in the stream table.
     default_replication_factor: usize,
 }
 
 impl StreamManagerStore {
-    pub fn new(
-        store: MetadataStore,
-        allocator: Arc<Mutex<Allocator>>,
-        default_replication_factor: usize,
-    ) -> Self {
+    pub fn new(store: MetadataStore, default_replication_factor: usize) -> Self {
         assert!(
             default_replication_factor >= 1,
             "default_replication_factor must be >= 1"
         );
+        let allocator = Allocator::new(store.clone());
         Self {
             store,
             allocator,
@@ -160,11 +154,6 @@ impl StreamManagerStore {
     /// Access the underlying MetadataStore (e.g., for heartbeat checker).
     pub fn store(&self) -> &MetadataStore {
         &self.store
-    }
-
-    /// Access the allocator (e.g., for heartbeat checker).
-    pub fn allocator(&self) -> &Arc<Mutex<Allocator>> {
-        &self.allocator
     }
 
     /// Reconcile SM metadata with EN state on startup.
@@ -482,9 +471,7 @@ impl StreamManagerStore {
         replication_factor: usize,
         epoch: Epoch,
     ) -> Result<(ExtentId, String), StorageError> {
-        let mut alloc = self.allocator.lock().await;
-        let nodes = alloc.pick_nodes(&self.store, replication_factor).await?;
-        drop(alloc);
+        let nodes = self.allocator.pick_nodes(replication_factor).await?;
 
         // Build (addr, role) pairs for the replica set.
         let replicas: Vec<(String, u8)> = nodes
@@ -607,9 +594,12 @@ impl StreamManagerStore {
             Some((node_id, metrics)) => {
                 match self.store.update_heartbeat(&node_id).await {
                     Ok(()) => {
-                        // Update in-memory metrics on the allocator for load-aware placement.
-                        let mut alloc = self.allocator.lock().await;
-                        alloc.update_metrics(&node_id, metrics);
+                        // Persist metrics to DB for load-aware placement (graceful on failure).
+                        if let Err(e) =
+                            self.store.persist_node_metrics(&node_id, &metrics).await
+                        {
+                            warn!("failed to persist node metrics for {node_id}: {e}");
+                        }
                         Frame::new(
                             VariableHeader::Heartbeat {
                                 request_id: frame.request_id(),
@@ -645,9 +635,6 @@ impl StreamManagerStore {
             Some(node_id) => {
                 match self.store.mark_node_dead(&node_id).await {
                     Ok(()) => {
-                        // Clean up in-memory metrics for the disconnected node.
-                        let mut alloc = self.allocator.lock().await;
-                        alloc.remove_metrics(&node_id);
                         info!("ExtentNode disconnected: node_id={node_id}");
                         Frame::new(
                             VariableHeader::DisconnectAck {
@@ -1062,9 +1049,7 @@ impl StreamManagerStore {
         // Pick nodes for new extent replica set using per-stream replication factor.
         let replication_factor =
             self.store.get_stream_replication_factor(stream_id).await? as usize;
-        let mut alloc = self.allocator.lock().await;
-        let nodes = alloc.pick_nodes(&self.store, replication_factor).await?;
-        drop(alloc);
+        let nodes = self.allocator.pick_nodes(replication_factor).await?;
 
         let new_replicas: Vec<(String, u8)> = nodes
             .iter()

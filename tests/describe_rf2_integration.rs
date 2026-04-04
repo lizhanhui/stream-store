@@ -31,7 +31,6 @@ fn init_tracing() {
 /// Drops and recreates tables via Refinery for a clean slate.
 async fn start_stream_manager_rf2() -> String {
     use std::sync::Arc;
-    use stream_manager::allocator::Allocator;
     use stream_manager::metadata::MetadataStore;
     use stream_manager::store::StreamManagerStore;
 
@@ -51,6 +50,8 @@ async fn start_stream_manager_rf2() -> String {
         "extent",
         "stream_sequence",
         "stream",
+        "node_metrics",
+        "stream_manager_leadership",
         "node",
         "refinery_schema_history",
     ] {
@@ -67,9 +68,8 @@ async fn start_stream_manager_rf2() -> String {
         .expect("failed to connect to MySQL");
     store.migrate().await.expect("failed to migrate");
 
-    let allocator = Arc::new(tokio::sync::Mutex::new(Allocator::new()));
     let stream_manager_store =
-        StreamManagerStore::new(store, allocator, config.default_replication_factor);
+        StreamManagerStore::new(store, config.default_replication_factor);
     let handler = Arc::new(stream_manager_store);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
