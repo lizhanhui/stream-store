@@ -109,7 +109,7 @@ impl Default for StreamManagerConfig {
         Self {
             bind_ip: "0.0.0.0".to_string(),
             port: 9800,
-            mysql_host: "tx.dev".to_string(),
+            mysql_host: "localhost".to_string(),
             mysql_port: 3306,
             mysql_username: "root".to_string(),
             mysql_password: "password".to_string(),
