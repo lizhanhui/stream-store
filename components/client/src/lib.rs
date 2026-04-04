@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use bytes::{Buf, Bytes};
-use common::config::{DEFAULT_RPC_CONNECT_TIMEOUT_MS, DEFAULT_SM_RPC_REQUEST_TIMEOUT_MS};
+use common::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SM_REQUEST_TIMEOUT_MS};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId};
 use futures_util::{SinkExt, StreamExt};
@@ -62,8 +62,8 @@ impl StorageClient {
     pub async fn connect(addr: &str) -> Result<Self, StorageError> {
         Self::connect_with_timeouts(
             addr,
-            Duration::from_millis(DEFAULT_RPC_CONNECT_TIMEOUT_MS),
-            Duration::from_millis(DEFAULT_SM_RPC_REQUEST_TIMEOUT_MS),
+            Duration::from_millis(DEFAULT_CONNECT_TIMEOUT_MS),
+            Duration::from_millis(DEFAULT_SM_REQUEST_TIMEOUT_MS),
         )
         .await
     }

@@ -163,8 +163,8 @@ impl ExtentNode {
             advertise_addr,
             config.stream_manager_addr.clone(),
             config.heartbeat_interval_ms,
-            Duration::from_millis(config.rpc_connect_timeout_ms),
-            Duration::from_millis(config.rpc_request_timeout_ms),
+            Duration::from_millis(config.connect_timeout_ms),
+            Duration::from_millis(config.request_timeout_ms),
         );
 
         // Spawn accept loop.

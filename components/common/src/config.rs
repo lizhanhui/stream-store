@@ -2,14 +2,14 @@ use serde::Deserialize;
 use std::net::Ipv4Addr;
 
 /// Default timeout for establishing an RPC TCP connection (LAN, RTT < 10ms).
-pub const DEFAULT_RPC_CONNECT_TIMEOUT_MS: u64 = 500;
+pub const DEFAULT_CONNECT_TIMEOUT_MS: u64 = 500;
 
 /// Default timeout for a single RPC request-response round trip.
 /// Covers EN-to-EN operations (sub-ms) with generous headroom.
-pub const DEFAULT_RPC_REQUEST_TIMEOUT_MS: u64 = 500;
+pub const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 500;
 
 /// Default timeout for SM-facing RPC requests that may involve MySQL transactions.
-pub const DEFAULT_SM_RPC_REQUEST_TIMEOUT_MS: u64 = 2000;
+pub const DEFAULT_SM_REQUEST_TIMEOUT_MS: u64 = 2000;
 
 /// Default timeout for replication quorum ACK (Primary waiting for Secondary watermarks).
 pub const DEFAULT_REPLICATION_TIMEOUT_MS: u64 = 500;
@@ -55,9 +55,9 @@ pub struct ExtentNodeConfig {
     /// expired with an error to the client. Defaults to 500ms.
     pub replication_timeout_ms: u64,
     /// Timeout (ms) for establishing an RPC TCP connection. Defaults to 500ms.
-    pub rpc_connect_timeout_ms: u64,
+    pub connect_timeout_ms: u64,
     /// Timeout (ms) for SM-facing RPC request-response round trips. Defaults to 2000ms.
-    pub rpc_request_timeout_ms: u64,
+    pub request_timeout_ms: u64,
 }
 
 impl Default for ExtentNodeConfig {
@@ -71,8 +71,8 @@ impl Default for ExtentNodeConfig {
             heartbeat_interval_ms: 5000,
             extent_arena_capacity: 64 * 1024 * 1024, // 64 MiB
             replication_timeout_ms: DEFAULT_REPLICATION_TIMEOUT_MS,
-            rpc_connect_timeout_ms: DEFAULT_RPC_CONNECT_TIMEOUT_MS,
-            rpc_request_timeout_ms: DEFAULT_SM_RPC_REQUEST_TIMEOUT_MS,
+            connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+            request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
         }
     }
 }
@@ -119,9 +119,9 @@ pub struct StreamManagerConfig {
     /// How often the heartbeat checker polls for expired nodes, in milliseconds.
     pub heartbeat_check_interval_ms: u32,
     /// Timeout (ms) for establishing an RPC TCP connection to ExtentNodes. Defaults to 500ms.
-    pub rpc_connect_timeout_ms: u64,
+    pub connect_timeout_ms: u64,
     /// Timeout (ms) for RPC request-response round trips to ExtentNodes. Defaults to 2000ms.
-    pub rpc_request_timeout_ms: u64,
+    pub request_timeout_ms: u64,
 }
 
 impl Default for StreamManagerConfig {
@@ -129,15 +129,15 @@ impl Default for StreamManagerConfig {
         Self {
             bind_ip: "0.0.0.0".to_string(),
             port: 9800,
-            mysql_host: "tx.dev".to_string(),
+            mysql_host: "localhost".to_string(),
             mysql_port: 3306,
             mysql_username: "root".to_string(),
             mysql_password: "password".to_string(),
             mysql_database: "stream_store".to_string(),
             default_replication_factor: 2,
             heartbeat_check_interval_ms: 3000,
-            rpc_connect_timeout_ms: DEFAULT_RPC_CONNECT_TIMEOUT_MS,
-            rpc_request_timeout_ms: DEFAULT_SM_RPC_REQUEST_TIMEOUT_MS,
+            connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
+            request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
         }
     }
 }
