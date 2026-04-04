@@ -309,6 +309,18 @@ impl ExtentNodeStore {
         self.replicas.get(&stream_id).map(|r| r.clone())
     }
 
+    /// Expire stale PendingAcks across all streams by running the timeout sweep.
+    ///
+    /// Called when a downstream secondary reader exits (secondary died or disconnected),
+    /// so clients get timely error responses instead of waiting for SM recovery.
+    /// Without this, RF=2 clients would stall for the full SM heartbeat detection
+    /// window (~7.5s) because no watermark ACKs arrive to trigger `drain_quorum`.
+    pub fn expire_pending_acks(&self) {
+        for mut entry in self.ack_queues.iter_mut() {
+            entry.value_mut().drain_quorum();
+        }
+    }
+
     /// Snapshot current metrics and reset counters.
     /// Returns (appends_since_last, bytes_written_since_last, active_extent_count).
     pub fn snapshot_metrics(&self) -> (u64, u64, u32) {

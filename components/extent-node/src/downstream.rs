@@ -257,11 +257,15 @@ async fn downstream_reader_inline(
             }
             Some(Err(e)) => {
                 error!("secondary {addr} read error: {e}");
-                return;
+                break;
             }
             None => break, // connection closed
         }
     }
+
+    // Secondary is gone — expire stale PendingAcks immediately so clients get
+    // timely error responses instead of waiting for SM heartbeat-based recovery.
+    store.expire_pending_acks();
 
     info!("secondary {addr} reader closed");
 }

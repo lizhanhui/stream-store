@@ -63,31 +63,34 @@ impl StreamManager {
 
         let allocator = Arc::new(Mutex::new(Allocator::new()));
 
-        // 3. Start heartbeat checker in background.
-        let heartbeat_store = store.clone();
-        let heartbeat_allocator = allocator.clone();
+        // 3. Create StreamManagerStore (shared between request handler and heartbeat checker).
+        let stream_manager_store = Arc::new(StreamManagerStore::new(
+            store,
+            allocator,
+            config.default_replication_factor,
+        ));
+
+        // 4. Start heartbeat checker in background (uses StreamManagerStore for
+        //    proper seal-and-new orchestration on node failure).
+        let heartbeat_sm_store = Arc::clone(&stream_manager_store);
         let heartbeat_check_interval =
             Duration::from_millis(config.heartbeat_check_interval_ms as u64);
         let heartbeat_shutdown = shutdown_tx.subscribe();
         task_handles.push(tokio::spawn(async move {
             run_heartbeat_checker(
-                heartbeat_store,
-                heartbeat_allocator,
+                heartbeat_sm_store,
                 heartbeat_check_interval,
                 heartbeat_shutdown,
             )
             .await;
         }));
 
-        // 4. Spawn accept loop.
-        let stream_manager_store =
-            StreamManagerStore::new(store, allocator, config.default_replication_factor);
-        let handler = Arc::new(stream_manager_store);
+        // 5. Spawn accept loop.
         let server_shutdown = shutdown_tx.subscribe();
         task_handles.push(tokio::spawn(async move {
             server::Server::builder("StreamManager")
                 .listener(listener)
-                .handler(handler)
+                .handler(stream_manager_store)
                 .shutdown(server_shutdown)
                 .build()
                 .run()

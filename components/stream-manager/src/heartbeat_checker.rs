@@ -1,23 +1,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::metadata::MetadataStore;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
-use crate::allocator::Allocator;
+use crate::store::StreamManagerStore;
 
 /// Background task that checks for expired ExtentNode nodes and handles failover.
 ///
 /// For each expired node:
 /// 1. Mark the node as DEAD in metadata.
-/// 2. Seal all active extents on that node.
-/// 3. Allocate replacement extents on alive nodes.
+/// 2. Resolve the true committed offset from surviving replicas.
+/// 3. Seal and allocate replacement extents with proper RF and RegisterExtent.
+///
+/// Uses `StreamManagerStore` to access the full seal-and-new orchestration
+/// (`resolve_committed_offset` + `seal_allocate_register`) instead of
+/// reimplementing a partial version with raw MetadataStore calls.
 ///
 /// Returns when the shutdown signal is received.
 pub async fn run_heartbeat_checker(
-    store: MetadataStore,
-    allocator: Arc<Mutex<Allocator>>,
+    sm_store: Arc<StreamManagerStore>,
     check_interval: Duration,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -32,7 +34,7 @@ pub async fn run_heartbeat_checker(
             }
         }
 
-        match check_expired_nodes(&store, &allocator).await {
+        match check_expired_nodes(&sm_store).await {
             Ok(dead_count) => {
                 if dead_count > 0 {
                     warn!("heartbeat checker: handled {dead_count} dead node(s)");
@@ -48,10 +50,18 @@ pub async fn run_heartbeat_checker(
 }
 
 /// Check for expired nodes and handle failover. Returns the number of dead nodes found.
+///
+/// For each active extent on the dead node:
+/// 1. Resolve the committed offset by querying surviving replicas (Primary if alive,
+///    otherwise secondary quorum). Falls back to metadata end_offset if all replicas
+///    are unreachable.
+/// 2. Bump epoch (replica set is changing due to node failure).
+/// 3. Seal-and-allocate with proper replication factor, RegisterExtent to new Primary,
+///    and fire-and-forget notify to secondaries.
 async fn check_expired_nodes(
-    store: &MetadataStore,
-    allocator: &Arc<Mutex<Allocator>>,
+    sm_store: &Arc<StreamManagerStore>,
 ) -> Result<usize, common::errors::StorageError> {
+    let store = sm_store.store();
     let expired = store.get_expired_nodes().await?;
     let dead_count = expired.len();
 
@@ -61,7 +71,7 @@ async fn check_expired_nodes(
         // 1. Mark node as dead and clean up in-memory metrics.
         store.mark_node_dead(&node.node_id).await?;
         {
-            let mut alloc = allocator.lock().await;
+            let mut alloc = sm_store.allocator().lock().await;
             alloc.remove_metrics(&node.node_id);
         }
 
@@ -70,34 +80,62 @@ async fn check_expired_nodes(
 
         for extent in &active_extents {
             info!(
-                "sealing extent {:?} on dead node {} (stream {:?})",
+                "failover: sealing extent {:?} on dead node {} (stream {:?})",
                 extent.extent_id, node.node_id, extent.stream_id
             );
-            // Seal with current end_offset (we can't know the exact count
-            // from ExtentNode since it's dead; record what metadata has).
-            store
-                .seal_extent(extent.stream_id, extent.extent_id, extent.end_offset)
-                .await?;
 
-            // 3. Allocate a replacement extent on a healthy node.
-            //    Bump epoch since the replica set is changing due to node failure.
-            let new_epoch = store.bump_epoch(extent.stream_id).await?;
-            let new_start_offset = extent.end_offset;
-            let mut alloc = allocator.lock().await;
-            match alloc.pick_node(store).await {
-                Ok(target) => {
-                    let replicas = vec![(target.addr.clone(), 0u8)];
-                    let new_extent = store
-                        .allocate_extent(extent.stream_id, new_start_offset, &replicas, new_epoch)
-                        .await?;
+            // Resolve the true committed offset from surviving replicas.
+            // This contacts the Primary (if alive) or uses secondary quorum.
+            let committed_offset = match sm_store
+                .resolve_committed_offset(
+                    extent.stream_id,
+                    extent.extent_id,
+                    extent.start_offset as u64,
+                )
+                .await
+            {
+                Ok(offset) => {
                     info!(
-                        "replacement extent {:?} allocated on {} for stream {:?}",
-                        new_extent, target.addr, extent.stream_id
+                        "failover: resolved committed offset={offset} for extent {:?} stream {:?}",
+                        extent.extent_id, extent.stream_id
+                    );
+                    offset
+                }
+                Err(e) => {
+                    // All replicas unreachable — fall back to metadata end_offset.
+                    // This may lose data but is the best we can do.
+                    warn!(
+                        "failover: resolve_committed_offset failed for extent {:?} stream {:?}: {e}; \
+                         falling back to metadata end_offset={}",
+                        extent.extent_id, extent.stream_id, extent.end_offset
+                    );
+                    extent.end_offset as u64
+                }
+            };
+
+            // Bump epoch since the replica set is changing due to node failure.
+            let new_epoch = store.bump_epoch(extent.stream_id).await?;
+
+            // Seal-and-allocate with proper RF, RegisterExtent to new Primary,
+            // and fire-and-forget notify to secondaries.
+            match sm_store
+                .seal_allocate_register(
+                    extent.stream_id,
+                    extent.extent_id,
+                    committed_offset,
+                    new_epoch,
+                )
+                .await
+            {
+                Ok((new_extent_id, primary_addr)) => {
+                    info!(
+                        "failover: replacement extent {:?} allocated on {primary_addr} for stream {:?} (epoch={:?})",
+                        new_extent_id, extent.stream_id, new_epoch
                     );
                 }
                 Err(e) => {
                     warn!(
-                        "cannot allocate replacement extent for stream {:?}: {e}",
+                        "failover: seal_allocate_register failed for stream {:?}: {e}",
                         extent.stream_id
                     );
                 }

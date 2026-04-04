@@ -85,6 +85,16 @@ impl StreamManagerStore {
         }
     }
 
+    /// Access the underlying MetadataStore (e.g., for heartbeat checker).
+    pub fn store(&self) -> &MetadataStore {
+        &self.store
+    }
+
+    /// Access the allocator (e.g., for heartbeat checker).
+    pub fn allocator(&self) -> &Arc<Mutex<Allocator>> {
+        &self.allocator
+    }
+
     /// Register the new extent on the Primary ExtentNode and wait for its ACK.
     ///
     /// This guarantees the Primary is ready to accept appends before any client
@@ -672,7 +682,7 @@ impl StreamManagerStore {
     /// **Fallback** — If the primary is unreachable (timeout/error), seal ALL
     /// replicas concurrently (secondaries with `offset=None`) and compute the
     /// committed offset from secondary quorum.
-    async fn resolve_committed_offset(
+    pub async fn resolve_committed_offset(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
@@ -820,7 +830,7 @@ impl StreamManagerStore {
 
     /// Shared logic for both seal paths: pick new nodes, seal-and-allocate in DB,
     /// register new replica set, and return (new_extent_id, primary_addr).
-    async fn seal_allocate_register(
+    pub async fn seal_allocate_register(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
