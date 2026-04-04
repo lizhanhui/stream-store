@@ -525,8 +525,8 @@ impl RequestHandler for StreamManagerStore {
     ) -> Option<Frame> {
         match frame.opcode() {
             // Fire-and-forget: no response frame
-            Opcode::NotifySealedExtent => {
-                self.handle_extent_sealed_notify(frame).await;
+            Opcode::UpdateExtent => {
+                self.handle_extent_update(frame).await;
                 None
             }
             // Request-response opcodes
@@ -1446,44 +1446,69 @@ impl StreamManagerStore {
         }
     }
 
-    /// NotifySealedExtent: fire-and-forget notification from Primary EN after autonomous seal.
+    /// UpdateExtent: fire-and-forget extent updates from Primary EN.
     ///
-    /// The Primary EN has already sealed the old extent and created a new one locally.
-    /// SM updates metadata: seal old extent, insert new extent, copy replicas, update sequence.
-    async fn handle_extent_sealed_notify(&self, frame: Frame) {
-        if let VariableHeader::NotifySealedExtent {
-            stream_id,
-            epoch,
-            sealed_extent_id,
-            end_offset,
-            new_extent_id,
-        } = &frame.variable_header
-        {
-            info!(
-                "NotifySealedExtent: stream={:?}, epoch={:?}, sealed_extent={:?}, end_offset={}, new_extent={:?}",
-                stream_id, epoch, sealed_extent_id, end_offset.0, new_extent_id
-            );
-            if let Err(e) = self
-                .store
-                .record_extent_sealed(
-                    *stream_id,
-                    *epoch,
-                    *sealed_extent_id,
-                    end_offset.0,
-                    *new_extent_id,
-                )
-                .await
-            {
+    /// Dispatches on variant:
+    /// - Sealed: extent was sealed, insert new extent (autonomous extent creation).
+    /// - Progress: periodic offset update for an active extent (observability).
+    async fn handle_extent_update(&self, frame: Frame) {
+        match &frame.variable_header {
+            VariableHeader::UpdateExtentSealed {
+                stream_id,
+                epoch,
+                sealed_extent_id,
+                end_offset,
+                new_extent_id,
+            } => {
+                info!(
+                    "UpdateExtentSealed: stream={:?}, epoch={:?}, sealed_extent={:?}, end_offset={}, new_extent={:?}",
+                    stream_id, epoch, sealed_extent_id, end_offset.0, new_extent_id
+                );
+                if let Err(e) = self
+                    .store
+                    .record_extent_sealed(
+                        *stream_id,
+                        *epoch,
+                        *sealed_extent_id,
+                        end_offset.0,
+                        *new_extent_id,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to record extent sealed for stream {:?}: {e}",
+                        stream_id
+                    );
+                }
+            }
+            VariableHeader::UpdateExtentProgress {
+                stream_id,
+                epoch,
+                extent_id,
+                current_offset,
+            } => {
+                if let Err(e) = self
+                    .store
+                    .record_extent_progress(
+                        *stream_id,
+                        *epoch,
+                        *extent_id,
+                        current_offset.0,
+                    )
+                    .await
+                {
+                    warn!(
+                        "Failed to record extent progress for stream {:?}: {e}",
+                        stream_id
+                    );
+                }
+            }
+            _ => {
                 warn!(
-                    "Failed to record extent sealed for stream {:?}: {e}",
-                    stream_id
+                    "handle_extent_update called with unexpected header: {:?}",
+                    frame.opcode()
                 );
             }
-        } else {
-            warn!(
-                "handle_extent_sealed_notify called with unexpected header: {:?}",
-                frame.opcode()
-            );
         }
     }
 

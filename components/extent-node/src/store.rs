@@ -172,19 +172,25 @@ impl AckQueue {
     }
 }
 
-/// Notification emitted after the Primary autonomously creates a new extent on extent-full.
-/// Sent to a background task that forwards an NOTIFY_SEALED_EXTENT to Stream Manager,
-/// allowing SM to update its metadata asynchronously (not on the critical path).
+/// Notification emitted by the Primary to update Stream Manager about extent state.
+/// Sent to the SM connection task which forwards it as an UPDATE_EXTENT frame.
 #[derive(Debug, Clone)]
-pub struct SealRequest {
-    pub stream_id: StreamId,
-    /// The extent that was sealed.
-    pub sealed_extent_id: ExtentId,
-    /// Committed offset = end_offset (exclusive upper bound) of the sealed extent.
-    pub end_offset: u64,
-    /// The newly created extent that replaced the sealed one.
-    pub new_extent_id: ExtentId,
-    pub epoch: Epoch,
+pub enum ExtentUpdate {
+    /// Extent was sealed and a new one created (autonomous extent creation).
+    Sealed {
+        stream_id: StreamId,
+        sealed_extent_id: ExtentId,
+        end_offset: u64,
+        new_extent_id: ExtentId,
+        epoch: Epoch,
+    },
+    /// Periodic progress report for an active extent (observability).
+    Progress {
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        current_offset: u64,
+        epoch: Epoch,
+    },
 }
 
 // ── Replica info ─────────────────────────────────────────────────────────────
@@ -264,9 +270,9 @@ pub struct ExtentNodeStore {
     /// Direct TCP connection pool for broadcast replication (None for standalone/test mode).
     /// Initialized via `set_downstream()` after construction (OnceLock breaks circular dep).
     downstream: OnceLock<Arc<DownstreamPool>>,
-    /// Channel to send proactive SealRequests when an extent is full (Primary only).
-    /// A background task receives these and forwards Seal RPCs to Stream Manager.
-    seal_tx: Option<mpsc::Sender<SealRequest>>,
+    /// Channel to send ExtentUpdate notifications to SM (Primary only).
+    /// The SM connection task receives these and sends UPDATE_EXTENT frames.
+    update_tx: Option<mpsc::Sender<ExtentUpdate>>,
     /// Per-stream ACK queues for the Primary (only used when this node is Primary for a stream).
     /// Fine-grained per-stream locking.
     pub ack_queues: DashMap<StreamId, AckQueue>,
@@ -288,7 +294,7 @@ impl ExtentNodeStore {
             arena_capacity: DEFAULT_ARENA_CAPACITY,
             replicas: DashMap::new(),
             downstream: OnceLock::new(),
-            seal_tx: None,
+            update_tx: None,
             ack_queues: DashMap::new(),
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
             append_count: AtomicU64::new(0),
@@ -315,8 +321,8 @@ impl ExtentNodeStore {
     }
 
     /// Set the seal request channel (called during ExtentNode bootstrap).
-    pub fn set_seal_tx(&mut self, seal_tx: mpsc::Sender<SealRequest>) {
-        self.seal_tx = Some(seal_tx);
+    pub fn set_update_tx(&mut self, update_tx: mpsc::Sender<ExtentUpdate>) {
+        self.update_tx = Some(update_tx);
     }
 
     /// Get the replication info for a stream, if registered via RegisterExtent.
@@ -350,6 +356,24 @@ impl ExtentNodeStore {
             .count() as u32;
 
         (appends, bytes, active_count)
+    }
+
+    /// Snapshot active extent info for progress reporting to SM.
+    /// Returns (stream_id, extent_id, current_offset, epoch) for each active extent.
+    pub fn snapshot_active_extents(&self) -> Vec<(StreamId, ExtentId, u64, Epoch)> {
+        self.streams
+            .iter()
+            .filter_map(|entry| {
+                let stream = entry.value();
+                if stream.is_mutable() {
+                    let extent_id = stream.active_extent_id()?;
+                    let offset = stream.max_offset().0;
+                    Some((*entry.key(), extent_id, offset, stream.epoch()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 }
 
@@ -385,7 +409,7 @@ impl RequestHandler for ExtentNodeStore {
                 None,
             )),
             Opcode::ReportExtents => Some(self.handle_report_extents(frame)),
-            Opcode::ReportExtentsResp | Opcode::NotifySealedExtent => {
+            Opcode::ReportExtentsResp | Opcode::UpdateExtent => {
                 warn!(
                     opcode = ?frame.opcode(),
                     "EN received unexpected opcode that should not be sent to ExtentNode"
@@ -646,13 +670,13 @@ impl ExtentNodeStore {
                 let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
                 forward_work.extend(batch_forward);
                 for notif in batch_seals {
-                    self.send_seal_notification(stream_id, &notif);
+                    self.send_extent_update(stream_id, &notif);
                 }
             }
 
             // Send SM notification if we sealed.
             if let Some(notif) = seal_notification {
-                self.send_seal_notification(stream_id, &notif);
+                self.send_extent_update(stream_id, &notif);
             }
             self.flush_forward_work(forward_work).await;
             return retry_result;
@@ -666,7 +690,7 @@ impl ExtentNodeStore {
             let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
             forward_work.extend(batch_forward);
             for notif in batch_seals {
-                self.send_seal_notification(stream_id, &notif);
+                self.send_extent_update(stream_id, &notif);
             }
         }
 
@@ -995,14 +1019,14 @@ impl ExtentNodeStore {
         }
     }
 
-    /// Send an async NOTIFY_SEALED_EXTENT to SM (fire-and-forget).
-    fn send_seal_notification(
+    /// Send an async UPDATE_EXTENT (Sealed) to SM (fire-and-forget).
+    fn send_extent_update(
         &self,
         stream_id: StreamId,
         notif: &crate::stream::SealNotification,
     ) {
-        if let Some(ref tx) = self.seal_tx {
-            let _ = tx.try_send(SealRequest {
+        if let Some(ref tx) = self.update_tx {
+            let _ = tx.try_send(ExtentUpdate::Sealed {
                 stream_id,
                 sealed_extent_id: notif.sealed_extent_id,
                 end_offset: notif.end_offset,
@@ -1160,7 +1184,7 @@ impl ExtentNodeStore {
                 let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
                 forward_work.extend(batch_forward);
                 for notif in batch_seals {
-                    self.send_seal_notification(stream_id, &notif);
+                    self.send_extent_update(stream_id, &notif);
                 }
             }
             if extent_full {
@@ -1180,7 +1204,7 @@ impl ExtentNodeStore {
                     }
                 }
                 if let Some(notif) = seal_notification {
-                    self.send_seal_notification(stream_id, &notif);
+                    self.send_extent_update(stream_id, &notif);
                 }
             }
             self.flush_forward_work(forward_work).await;
@@ -1317,7 +1341,7 @@ impl ExtentNodeStore {
             let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
             forward_work.extend(batch_forward);
             for notif in batch_seals {
-                self.send_seal_notification(stream_id, &notif);
+                self.send_extent_update(stream_id, &notif);
             }
         }
 
@@ -1338,7 +1362,7 @@ impl ExtentNodeStore {
                 }
             }
             if let Some(notif) = seal_notification {
-                self.send_seal_notification(stream_id, &notif);
+                self.send_extent_update(stream_id, &notif);
             }
         }
 

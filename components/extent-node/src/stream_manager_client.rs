@@ -2,8 +2,8 @@
 //!
 //! [`StreamManagerClient`] manages the full lifecycle of the connection to
 //! StreamManager: TCP connect, Connect handshake, periodic Heartbeat,
-//! NOTIFY_SEALED_EXTENT notifications, reconnection on failure, and graceful
-//! Disconnect on drop.
+//! UPDATE_EXTENT notifications (sealed + progress), reconnection on failure,
+//! and graceful Disconnect on drop.
 //!
 //! Created via [`StreamManagerClient::spawn`], which starts an internal
 //! background task. When the value is dropped, the background task receives
@@ -26,11 +26,12 @@ use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
 
 use crate::ExtentNode;
-use crate::store::{ExtentNodeStore, SealRequest};
+use crate::store::{ExtentNodeStore, ExtentUpdate};
 
 /// Manages the full lifecycle of the connection to StreamManager:
-/// TCP connect, Connect handshake, periodic Heartbeat, NOTIFY_SEALED_EXTENT
-/// notifications, reconnection on failure, and graceful Disconnect on drop (RAII).
+/// TCP connect, Connect handshake, periodic Heartbeat, UPDATE_EXTENT
+/// notifications (sealed + progress), reconnection on failure, and graceful
+/// Disconnect on drop (RAII).
 ///
 /// Created via [`StreamManagerClient::spawn`], which starts an internal background
 /// task. When the `StreamManagerClient` value is dropped, the background task
@@ -54,9 +55,10 @@ impl StreamManagerClient {
     /// the reconnection loop. Returns a handle that, when dropped, triggers
     /// graceful Disconnect.
     ///
-    /// `seal_rx` receives NOTIFY_SEALED_EXTENT requests from the store's
+    /// `update_rx` receives extent update notifications from the store's
     /// autonomous extent creation path. These are multiplexed onto the same
-    /// SM connection alongside heartbeats.
+    /// SM connection alongside heartbeats. Progress updates for active extents
+    /// are also sent after each heartbeat.
     pub fn spawn(
         store: Arc<ExtentNodeStore>,
         node_id: String,
@@ -65,7 +67,7 @@ impl StreamManagerClient {
         heartbeat_interval_ms: u32,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
-        seal_rx: mpsc::Receiver<SealRequest>,
+        update_rx: mpsc::Receiver<ExtentUpdate>,
     ) -> Self {
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -79,7 +81,7 @@ impl StreamManagerClient {
                 shutdown_rx,
                 rpc_connect_timeout,
                 rpc_request_timeout,
-                seal_rx,
+                update_rx,
             )
             .await;
         });
@@ -122,7 +124,7 @@ impl StreamManagerClient {
         mut shutdown_rx: oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
-        mut seal_rx: mpsc::Receiver<SealRequest>,
+        mut update_rx: mpsc::Receiver<ExtentUpdate>,
     ) {
         loop {
             match Self::connect_and_heartbeat(
@@ -134,7 +136,7 @@ impl StreamManagerClient {
                 &mut shutdown_rx,
                 rpc_connect_timeout,
                 rpc_request_timeout,
-                &mut seal_rx,
+                &mut update_rx,
             )
             .await
             {
@@ -176,7 +178,7 @@ impl StreamManagerClient {
         shutdown_rx: &mut oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
-        seal_rx: &mut mpsc::Receiver<SealRequest>,
+        update_rx: &mut mpsc::Receiver<ExtentUpdate>,
     ) -> Result<bool, StorageError> {
         let stream =
             tokio::time::timeout(rpc_connect_timeout, TcpStream::connect(stream_manager_addr))
@@ -226,15 +228,15 @@ impl StreamManagerClient {
         let mut request_id = 1u32;
 
         loop {
-            // Sleep until the next heartbeat, but also watch for shutdown and seal notifications.
+            // Sleep until the next heartbeat, but also watch for shutdown and extent updates.
             tokio::select! {
                 _ = tokio::time::sleep(interval) => {}
-                Some(req) = seal_rx.recv() => {
-                    // NOTIFY_SEALED_EXTENT: send on the existing connection (fire-and-forget).
-                    Self::send_seal_notification(&mut framed, req, rpc_request_timeout).await;
-                    // Drain any additional queued notifications to batch them.
-                    while let Ok(req) = seal_rx.try_recv() {
-                        Self::send_seal_notification(&mut framed, req, rpc_request_timeout).await;
+                Some(update) = update_rx.recv() => {
+                    // Extent update: send on the existing connection (fire-and-forget).
+                    Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
+                    // Drain any additional queued updates to batch them.
+                    while let Ok(update) = update_rx.try_recv() {
+                        Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
                     }
                     continue;
                 }
@@ -325,39 +327,76 @@ impl StreamManagerClient {
                     ));
                 }
             }
+
+            // After each heartbeat, send progress updates for all active extents.
+            for (stream_id, extent_id, current_offset, epoch) in store.snapshot_active_extents() {
+                Self::send_extent_update(
+                    &mut framed,
+                    ExtentUpdate::Progress {
+                        stream_id,
+                        extent_id,
+                        current_offset,
+                        epoch,
+                    },
+                    rpc_request_timeout,
+                )
+                .await;
+            }
         }
     }
 
-    /// Send a single NOTIFY_SEALED_EXTENT frame on the SM connection.
+    /// Send a single UPDATE_EXTENT frame on the SM connection.
     /// Fire-and-forget: logs and drops on failure.
-    async fn send_seal_notification(
+    async fn send_extent_update(
         framed: &mut Framed<TcpStream, FrameCodec>,
-        req: SealRequest,
+        update: ExtentUpdate,
         rpc_request_timeout: Duration,
     ) {
-        let frame = Frame::new(
-            VariableHeader::NotifySealedExtent {
-                stream_id: req.stream_id,
-                epoch: req.epoch,
-                sealed_extent_id: req.sealed_extent_id,
-                end_offset: Offset(req.end_offset),
-                new_extent_id: req.new_extent_id,
-            },
-            None,
-        );
+        let (frame, desc) = match update {
+            ExtentUpdate::Sealed {
+                stream_id,
+                sealed_extent_id,
+                end_offset,
+                new_extent_id,
+                epoch,
+            } => (
+                Frame::new(
+                    VariableHeader::UpdateExtentSealed {
+                        stream_id,
+                        epoch,
+                        sealed_extent_id,
+                        end_offset: Offset(end_offset),
+                        new_extent_id,
+                    },
+                    None,
+                ),
+                format!("UpdateExtentSealed stream={stream_id:?}"),
+            ),
+            ExtentUpdate::Progress {
+                stream_id,
+                extent_id,
+                current_offset,
+                epoch,
+            } => (
+                Frame::new(
+                    VariableHeader::UpdateExtentProgress {
+                        stream_id,
+                        epoch,
+                        extent_id,
+                        current_offset: Offset(current_offset),
+                    },
+                    None,
+                ),
+                format!("UpdateExtentProgress stream={stream_id:?}"),
+            ),
+        };
         match tokio::time::timeout(rpc_request_timeout, framed.send(frame)).await {
             Ok(Ok(())) => {}
             Ok(Err(e)) => {
-                warn!(
-                    "failed to send NotifySealedExtent for stream {:?}: {e}",
-                    req.stream_id
-                );
+                warn!("failed to send {desc}: {e}");
             }
             Err(_) => {
-                warn!(
-                    "timeout sending NotifySealedExtent for stream {:?}",
-                    req.stream_id
-                );
+                warn!("timeout sending {desc}");
             }
         }
     }

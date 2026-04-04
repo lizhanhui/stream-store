@@ -28,6 +28,11 @@ pub const FLAG_NEW_EXTENT_PRESENT: u8 = 0x01;
 /// and for SM responses that include the new epoch after an epoch bump.
 pub const FLAG_EPOCH_PRESENT: u8 = 0x04;
 
+/// Flag on UPDATE_EXTENT: extent was sealed, new extent created.
+pub const FLAG_EXTENT_SEALED: u8 = 0x00;
+/// Flag on UPDATE_EXTENT: progress report for an active extent.
+pub const FLAG_EXTENT_PROGRESS: u8 = 0x01;
+
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);
@@ -79,9 +84,9 @@ pub enum Opcode {
     RegisterExtent = 0x15,
     RegisterExtentAck = 0x16,
     Watermark = 0x17,
-    /// Async notification from Primary EN to SM after autonomous extent creation.
-    /// Fire-and-forget: SM updates metadata, no response needed.
-    NotifySealedExtent = 0x18,
+    /// Async extent update from Primary EN to SM. Fire-and-forget.
+    /// Flags distinguish variants: sealed (0x00) or progress (0x01).
+    UpdateExtent = 0x18,
     /// SM queries an EN for all extents it holds for a stream (recovery path).
     ReportExtents = 0x19,
     /// EN response to ReportExtents with extent state for reconciliation.
@@ -126,7 +131,7 @@ impl Opcode {
             0x15 => Some(Opcode::RegisterExtent),
             0x16 => Some(Opcode::RegisterExtentAck),
             0x17 => Some(Opcode::Watermark),
-            0x18 => Some(Opcode::NotifySealedExtent),
+            0x18 => Some(Opcode::UpdateExtent),
             0x19 => Some(Opcode::ReportExtents),
             0x1A => Some(Opcode::ReportExtentsResp),
             // Cluster management

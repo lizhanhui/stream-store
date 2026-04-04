@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::downstream::DownstreamPool;
-use crate::store::{ExtentNodeStore, SealRequest};
+use crate::store::{ExtentNodeStore, ExtentUpdate};
 use crate::stream_manager_client::StreamManagerClient;
 
 /// A running ExtentNode with lifecycle management.
@@ -71,11 +71,12 @@ impl ExtentNode {
         store_inner.set_arena_capacity(config.extent_arena_capacity);
         store_inner.set_replication_timeout(Duration::from_millis(config.replication_timeout_ms));
 
-        // Wire up the seal notification channel for autonomous extent creation.
-        // The receiver is passed to StreamManagerClient which multiplexes seal
-        // notifications onto the existing heartbeat connection.
-        let (seal_tx, seal_rx) = mpsc::channel::<SealRequest>(64);
-        store_inner.set_seal_tx(seal_tx);
+        // Wire up the extent update channel for autonomous extent creation
+        // and periodic progress reporting. The receiver is passed to
+        // StreamManagerClient which sends UPDATE_EXTENT frames on the
+        // existing heartbeat connection.
+        let (update_tx, update_rx) = mpsc::channel::<ExtentUpdate>(64);
+        store_inner.set_update_tx(update_tx);
 
         let store = Arc::new(store_inner);
 
@@ -102,7 +103,7 @@ impl ExtentNode {
         };
 
         // Spawn StreamManagerClient (RAII: sends Disconnect when dropped).
-        // The seal_rx channel is passed here so NOTIFY_SEALED_EXTENT frames
+        // The update_rx channel is passed here so UPDATE_EXTENT frames
         // are sent on the same connection as heartbeats.
         let stream_manager_client = StreamManagerClient::spawn(
             Arc::clone(&store),
@@ -112,7 +113,7 @@ impl ExtentNode {
             config.heartbeat_interval_ms,
             Duration::from_millis(config.connect_timeout_ms),
             Duration::from_millis(config.request_timeout_ms),
-            seal_rx,
+            update_rx,
         );
 
         // Spawn accept loop.

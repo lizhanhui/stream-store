@@ -980,6 +980,71 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Record a progress update for an active extent (periodic observability report).
+    ///
+    /// Updates end_offset for the extent if the reported offset is larger than
+    /// the current value. Only updates Active extents. Idempotent and epoch-validated.
+    pub async fn record_extent_progress(
+        &self,
+        stream_id: StreamId,
+        epoch: Epoch,
+        extent_id: ExtentId,
+        current_offset: u64,
+    ) -> Result<(), StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+
+        // Validate epoch matches current stream epoch.
+        let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
+            .bind(stream_id.0 as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
+
+        if let Some(row) = row {
+            let current_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
+            if epoch != current_epoch {
+                // Stale notification from an old epoch — skip.
+                tx.commit()
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+                return Ok(());
+            }
+        } else {
+            return Err(StorageError::Internal(format!(
+                "stream {:?} not found",
+                stream_id
+            )));
+        }
+
+        // Update end_offset only if the new value is larger (monotonic progress).
+        sqlx::query(
+            "UPDATE extent SET end_offset = ? \
+             WHERE stream_id = ? AND extent_id = ? AND state = ? AND end_offset < ?",
+        )
+        .bind(current_offset as i64)
+        .bind(stream_id.0 as i64)
+        .bind(extent_id.0 as i64)
+        .bind(ExtentState::Active.as_u8())
+        .bind(current_offset as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Internal(format!("update extent progress: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+
+        Ok(())
+    }
+
     /// Reconcile extents reported by a surviving EN during crash recovery.
     ///
     /// For each extent in the report, insert it if missing and update stream_sequence.

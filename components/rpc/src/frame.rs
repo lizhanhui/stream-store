@@ -1,8 +1,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, FLAG_EPOCH_PRESENT, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT,
-    FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    Epoch, ErrorCode, ExtentId, FLAG_EPOCH_PRESENT, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
+    FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC,
+    Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.
@@ -121,14 +122,22 @@ pub enum VariableHeader {
         stream_id: StreamId,
         offset: Offset,
     },
-    /// Async notification from Primary EN to SM after autonomous extent creation (0x18).
+    /// Extent sealed: Primary EN sealed an extent and created a new one (UpdateExtent, flag=0x00).
     /// Fire-and-forget: no request_id needed.
-    NotifySealedExtent {
+    UpdateExtentSealed {
         stream_id: StreamId,
         epoch: Epoch,
         sealed_extent_id: ExtentId,
         end_offset: Offset,
         new_extent_id: ExtentId,
+    },
+    /// Active extent progress report (UpdateExtent, flag=0x01).
+    /// Fire-and-forget periodic update of current offset for observability.
+    UpdateExtentProgress {
+        stream_id: StreamId,
+        epoch: Epoch,
+        extent_id: ExtentId,
+        current_offset: Offset,
     },
     /// SM queries an EN for all extents it holds for a stream at a given epoch (0x19).
     ReportExtents {
@@ -281,7 +290,8 @@ impl Frame {
             | VariableHeader::Error { request_id, .. } => *request_id,
             VariableHeader::Watermark { .. }
             | VariableHeader::Forward { .. }
-            | VariableHeader::NotifySealedExtent { .. }
+            | VariableHeader::UpdateExtentSealed { .. }
+            | VariableHeader::UpdateExtentProgress { .. }
             | VariableHeader::StreamManagerMembershipChange => 0,
         }
     }
@@ -302,7 +312,8 @@ impl Frame {
             | VariableHeader::RegisterExtent { stream_id, .. }
             | VariableHeader::Watermark { stream_id, .. }
             | VariableHeader::Forward { stream_id, .. }
-            | VariableHeader::NotifySealedExtent { stream_id, .. }
+            | VariableHeader::UpdateExtentSealed { stream_id, .. }
+            | VariableHeader::UpdateExtentProgress { stream_id, .. }
             | VariableHeader::ReportExtents { stream_id, .. }
             | VariableHeader::ReportExtentsResp { stream_id, .. }
             | VariableHeader::DescribeStream { stream_id, .. }
@@ -358,7 +369,8 @@ impl Frame {
             VariableHeader::Seal { epoch, .. }
             | VariableHeader::SealAck { epoch, .. } => epoch.unwrap_or(Epoch(0)),
             VariableHeader::RegisterExtent { epoch, .. } => *epoch,
-            VariableHeader::NotifySealedExtent { epoch, .. } => *epoch,
+            VariableHeader::UpdateExtentSealed { epoch, .. }
+            | VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
             VariableHeader::Forward { epoch, .. } => *epoch,
             VariableHeader::ReportExtents { epoch, .. }
             | VariableHeader::ReportExtentsResp { epoch, .. } => *epoch,
@@ -418,6 +430,8 @@ impl Frame {
                 }
                 f
             }
+            VariableHeader::UpdateExtentSealed { .. } => FLAG_EXTENT_SEALED,
+            VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
             _ => 0,
         };
         self.header.flags | computed
@@ -516,7 +530,9 @@ impl Frame {
             // stream_id(8) + offset(8) -- no request_id
             VariableHeader::Watermark { .. } => 8 + 8,
             // stream_id(8) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4)
-            VariableHeader::NotifySealedExtent { .. } => 8 + 4 + 4 + 8 + 4,
+            VariableHeader::UpdateExtentSealed { .. } => 8 + 4 + 4 + 8 + 4,
+            // stream_id(8) + epoch(4) + extent_id(4) + current_offset(8)
+            VariableHeader::UpdateExtentProgress { .. } => 8 + 4 + 4 + 8,
             // request_id(4) + stream_id(8) + epoch(4)
             VariableHeader::ReportExtents { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + epoch(4)
@@ -808,7 +824,7 @@ impl Frame {
                 dst.put_u64(stream_id.0);
                 dst.put_u64(offset.0);
             }
-            VariableHeader::NotifySealedExtent {
+            VariableHeader::UpdateExtentSealed {
                 stream_id,
                 epoch,
                 sealed_extent_id,
@@ -820,6 +836,17 @@ impl Frame {
                 dst.put_u32(sealed_extent_id.0);
                 dst.put_u64(end_offset.0);
                 dst.put_u32(new_extent_id.0);
+            }
+            VariableHeader::UpdateExtentProgress {
+                stream_id,
+                epoch,
+                extent_id,
+                current_offset,
+            } => {
+                dst.put_u64(stream_id.0);
+                dst.put_u32(epoch.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u64(current_offset.0);
             }
             VariableHeader::ReportExtents {
                 request_id,
@@ -1250,22 +1277,42 @@ impl Frame {
                     payload,
                 ))
             }
-            Opcode::NotifySealedExtent => {
+            Opcode::UpdateExtent => {
                 let stream_id = StreamId(body.get_u64());
                 let epoch = Epoch(body.get_u32());
-                let sealed_extent_id = ExtentId(body.get_u32());
-                let end_offset = Offset(body.get_u64());
-                let new_extent_id = ExtentId(body.get_u32());
-                Ok((
-                    VariableHeader::NotifySealedExtent {
-                        stream_id,
-                        epoch,
-                        sealed_extent_id,
-                        end_offset,
-                        new_extent_id,
-                    },
-                    None,
-                ))
+                match flags {
+                    FLAG_EXTENT_SEALED => {
+                        let sealed_extent_id = ExtentId(body.get_u32());
+                        let end_offset = Offset(body.get_u64());
+                        let new_extent_id = ExtentId(body.get_u32());
+                        Ok((
+                            VariableHeader::UpdateExtentSealed {
+                                stream_id,
+                                epoch,
+                                sealed_extent_id,
+                                end_offset,
+                                new_extent_id,
+                            },
+                            None,
+                        ))
+                    }
+                    FLAG_EXTENT_PROGRESS => {
+                        let extent_id = ExtentId(body.get_u32());
+                        let current_offset = Offset(body.get_u64());
+                        Ok((
+                            VariableHeader::UpdateExtentProgress {
+                                stream_id,
+                                epoch,
+                                extent_id,
+                                current_offset,
+                            },
+                            None,
+                        ))
+                    }
+                    _ => Err(StorageError::Internal(format!(
+                        "unknown UpdateExtent flag: {flags:#x}"
+                    ))),
+                }
             }
             Opcode::ReportExtents => {
                 let request_id = body.get_u32();
@@ -1345,7 +1392,8 @@ impl VariableHeader {
             VariableHeader::RegisterExtent { .. } => Opcode::RegisterExtent,
             VariableHeader::RegisterExtentAck { .. } => Opcode::RegisterExtentAck,
             VariableHeader::Watermark { .. } => Opcode::Watermark,
-            VariableHeader::NotifySealedExtent { .. } => Opcode::NotifySealedExtent,
+            VariableHeader::UpdateExtentSealed { .. }
+            | VariableHeader::UpdateExtentProgress { .. } => Opcode::UpdateExtent,
             VariableHeader::ReportExtents { .. } => Opcode::ReportExtents,
             VariableHeader::ReportExtentsResp { .. } => Opcode::ReportExtentsResp,
             VariableHeader::Forward { .. } => Opcode::Forward,
