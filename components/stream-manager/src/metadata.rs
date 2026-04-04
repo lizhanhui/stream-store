@@ -153,6 +153,34 @@ impl MetadataStore {
         }))
     }
 
+    /// Get all streams that have at least one active extent.
+    /// Used during SM startup reconciliation to discover streams that may have
+    /// extents created autonomously by ENs during SM downtime.
+    pub async fn get_streams_with_active_extents(
+        &self,
+    ) -> Result<Vec<(StreamId, Epoch)>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT e.stream_id, s.epoch \
+             FROM extent e \
+             INNER JOIN stream s ON e.stream_id = s.stream_id \
+             WHERE e.state = ?",
+        )
+        .bind(ExtentState::Active.as_u8())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("get_streams_with_active_extents: {e}")))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|r| {
+                (
+                    StreamId(r.get::<i64, _>("stream_id") as u64),
+                    Epoch(r.get::<i32, _>("epoch") as u32),
+                )
+            })
+            .collect())
+    }
+
     /// Get the replication factor for a stream.
     pub async fn get_stream_replication_factor(
         &self,
@@ -1020,6 +1048,32 @@ impl MetadataStore {
         tx.commit()
             .await
             .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Copy replica rows from one extent to another (same stream, same replica set).
+    /// Used during reconciliation: extents created autonomously within an epoch
+    /// share the same replica set as the original extent.
+    /// Idempotent: uses INSERT IGNORE to skip already-existing replicas.
+    pub async fn copy_replicas(
+        &self,
+        stream_id: StreamId,
+        from_extent_id: ExtentId,
+        to_extent_id: ExtentId,
+    ) -> Result<(), StorageError> {
+        sqlx::query(
+            "INSERT IGNORE INTO extent_replica (stream_id, extent_id, node_addr, role) \
+             SELECT stream_id, ?, node_addr, role \
+             FROM extent_replica \
+             WHERE stream_id = ? AND extent_id = ?",
+        )
+        .bind(to_extent_id.0 as i64)
+        .bind(stream_id.0 as i64)
+        .bind(from_extent_id.0 as i64)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("copy_replicas: {e}")))?;
 
         Ok(())
     }

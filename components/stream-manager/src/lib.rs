@@ -70,7 +70,11 @@ impl StreamManager {
             config.default_replication_factor,
         ));
 
-        // 4. Start heartbeat checker in background (uses StreamManagerStore for
+        // 4. Reconcile metadata with EN state (catch up on missed NOTIFY_SEALED_EXTENT
+        //    notifications from any prior SM downtime).
+        stream_manager_store.reconcile_on_startup().await;
+
+        // 5. Start heartbeat checker in background (uses StreamManagerStore for
         //    proper seal-and-new orchestration on node failure).
         let heartbeat_sm_store = Arc::clone(&stream_manager_store);
         let heartbeat_check_interval =

@@ -59,6 +59,76 @@ async fn seal_extent_node_static(
     Ok(resp.offset().0)
 }
 
+/// Query an ExtentNode for all extents it holds for a stream (used during recovery/reconciliation).
+///
+/// Sends a ReportExtents RPC and parses the ReportExtentsResp payload.
+/// Response format: [num_extents:u32] then for each extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+///
+/// Returns Vec of (ExtentId, start_offset, end_offset, ExtentState) tuples.
+async fn report_extents_from_node_static(
+    addr: &str,
+    stream_id: StreamId,
+    epoch: Epoch,
+) -> Result<Vec<(ExtentId, u64, u64, common::types::ExtentState)>, StorageError> {
+    use bytes::Buf;
+    
+    let client = client::StorageClient::connect(addr).await.map_err(|e| {
+        StorageError::Internal(format!("connect to ExtentNode {addr} for ReportExtents: {e}"))
+    })?;
+
+    let resp = client
+        .send_frame(Frame::new(
+            VariableHeader::ReportExtents {
+                request_id: 0,
+                stream_id,
+                epoch,
+            },
+            None,
+        ))
+        .await
+        .map_err(|e| StorageError::Internal(format!("ReportExtents to ExtentNode {addr}: {e}")))?;
+
+    if resp.opcode() == Opcode::Error {
+        let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
+        return Err(StorageError::Internal(format!(
+            "ExtentNode {addr} rejected ReportExtents: {msg}"
+        )));
+    }
+
+    // Parse ReportExtentsResp payload: [num_extents:u32] then for each: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+    let payload = resp.payload.clone().unwrap_or_else(|| Bytes::new());
+    let mut buf = &payload[..];
+    
+    if buf.len() < 4 {
+        return Err(StorageError::Internal(format!(
+            "ReportExtentsResp from {addr} has invalid payload: too short"
+        )));
+    }
+
+    let num_extents = buf.get_u32() as usize;
+    let mut extents = Vec::with_capacity(num_extents);
+
+    for _ in 0..num_extents {
+        if buf.len() < 4 + 8 + 8 + 1 {
+            return Err(StorageError::Internal(format!(
+                "ReportExtentsResp from {addr} has truncated extent record"
+            )));
+        }
+
+        let extent_id = ExtentId(buf.get_u32());
+        let start_offset = buf.get_u64();
+        let end_offset = buf.get_u64();
+        let state_u8 = buf.get_u8();
+        
+        let state = common::types::ExtentState::from_u8(state_u8)
+            .unwrap_or(common::types::ExtentState::Unspecified);
+
+        extents.push((extent_id, start_offset, end_offset, state));
+    }
+
+    Ok(extents)
+}
+
 /// The Stream Manager's request handler.
 pub struct StreamManagerStore {
     store: MetadataStore,
@@ -93,6 +163,150 @@ impl StreamManagerStore {
     /// Access the allocator (e.g., for heartbeat checker).
     pub fn allocator(&self) -> &Arc<Mutex<Allocator>> {
         &self.allocator
+    }
+
+    /// Reconcile SM metadata with EN state on startup.
+    ///
+    /// During SM downtime, Primary ENs may have autonomously created extents
+    /// (extent-full within an epoch). The NOTIFY_SEALED_EXTENT fire-and-forget
+    /// notifications would have been lost. This method queries each Primary EN
+    /// for its extent state and updates MySQL metadata accordingly.
+    ///
+    /// For each stream with an active extent:
+    /// 1. Find the Primary EN from replica metadata
+    /// 2. Send REPORT_EXTENTS(epoch) to the Primary
+    /// 3. Call reconcile_extents to upsert any missing extents into MySQL
+    ///
+    /// Best-effort: failures for individual streams are logged and skipped.
+    pub async fn reconcile_on_startup(&self) {
+        let streams = match self.store.get_streams_with_active_extents().await {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("startup reconciliation: failed to get active streams: {e}");
+                return;
+            }
+        };
+
+        if streams.is_empty() {
+            info!("startup reconciliation: no active streams to reconcile");
+            return;
+        }
+
+        info!(
+            "startup reconciliation: checking {} stream(s) for missed extent notifications",
+            streams.len()
+        );
+
+        let mut reconciled = 0u32;
+        let mut skipped = 0u32;
+
+        for (stream_id, epoch) in &streams {
+            // Find the active extent to look up the Primary's address.
+            let active = match self.store.get_active_extent(*stream_id).await {
+                Ok(Some(ext)) => ext,
+                Ok(None) => {
+                    // Active extent may have been sealed between our query and now.
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "startup reconciliation: get_active_extent for stream {:?}: {e}",
+                        stream_id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            let replicas = match self.store.get_replicas(*stream_id, active.extent_id).await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        "startup reconciliation: get_replicas for stream {:?}: {e}",
+                        stream_id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            let primary_addr = match replicas.iter().find(|r| r.role == 0) {
+                Some(r) => r.node_addr.clone(),
+                None => {
+                    warn!(
+                        "startup reconciliation: no primary replica for stream {:?}",
+                        stream_id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            // Query the Primary EN for all extents at this epoch.
+            let en_extents = match tokio::time::timeout(
+                Duration::from_secs(3),
+                report_extents_from_node_static(&primary_addr, *stream_id, *epoch),
+            )
+            .await
+            {
+                Ok(Ok(extents)) => extents,
+                Ok(Err(e)) => {
+                    warn!(
+                        "startup reconciliation: REPORT_EXTENTS to {primary_addr} for stream {:?}: {e}",
+                        stream_id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+                Err(_) => {
+                    warn!(
+                        "startup reconciliation: REPORT_EXTENTS to {primary_addr} timed out for stream {:?}",
+                        stream_id
+                    );
+                    skipped += 1;
+                    continue;
+                }
+            };
+
+            if en_extents.is_empty() {
+                continue;
+            }
+
+            // Reconcile: upsert any missing extents into MySQL, copy replicas.
+            if let Err(e) = self.store.reconcile_extents(*stream_id, *epoch, &en_extents).await {
+                warn!(
+                    "startup reconciliation: reconcile_extents for stream {:?}: {e}",
+                    stream_id
+                );
+                skipped += 1;
+                continue;
+            }
+
+            // Copy replica rows for any newly discovered extents.
+            // Extents within the same epoch share the same replica set as the known active extent.
+            let known_extent_id = active.extent_id;
+            for (extent_id, _, _, _) in &en_extents {
+                if *extent_id != known_extent_id {
+                    // Best-effort: copy replicas from known extent to new extent.
+                    if let Err(e) = self
+                        .store
+                        .copy_replicas(*stream_id, known_extent_id, *extent_id)
+                        .await
+                    {
+                        warn!(
+                            "startup reconciliation: copy_replicas for extent {:?}: {e}",
+                            extent_id
+                        );
+                    }
+                }
+            }
+
+            reconciled += 1;
+        }
+
+        info!(
+            "startup reconciliation complete: {reconciled} stream(s) reconciled, {skipped} skipped"
+        );
     }
 
     /// Register the new extent on the Primary ExtentNode and wait for its ACK.
