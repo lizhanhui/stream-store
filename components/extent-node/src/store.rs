@@ -614,11 +614,14 @@ impl ExtentNodeStore {
 
             // Drain followers on the (now new) stream.
             let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+            drop(stream_ref); // ← release read guard BEFORE drain
             if remaining > 1 {
-                let batch_forward = self.drain_append_batch(&stream_ref, stream_id);
+                let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
                 forward_work.extend(batch_forward);
+                for notif in batch_seals {
+                    self.send_seal_notification(stream_id, &notif);
+                }
             }
-            drop(stream_ref);
 
             // Send SM notification if we sealed.
             if let Some(notif) = seal_notification {
@@ -630,14 +633,15 @@ impl ExtentNodeStore {
 
         // Check if followers arrived while we were appending.
         let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+        drop(stream_ref); // ← release read guard BEFORE drain
         if remaining > 1 {
             // Followers are waiting — drain the batch.
-            let batch_forward = self.drain_append_batch(&stream_ref, stream_id);
+            let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
             forward_work.extend(batch_forward);
+            for notif in batch_seals {
+                self.send_seal_notification(stream_id, &notif);
+            }
         }
-
-        // Drop stream guard before async work.
-        drop(stream_ref);
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
         self.flush_forward_work(forward_work).await;
@@ -822,42 +826,63 @@ impl ExtentNodeStore {
     /// Called by the active writer after its own append when `in_flight > 1`.
     /// Loops until all followers have been processed.
     ///
-    /// On ExtentFull within the drain, drops the stream ref, acquires write ref
-    /// for seal+create, then re-acquires read ref and retries.
+    /// Unlike the old `drain_append_batch`, this method manages its own DashMap
+    /// guard lifecycle: on ExtentFull it drops the read guard, acquires a write
+    /// guard for seal+create, then re-acquires a read guard and continues.
+    /// This avoids the read→write deadlock on the same DashMap shard.
     ///
-    /// Returns forward work to flush.
-    fn drain_append_batch(
+    /// Returns (forward_work, seal_notifications).
+    async fn drain_follower_jobs(
         &self,
-        stream: &Stream,
-        _stream_id: StreamId,
-    ) -> Vec<(String, Frame)> {
-        let epoch = stream.epoch();
+        stream_id: StreamId,
+    ) -> (Vec<(String, Frame)>, Vec<crate::stream::SealNotification>) {
         let mut all_forward_work = Vec::new();
+        let mut all_seal_notifications = Vec::new();
+
         loop {
+            // Acquire a fresh read guard each outer iteration.
+            let stream_ref = match self.streams.get(&stream_id) {
+                Some(s) => s,
+                None => break,
+            };
+            let epoch = stream_ref.epoch();
+
             let mut batch: Vec<AppendJob> = Vec::new();
 
             // Drain all available jobs from the channel.
-            // Brief spin if a follower has incremented in_flight but hasn't pushed yet.
-            loop {
-                match stream.job_rx().try_recv() {
-                    Ok(job) => batch.push(job),
-                    Err(_) => {
-                        if batch.is_empty() {
-                            // Follower incremented in_flight but hasn't pushed to channel yet.
-                            // Brief spin to wait.
-                            std::hint::spin_loop();
-                            continue;
+            // Bounded spin if a follower has incremented in_flight but hasn't pushed yet.
+            {
+                let mut spin_count = 0u32;
+                loop {
+                    match stream_ref.job_rx().try_recv() {
+                        Ok(job) => {
+                            batch.push(job);
+                            spin_count = 0;
                         }
-                        break;
+                        Err(_) => {
+                            if batch.is_empty() {
+                                if spin_count < 8 {
+                                    std::hint::spin_loop();
+                                    spin_count += 1;
+                                } else {
+                                    std::thread::yield_now();
+                                    spin_count = 0;
+                                }
+                                continue;
+                            }
+                            break;
+                        }
                     }
                 }
             }
 
-            // Process each job.
             let batch_len = batch.len();
-            for job in batch {
+            let mut extent_full_idx: Option<usize> = None;
+
+            // Process each job. Stop at the first ExtentFull.
+            for (i, job) in batch.iter().enumerate() {
                 let (_, extent_full, forward_work) = self.do_append_and_respond(
-                    stream,
+                    &stream_ref,
                     job.request_id,
                     job.stream_id,
                     epoch,
@@ -866,66 +891,59 @@ impl ExtentNodeStore {
                 );
                 all_forward_work.extend(forward_work);
                 if extent_full {
-                    // Need to seal+create. We can't drop the caller's ref from here,
-                    // but we can handle it by doing seal+create and retrying.
-                    // Since drain_append_batch is called with a borrowed stream ref,
-                    // we use the self.seal_and_create_and_retry helper.
-                    self.handle_extent_full_for_job(
-                        job.request_id,
-                        job.stream_id,
-                        epoch,
-                        job.payload,
-                        job.response_tx,
-                        &mut all_forward_work,
-                    );
+                    extent_full_idx = Some(i);
+                    break;
                 }
             }
 
-            // Decrement in_flight by the batch size.
-            let remaining = stream
-                .in_flight()
-                .fetch_sub(batch_len as u64, Ordering::Release);
-            if remaining <= batch_len as u64 {
-                // No more followers waiting.
-                break;
+            if let Some(ef_idx) = extent_full_idx {
+                // Drop the read guard BEFORE acquiring write guard for seal+create.
+                drop(stream_ref);
+
+                let seal_notification = self.seal_and_create_on_full(stream_id);
+                if let Some(notif) = seal_notification {
+                    all_seal_notifications.push(notif);
+                }
+
+                // Re-acquire read guard to retry the failed job and remaining jobs on the new extent.
+                if let Some(stream_ref2) = self.streams.get(&stream_id) {
+                    let epoch2 = stream_ref2.epoch();
+                    for job in &batch[ef_idx..] {
+                        let (_, _, retry_forward) = self.do_append_and_respond(
+                            &stream_ref2,
+                            job.request_id,
+                            job.stream_id,
+                            epoch2,
+                            job.payload.clone(),
+                            job.response_tx.clone(),
+                        );
+                        all_forward_work.extend(retry_forward);
+                    }
+                    // Decrement in_flight by the full batch size.
+                    let remaining = stream_ref2
+                        .in_flight()
+                        .fetch_sub(batch_len as u64, Ordering::Release);
+                    drop(stream_ref2);
+                    if remaining <= batch_len as u64 {
+                        break;
+                    }
+                } else {
+                    break;
+                }
+            } else {
+                // All jobs processed without ExtentFull.
+                let remaining = stream_ref
+                    .in_flight()
+                    .fetch_sub(batch_len as u64, Ordering::Release);
+                drop(stream_ref);
+                if remaining <= batch_len as u64 {
+                    break;
+                }
             }
             // More followers arrived during processing — loop again.
         }
-        all_forward_work
-    }
 
-    /// Handle extent-full for a single follower job during drain.
-    ///
-    /// Since the drain loop holds a borrow on the stream, we can't drop it.
-    /// Instead, we acquire a separate get_mut to seal+create, then retry
-    /// via a fresh get().
-    fn handle_extent_full_for_job(
-        &self,
-        request_id: u32,
-        stream_id: StreamId,
-        epoch: Epoch,
-        payload: Bytes,
-        response_tx: Option<mpsc::Sender<Frame>>,
-        forward_work: &mut Vec<(String, Frame)>,
-    ) {
-        let seal_notification = self.seal_and_create_on_full(stream_id);
-
-        // Retry on the new extent.
-        if let Some(stream_ref) = self.streams.get(&stream_id) {
-            let (_, _, retry_forward) = self.do_append_and_respond(
-                &stream_ref,
-                request_id,
-                stream_id,
-                epoch,
-                payload,
-                response_tx,
-            );
-            forward_work.extend(retry_forward);
-        }
-
-        if let Some(notif) = seal_notification {
-            self.send_seal_notification(stream_id, &notif);
-        }
+        (all_forward_work, all_seal_notifications)
     }
 
     /// Seal the active extent and create a new one. Used on ExtentFull.
@@ -1110,11 +1128,14 @@ impl ExtentNodeStore {
         if entries.is_empty() {
             // All appends failed — decrement and possibly drain followers.
             let remaining = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
+            drop(stream_ref); // ← release read guard BEFORE drain
             if remaining > batch_len {
-                let batch_forward = self.drain_append_batch(&stream_ref, stream_id);
+                let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
                 forward_work.extend(batch_forward);
+                for notif in batch_seals {
+                    self.send_seal_notification(stream_id, &notif);
+                }
             }
-            drop(stream_ref);
             if extent_full {
                 // Autonomous extent creation for batch path — retry all failed frames.
                 let seal_notification = self.seal_and_create_on_full(stream_id);
@@ -1264,13 +1285,14 @@ impl ExtentNodeStore {
 
         // Check if followers arrived while we were appending.
         let remaining = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
+        drop(stream_ref); // ← release read guard BEFORE drain
         if remaining > batch_len {
-            let batch_forward = self.drain_append_batch(&stream_ref, stream_id);
+            let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
             forward_work.extend(batch_forward);
+            for notif in batch_seals {
+                self.send_seal_notification(stream_id, &notif);
+            }
         }
-
-        // Drop stream guard before proactive seal (needs write lock).
-        drop(stream_ref);
 
         if extent_full {
             // Autonomous extent creation for batch path (end of batch) — retry failed frames.
