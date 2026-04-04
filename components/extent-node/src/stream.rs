@@ -74,7 +74,7 @@ impl Stream {
         self.arena_capacity = capacity;
         self.next_extent_id = ExtentId(id.0 + 1);
         self.extents
-            .push(Extent::with_capacity(id, start_offset, capacity));
+            .push(Extent::with_capacity(id, start_offset, capacity, epoch));
     }
 
     /// Append a message to the specified extent. Returns the assigned
@@ -219,7 +219,7 @@ impl Stream {
         let new_id = self.next_extent_id;
         self.next_extent_id = ExtentId(new_id.0 + 1);
         self.extents
-            .push(Extent::with_capacity(new_id, end_offset, self.arena_capacity));
+            .push(Extent::with_capacity(new_id, end_offset, self.arena_capacity, self.epoch));
         (new_id, end_offset)
     }
 
@@ -233,10 +233,16 @@ impl Stream {
         self.epoch = epoch;
     }
 
-    /// Get a list of all extents for this stream (used for REPORT_EXTENTS).
-    pub fn extent_report(&self) -> Vec<(ExtentId, Offset, u64, ExtentState)> {
+    /// Report extents for this stream that belong to the specified epoch.
+    ///
+    /// During recovery, SM only cares about extents created in the specified epoch
+    /// (extents from prior epochs are already reconciled in MySQL metadata).
+    /// Filters by per-extent epoch, so only extents actually created under the
+    /// requested epoch are returned.
+    pub fn report_extents(&self, epoch: Epoch) -> Vec<(ExtentId, Offset, u64, ExtentState)> {
         self.extents
             .iter()
+            .filter(|e| e.epoch == epoch)
             .map(|e| {
                 let end_offset = if e.is_sealed() {
                     e.start_offset.0 + e.message_count()

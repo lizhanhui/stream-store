@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
-use common::types::{ExtentId, ExtentState, Offset};
+use common::types::{Epoch, ExtentId, ExtentState, Offset};
 
 /// Default arena capacity: 64 MB.
 pub const DEFAULT_ARENA_CAPACITY: usize = 64 * 1024 * 1024;
@@ -133,6 +133,9 @@ pub struct AppendResult {
 pub struct Extent {
     pub id: ExtentId,
     pub start_offset: Offset,
+    /// The epoch under which this extent was created (informational).
+    /// Used by `report_extents` to filter extents by epoch during SM recovery.
+    pub epoch: Epoch,
 
     /// Reference-counted arena buffer. Shared with any outstanding `Bytes`
     /// slices, so the memory is not freed until all readers are done.
@@ -180,12 +183,12 @@ unsafe impl Sync for Extent {}
 
 impl Extent {
     /// Create a new active extent with default capacity (64 MB).
-    pub fn new(id: ExtentId, start_offset: Offset) -> Self {
-        Self::with_capacity(id, start_offset, DEFAULT_ARENA_CAPACITY)
+    pub fn new(id: ExtentId, start_offset: Offset, epoch: Epoch) -> Self {
+        Self::with_capacity(id, start_offset, DEFAULT_ARENA_CAPACITY, epoch)
     }
 
     /// Create a new active extent with the specified capacity in bytes.
-    pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: usize) -> Self {
+    pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: usize, epoch: Epoch) -> Self {
         let layout = Layout::from_size_align(capacity, 8).expect("invalid layout");
         // SAFETY: layout is valid, nonzero size.
         let ptr = unsafe { alloc(layout) };
@@ -232,6 +235,7 @@ impl Extent {
         Self {
             id,
             start_offset,
+            epoch,
             arena,
             buf,
             capacity,
@@ -595,6 +599,7 @@ impl std::fmt::Debug for Extent {
         f.debug_struct("Extent")
             .field("id", &self.id)
             .field("start_offset", &self.start_offset)
+            .field("epoch", &self.epoch)
             .field("capacity", &self.capacity)
             .field("write_cursor", &self.write_cursor.load(Ordering::Relaxed))
             .field("record_count", &self.record_count.load(Ordering::Relaxed))
@@ -614,7 +619,7 @@ mod tests {
 
     #[test]
     fn append_and_read() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         let r0 = ext.append(Bytes::from_static(b"msg0")).unwrap();
         let r1 = ext.append(Bytes::from_static(b"msg1")).unwrap();
         let r2 = ext.append(Bytes::from_static(b"msg2")).unwrap();
@@ -644,7 +649,7 @@ mod tests {
 
     #[test]
     fn read_from_middle() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(10), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(10), 4096, Epoch(0));
         let _r0 = ext.append(Bytes::from_static(b"a")).unwrap();
         let r1 = ext.append(Bytes::from_static(b"b")).unwrap();
 
@@ -656,7 +661,7 @@ mod tests {
 
     #[test]
     fn read_out_of_range_returns_empty() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         // No records appended, read at byte_pos 0 returns empty.
         let msgs = ext.read(0, 10).unwrap();
         assert!(msgs.is_empty());
@@ -669,7 +674,7 @@ mod tests {
 
     #[test]
     fn seal_rejects_append() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.append(Bytes::from_static(b"ok")).unwrap();
         ext.seal(None);
 
@@ -680,7 +685,7 @@ mod tests {
 
     #[test]
     fn start_offset_nonzero() {
-        let ext = Extent::with_capacity(ExtentId(2), Offset(100), 4096);
+        let ext = Extent::with_capacity(ExtentId(2), Offset(100), 4096, Epoch(0));
         let r = ext.append(Bytes::from_static(b"hello")).unwrap();
         assert_eq!(r.offset, Offset(100));
         assert_eq!(r.byte_pos, 0);
@@ -694,7 +699,7 @@ mod tests {
     fn extent_full_returns_error() {
         // Tiny capacity: 16 bytes. Each record is 4 (len prefix) + payload.
         // "hello" = 5 bytes -> record = 9 bytes. Two records = 18 bytes > 16.
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 16);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 16, Epoch(0));
         ext.append(Bytes::from_static(b"hello")).unwrap(); // 9 bytes, fits
         let result = ext.append(Bytes::from_static(b"world")); // 9 bytes, doesn't fit
         assert!(matches!(result, Err(StorageError::ExtentFull(_))));
@@ -702,7 +707,7 @@ mod tests {
 
     #[test]
     fn committed_data_returns_arena_slice() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.append(Bytes::from_static(b"abc")).unwrap();
         ext.append(Bytes::from_static(b"de")).unwrap();
 
@@ -719,7 +724,7 @@ mod tests {
 
     #[test]
     fn index_lookup_basic() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Before any append, all index entries are None.
         assert_eq!(ext.index_lookup(0), None);
@@ -743,7 +748,7 @@ mod tests {
 
     #[test]
     fn index_lookup_with_nonzero_start_offset() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(100), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(100), 4096, Epoch(0));
         let r0 = ext.append(Bytes::from_static(b"hello")).unwrap();
         assert_eq!(r0.offset, Offset(100));
 
@@ -754,7 +759,7 @@ mod tests {
     #[test]
     fn replicate_basic() {
         // Simulate a secondary receiving 3 records from the primary.
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         let r0 = ext.replicate(0, 0, Bytes::from_static(b"msg0")).unwrap();
         assert_eq!(r0.offset, Offset(0));
@@ -783,8 +788,8 @@ mod tests {
     #[test]
     fn replicate_matches_append_layout() {
         // Prove that replicate() produces a bit-for-bit identical arena as append().
-        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
-        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         let payloads: Vec<Bytes> = vec![
             Bytes::from_static(b"hello"),
@@ -807,7 +812,7 @@ mod tests {
 
     #[test]
     fn replicate_sealed_extent_rejects() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.replicate(0, 0, Bytes::from_static(b"msg0")).unwrap();
         ext.seal(Some(1)); // seal at 1 record
 
@@ -821,7 +826,7 @@ mod tests {
         // Simulate a secondary: primary committed 3 records, but secondary only
         // received 1 before seal. SM seals secondary with committed_offset=3.
         // Late forwarded appends for offsets 1,2 should be accepted.
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Secondary receives 1 of 3 expected messages before seal.
         ext.append(Bytes::from_static(b"msg0")).unwrap();
@@ -847,7 +852,7 @@ mod tests {
     #[test]
     fn seal_without_committed_offset_uses_local_count() {
         // Primary sealing itself (extent-full path): no committed_offset provided.
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.append(Bytes::from_static(b"msg0")).unwrap();
         ext.append(Bytes::from_static(b"msg1")).unwrap();
 
@@ -861,7 +866,7 @@ mod tests {
 
     #[test]
     fn accepts_post_seal_writes_flag() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096);
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Not sealed → false.
         assert!(!ext.accepts_post_seal_writes());

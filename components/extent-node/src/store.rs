@@ -1581,7 +1581,7 @@ impl ExtentNodeStore {
             }
         };
 
-        let report = stream_ref.extent_report();
+        let report = stream_ref.report_extents(epoch);
         // Encode payload: [num_extents:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
         let mut buf = BytesMut::with_capacity(4 + report.len() * (4 + 8 + 8 + 1));
         buf.put_u32(report.len() as u32);
