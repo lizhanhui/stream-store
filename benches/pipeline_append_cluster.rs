@@ -13,7 +13,7 @@
 //! during normal operation -- the Primary seals the full extent, creates a new one with the
 //! next sequential ID (same replica set, same epoch), and retries the triggering append
 //! transparently. Stream Manager is notified asynchronously via fire-and-forget
-//! EXTENT_SEALED_NOTIFY. Clients just keep appending; extent transitions are invisible.
+//! NOTIFY_SEALED_EXTENT. Clients just keep appending; extent transitions are invisible.
 //!
 //! **Prerequisites**: A running cluster with StreamManager at tx.dev:9800.
 //!
@@ -56,7 +56,7 @@ async fn main() {
     let stream_manager_client = StorageClient::connect(&stream_manager_addr)
         .await
         .expect("connect to StreamManager");
-    let (stream_id, initial_extent_id, initial_primary_addr) = stream_manager_client
+    let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = stream_manager_client
         .create_stream("bench-pipeline-cluster", REPLICATION_FACTOR)
         .await
         .expect("create_stream");

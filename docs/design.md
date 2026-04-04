@@ -67,7 +67,7 @@ Both paths share the same downstream procedure in Stream Manager: seal in MySQL 
    - Seals the current extent locally (atomic `limit` store)
    - Creates a new extent with the next sequential ID (same replica set, same epoch)
    - Retries the triggering append on the new extent — **the client never sees an error**
-   - Asynchronously notifies Stream Manager via `EXTENT_SEALED_NOTIFY` (fire-and-forget)
+   - Asynchronously notifies Stream Manager via `NOTIFY_SEALED_EXTENT` (fire-and-forget)
    - Secondaries learn about the new extent via lazy creation on the first Forward frame
 
 3. **Stream-Level Leader Election**: The pipelined group commit leader election (`in_flight` counter + follower channel) operates at the **Stream level**, not the Extent level. This means:
@@ -76,7 +76,7 @@ Both paths share the same downstream procedure in Stream Manager: seal in MySQL 
    - Followers queued during the transition are processed on the new extent after it's created
    - Message ordering is preserved by construction (single writer + FIFO channel)
 
-4. **SM Metadata Catch-Up**: Stream Manager receives `EXTENT_SEALED_NOTIFY` notifications and updates MySQL metadata asynchronously. If notifications are lost, SM reconciles at the next epoch bump.
+4. **SM Metadata Catch-Up**: Stream Manager receives `NOTIFY_SEALED_EXTENT` notifications and updates MySQL metadata asynchronously. If notifications are lost, SM reconciles at the next epoch bump.
 
 5. **Epoch Bump**: SM bumps the epoch when the replica set needs to change (node failure, rebalancing). SM sends `Seal(stream_id, epoch)` to the Primary, waits for it to seal, reconciles metadata, then allocates a new epoch with a new replica set.
 
@@ -295,10 +295,16 @@ Payload:
 
 ##### 0x05 SEAL (Client -> Stream Manager; Extent Node -> Stream Manager; Stream Manager -> Extent Node)
 
-Seal an extent. A single opcode covers all trigger sources; `Flags` bit 0 (`FLAG_OFFSET_PRESENT`) distinguishes whether the caller provides the resolved end offset:
+Seal an extent. A single opcode covers all trigger sources; `Flags` distinguish the seal variant:
 
-- **Client seal** (`FLAG_OFFSET_PRESENT = 0`): Client doesn't know the committed offset. Stream Manager concurrently seals all Extent Node replicas and determines the committed offset via quorum (Primary's offset if available, otherwise k-th largest Secondary offset where `k = RF/2`).
+Flags:
+- `FLAG_OFFSET_PRESENT = 0x01`: caller provides committed end offset
+- `FLAG_START_OFFSET_PRESENT = 0x02`: start_offset field is present (for absent-extent handling)
+- `FLAG_EPOCH_PRESENT = 0x04`: epoch field present (epoch-based seal)
+
+- **Client seal** (`FLAG_OFFSET_PRESENT = 0`, `FLAG_EPOCH_PRESENT = 0`): Client doesn't know the committed offset. Stream Manager concurrently seals all Extent Node replicas and determines the committed offset via quorum (Primary's offset if available, otherwise k-th largest Secondary offset where `k = RF/2`).
 - **Extent-node seal** (`FLAG_OFFSET_PRESENT = 1`): Primary ExtentNode proactively seals (e.g. ExtentFull) and reports its committed end_offset. Stream Manager trusts the offset, skips sealing the Primary (already sealed locally), and fire-and-forgets Seal RPCs to secondary ExtentNodes only.
+- **Client epoch-based seal** (`FLAG_EPOCH_PRESENT = 1`): Client seals by epoch rather than extent_id. Stream Manager resolves the active extent for that epoch.
 - **Stream Manager -> Extent Node**: Stream Manager sends Seal to individual Extent Nodes during client-seal quorum collection. Variable header carries `stream_id` only; Extent Node seals locally and responds with SEAL_ACK.
 
 Both client-initiated and EN-initiated paths end with Stream Manager allocating a new extent and responding with SEAL_ACK.
@@ -321,6 +327,16 @@ FLAG_OFFSET_PRESENT = 1 (extent-node seal):
     [stream_id    : u64]    -- stream to seal
     [extent_id    : u32]    -- extent to seal
     [offset       : u64]    -- committed end_offset, trusted by SM
+  No Payload.
+
+FLAG_EPOCH_PRESENT = 4 (client epoch-based seal):
+  Fixed Header (8B)
+    Flags: 0x04
+  Variable Header:
+    [request_id   : u32]    -- correlates request/response
+    [stream_id    : u64]    -- stream to seal
+    [extent_id    : u32]    -- ignored (SM resolves via epoch)
+    [epoch        : u32]    -- seal active extent at this epoch
   No Payload.
 ```
 
@@ -355,6 +371,11 @@ Variable Header:
 No Payload.
 ```
 
+When `FLAG_EPOCH_PRESENT` (0x04) is also set on SealAck (epoch-based seal response), an additional field follows:
+```
+  [epoch        : u32]    -- new epoch after epoch bump
+```
+
 ##### 0x07 CREATE_STREAM (Client -> Stream Manager)
 
 Create a new stream. If `replication_factor = 0`, Stream Manager uses its default.
@@ -379,6 +400,7 @@ Variable Header:
   [request_id  : u32]
   [stream_id   : u64]
   [extent_id   : u32]
+  [epoch       : u32]    -- initial stream epoch (always 0 for new streams)
 Payload:
   [addr_len      : u16]
   [primary_addr  : bytes]  -- address of the initial extent's Primary node
@@ -415,9 +437,10 @@ Dedicated opcode for Primary→Secondary broadcast replication. Carries all meta
 
 ```
 Fixed Header (8B)
-Variable Header (36B):
+Variable Header (40B):
   [stream_id    : u64]    -- target stream
   [extent_id    : u32]    -- target extent
+  [epoch        : u32]    -- stream epoch (for secondary lazy creation)
   [start_offset : u64]    -- extent base offset (for lazy creation)
   [offset       : u64]    -- primary-assigned logical offset for this record
   [byte_pos     : u64]    -- primary-assigned byte position in arena
@@ -518,6 +541,7 @@ Variable Header:
   [extent_id           : u32]    -- extent being registered
   [role                : u8]     -- 0 = Primary, 1+ = Secondary
   [replication_factor  : u16]
+  [epoch               : u32]    -- stream epoch for this extent registration
 Payload:
   [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
   per address:
@@ -548,6 +572,54 @@ Variable Header:
   [stream_id    : u64]    -- stream the watermark applies to
   [offset       : u64]    -- highest committed offset (inclusive, cumulative)
 No Payload.
+```
+
+##### 0x18 NOTIFY_SEALED_EXTENT (Primary ExtentNode -> Stream Manager)
+
+Async notification from Primary EN after autonomous extent creation (extent-full within an epoch). Fire-and-forget: no response expected. SM updates metadata asynchronously.
+
+```
+Fixed Header (8B)
+Variable Header (28B):
+  [stream_id           : u64]    -- stream that was sealed
+  [epoch               : u32]    -- current epoch at time of seal
+  [sealed_extent_id    : u32]    -- extent that was sealed
+  [end_offset          : u64]    -- committed end_offset of sealed extent
+  [new_extent_id       : u32]    -- newly created extent (same epoch, same replica set)
+No Payload.
+```
+
+##### 0x19 REPORT_EXTENTS (Stream Manager -> Extent Node)
+
+SM queries an EN for all extents it holds for a stream at a given epoch (recovery path).
+
+```
+Fixed Header (8B)
+Variable Header:
+  [request_id   : u32]    -- correlates request/response
+  [stream_id    : u64]    -- target stream
+  [epoch        : u32]    -- epoch to report
+No Payload.
+```
+
+##### 0x1A REPORT_EXTENTS_RESP (Extent Node -> Stream Manager)
+
+EN response to REPORT_EXTENTS with extent state for reconciliation.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [request_id   : u32]    -- correlates request/response
+  [stream_id    : u64]    -- queried stream
+  [epoch        : u32]    -- epoch reported
+Payload:
+  [payload_len  : u32]
+  [num_extents  : u32]
+  per extent:
+    [extent_id    : u32]
+    [start_offset : u64]
+    [end_offset   : u64]
+    [state        : u8]
 ```
 
 **Cluster management (0x20-0x2F) -- Stream Manager -> Extent Node/Client**
@@ -655,7 +727,7 @@ For sealed/flushed extents: `start_offset <= offset < end_offset`. For the activ
 ```
 [num_extents:u32]
   per extent:
-    [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+    [extent_id:u32][start_offset:u64][end_offset:u64][state:u8][epoch:u32]
     [num_replicas:u16]
       per replica:
         [addr_len:u16][addr_bytes][role:u8][is_alive:u8]

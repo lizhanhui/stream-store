@@ -151,7 +151,7 @@ async fn describe_stream_rf2_integration() {
             .as_millis()
     );
 
-    let (stream_id, first_extent_id, primary_addr) =
+    let (stream_id, first_extent_id, _epoch, primary_addr) =
         stream_manager.create_stream(&stream_name, 2).await.unwrap();
 
     assert!(stream_id.0 > 0);

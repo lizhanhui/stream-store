@@ -150,7 +150,7 @@ async fn stream_manager_integration() {
                 .as_millis()
         );
 
-        let (stream_id, extent_id, returned_addr) = stream_manager_client
+        let (stream_id, extent_id, _epoch, returned_addr) = stream_manager_client
             .create_stream(&stream_name, 1)
             .await
             .unwrap();

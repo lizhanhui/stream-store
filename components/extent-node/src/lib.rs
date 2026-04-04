@@ -35,7 +35,7 @@ pub struct ExtentNode {
 
 impl ExtentNode {
     /// Background task that receives SealRequest notifications and sends
-    /// EXTENT_SEALED_NOTIFY frames to Stream Manager.
+    /// NOTIFY_SEALED_EXTENT frames to Stream Manager.
     ///
     /// Fire-and-forget: if the SM connection fails, the notification is logged
     /// and dropped. SM will reconcile during the next epoch bump.
@@ -47,11 +47,11 @@ impl ExtentNode {
             if sm_addr.is_empty() {
                 continue;
             }
-            // Send EXTENT_SEALED_NOTIFY to SM via a fire-and-forget connection.
+            // Send NOTIFY_SEALED_EXTENT to SM via a fire-and-forget connection.
             match client::StorageClient::connect(&sm_addr).await {
                 Ok(client) => {
                     let frame = Frame::new(
-                        VariableHeader::ExtentSealedNotify {
+                        VariableHeader::NotifySealedExtent {
                             stream_id: req.stream_id,
                             epoch: req.epoch,
                             sealed_extent_id: req.sealed_extent_id,
@@ -62,14 +62,14 @@ impl ExtentNode {
                     );
                     if let Err(e) = client.send_frame_no_response(frame).await {
                         warn!(
-                            "Failed to send ExtentSealedNotify to SM for stream {:?}: {e}",
+                            "Failed to send NotifySealedExtent to SM for stream {:?}: {e}",
                             req.stream_id
                         );
                     }
                 }
                 Err(e) => {
                     warn!(
-                        "Failed to connect to SM for ExtentSealedNotify: {e}"
+                        "Failed to connect to SM for NotifySealedExtent: {e}"
                     );
                 }
             }
@@ -110,13 +110,13 @@ impl ExtentNode {
         store_inner.set_arena_capacity(config.extent_arena_capacity);
 
         // Wire up the seal notification channel for autonomous extent creation.
-        // The receiver task sends EXTENT_SEALED_NOTIFY frames to Stream Manager.
+        // The receiver task sends NOTIFY_SEALED_EXTENT frames to Stream Manager.
         let (seal_tx, seal_rx) = mpsc::channel::<SealRequest>(64);
         store_inner.set_seal_tx(seal_tx);
 
         let store = Arc::new(store_inner);
 
-        // Spawn background task for EXTENT_SEALED_NOTIFY notifications to SM.
+        // Spawn background task for NOTIFY_SEALED_EXTENT notifications to SM.
         let sm_addr_for_notify = config.stream_manager_addr.clone();
         task_handles.push(tokio::spawn(
             Self::seal_notify_task(seal_rx, sm_addr_for_notify),

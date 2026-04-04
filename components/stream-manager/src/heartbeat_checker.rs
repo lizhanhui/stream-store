@@ -2,7 +2,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::metadata::MetadataStore;
-use common::types::Epoch;
 use tokio::sync::{Mutex, broadcast};
 use tracing::{error, info, warn};
 
@@ -81,13 +80,15 @@ async fn check_expired_nodes(
                 .await?;
 
             // 3. Allocate a replacement extent on a healthy node.
+            //    Bump epoch since the replica set is changing due to node failure.
+            let new_epoch = store.bump_epoch(extent.stream_id).await?;
             let new_start_offset = extent.end_offset;
             let mut alloc = allocator.lock().await;
             match alloc.pick_node(store).await {
                 Ok(target) => {
                     let replicas = vec![(target.addr.clone(), 0u8)];
                     let new_extent = store
-                        .allocate_extent(extent.stream_id, new_start_offset, &replicas, Epoch(0))
+                        .allocate_extent(extent.stream_id, new_start_offset, &replicas, new_epoch)
                         .await?;
                     info!(
                         "replacement extent {:?} allocated on {} for stream {:?}",
