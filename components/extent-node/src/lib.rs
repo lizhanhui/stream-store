@@ -1,6 +1,5 @@
 pub mod downstream;
 pub mod extent;
-pub mod offload;
 pub mod store;
 pub mod stream;
 pub mod stream_manager_client;
@@ -16,7 +15,6 @@ use tokio::task::JoinHandle;
 use tracing::info;
 
 use crate::downstream::DownstreamPool;
-use crate::offload::{OffloadTask, OffloadWorker};
 use crate::store::{ExtentNodeStore, ExtentUpdate};
 use crate::stream_manager_client::StreamManagerClient;
 
@@ -79,19 +77,7 @@ impl ExtentNode {
         let (update_tx, update_rx) = mpsc::channel::<ExtentUpdate>(64);
         store_inner.set_update_tx(update_tx);
 
-        // Wire up the offload channel for non-critical background tasks
-        // (e.g., CRC32 checksum verification after extent sealing).
-        let (offload_tx, offload_rx) = mpsc::channel::<OffloadTask>(128);
-        store_inner.set_offload_tx(offload_tx);
-
         let store = Arc::new(store_inner);
-
-        // Spawn offload worker — processes fire-and-forget tasks off the hot path.
-        let offload_store = Arc::clone(&store);
-        let offload_shutdown = shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            OffloadWorker::run(offload_store, offload_rx, offload_shutdown).await;
-        });
 
         // Create DownstreamPool with back-reference to store (for inline watermark processing).
         let downstream = Arc::new(DownstreamPool::new(Arc::clone(&store)));
