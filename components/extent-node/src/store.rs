@@ -678,37 +678,52 @@ impl ExtentNodeStore {
             // Drain followers on the (now new) stream.
             let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
             drop(stream_ref); // ← release read guard BEFORE drain
+            let mut sealed_extent_ids = Vec::new();
             if remaining > 1 {
                 let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
                 forward_work.extend(batch_forward);
-                for notif in batch_seals {
-                    self.send_extent_update(stream_id, &notif);
+                for notif in &batch_seals {
+                    self.send_extent_update(stream_id, notif);
+                    sealed_extent_ids.push(notif.sealed_extent_id);
                 }
             }
 
             // Send SM notification if we sealed.
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                forward_work.extend(self.build_checksum_frames(stream_id, notif.sealed_extent_id));
+                sealed_extent_ids.push(notif.sealed_extent_id);
             }
             self.flush_forward_work(forward_work).await;
+            // After critical path: compute and send checksums for any sealed extents.
+            for eid in &sealed_extent_ids {
+                let checksum_work = self.build_checksum_frames(stream_id, *eid);
+                self.flush_forward_work(checksum_work).await;
+            }
             return retry_result;
         }
 
         // Check if followers arrived while we were appending.
         let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
         drop(stream_ref); // ← release read guard BEFORE drain
+        let mut seal_notifications = Vec::new();
         if remaining > 1 {
             // Followers are waiting — drain the batch.
             let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
             forward_work.extend(batch_forward);
-            for notif in batch_seals {
-                self.send_extent_update(stream_id, &notif);
+            for notif in &batch_seals {
+                self.send_extent_update(stream_id, notif);
             }
+            seal_notifications = batch_seals;
         }
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
         self.flush_forward_work(forward_work).await;
+
+        // After critical path: compute and send checksums for any sealed extents.
+        for notif in &seal_notifications {
+            let checksum_work = self.build_checksum_frames(stream_id, notif.sealed_extent_id);
+            self.flush_forward_work(checksum_work).await;
+        }
 
         own_result
     }
@@ -969,8 +984,6 @@ impl ExtentNodeStore {
                 let seal_notification = self.seal_and_create_on_full(stream_id);
                 if let Some(ref notif) = seal_notification {
                     all_seal_notifications.push(notif.clone());
-                    all_forward_work
-                        .extend(self.build_checksum_frames(stream_id, notif.sealed_extent_id));
                 }
 
                 // Re-acquire read guard to retry the failed job and remaining jobs on the new extent.
@@ -1280,11 +1293,17 @@ impl ExtentNodeStore {
                 }
                 if let Some(ref notif) = seal_notification {
                     self.send_extent_update(stream_id, notif);
-                    forward_work
-                        .extend(self.build_checksum_frames(stream_id, notif.sealed_extent_id));
                 }
+                self.flush_forward_work(forward_work).await;
+                // After critical path: compute and send checksum separately.
+                if let Some(ref notif) = seal_notification {
+                    let checksum_work =
+                        self.build_checksum_frames(stream_id, notif.sealed_extent_id);
+                    self.flush_forward_work(checksum_work).await;
+                }
+            } else {
+                self.flush_forward_work(forward_work).await;
             }
-            self.flush_forward_work(forward_work).await;
             return responses;
         }
 
@@ -1417,11 +1436,13 @@ impl ExtentNodeStore {
             .in_flight()
             .fetch_sub(batch_len, Ordering::Release);
         drop(stream_ref); // ← release read guard BEFORE drain
+        let mut sealed_extent_ids = Vec::new();
         if remaining > batch_len {
             let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
             forward_work.extend(batch_forward);
-            for notif in batch_seals {
-                self.send_extent_update(stream_id, &notif);
+            for notif in &batch_seals {
+                self.send_extent_update(stream_id, notif);
+                sealed_extent_ids.push(notif.sealed_extent_id);
             }
         }
 
@@ -1445,12 +1466,18 @@ impl ExtentNodeStore {
             }
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                forward_work.extend(self.build_checksum_frames(stream_id, notif.sealed_extent_id));
+                sealed_extent_ids.push(notif.sealed_extent_id);
             }
         }
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
         self.flush_forward_work(forward_work).await;
+
+        // After critical path: compute and send checksums for any sealed extents.
+        for eid in &sealed_extent_ids {
+            let checksum_work = self.build_checksum_frames(stream_id, *eid);
+            self.flush_forward_work(checksum_work).await;
+        }
 
         responses
     }
