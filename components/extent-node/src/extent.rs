@@ -1,4 +1,5 @@
 use std::alloc::{Layout, alloc, dealloc};
+use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -178,6 +179,19 @@ pub struct Extent {
     /// When true, the primary must prepend a ForwardInitExtent frame before the
     /// first Forward batch for this extent. Cleared atomically on first use.
     init_forward: AtomicBool,
+
+    /// Incremental CRC32 hasher, updated on every primary append.
+    /// Only valid on the primary side (single-writer guarantee from pipelined
+    /// group commit). Secondary replicas use full-extent hash on verify.
+    ///
+    /// `UnsafeCell` is used instead of `Mutex` because the single-writer
+    /// invariant already guarantees exclusive access — same reasoning as
+    /// `write_cursor`, `record_count`, etc.
+    hasher: UnsafeCell<crc32fast::Hasher>,
+
+    /// Finalized CRC32 checksum, set at seal time on the primary.
+    /// 0 while the extent is still active (not yet sealed).
+    finalized_crc32: AtomicU32,
 }
 
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
@@ -242,6 +256,8 @@ impl Extent {
             limit: AtomicU64::new(LIMIT_OPEN),
             index,
             init_forward: AtomicBool::new(true),
+            hasher: UnsafeCell::new(crc32fast::Hasher::new()),
+            finalized_crc32: AtomicU32::new(0),
         }
     }
 
@@ -303,6 +319,16 @@ impl Extent {
             // Write payload bytes.
             if payload_len > 0 {
                 std::ptr::copy_nonoverlapping(payload.as_ref().as_ptr(), dst.add(4), payload_len);
+            }
+        }
+
+        // 3b. Update incremental CRC32 with the same [len][payload] record bytes.
+        // Single-writer guarantee means no contention on the hasher.
+        unsafe {
+            let h = &mut *self.hasher.get();
+            h.update(&(payload_len as u32).to_be_bytes());
+            if payload_len > 0 {
+                h.update(&payload);
             }
         }
 
@@ -522,6 +548,11 @@ impl Extent {
                 self.limit.store(final_count, Ordering::Release);
             }
 
+            // Finalize incremental CRC32 (primary path only).
+            // clone() is cheap (~40 bytes of internal state); finalize() consumes.
+            let crc = unsafe { (*self.hasher.get()).clone().finalize() };
+            self.finalized_crc32.store(crc, Ordering::Release);
+
             self.start_offset.0 + final_count
         }
     }
@@ -529,6 +560,17 @@ impl Extent {
     /// Whether this extent is sealed.
     pub fn is_sealed(&self) -> bool {
         self.limit.load(Ordering::Acquire) != LIMIT_OPEN
+    }
+
+    /// Returns the finalized CRC32 checksum computed incrementally during primary
+    /// appends, or `None` if this extent has not been sealed on the primary path.
+    pub fn finalized_crc32(&self) -> Option<u32> {
+        let crc = self.finalized_crc32.load(Ordering::Acquire);
+        if crc == 0 && self.limit.load(Ordering::Acquire) == LIMIT_OPEN {
+            // Not sealed yet — no finalized checksum.
+            return None;
+        }
+        Some(crc)
     }
 
     /// Whether this sealed extent can still accept post-seal forwarded writes.
@@ -879,5 +921,55 @@ mod tests {
 
         // Sealed with local count, committed_seq == limit → false.
         assert!(!ext.accepts_post_seal_writes());
+    }
+
+    #[test]
+    fn incremental_crc32_matches_full_hash() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+
+        // Before any append, no finalized CRC32.
+        assert_eq!(ext.finalized_crc32(), None);
+
+        ext.append(Bytes::from_static(b"hello")).unwrap();
+        ext.append(Bytes::from_static(b"world")).unwrap();
+        ext.append(Bytes::from_static(b"!")).unwrap();
+
+        // Still active — no finalized CRC32.
+        assert_eq!(ext.finalized_crc32(), None);
+
+        // Seal triggers finalization.
+        ext.seal(None);
+
+        let incremental = ext.finalized_crc32().expect("should be finalized after seal");
+        let full_hash = crc32fast::hash(&ext.committed_data());
+        assert_eq!(
+            incremental, full_hash,
+            "incremental CRC32 ({:#010x}) != full hash ({:#010x})",
+            incremental, full_hash,
+        );
+    }
+
+    #[test]
+    fn incremental_crc32_single_record() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        ext.append(Bytes::from_static(b"only-one")).unwrap();
+        ext.seal(None);
+
+        let incremental = ext.finalized_crc32().unwrap();
+        let full_hash = crc32fast::hash(&ext.committed_data());
+        assert_eq!(incremental, full_hash);
+    }
+
+    #[test]
+    fn incremental_crc32_empty_payloads() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        ext.append(Bytes::new()).unwrap(); // empty payload
+        ext.append(Bytes::from_static(b"data")).unwrap();
+        ext.append(Bytes::new()).unwrap(); // another empty
+        ext.seal(None);
+
+        let incremental = ext.finalized_crc32().unwrap();
+        let full_hash = crc32fast::hash(&ext.committed_data());
+        assert_eq!(incremental, full_hash);
     }
 }
