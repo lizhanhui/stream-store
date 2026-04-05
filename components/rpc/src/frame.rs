@@ -3,8 +3,8 @@ use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_EPOCH_PRESENT, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
     FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT,
-    FLAG_OFFSET_PRESENT,
-    FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    FLAG_OFFSET_PRESENT, FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode,
+    PROTOCOL_VERSION, StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.

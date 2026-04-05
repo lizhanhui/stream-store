@@ -17,6 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::downstream::DownstreamPool;
+use crate::offload::OffloadTask;
 use crate::stream::Stream;
 
 // ── Broadcast replication types ──────────────────────────────────────────────
@@ -269,6 +270,9 @@ pub struct ExtentNodeStore {
     /// Channel to send ExtentUpdate notifications to SM (Primary only).
     /// The SM connection task receives these and sends UPDATE_EXTENT frames.
     update_tx: Option<mpsc::Sender<ExtentUpdate>>,
+    /// Channel to send async offload work (checksums, monitoring, etc.).
+    /// Fire-and-forget from hot path; processed by background OffloadWorker.
+    offload_tx: Option<mpsc::Sender<OffloadTask>>,
     /// Per-stream ACK queues for the Primary (only used when this node is Primary for a stream).
     /// Fine-grained per-stream locking.
     pub ack_queues: DashMap<StreamId, AckQueue>,
@@ -290,6 +294,7 @@ impl ExtentNodeStore {
             replicas: DashMap::new(),
             downstream: OnceLock::new(),
             update_tx: None,
+            offload_tx: None,
             ack_queues: DashMap::new(),
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
             append_count: AtomicU64::new(0),
@@ -312,6 +317,21 @@ impl ExtentNodeStore {
     /// Set the seal request channel (called during ExtentNode bootstrap).
     pub fn set_update_tx(&mut self, update_tx: mpsc::Sender<ExtentUpdate>) {
         self.update_tx = Some(update_tx);
+    }
+
+    /// Set the offload work channel (called during ExtentNode bootstrap).
+    pub fn set_offload_tx(&mut self, offload_tx: mpsc::Sender<OffloadTask>) {
+        self.offload_tx = Some(offload_tx);
+    }
+
+    /// Fire-and-forget: enqueue a checksum verification task on the offload channel.
+    fn send_offload(&self, stream_id: StreamId, extent_id: ExtentId) {
+        if let Some(ref tx) = self.offload_tx {
+            let _ = tx.try_send(OffloadTask::Checksum {
+                stream_id,
+                extent_id,
+            });
+        }
     }
 
     /// Get the replication info for a stream, if registered via RegisterExtent.
@@ -678,52 +698,39 @@ impl ExtentNodeStore {
             // Drain followers on the (now new) stream.
             let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
             drop(stream_ref); // ← release read guard BEFORE drain
-            let mut sealed_extent_ids = Vec::new();
             if remaining > 1 {
                 let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
                 forward_work.extend(batch_forward);
                 for notif in &batch_seals {
                     self.send_extent_update(stream_id, notif);
-                    sealed_extent_ids.push(notif.sealed_extent_id);
+                    self.send_offload(stream_id, notif.sealed_extent_id);
                 }
             }
 
             // Send SM notification if we sealed.
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                sealed_extent_ids.push(notif.sealed_extent_id);
+                self.send_offload(stream_id, notif.sealed_extent_id);
             }
             self.flush_forward_work(forward_work).await;
-            // After critical path: compute and send checksums for any sealed extents.
-            for eid in &sealed_extent_ids {
-                let checksum_work = self.build_checksum_frames(stream_id, *eid);
-                self.flush_forward_work(checksum_work).await;
-            }
             return retry_result;
         }
 
         // Check if followers arrived while we were appending.
         let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
         drop(stream_ref); // ← release read guard BEFORE drain
-        let mut seal_notifications = Vec::new();
         if remaining > 1 {
             // Followers are waiting — drain the batch.
             let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
             forward_work.extend(batch_forward);
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
+                self.send_offload(stream_id, notif.sealed_extent_id);
             }
-            seal_notifications = batch_seals;
         }
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
         self.flush_forward_work(forward_work).await;
-
-        // After critical path: compute and send checksums for any sealed extents.
-        for notif in &seal_notifications {
-            let checksum_work = self.build_checksum_frames(stream_id, notif.sealed_extent_id);
-            self.flush_forward_work(checksum_work).await;
-        }
 
         own_result
     }
@@ -746,7 +753,7 @@ impl ExtentNodeStore {
         epoch: Epoch,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
-    ) -> (Option<Frame>, bool, Vec<(String, Frame)>) {
+    ) -> (Option<Frame>, bool, Vec<(Vec<String>, Frame)>) {
         let payload_len = payload.len();
         let payload_for_forward = payload.clone();
 
@@ -842,20 +849,18 @@ impl ExtentNodeStore {
                 } else {
                     // RF≥2: build Forward frames for secondaries.
                     let mut forward_work = Vec::new();
-                    if self.downstream.get().is_some() {
-                        for secondary_addr in &ri.replica_addrs {
-                            let frame = Frame::new(
-                                VariableHeader::Forward {
-                                    stream_id,
-                                    extent_id,
-                                    epoch,
-                                    offset,
-                                    byte_pos: append_result.byte_pos,
-                                },
-                                Some(payload_for_forward.clone()),
-                            );
-                            forward_work.push((secondary_addr.clone(), frame));
-                        }
+                    if self.downstream.get().is_some() && !ri.replica_addrs.is_empty() {
+                        let frame = Frame::new(
+                            VariableHeader::Forward {
+                                stream_id,
+                                extent_id,
+                                epoch,
+                                offset,
+                                byte_pos: append_result.byte_pos,
+                            },
+                            Some(payload_for_forward),
+                        );
+                        forward_work.push((ri.replica_addrs.clone(), frame));
                     }
 
                     // Queue deferred ACK.
@@ -916,7 +921,7 @@ impl ExtentNodeStore {
     async fn drain_follower_jobs(
         &self,
         stream_id: StreamId,
-    ) -> (Vec<(String, Frame)>, Vec<crate::stream::SealNotification>) {
+    ) -> (Vec<(Vec<String>, Frame)>, Vec<crate::stream::SealNotification>) {
         let mut all_forward_work = Vec::new();
         let mut all_seal_notifications = Vec::new();
 
@@ -1062,33 +1067,30 @@ impl ExtentNodeStore {
         }
     }
 
-    /// Build ForwardChecksum frames for secondaries after sealing an extent.
+    /// Build a single ForwardChecksum frame after sealing an extent.
     ///
-    /// Computes CRC32 of the sealed extent's committed data and creates a
-    /// ForwardChecksum frame for each secondary replica. Returns frames to be
-    /// appended to the forward_work batch.
-    fn build_checksum_frames(
+    /// Computes CRC32 of the sealed extent's committed data and returns the
+    /// frame together with the list of replica addresses to send it to.
+    /// Returns `None` if there are no replicas or the extent is not found.
+    pub(crate) fn build_checksum_frame(
         &self,
         stream_id: StreamId,
-        sealed_extent_id: ExtentId,
-    ) -> Vec<(String, Frame)> {
+        extent_id: ExtentId,
+    ) -> Option<(Frame, Vec<String>)> {
         if self.downstream.get().is_none() {
-            return Vec::new();
+            return None;
         }
         let replica_addrs: Vec<String> = match self.replicas.get(&stream_id) {
-            Some(ri) => ri.replica_addrs.clone(),
-            None => return Vec::new(),
+            Some(ri) if !ri.replica_addrs.is_empty() => ri.replica_addrs.clone(),
+            _ => return None,
         };
-        if replica_addrs.is_empty() {
-            return Vec::new();
-        }
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
-            None => return Vec::new(),
+            None => return None,
         };
-        let extent = match stream_ref.find_extent(sealed_extent_id) {
+        let extent = match stream_ref.find_extent(extent_id) {
             Some(e) => e,
-            None => return Vec::new(),
+            None => return None,
         };
         let committed_data = extent.committed_data();
         let checksum = crc32fast::hash(&committed_data);
@@ -1097,25 +1099,19 @@ impl ExtentNodeStore {
 
         info!(
             "extent sealed: stream={}, extent={}, crc32={:#x}, bytes={}",
-            stream_id, sealed_extent_id, checksum, committed_bytes,
+            stream_id, extent_id, checksum, committed_bytes,
         );
 
-        let mut frames = Vec::with_capacity(replica_addrs.len());
-        for addr in &replica_addrs {
-            frames.push((
-                addr.clone(),
-                Frame::new(
-                    VariableHeader::ForwardChecksum {
-                        stream_id,
-                        extent_id: sealed_extent_id,
-                        checksum,
-                        committed_bytes,
-                    },
-                    None,
-                ),
-            ));
-        }
-        frames
+        let frame = Frame::new(
+            VariableHeader::ForwardChecksum {
+                stream_id,
+                extent_id,
+                checksum,
+                committed_bytes,
+            },
+            None,
+        );
+        Some((frame, replica_addrs))
     }
 
     /// Optimized batch append: all frames share the same stream_id/extent_id.
@@ -1258,7 +1254,7 @@ impl ExtentNodeStore {
             }
         }
 
-        let mut forward_work: Vec<(String, Frame)> = Vec::new();
+        let mut forward_work: Vec<(Vec<String>, Frame)> = Vec::new();
 
         if entries.is_empty() {
             // All appends failed — decrement and possibly drain followers.
@@ -1295,11 +1291,8 @@ impl ExtentNodeStore {
                     self.send_extent_update(stream_id, notif);
                 }
                 self.flush_forward_work(forward_work).await;
-                // After critical path: compute and send checksum separately.
                 if let Some(ref notif) = seal_notification {
-                    let checksum_work =
-                        self.build_checksum_frames(stream_id, notif.sealed_extent_id);
-                    self.flush_forward_work(checksum_work).await;
+                    self.send_offload(stream_id, notif.sealed_extent_id);
                 }
             } else {
                 self.flush_forward_work(forward_work).await;
@@ -1365,21 +1358,19 @@ impl ExtentNodeStore {
                     }
                 } else {
                     // RF≥2: build Forward frames for secondaries.
-                    if self.downstream.get().is_some() {
+                    if self.downstream.get().is_some() && !ri.replica_addrs.is_empty() {
                         for entry in &entries {
-                            for secondary_addr in &ri.replica_addrs {
-                                let frame = Frame::new(
-                                    VariableHeader::Forward {
-                                        stream_id,
-                                        extent_id: entry.extent_id,
-                                        epoch,
-                                        offset: entry.offset,
-                                        byte_pos: entry.byte_pos,
-                                    },
-                                    Some(entry.payload_for_forward.clone()),
-                                );
-                                forward_work.push((secondary_addr.clone(), frame));
-                            }
+                            let frame = Frame::new(
+                                VariableHeader::Forward {
+                                    stream_id,
+                                    extent_id: entry.extent_id,
+                                    epoch,
+                                    offset: entry.offset,
+                                    byte_pos: entry.byte_pos,
+                                },
+                                Some(entry.payload_for_forward.clone()),
+                            );
+                            forward_work.push((ri.replica_addrs.clone(), frame));
                         }
                     }
 
@@ -1436,13 +1427,12 @@ impl ExtentNodeStore {
             .in_flight()
             .fetch_sub(batch_len, Ordering::Release);
         drop(stream_ref); // ← release read guard BEFORE drain
-        let mut sealed_extent_ids = Vec::new();
         if remaining > batch_len {
             let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
             forward_work.extend(batch_forward);
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
-                sealed_extent_ids.push(notif.sealed_extent_id);
+                self.send_offload(stream_id, notif.sealed_extent_id);
             }
         }
 
@@ -1466,18 +1456,12 @@ impl ExtentNodeStore {
             }
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                sealed_extent_ids.push(notif.sealed_extent_id);
+                self.send_offload(stream_id, notif.sealed_extent_id);
             }
         }
 
         // Flush forward work to downstream pool (direct TCP write, no channel hop).
         self.flush_forward_work(forward_work).await;
-
-        // After critical path: compute and send checksums for any sealed extents.
-        for eid in &sealed_extent_ids {
-            let checksum_work = self.build_checksum_frames(stream_id, *eid);
-            self.flush_forward_work(checksum_work).await;
-        }
 
         responses
     }
@@ -1487,7 +1471,7 @@ impl ExtentNodeStore {
     /// Groups frames by destination address and sends each batch directly via TCP.
     /// This is the point where the async boundary is crossed — all synchronous
     /// append logic collects forward work, and this method flushes it.
-    async fn flush_forward_work(&self, forward_work: Vec<(String, Frame)>) {
+    pub(crate) async fn flush_forward_work(&self, forward_work: Vec<(Vec<String>, Frame)>) {
         if forward_work.is_empty() {
             return;
         }
@@ -1497,8 +1481,10 @@ impl ExtentNodeStore {
         };
         // Group by destination address for efficient batching.
         let mut by_addr: HashMap<&str, Vec<&Frame>> = HashMap::new();
-        for (addr, frame) in &forward_work {
-            by_addr.entry(addr.as_str()).or_default().push(frame);
+        for (addrs, frame) in &forward_work {
+            for addr in addrs {
+                by_addr.entry(addr.as_str()).or_default().push(frame);
+            }
         }
         for (addr, frames) in by_addr {
             let writer = match pool.get_or_create_writer(addr).await {
@@ -1775,8 +1761,7 @@ impl ExtentNodeStore {
         let secondary_crc32 = crc32fast::hash(&committed_data);
         let secondary_committed_bytes = committed_data.len() as u64;
 
-        if secondary_crc32 != primary_crc32
-            || secondary_committed_bytes != primary_committed_bytes
+        if secondary_crc32 != primary_crc32 || secondary_committed_bytes != primary_committed_bytes
         {
             warn!(
                 "CRC32 checksum mismatch: stream={}, extent={}, \
