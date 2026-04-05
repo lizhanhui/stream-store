@@ -514,7 +514,14 @@ impl StreamManagerStore {
             .unwrap_or_else(|e| {
                 warn!("register_primary failed for initial extent {}: {e}; client will discover on first append", extent_id);
             });
-        self.notify_secondaries(stream_id, extent_id, &node_addrs[1..], rf, epoch, extent_capacity);
+        self.notify_secondaries(
+            stream_id,
+            extent_id,
+            &node_addrs[1..],
+            rf,
+            epoch,
+            extent_capacity,
+        );
 
         Ok((extent_id, node_addrs[0].clone()))
     }
@@ -605,9 +612,7 @@ impl StreamManagerStore {
                 match self.store.update_heartbeat(&node_id).await {
                     Ok(()) => {
                         // Persist metrics to DB for load-aware placement (graceful on failure).
-                        if let Err(e) =
-                            self.store.persist_node_metrics(&node_id, &metrics).await
-                        {
+                        if let Err(e) = self.store.persist_node_metrics(&node_id, &metrics).await {
                             warn!("failed to persist node metrics for {node_id}: {e}");
                         }
                         Frame::new(
@@ -642,28 +647,26 @@ impl StreamManagerStore {
     async fn handle_disconnect(&self, frame: Frame) -> Frame {
         let payload = frame.payload.as_deref().unwrap_or_default();
         match parse_string_payload(payload) {
-            Some(node_id) => {
-                match self.store.mark_node_dead(&node_id).await {
-                    Ok(()) => {
-                        info!("ExtentNode disconnected: node_id={node_id}");
-                        Frame::new(
-                            VariableHeader::DisconnectAck {
-                                request_id: frame.request_id(),
-                            },
-                            None,
-                        )
-                    }
-                    Err(e) => {
-                        error!("mark_node_dead on disconnect failed: {e}");
-                        Frame::error_response(
-                            frame.request_id(),
-                            ErrorCode::InternalError,
-                            &e.to_string(),
-                            ExtentId(0),
-                        )
-                    }
+            Some(node_id) => match self.store.mark_node_dead(&node_id).await {
+                Ok(()) => {
+                    info!("ExtentNode disconnected: node_id={node_id}");
+                    Frame::new(
+                        VariableHeader::DisconnectAck {
+                            request_id: frame.request_id(),
+                        },
+                        None,
+                    )
                 }
-            }
+                Err(e) => {
+                    error!("mark_node_dead on disconnect failed: {e}");
+                    Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::InternalError,
+                        &e.to_string(),
+                        ExtentId(0),
+                    )
+                }
+            },
             None => Frame::error_response(
                 frame.request_id(),
                 ErrorCode::InternalError,
@@ -682,7 +685,9 @@ impl StreamManagerStore {
     /// Response payload: [addr_len:u16][primary_addr]
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
         let payload = frame.payload.as_deref().unwrap_or_default();
-        let (stream_name, replication_factor, extent_capacity) = match parse_create_stream_payload(payload) {
+        let (stream_name, replication_factor, extent_capacity) = match parse_create_stream_payload(
+            payload,
+        ) {
             Some((name, rf, ec)) => (name, rf, ec),
             None => {
                 return Frame::error_response(
@@ -832,9 +837,9 @@ impl StreamManagerStore {
             .await?
             .ok_or_else(|| {
                 StorageError::Internal(format!(
-                "no active extent found for stream {} during seal_extent",
-                stream_id
-            ))
+                    "no active extent found for stream {} during seal_extent",
+                    stream_id
+                ))
             })?;
         let extent_start_offset = extent_row.start_offset;
 
@@ -1116,7 +1121,14 @@ impl StreamManagerStore {
                 }
 
                 // notify extent secondary nodes in fire-and-forget way
-                self.notify_secondaries(stream_id, new_extent_id, &node_addrs[1..], rf, epoch, extent_capacity);
+                self.notify_secondaries(
+                    stream_id,
+                    new_extent_id,
+                    &node_addrs[1..],
+                    rf,
+                    epoch,
+                    extent_capacity,
+                );
 
                 (new_extent_id, primary_addr)
             }
@@ -1294,10 +1306,7 @@ impl StreamManagerStore {
     /// 4. SM reconciles metadata, bumps epoch, allocates new extent on new replica set.
     /// 5. SM responds to client with new epoch/extent info.
     async fn handle_epoch_seal(&self, request_id: u32, stream_id: StreamId, epoch: Epoch) -> Frame {
-        info!(
-            "Epoch-based seal: stream={}, epoch={}",
-            stream_id, epoch
-        );
+        info!("Epoch-based seal: stream={}, epoch={}", stream_id, epoch);
 
         // Get the active extent to find the Primary's address.
         let active = match self.store.get_active_extent(stream_id).await {

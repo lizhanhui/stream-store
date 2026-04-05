@@ -34,7 +34,7 @@ const NUM_CLIENTS: usize = 10;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const BENCH_DURATION: Duration = Duration::from_secs(5);
 const REPLICATION_FACTOR: u16 = 2;
-const ARENA_CAPACITY: usize = 4 * 1024 * 1024; // 4 MiB -- triggers frequent seals
+const EXTENT_CAPACITY: usize = 4 * 1024 * 1024; // 4 MiB -- triggers frequent seals
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
 async fn main() {
@@ -63,7 +63,6 @@ async fn main() {
             bind_ip: "127.0.0.1".into(),
             port: 0,
             stream_manager_addrs: vec![stream_manager_addr_socket.to_string()],
-            extent_arena_capacity: ARENA_CAPACITY,
             ..Default::default()
         };
         let extent_node = ExtentNode::start(extent_node_config).await;
@@ -118,7 +117,7 @@ async fn main() {
     info!("Duration:      {elapsed:.2} seconds");
     info!("Clients:       {NUM_CLIENTS}");
     info!("Payload size:  {PAYLOAD_SIZE} bytes");
-    info!("Arena capacity: {} MiB", ARENA_CAPACITY / (1024 * 1024));
+    info!("Extent capacity: {} MiB", EXTENT_CAPACITY / (1024 * 1024));
     info!("RF:            {REPLICATION_FACTOR}");
     info!("Total appends: {total_appends}");
     info!(

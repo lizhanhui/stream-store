@@ -68,8 +68,7 @@ async fn start_stream_manager_rf2() -> String {
         .expect("failed to connect to MySQL");
     store.migrate().await.expect("failed to migrate");
 
-    let stream_manager_store =
-        StreamManagerStore::new(store, config.default_replication_factor);
+    let stream_manager_store = StreamManagerStore::new(store, config.default_replication_factor);
     let handler = Arc::new(stream_manager_store);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -151,8 +150,10 @@ async fn describe_stream_rf2_integration() {
             .as_millis()
     );
 
-    let (stream_id, first_extent_id, _epoch, primary_addr) =
-        stream_manager.create_stream(&stream_name, 2, 0).await.unwrap();
+    let (stream_id, first_extent_id, _epoch, primary_addr) = stream_manager
+        .create_stream(&stream_name, 2, 0)
+        .await
+        .unwrap();
 
     assert!(stream_id.0 > 0);
     // Primary should be one of the two registered ENs.

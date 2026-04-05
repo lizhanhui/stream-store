@@ -916,7 +916,7 @@ Each stream on an Extent Node uses a **pipelined group commit** pattern to maxim
 
 #### Arena Layout
 
-Each active extent pre-allocates a contiguous buffer (configurable, default 64 MiB via `ExtentNodeConfig.extent_arena_capacity`). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed extents.
+Each active extent pre-allocates a contiguous buffer (configurable, default 64 MiB per stream via `extent_capacity`). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed extents.
 
 The arena has no internal index structure. Records are self-contained: a reader can walk forward from any byte position by reading the length prefix and advancing by `4 + len` bytes. Random access is provided by an **internal index** (see below).
 
@@ -1001,7 +1001,7 @@ Each extent maintains an **internal index** — a lock-free array mapping sequen
 **Index structure:**
 - `Box<[AtomicU32]>` — one entry per possible record in the extent, using compressed 32-bit pointers (sufficient for 64 MiB arenas, max byte_pos < 2^32).
 - Entry `i` stores the byte_pos for the `i`-th record (where `i = offset - extent.start_offset`).
-- Capacity = `arena_capacity / 5` (minimum record = 4 byte header + 1 byte payload).
+- Capacity = `extent_capacity / 5` (minimum record = 4 byte header + 1 byte payload).
 - Sentinel value `u32::MAX` distinguishes unwritten entries from byte_pos=0.
 - Memory savings: 4 bytes per entry vs 8 bytes with `AtomicU64` — halves index memory overhead.
 
@@ -1023,14 +1023,14 @@ Each extent maintains an **internal index** — a lock-free array mapping sequen
 - **Lock-free reads** — readers use atomic loads on `committed_bytes` and index entries, never blocking the writer.
 - **Single-struct ownership** — one `Extent` owns both data and index, simplifying lifecycle management.
 
-#### Configurable Arena Capacity
+#### Configurable Extent Capacity
 
-The arena capacity is configurable per ExtentNode via `ExtentNodeConfig.extent_arena_capacity` (default 64 MiB). Application users can tune this per workload:
+The extent capacity is configurable per stream (default 64 MiB). Application users can tune this per workload:
 
-- **Smaller arenas**: More frequent seal-and-new, lower write amplification for small streams, faster S3 flush cycles.
-- **Larger arenas**: Fewer seals, better for high-throughput streams that batch many messages per extent.
+- **Smaller extents**: More frequent seal-and-new, lower write amplification for small streams, faster S3 flush cycles.
+- **Larger extents**: Fewer seals, better for high-throughput streams that batch many messages per extent.
 
-The capacity is applied to all extents created on the ExtentNode, including new extents created during seal-and-new.
+The capacity is applied to all extents created for the stream, including new extents created during seal-and-new.
 
 #### Seal
 

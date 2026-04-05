@@ -5,7 +5,7 @@ use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, ExtentState, Offset, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 
-use crate::extent::{AppendResult, DEFAULT_ARENA_CAPACITY, Extent};
+use crate::extent::{AppendResult, Extent};
 use crate::store::AppendJob;
 
 /// A stream: an ordered, append-only sequence of messages backed by a list of extents.
@@ -28,18 +28,24 @@ use crate::store::AppendJob;
 /// know about individual extent boundaries.
 pub struct Stream {
     pub id: StreamId,
+
     extents: Vec<Extent>,
+
     /// Current epoch assigned by Stream Manager. Within an epoch, the replica set
     /// is fixed and the Primary can autonomously create extents on extent-full.
     epoch: Epoch,
+
     /// Next extent ID for autonomous creation within the current epoch.
     /// Initialized to `first_extent_id + 1` when SM sends RegisterExtent.
     next_extent_id: ExtentId,
-    /// Arena capacity for autonomously created extents (bytes).
-    arena_capacity: u32,
+
+    /// Extent capacity for autonomously created extents (bytes).
+    extent_capacity: u32,
+
     /// Leader election counter for pipelined group commit (stream-level).
     /// 0 = idle. The leader owns the entire stream, handling extent transitions inline.
     in_flight: AtomicU64,
+
     /// Channel for followers to submit append jobs to the active writer.
     job_tx: Sender<AppendJob>,
     job_rx: Receiver<AppendJob>,
@@ -54,7 +60,7 @@ impl Stream {
             extents: Vec::new(),
             epoch: Epoch(0),
             next_extent_id: ExtentId(0),
-            arena_capacity: DEFAULT_ARENA_CAPACITY,
+            extent_capacity: 0,
             in_flight: AtomicU64::new(0),
             job_tx,
             job_rx,
@@ -67,19 +73,23 @@ impl Stream {
         &mut self,
         id: ExtentId,
         start_offset: Offset,
-        capacity: u32,
+        extent_capacity: u32,
         epoch: Epoch,
     ) {
         self.epoch = epoch;
-        self.arena_capacity = capacity;
+        self.extent_capacity = extent_capacity;
         self.next_extent_id = ExtentId(id.0 + 1);
-        self.extents
-            .push(Extent::with_capacity(id, start_offset, capacity, epoch));
+        self.extents.push(Extent::with_capacity(
+            id,
+            start_offset,
+            extent_capacity,
+            epoch,
+        ));
     }
 
-    /// Return the arena capacity configured for this stream.
-    pub fn arena_capacity(&self) -> u32 {
-        self.arena_capacity
+    /// Return the extent capacity configured for this stream.
+    pub fn extent_capacity(&self) -> u32 {
+        self.extent_capacity
     }
 
     /// Append a message to the specified extent. Returns the assigned
@@ -226,7 +236,7 @@ impl Stream {
         self.extents.push(Extent::with_capacity(
             new_id,
             end_offset,
-            self.arena_capacity,
+            self.extent_capacity,
             self.epoch,
         ));
         (new_id, end_offset)
@@ -343,7 +353,7 @@ impl std::fmt::Debug for Stream {
             .field("extents", &self.extents)
             .field("epoch", &self.epoch)
             .field("next_extent_id", &self.next_extent_id)
-            .field("arena_capacity", &self.arena_capacity)
+            .field("extent_capacity", &self.extent_capacity)
             .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
             .finish()
     }
@@ -352,12 +362,12 @@ impl std::fmt::Debug for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extent::DEFAULT_ARENA_CAPACITY;
+    const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
 
     /// Helper: create a stream with one active extent (simulating RegisterExtent from SM).
     fn new_stream_with_extent(id: StreamId) -> Stream {
         let mut stream = Stream::new(id);
-        stream.register_extent(ExtentId(0), Offset(0), DEFAULT_ARENA_CAPACITY, Epoch(0));
+        stream.register_extent(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
     }
 
@@ -474,7 +484,7 @@ mod tests {
         stream.register_extent(
             second_extent_id,
             Offset(3),
-            DEFAULT_ARENA_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         assert!(stream.is_mutable());
@@ -510,7 +520,7 @@ mod tests {
         stream.register_extent(
             second_extent_id,
             Offset(1),
-            DEFAULT_ARENA_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         let r = stream

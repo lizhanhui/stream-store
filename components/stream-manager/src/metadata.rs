@@ -890,9 +890,7 @@ impl MetadataStore {
     }
 
     /// Load all node metrics from the database (for load-aware placement).
-    pub async fn get_all_node_metrics(
-        &self,
-    ) -> Result<HashMap<String, NodeMetrics>, StorageError> {
+    pub async fn get_all_node_metrics(&self) -> Result<HashMap<String, NodeMetrics>, StorageError> {
         let rows = sqlx::query(
             "SELECT node_id, available_memory_bytes, total_memory_bytes, \
                     appends_per_sec, active_extent_count, bytes_written_per_sec \
@@ -948,14 +946,13 @@ impl MetadataStore {
     pub async fn bump_epoch(&self, stream_id: StreamId) -> Result<Epoch, StorageError> {
         let current = self.get_stream_epoch(stream_id).await?;
 
-        let result = sqlx::query(
-            "UPDATE stream SET epoch = epoch + 1 WHERE stream_id = ? AND epoch = ?",
-        )
-        .bind(stream_id.0 as i64)
-        .bind(current.0 as i32)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("bump_epoch: {e}")))?;
+        let result =
+            sqlx::query("UPDATE stream SET epoch = epoch + 1 WHERE stream_id = ? AND epoch = ?")
+                .bind(stream_id.0 as i64)
+                .bind(current.0 as i32)
+                .execute(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(format!("bump_epoch: {e}")))?;
 
         if result.rows_affected() == 0 {
             return Err(StorageError::Internal(

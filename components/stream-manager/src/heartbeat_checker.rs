@@ -123,11 +123,7 @@ async fn check_expired_nodes(
             // Resolve the true committed offset from surviving replicas.
             // This contacts the Primary (if alive) or uses secondary quorum.
             let committed_offset = match sm_store
-                .resolve_committed_offset(
-                    extent.stream_id,
-                    extent.extent_id,
-                    extent.start_offset,
-                )
+                .resolve_committed_offset(extent.stream_id, extent.extent_id, extent.start_offset)
                 .await
             {
                 Ok(offset) => {

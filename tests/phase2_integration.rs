@@ -60,8 +60,7 @@ async fn start_stream_manager_server() -> String {
         .expect("failed to connect to MySQL");
     store.migrate().await.expect("failed to migrate");
 
-    let stream_manager_store =
-        StreamManagerStore::new(store, config.default_replication_factor);
+    let stream_manager_store = StreamManagerStore::new(store, config.default_replication_factor);
     let handler = Arc::new(stream_manager_store);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

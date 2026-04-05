@@ -247,7 +247,11 @@ impl StorageClient {
             VariableHeader::CreateStream {
                 request_id: self.alloc_request_id(),
             },
-            Some(build_create_stream_payload(name, replication_factor, extent_capacity)),
+            Some(build_create_stream_payload(
+                name,
+                replication_factor,
+                extent_capacity,
+            )),
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
@@ -425,7 +429,7 @@ impl StorageClient {
     ///   to determine the committed offset via quorum algorithm.
     /// - `committed_offset = Some(offset)` (extent-node seal): StreamManager trusts the
     ///   provided offset without querying replicas. Used when the primary ExtentNode has
-    ///   already sealed the extent locally (e.g. arena full).
+    ///   already sealed the extent locally (e.g. extent full).
     ///
     /// Returns (new_extent_id, new_primary_addr).
     pub async fn seal(

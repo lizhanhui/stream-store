@@ -8,11 +8,11 @@ use bytes::{BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use dashmap::DashMap;
+use futures_util::SinkExt;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
 use std::sync::Arc;
-use futures_util::SinkExt;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -461,25 +461,33 @@ impl ExtentNodeStore {
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
     fn handle_register_extent(&self, frame: Frame) -> Frame {
         // Extract stream_id, extent_id, role, replication_factor from the variable header.
-        let (stream_id, extent_id, role, replication_factor, epoch, extent_capacity) = match &frame.variable_header {
-            VariableHeader::RegisterExtent {
-                stream_id,
-                extent_id,
-                role,
-                replication_factor,
-                epoch,
-                extent_capacity,
-                ..
-            } => (*stream_id, *extent_id, *role, *replication_factor, *epoch, *extent_capacity),
-            _ => {
-                return Frame::error_response(
-                    frame.request_id(),
-                    ErrorCode::InternalError,
-                    "invalid RegisterExtent frame",
-                    ExtentId(0),
-                );
-            }
-        };
+        let (stream_id, extent_id, role, replication_factor, epoch, extent_capacity) =
+            match &frame.variable_header {
+                VariableHeader::RegisterExtent {
+                    stream_id,
+                    extent_id,
+                    role,
+                    replication_factor,
+                    epoch,
+                    extent_capacity,
+                    ..
+                } => (
+                    *stream_id,
+                    *extent_id,
+                    *role,
+                    *replication_factor,
+                    *epoch,
+                    *extent_capacity,
+                ),
+                _ => {
+                    return Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::InternalError,
+                        "invalid RegisterExtent frame",
+                        ExtentId(0),
+                    );
+                }
+            };
 
         // Parse replica addresses from the payload.
         let replica_addrs =
@@ -602,10 +610,7 @@ impl ExtentNodeStore {
             return Some(Frame::error_response(
                 frame.request_id(),
                 ErrorCode::EpochStale,
-                &format!(
-                    "epoch stale: client={}, current={}",
-                    client_epoch, epoch
-                ),
+                &format!("epoch stale: client={}, current={}", client_epoch, epoch),
                 ExtentId(0),
             ));
         }
@@ -1428,7 +1433,7 @@ impl ExtentNodeStore {
                                         extent_id: *extent_id,
                                         epoch: *epoch,
                                         start_offset: ext.start_offset,
-                                        extent_capacity: stream_ref.arena_capacity(),
+                                        extent_capacity: stream_ref.extent_capacity(),
                                     },
                                     None,
                                 );
@@ -1465,7 +1470,13 @@ impl ExtentNodeStore {
                     epoch,
                     start_offset,
                     extent_capacity,
-                } => (*stream_id, *extent_id, *epoch, *start_offset, *extent_capacity),
+                } => (
+                    *stream_id,
+                    *extent_id,
+                    *epoch,
+                    *start_offset,
+                    *extent_capacity,
+                ),
                 _ => return,
             };
 
@@ -1500,31 +1511,24 @@ impl ExtentNodeStore {
     ///
     /// Returns a cumulative Watermark with the highest written offset.
     fn handle_forward(&self, frame: Frame) -> Frame {
-        let (stream_id, extent_id, _epoch, offset, byte_pos) =
-            match &frame.variable_header {
-                VariableHeader::Forward {
-                    stream_id,
-                    extent_id,
-                    epoch,
-                    offset,
-                    byte_pos,
-                } => (
-                    *stream_id,
-                    *extent_id,
-                    *epoch,
-                    *offset,
-                    *byte_pos,
-                ),
-                _ => {
-                    return Frame::new(
-                        VariableHeader::Watermark {
-                            stream_id: frame.stream_id(),
-                            offset: Offset(0),
-                        },
-                        None,
-                    );
-                }
-            };
+        let (stream_id, extent_id, _epoch, offset, byte_pos) = match &frame.variable_header {
+            VariableHeader::Forward {
+                stream_id,
+                extent_id,
+                epoch,
+                offset,
+                byte_pos,
+            } => (*stream_id, *extent_id, *epoch, *offset, *byte_pos),
+            _ => {
+                return Frame::new(
+                    VariableHeader::Watermark {
+                        stream_id: frame.stream_id(),
+                        offset: Offset(0),
+                    },
+                    None,
+                );
+            }
+        };
 
         // Look up the stream — must exist (created by ForwardInitExtent or RegisterExtent).
         let stream_ref = match self.streams.get(&stream_id) {
@@ -1880,7 +1884,8 @@ impl ExtentNodeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::extent::DEFAULT_ARENA_CAPACITY;
+
+    const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
 
     /// Register a stream on the ExtentNode via RegisterExtent (RF=1, Primary, no secondaries).
     /// This is the production path: StreamManager assigns a stream_id and sends RegisterExtent.
@@ -1899,7 +1904,7 @@ mod tests {
                         role: 0,
                         replication_factor: 1,
                         epoch: Epoch(0),
-                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
+                        extent_capacity: DEFAULT_EXTENT_CAPACITY,
                     },
                     Some(payload),
                 ),
@@ -2073,7 +2078,7 @@ mod tests {
                         role: 0,
                         replication_factor: 2,
                         epoch: Epoch(0),
-                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
+                        extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2117,7 +2122,7 @@ mod tests {
                         role: 1,
                         replication_factor: 2,
                         epoch: Epoch(0),
-                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
+                        extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2156,7 +2161,7 @@ mod tests {
                         role: 0,
                         replication_factor: 1,
                         epoch: Epoch(0),
-                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
+                        extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2216,7 +2221,7 @@ mod tests {
                         role: 0,
                         replication_factor: 3,
                         epoch: Epoch(0),
-                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
+                        extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2298,7 +2303,7 @@ mod tests {
                         role: 1,
                         replication_factor: 2,
                         epoch: Epoch(0),
-                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
+                        extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     },
                     Some(payload),
                 ),
@@ -2904,7 +2909,7 @@ mod tests {
                         role: 1,
                         replication_factor: 2,
                         epoch: Epoch(0),
-                        extent_capacity: DEFAULT_ARENA_CAPACITY as u32,
+                        extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     },
                     Some(payload),
                 ),

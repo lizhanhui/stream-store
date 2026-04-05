@@ -1455,8 +1455,9 @@ impl VariableHeader {
             | VariableHeader::UpdateExtentProgress { .. } => Opcode::UpdateExtent,
             VariableHeader::ReportExtents { .. } => Opcode::ReportExtents,
             VariableHeader::ReportExtentsResp { .. } => Opcode::ReportExtentsResp,
-            VariableHeader::Forward { .. }
-            | VariableHeader::ForwardInitExtent { .. } => Opcode::Forward,
+            VariableHeader::Forward { .. } | VariableHeader::ForwardInitExtent { .. } => {
+                Opcode::Forward
+            }
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
             VariableHeader::DescribeStream { .. } => Opcode::DescribeStream,
             VariableHeader::DescribeStreamResp { .. } => Opcode::DescribeStreamResp,

@@ -8,9 +8,6 @@ use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, ExtentState, Offset};
 
-/// Default arena capacity: 64 MB.
-pub const DEFAULT_ARENA_CAPACITY: u32 = 64 * 1024 * 1024;
-
 /// Sentinel for unwritten index entries.
 /// We use 0 so the index can be allocated with `alloc_zeroed` (OS provides
 /// pre-zeroed pages via MAP_ANONYMOUS at near-zero cost), avoiding a 13M+
@@ -132,7 +129,9 @@ pub struct AppendResult {
 /// sealed extents.
 pub struct Extent {
     pub id: ExtentId,
+
     pub start_offset: Offset,
+
     /// The epoch under which this extent was created (informational).
     /// Used by `report_extents` to filter extents by epoch during SM recovery.
     pub epoch: Epoch,
@@ -140,8 +139,10 @@ pub struct Extent {
     /// Reference-counted arena buffer. Shared with any outstanding `Bytes`
     /// slices, so the memory is not freed until all readers are done.
     arena: Arc<ArenaBuffer>,
+
     /// Derived write pointer into the arena (for append writes).
     buf: *mut u8,
+
     /// Total capacity of the arena in bytes.
     capacity: u32,
 
@@ -171,7 +172,7 @@ pub struct Extent {
 
     /// Internal index mapping sequence number → byte position (compressed u32).
     /// Entry i holds the byte_pos for the i-th record appended to this extent.
-    /// Capacity = arena_capacity / MIN_RECORD_SIZE.
+    /// Capacity = extent_capacity / MIN_RECORD_SIZE.
     index: Box<[AtomicU32]>,
 
     /// When true, the primary must prepend a ForwardInitExtent frame before the
@@ -186,18 +187,8 @@ unsafe impl Send for Extent {}
 unsafe impl Sync for Extent {}
 
 impl Extent {
-    /// Create a new active extent with default capacity (64 MB).
-    pub fn new(id: ExtentId, start_offset: Offset, epoch: Epoch) -> Self {
-        Self::with_capacity(id, start_offset, DEFAULT_ARENA_CAPACITY, epoch)
-    }
-
     /// Create a new active extent with the specified capacity in bytes.
-    pub fn with_capacity(
-        id: ExtentId,
-        start_offset: Offset,
-        capacity: u32,
-        epoch: Epoch,
-    ) -> Self {
+    pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: u32, epoch: Epoch) -> Self {
         let layout = Layout::from_size_align(capacity as usize, 8).expect("invalid layout");
         // SAFETY: layout is valid, nonzero size.
         let ptr = unsafe { alloc(layout) };
@@ -215,7 +206,7 @@ impl Extent {
         // Allocate the index with alloc_zeroed: the OS provides pre-zeroed pages
         // (MAP_ANONYMOUS) at near-zero cost, avoiding a 13M+ iteration init loop
         // that caused ~80ms stalls. INDEX_UNSET == 0, so zeroed memory is correct.
-        let index_capacity  = (capacity / MIN_RECORD_SIZE) as usize;
+        let index_capacity = (capacity / MIN_RECORD_SIZE) as usize;
         let index = {
             let index_layout = Layout::from_size_align(
                 index_capacity * std::mem::size_of::<AtomicU32>(),

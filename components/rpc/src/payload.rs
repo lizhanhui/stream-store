@@ -191,7 +191,11 @@ pub fn parse_register_extent_payload(payload: &[u8]) -> Option<Vec<String>> {
 }
 
 /// Build a CreateStream payload: [name_len:u16][stream_name][replication_factor:u16][extent_capacity:u32]
-pub fn build_create_stream_payload(name: &str, replication_factor: u16, extent_capacity: u32) -> Bytes {
+pub fn build_create_stream_payload(
+    name: &str,
+    replication_factor: u16,
+    extent_capacity: u32,
+) -> Bytes {
     let mut buf = BytesMut::with_capacity(2 + name.len() + 2 + 4);
     buf.put_u16(name.len() as u16);
     buf.extend_from_slice(name.as_bytes());
@@ -424,7 +428,8 @@ mod tests {
     #[test]
     fn create_stream_payload_roundtrip() {
         let payload = build_create_stream_payload("my-stream", 3, 67_108_864);
-        let (name, replication_factor, extent_capacity) = parse_create_stream_payload(&payload).unwrap();
+        let (name, replication_factor, extent_capacity) =
+            parse_create_stream_payload(&payload).unwrap();
         assert_eq!(name, "my-stream");
         assert_eq!(replication_factor, 3);
         assert_eq!(extent_capacity, 67_108_864);
