@@ -546,6 +546,7 @@ dependencies = [
  "bytes",
  "client",
  "common",
+ "crc32fast",
  "criterion",
  "crossbeam-channel",
  "dashmap",
