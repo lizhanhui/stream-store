@@ -73,7 +73,13 @@ impl StreamManager {
         // 5. Start heartbeat checker with leadership lease (only the leader
         //    runs failover; all SMs compete for the lease).
         let heartbeat_sm_store = Arc::clone(&stream_manager_store);
-        let node_id = local_addr.to_string();
+        let effective_port = if config.port == 0 {
+            local_addr.port()
+        } else {
+            config.port
+        };
+        let node_id = config.advertise_addr(effective_port);
+        info!("StreamManager node-id={node_id}");
         let heartbeat_check_interval =
             Duration::from_millis(config.heartbeat_check_interval_ms as u64);
         let lease_duration_secs = config.leadership_lease_duration_secs;

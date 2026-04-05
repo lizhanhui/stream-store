@@ -114,6 +114,13 @@ impl StreamManagerClient {
         }
     }
 
+    /// Abort the background task immediately without sending Disconnect.
+    ///
+    /// Used to simulate a crash — SM will detect the node via expired heartbeat.
+    pub fn abort(self) {
+        self.task_handle.abort();
+    }
+
     /// Reconnection loop. Tries SM addresses in round-robin order on failure.
     async fn run_loop(
         store: Arc<ExtentNodeStore>,

@@ -157,4 +157,17 @@ impl ExtentNode {
         }
         info!("ExtentNode stopped");
     }
+
+    /// Simulate an abrupt crash: abort all tasks without sending Disconnect.
+    ///
+    /// This is useful for testing SM failover — the SM will detect the dead node
+    /// via expired heartbeat instead of receiving a graceful Disconnect.
+    pub fn kill(self) {
+        info!("ExtentNode killed (simulated crash)");
+        for handle in self.task_handles {
+            handle.abort();
+        }
+        self.stream_manager_client.abort();
+        // Drop everything else — TCP connections will be reset.
+    }
 }

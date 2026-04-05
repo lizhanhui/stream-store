@@ -102,6 +102,10 @@ pub struct StreamManagerConfig {
     pub bind_ip: String,
     /// Port to listen on. Defaults to 9800.
     pub port: u16,
+    /// IP advertised to other SM instances for leadership identification.
+    /// If empty and `bind_ip` is `0.0.0.0`, auto-detects the primary non-loopback
+    /// interface IP. Set explicitly in multi-homed environments.
+    pub advertise_ip: String,
     /// MySQL host.
     pub mysql_host: String,
     /// MySQL port.
@@ -130,6 +134,7 @@ impl Default for StreamManagerConfig {
         Self {
             bind_ip: "0.0.0.0".to_string(),
             port: 9800,
+            advertise_ip: String::new(),
             mysql_host: "localhost".to_string(),
             mysql_port: 3306,
             mysql_username: "root".to_string(),
@@ -148,6 +153,18 @@ impl StreamManagerConfig {
     /// The address to bind the TCP listener on: `{bind_ip}:{port}`.
     pub fn listen_addr(&self) -> String {
         format!("{}:{}", self.bind_ip, self.port)
+    }
+
+    /// The address used as this SM's identity (leadership lease, logging).
+    ///
+    /// Resolution order:
+    /// 1. `advertise_ip` if explicitly configured.
+    /// 2. `bind_ip` if it's a usable address (not `0.0.0.0`).
+    /// 3. Auto-detected local IP (primary non-loopback interface).
+    /// 4. Falls back to `bind_ip` if auto-detection fails.
+    pub fn advertise_addr(&self, effective_port: u16) -> String {
+        let ip = resolve_advertise_ip(&self.bind_ip, &self.advertise_ip);
+        format!("{ip}:{effective_port}")
     }
 
     /// Build the MySQL connection URL from individual fields.
@@ -175,34 +192,74 @@ where
 
 /// Detect the primary non-loopback IPv4 address of this machine.
 ///
-/// Enumerates network interfaces via `getifaddrs` and collects all non-loopback
-/// IPv4 addresses. If exactly one is found, returns it — this covers the common
-/// single-NIC case. If multiple are found, returns `None` (the user should set
-/// `advertise_ip` explicitly in multi-homed environments).
+/// Detect the primary non-loopback IPv4 address of this machine.
+///
+/// Enumerates network interfaces via `getifaddrs` and filters out:
+/// - Loopback and unspecified addresses.
+/// - Virtual/bridge interfaces: `docker*`, `br-*`, `veth*`, `virbr*`, `lxc*`,
+///   `flannel*`, `cni*`, `podman*`.
+///
+/// If multiple candidates remain after filtering, prefers addresses outside the
+/// `172.16.0.0/12` range (commonly used by Docker/container bridges). If still
+/// ambiguous, returns the first candidate in sorted order for determinism.
 ///
 /// Returns `None` if no suitable address is found or if enumeration fails.
 pub fn detect_local_ip() -> Option<String> {
     use nix::ifaddrs::getifaddrs;
 
     let addrs = getifaddrs().ok()?;
-    let candidates: Vec<Ipv4Addr> = addrs
+
+    // Virtual/bridge interface prefixes to skip.
+    const VIRTUAL_PREFIXES: &[&str] = &[
+        "docker", "br-", "veth", "virbr", "lxc", "flannel", "cni", "podman",
+    ];
+
+    let candidates: Vec<(String, Ipv4Addr)> = addrs
         .filter_map(|ifa| {
+            // Skip virtual/bridge interfaces.
+            let name = &ifa.interface_name;
+            if VIRTUAL_PREFIXES.iter().any(|p| name.starts_with(p)) {
+                return None;
+            }
+
             let addr = ifa.address?;
             let inet = addr.as_sockaddr_in()?;
             let ip = inet.ip();
-            if !ip.is_loopback() && !ip.is_unspecified() {
-                Some(ip)
-            } else {
-                None
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_link_local() {
+                return None;
             }
+            Some((name.clone(), ip))
         })
         .collect();
 
-    if candidates.len() == 1 {
-        Some(candidates[0].to_string())
-    } else {
-        None
+    if candidates.is_empty() {
+        return None;
     }
+    if candidates.len() == 1 {
+        return Some(candidates[0].1.to_string());
+    }
+
+    // Multiple candidates: deprioritize 172.16.0.0/12 (Docker default range).
+    let is_docker_range = |ip: &Ipv4Addr| {
+        let octets = ip.octets();
+        octets[0] == 172 && (16..=31).contains(&octets[1])
+    };
+
+    let non_docker: Vec<(String, Ipv4Addr)> = candidates
+        .iter()
+        .filter(|(_, ip)| !is_docker_range(ip))
+        .cloned()
+        .collect();
+
+    // Pick from non-docker if possible, otherwise from all candidates.
+    let mut pool = if !non_docker.is_empty() {
+        non_docker
+    } else {
+        candidates
+    };
+
+    pool.sort_by(|a, b| a.0.cmp(&b.0));
+    Some(pool[0].1.to_string())
 }
 
 /// Resolve the effective advertise IP given a `bind_ip` and an optional `advertise_ip`.

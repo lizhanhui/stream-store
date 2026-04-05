@@ -26,21 +26,8 @@ pub async fn run_heartbeat_checker(
     let mut is_leader = false;
 
     loop {
-        tokio::select! {
-            _ = tokio::time::sleep(check_interval) => {}
-            _ = shutdown_rx.recv() => {
-                info!("heartbeat checker received shutdown signal");
-                // Release leadership on graceful shutdown.
-                if is_leader {
-                    if let Err(e) = sm_store.store().release_leadership(&node_id).await {
-                        warn!("failed to release leadership on shutdown: {e}");
-                    }
-                }
-                break;
-            }
-        }
-
-        // Acquire or renew leadership lease.
+        // Acquire or renew leadership lease (runs immediately on first iteration
+        // so the SM doesn't wait a full check_interval before competing).
         let store = sm_store.store();
         let lease_result = if is_leader {
             store.renew_leadership(&node_id, lease_duration_secs).await
@@ -70,18 +57,30 @@ pub async fn run_heartbeat_checker(
         }
 
         // Only check expired nodes if we hold the leadership lease.
-        if !is_leader {
-            continue;
-        }
-
-        match check_expired_nodes(&sm_store).await {
-            Ok(dead_count) => {
-                if dead_count > 0 {
-                    warn!("heartbeat checker: handled {dead_count} dead node(s)");
+        if is_leader {
+            match check_expired_nodes(&sm_store).await {
+                Ok(dead_count) => {
+                    if dead_count > 0 {
+                        warn!("heartbeat checker: handled {dead_count} dead node(s)");
+                    }
+                }
+                Err(e) => {
+                    error!("heartbeat checker error: {e}");
                 }
             }
-            Err(e) => {
-                error!("heartbeat checker error: {e}");
+        }
+
+        // Wait for next check interval or shutdown signal.
+        tokio::select! {
+            _ = tokio::time::sleep(check_interval) => {}
+            _ = shutdown_rx.recv() => {
+                info!("heartbeat checker received shutdown signal");
+                if is_leader {
+                    if let Err(e) = sm_store.store().release_leadership(&node_id).await {
+                        warn!("failed to release leadership on shutdown: {e}");
+                    }
+                }
+                break;
             }
         }
     }

@@ -1022,6 +1022,18 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Return the current leader's node_id if the lease is still active.
+    pub async fn get_leader(&self) -> Result<Option<String>, StorageError> {
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT node_id FROM stream_manager_leadership \
+             WHERE id = 1 AND node_id != '' AND lease_until >= NOW()",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("get_leader: {e}")))?;
+        Ok(row.map(|(id,)| id))
+    }
+
     /// Record an extent sealed notification from a Primary EN (autonomous extent creation).
     ///
     /// This is the lightweight metadata update for NOTIFY_SEALED_EXTENT:
