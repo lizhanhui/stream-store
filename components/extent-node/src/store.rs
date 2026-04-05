@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -12,6 +12,7 @@ use futures_util::SinkExt;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
+use smallvec::SmallVec;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -1424,7 +1425,8 @@ impl ExtentNodeStore {
 
             // Collect which (stream, extent) pairs have Forward frames in this batch.
             // Used to decide which extents to check for pending checksum.
-            let mut seen_extents: HashSet<(StreamId, ExtentId)> = HashSet::new();
+            // SmallVec avoids heap allocation for the common case (1-2 extents).
+            let mut seen_extents: SmallVec<[(StreamId, ExtentId); 2]> = SmallVec::new();
 
             // Under the Mutex: check if any Forward frame targets an extent that
             // needs ForwardInitExtent. Send init frames first to guarantee ordering.
@@ -1436,7 +1438,7 @@ impl ExtentNodeStore {
                     ..
                 } = &f.variable_header
                 {
-                    seen_extents.insert((*stream_id, *extent_id));
+                    seen_extents.push((*stream_id, *extent_id));
                     if let Some(stream_ref) = self.streams.get(stream_id) {
                         if let Some(ext) = stream_ref.find_extent(*extent_id) {
                             if ext.take_init_forward() {
@@ -1469,6 +1471,7 @@ impl ExtentNodeStore {
             // sealed extent in THIS batch. Only checking extents we just wrote
             // Forwards for ensures a racing leader (whose batch has no Forwards
             // for this extent) won't send the checksum before our Forwards.
+            seen_extents.dedup();
             for (stream_id, extent_id) in &seen_extents {
                 if let Some(stream_ref) = self.streams.get(stream_id) {
                     if let Some(ext) = stream_ref.find_extent(*extent_id) {
