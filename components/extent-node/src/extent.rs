@@ -3,7 +3,7 @@ use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
@@ -20,6 +20,12 @@ const INDEX_UNSET: u32 = 0;
 /// Sentinel value for `limit`: extent is not sealed.
 const LIMIT_OPEN: u64 = u64::MAX;
 const MIN_RECORD_SIZE: u32 = 5;
+
+/// Forward-flags bitmap: checked and cleared under the downstream Mutex
+/// in `flush_forward_work()` to guarantee ordering relative to Forward frames.
+pub const FLAG_INIT_FORWARD: u8 = 0x01;
+/// Send ForwardChecksum after the last Forward for this extent.
+pub const FLAG_PENDING_CHECKSUM: u8 = 0x02;
 
 /// Owns the raw heap allocation for an extent's arena buffer.
 /// Wrapped in `Arc` so that `Bytes` slices keep the buffer alive
@@ -176,9 +182,11 @@ pub struct Extent {
     /// Capacity = extent_capacity / MIN_RECORD_SIZE.
     index: Box<[AtomicU32]>,
 
-    /// When true, the primary must prepend a ForwardInitExtent frame before the
-    /// first Forward batch for this extent. Cleared atomically on first use.
-    init_forward: AtomicBool,
+    /// Bitmap of deferred forward actions, checked under the downstream Mutex
+    /// in `flush_forward_work()`:
+    /// - `FLAG_INIT_FORWARD` (0x01): prepend ForwardInitExtent before first Forward
+    /// - `FLAG_PENDING_CHECKSUM` (0x02): append ForwardChecksum after last Forward
+    forward_flags: AtomicU8,
 
     /// Incremental CRC32 hasher, updated on every primary append.
     /// Only valid on the primary side (single-writer guarantee from pipelined
@@ -255,16 +263,24 @@ impl Extent {
             committed_bytes: AtomicU64::new(0),
             limit: AtomicU64::new(LIMIT_OPEN),
             index,
-            init_forward: AtomicBool::new(true),
+            forward_flags: AtomicU8::new(FLAG_INIT_FORWARD),
             hasher: UnsafeCell::new(crc32fast::Hasher::new()),
             finalized_crc32: AtomicU32::new(0),
         }
     }
 
-    /// Atomically check and clear the `init_forward` flag.
+    /// Atomically check and clear the `FLAG_INIT_FORWARD` bit.
     /// Returns `true` if the flag was set (i.e., caller should prepend ForwardInitExtent).
     pub fn take_init_forward(&self) -> bool {
-        self.init_forward.swap(false, Ordering::AcqRel)
+        self.forward_flags.fetch_and(!FLAG_INIT_FORWARD, Ordering::AcqRel) & FLAG_INIT_FORWARD != 0
+    }
+
+    /// Atomically check and clear the `FLAG_PENDING_CHECKSUM` bit.
+    /// Returns `true` if the flag was set (i.e., caller should append ForwardChecksum).
+    pub fn take_pending_checksum(&self) -> bool {
+        self.forward_flags.fetch_and(!FLAG_PENDING_CHECKSUM, Ordering::AcqRel)
+            & FLAG_PENDING_CHECKSUM
+            != 0
     }
 
     /// Append a message. Returns the assigned logical offset and the byte
@@ -561,6 +577,11 @@ impl Extent {
 
             // Finalize incremental CRC32 (primary path — all writers drained).
             self.finalize_crc32();
+
+            // Signal that ForwardChecksum should be sent after the last Forward
+            // for this extent. Checked under the downstream Mutex in flush_forward_work().
+            self.forward_flags
+                .fetch_or(FLAG_PENDING_CHECKSUM, Ordering::Release);
 
             self.start_offset.0 + final_count
         }
