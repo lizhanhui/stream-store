@@ -17,7 +17,6 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::downstream::DownstreamPool;
-use crate::offload::OffloadTask;
 use crate::stream::Stream;
 
 // ── Broadcast replication types ──────────────────────────────────────────────
@@ -270,9 +269,6 @@ pub struct ExtentNodeStore {
     /// Channel to send ExtentUpdate notifications to SM (Primary only).
     /// The SM connection task receives these and sends UPDATE_EXTENT frames.
     update_tx: Option<mpsc::Sender<ExtentUpdate>>,
-    /// Channel to send async offload work (checksums, monitoring, etc.).
-    /// Fire-and-forget from hot path; processed by background OffloadWorker.
-    offload_tx: Option<mpsc::Sender<OffloadTask>>,
     /// Per-stream ACK queues for the Primary (only used when this node is Primary for a stream).
     /// Fine-grained per-stream locking.
     pub ack_queues: DashMap<StreamId, AckQueue>,
@@ -294,7 +290,6 @@ impl ExtentNodeStore {
             replicas: DashMap::new(),
             downstream: OnceLock::new(),
             update_tx: None,
-            offload_tx: None,
             ack_queues: DashMap::new(),
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
             append_count: AtomicU64::new(0),
@@ -317,21 +312,6 @@ impl ExtentNodeStore {
     /// Set the seal request channel (called during ExtentNode bootstrap).
     pub fn set_update_tx(&mut self, update_tx: mpsc::Sender<ExtentUpdate>) {
         self.update_tx = Some(update_tx);
-    }
-
-    /// Set the offload work channel (called during ExtentNode bootstrap).
-    pub fn set_offload_tx(&mut self, offload_tx: mpsc::Sender<OffloadTask>) {
-        self.offload_tx = Some(offload_tx);
-    }
-
-    /// Fire-and-forget: enqueue a checksum verification task on the offload channel.
-    fn send_offload(&self, stream_id: StreamId, extent_id: ExtentId) {
-        if let Some(ref tx) = self.offload_tx {
-            let _ = tx.try_send(OffloadTask::Checksum {
-                stream_id,
-                extent_id,
-            });
-        }
     }
 
     /// Get the replication info for a stream, if registered via RegisterExtent.
@@ -703,14 +683,14 @@ impl ExtentNodeStore {
                 forward_work.extend(batch_forward);
                 for notif in &batch_seals {
                     self.send_extent_update(stream_id, notif);
-                    self.send_offload(stream_id, notif.sealed_extent_id);
+                    forward_work.extend(self.build_checksum_forward(stream_id, notif.sealed_extent_id));
                 }
             }
 
             // Send SM notification if we sealed.
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                self.send_offload(stream_id, notif.sealed_extent_id);
+                forward_work.extend(self.build_checksum_forward(stream_id, notif.sealed_extent_id));
             }
             self.flush_forward_work(forward_work).await;
             return retry_result;
@@ -725,7 +705,7 @@ impl ExtentNodeStore {
             forward_work.extend(batch_forward);
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
-                self.send_offload(stream_id, notif.sealed_extent_id);
+                forward_work.extend(self.build_checksum_forward(stream_id, notif.sealed_extent_id));
             }
         }
 
@@ -1072,11 +1052,14 @@ impl ExtentNodeStore {
     /// Computes CRC32 of the sealed extent's committed data and returns the
     /// frame together with the list of replica addresses to send it to.
     /// Returns `None` if there are no replicas or the extent is not found.
-    pub(crate) fn build_checksum_frame(
+    /// Build a ForwardChecksum frame for a sealed extent using the pre-computed
+    /// incremental CRC32. Returns `(addrs, frame)` matching the `forward_work` layout,
+    /// or `None` if not applicable (standalone mode, no replicas, etc.).
+    fn build_checksum_forward(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
-    ) -> Option<(Frame, Vec<String>)> {
+    ) -> Option<(Vec<String>, Frame)> {
         if self.downstream.get().is_none() {
             return None;
         }
@@ -1093,8 +1076,6 @@ impl ExtentNodeStore {
             None => return None,
         };
         let committed_data = extent.committed_data();
-        // Use pre-computed incremental CRC32 if available (primary path),
-        // otherwise fall back to full-extent hash (secondary or edge case).
         let checksum = extent.finalized_crc32().unwrap_or_else(|| {
             crc32fast::hash(&committed_data)
         });
@@ -1115,7 +1096,7 @@ impl ExtentNodeStore {
             },
             None,
         );
-        Some((frame, replica_addrs))
+        Some((replica_addrs, frame))
     }
 
     /// Optimized batch append: all frames share the same stream_id/extent_id.
@@ -1293,11 +1274,9 @@ impl ExtentNodeStore {
                 }
                 if let Some(ref notif) = seal_notification {
                     self.send_extent_update(stream_id, notif);
+                    forward_work.extend(self.build_checksum_forward(stream_id, notif.sealed_extent_id));
                 }
                 self.flush_forward_work(forward_work).await;
-                if let Some(ref notif) = seal_notification {
-                    self.send_offload(stream_id, notif.sealed_extent_id);
-                }
             } else {
                 self.flush_forward_work(forward_work).await;
             }
@@ -1436,7 +1415,7 @@ impl ExtentNodeStore {
             forward_work.extend(batch_forward);
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
-                self.send_offload(stream_id, notif.sealed_extent_id);
+                forward_work.extend(self.build_checksum_forward(stream_id, notif.sealed_extent_id));
             }
         }
 
@@ -1460,7 +1439,7 @@ impl ExtentNodeStore {
             }
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                self.send_offload(stream_id, notif.sealed_extent_id);
+                forward_work.extend(self.build_checksum_forward(stream_id, notif.sealed_extent_id));
             }
         }
 
