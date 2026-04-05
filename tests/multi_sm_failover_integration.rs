@@ -13,8 +13,8 @@ use client::StorageClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::{ExtentState, Offset};
 use extent_node::ExtentNode;
-use stream_manager::metadata::MetadataStore;
 use stream_manager::StreamManager;
+use stream_manager::metadata::MetadataStore;
 use tokio::time::sleep;
 use tracing::info;
 
@@ -107,9 +107,7 @@ async fn poll_leader_is(store: &MetadataStore, expected: &str, timeout: Duration
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            panic!(
-                "timed out waiting for {expected} to become leader"
-            );
+            panic!("timed out waiting for {expected} to become leader");
         }
         sleep(Duration::from_millis(100)).await;
     }
@@ -147,7 +145,10 @@ async fn multi_sm_leadership_failover() {
     // Give SM-2 time to attempt acquisition and fail.
     sleep(Duration::from_secs(2)).await;
     let leader = poll_leader(&meta, Duration::from_secs(2)).await;
-    assert_eq!(leader, sm1_addr, "SM-1 should still be leader after SM-2 starts");
+    assert_eq!(
+        leader, sm1_addr,
+        "SM-1 should still be leader after SM-2 starts"
+    );
     info!("Phase 2: SM-1 still leads, SM-2 is follower at {sm2_addr}");
 
     // ── Phase 3: Start 3 ExtentNodes (connected to both SMs) ───────────
@@ -165,7 +166,8 @@ async fn multi_sm_leadership_failover() {
     );
 
     // Collect ENs into a map so we can kill by address later.
-    let mut en_map: std::collections::HashMap<String, ExtentNode> = std::collections::HashMap::new();
+    let mut en_map: std::collections::HashMap<String, ExtentNode> =
+        std::collections::HashMap::new();
     en_map.insert(en1.addr().to_string(), en1);
     en_map.insert(en2.addr().to_string(), en2);
     en_map.insert(en3.addr().to_string(), en3);
@@ -234,7 +236,10 @@ async fn multi_sm_leadership_failover() {
         .await
         .expect("describe_stream after failover");
 
-    info!("Phase 6: stream has {} extent(s) after failover", extents.len());
+    info!(
+        "Phase 6: stream has {} extent(s) after failover",
+        extents.len()
+    );
     for ext in &extents {
         info!(
             "  extent={} state={:?} start={} end={} epoch={:?} replicas={}",
