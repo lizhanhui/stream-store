@@ -39,6 +39,8 @@ pub const FLAG_EXTENT_PROGRESS: u8 = 0x01;
 pub const FLAG_FORWARD_APPEND: u8 = 0x00;
 /// Flag on FORWARD: init-extent notification (new extent metadata).
 pub const FLAG_FORWARD_INIT_EXTENT: u8 = 0x01;
+/// Flag on FORWARD: CRC32 checksum verification for sealed extent.
+pub const FLAG_FORWARD_CHECKSUM: u8 = 0x02;
 
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
