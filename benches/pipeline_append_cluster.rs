@@ -39,7 +39,7 @@ const BENCH_DURATION: Duration = Duration::from_secs(5);
 const NUM_SENDERS: usize = 4;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u16 = 2;
-const EXTENT_CAPACITY: usize = 64 * 1024 * 1024; // 64 MiB
+const EXTENT_CAPACITY: u32 = 64 * 1024 * 1024; // 64 MiB
 const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
 
 // -- Main ---------------------------------------------------------------------
@@ -57,7 +57,11 @@ async fn main() {
         .await
         .expect("connect to StreamManager");
     let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = stream_manager_client
-        .create_stream("bench-pipeline-cluster", REPLICATION_FACTOR, 0)
+        .create_stream(
+            "bench-pipeline-cluster",
+            REPLICATION_FACTOR,
+            EXTENT_CAPACITY,
+        )
         .await
         .expect("create_stream");
     info!(
