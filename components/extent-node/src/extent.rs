@@ -387,11 +387,22 @@ impl Extent {
             }
         }
 
+        // Update incremental CRC32 (single-writer — secondary processes forwards
+        // sequentially via TCP ordering + single connection read loop).
+        unsafe {
+            let h = &mut *self.hasher.get();
+            h.update(&(payload_len as u32).to_be_bytes());
+            if payload_len > 0 {
+                h.update(&payload);
+            }
+        }
+
         // Update cursors via plain store (single-writer on secondary).
+        // Records arrive in order (TCP ordering + serialized Mutex writes on primary +
+        // sequential frame processing on secondary), so these are always monotonic.
+        // The max() guards are kept as a defensive invariant.
         let new_write_cursor = byte_pos + record_len as u64;
         let new_count = seq + 1;
-
-        // Advance write_cursor to max(current, new) — records may arrive out of order.
         let current_wc = self.write_cursor.load(Ordering::Relaxed);
         if new_write_cursor > current_wc {
             self.write_cursor.store(new_write_cursor, Ordering::Relaxed);
@@ -548,10 +559,8 @@ impl Extent {
                 self.limit.store(final_count, Ordering::Release);
             }
 
-            // Finalize incremental CRC32 (primary path only).
-            // clone() is cheap (~40 bytes of internal state); finalize() consumes.
-            let crc = unsafe { (*self.hasher.get()).clone().finalize() };
-            self.finalized_crc32.store(crc, Ordering::Release);
+            // Finalize incremental CRC32 (primary path — all writers drained).
+            self.finalize_crc32();
 
             self.start_offset.0 + final_count
         }
@@ -571,6 +580,23 @@ impl Extent {
             return None;
         }
         Some(crc)
+    }
+
+    /// Finalize the incremental CRC32 hasher and store the result.
+    ///
+    /// Called when all records have been written: at seal time on the primary,
+    /// or when `ForwardChecksum` arrives on the secondary (after all Forward
+    /// frames have landed). Safe to call multiple times — subsequent calls
+    /// overwrite with the same value.
+    ///
+    /// # Safety contract
+    ///
+    /// Must not be called while a writer is concurrently appending/replicating.
+    /// On the primary, seal ensures `in_flight == 0`. On the secondary, this is
+    /// called from the same sequential connection read loop as `replicate()`.
+    pub fn finalize_crc32(&self) {
+        let crc = unsafe { (*self.hasher.get()).clone().finalize() };
+        self.finalized_crc32.store(crc, Ordering::Release);
     }
 
     /// Whether this sealed extent can still accept post-seal forwarded writes.
@@ -971,5 +997,42 @@ mod tests {
         let incremental = ext.finalized_crc32().unwrap();
         let full_hash = crc32fast::hash(&ext.committed_data());
         assert_eq!(incremental, full_hash);
+    }
+
+    #[test]
+    fn incremental_crc32_via_replicate() {
+        // Simulate primary appends to get reference data.
+        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let r0 = primary.append(Bytes::from_static(b"hello")).unwrap();
+        let r1 = primary.append(Bytes::from_static(b"world")).unwrap();
+        let r2 = primary.append(Bytes::from_static(b"!")).unwrap();
+        primary.seal(None);
+
+        // Simulate secondary receiving the same records via replicate().
+        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        secondary
+            .replicate(0, r0.byte_pos, Bytes::from_static(b"hello"))
+            .unwrap();
+        secondary
+            .replicate(1, r1.byte_pos, Bytes::from_static(b"world"))
+            .unwrap();
+        secondary
+            .replicate(2, r2.byte_pos, Bytes::from_static(b"!"))
+            .unwrap();
+
+        // Finalize on demand (as handle_forward_checksum would).
+        secondary.finalize_crc32();
+
+        let primary_crc = primary.finalized_crc32().unwrap();
+        let secondary_crc = secondary.finalized_crc32().unwrap();
+        assert_eq!(
+            primary_crc, secondary_crc,
+            "primary CRC32 ({:#010x}) != secondary CRC32 ({:#010x})",
+            primary_crc, secondary_crc,
+        );
+
+        // Also verify both match the full-extent hash.
+        let full_hash = crc32fast::hash(&primary.committed_data());
+        assert_eq!(primary_crc, full_hash);
     }
 }

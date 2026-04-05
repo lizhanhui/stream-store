@@ -1725,9 +1725,10 @@ impl ExtentNodeStore {
 
     /// Handle ForwardChecksum (0x0B, flag=0x02) — CRC32 verification for sealed extent.
     ///
-    /// Offloads the CRC32 computation to `spawn_blocking` so it doesn't block
-    /// the connection read task (which processes Forward/Watermark frames).
-    /// Fire-and-forget.
+    /// By the time this frame arrives, all Forward frames for the sealed extent
+    /// have been processed (TCP ordering guarantees this). The incremental CRC32
+    /// hasher has been updated on every `replicate()` call, so finalization is
+    /// O(1) — no arena scan needed. Fire-and-forget.
     fn handle_forward_checksum(&self, frame: Frame) {
         let (stream_id, extent_id, primary_crc32, primary_committed_bytes) =
             match &frame.variable_header {
@@ -1740,8 +1741,6 @@ impl ExtentNodeStore {
                 _ => return,
             };
 
-        // Grab the committed data (zero-copy Bytes slice) on this task,
-        // then offload the CPU-bound CRC32 hash to the blocking pool.
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
             None => {
@@ -1764,34 +1763,31 @@ impl ExtentNodeStore {
             }
         };
 
-        let committed_data = extent.committed_data();
-        drop(stream_ref);
+        // Finalize the secondary's incremental CRC32 — all forwards have arrived.
+        extent.finalize_crc32();
+        let secondary_crc32 = extent.finalized_crc32().unwrap_or(0);
+        let secondary_committed_bytes = extent.committed_data().len() as u64;
 
-        tokio::task::spawn_blocking(move || {
-            let secondary_crc32 = crc32fast::hash(&committed_data);
-            let secondary_committed_bytes = committed_data.len() as u64;
-
-            if secondary_crc32 != primary_crc32
-                || secondary_committed_bytes != primary_committed_bytes
-            {
-                warn!(
-                    "CRC32 checksum mismatch: stream={}, extent={}, \
-                     primary_crc32={:#010x}, secondary_crc32={:#010x}, \
-                     primary_bytes={}, secondary_bytes={}",
-                    stream_id,
-                    extent_id,
-                    primary_crc32,
-                    secondary_crc32,
-                    primary_committed_bytes,
-                    secondary_committed_bytes,
-                );
-            } else {
-                info!(
-                    "CRC32 checksum verified: stream={}, extent={}, crc32={:#010x}, bytes={}",
-                    stream_id, extent_id, primary_crc32, primary_committed_bytes,
-                );
-            }
-        });
+        if secondary_crc32 != primary_crc32
+            || secondary_committed_bytes != primary_committed_bytes
+        {
+            warn!(
+                "CRC32 checksum mismatch: stream={}, extent={}, \
+                 primary_crc32={:#010x}, secondary_crc32={:#010x}, \
+                 primary_bytes={}, secondary_bytes={}",
+                stream_id,
+                extent_id,
+                primary_crc32,
+                secondary_crc32,
+                primary_committed_bytes,
+                secondary_committed_bytes,
+            );
+        } else {
+            info!(
+                "CRC32 checksum verified: stream={}, extent={}, crc32={:#010x}, bytes={}",
+                stream_id, extent_id, primary_crc32, primary_committed_bytes,
+            );
+        }
     }
 
     fn handle_read(&self, frame: Frame) -> Frame {
