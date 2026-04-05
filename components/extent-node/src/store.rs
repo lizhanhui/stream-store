@@ -381,10 +381,14 @@ impl RequestHandler for ExtentNodeStore {
         match frame.opcode() {
             Opcode::Append => self.handle_append(frame, response_tx).await,
             Opcode::Forward => {
-                // Both Forward and ForwardInitExtent share opcode 0x0B.
+                // Forward, ForwardInitExtent, and ForwardChecksum share opcode 0x0B.
                 match &frame.variable_header {
                     VariableHeader::ForwardInitExtent { .. } => {
                         self.handle_forward_init_extent(frame);
+                        None // fire-and-forget, no response
+                    }
+                    VariableHeader::ForwardChecksum { .. } => {
+                        self.handle_forward_checksum(frame);
                         None // fire-and-forget, no response
                     }
                     _ => Some(self.handle_forward(frame)),
@@ -683,8 +687,9 @@ impl ExtentNodeStore {
             }
 
             // Send SM notification if we sealed.
-            if let Some(notif) = seal_notification {
-                self.send_extent_update(stream_id, &notif);
+            if let Some(ref notif) = seal_notification {
+                self.send_extent_update(stream_id, notif);
+                forward_work.extend(self.build_checksum_frames(stream_id, notif.sealed_extent_id));
             }
             self.flush_forward_work(forward_work).await;
             return retry_result;
@@ -964,6 +969,8 @@ impl ExtentNodeStore {
                 let seal_notification = self.seal_and_create_on_full(stream_id);
                 if let Some(ref notif) = seal_notification {
                     all_seal_notifications.push(notif.clone());
+                    all_forward_work
+                        .extend(self.build_checksum_frames(stream_id, notif.sealed_extent_id));
                 }
 
                 // Re-acquire read guard to retry the failed job and remaining jobs on the new extent.
@@ -1040,6 +1047,62 @@ impl ExtentNodeStore {
                 epoch: notif.epoch,
             });
         }
+    }
+
+    /// Build ForwardChecksum frames for secondaries after sealing an extent.
+    ///
+    /// Computes CRC32 of the sealed extent's committed data and creates a
+    /// ForwardChecksum frame for each secondary replica. Returns frames to be
+    /// appended to the forward_work batch.
+    fn build_checksum_frames(
+        &self,
+        stream_id: StreamId,
+        sealed_extent_id: ExtentId,
+    ) -> Vec<(String, Frame)> {
+        if self.downstream.get().is_none() {
+            return Vec::new();
+        }
+        let replica_addrs: Vec<String> = match self.replicas.get(&stream_id) {
+            Some(ri) => ri.replica_addrs.clone(),
+            None => return Vec::new(),
+        };
+        if replica_addrs.is_empty() {
+            return Vec::new();
+        }
+        let stream_ref = match self.streams.get(&stream_id) {
+            Some(s) => s,
+            None => return Vec::new(),
+        };
+        let extent = match stream_ref.find_extent(sealed_extent_id) {
+            Some(e) => e,
+            None => return Vec::new(),
+        };
+        let committed_data = extent.committed_data();
+        let checksum = crc32fast::hash(&committed_data);
+        let committed_bytes = committed_data.len() as u64;
+        drop(stream_ref);
+
+        info!(
+            "extent sealed: stream={}, extent={}, crc32={:#x}, bytes={}",
+            stream_id, sealed_extent_id, checksum, committed_bytes,
+        );
+
+        let mut frames = Vec::with_capacity(replica_addrs.len());
+        for addr in &replica_addrs {
+            frames.push((
+                addr.clone(),
+                Frame::new(
+                    VariableHeader::ForwardChecksum {
+                        stream_id,
+                        extent_id: sealed_extent_id,
+                        checksum,
+                        committed_bytes,
+                    },
+                    None,
+                ),
+            ));
+        }
+        frames
     }
 
     /// Optimized batch append: all frames share the same stream_id/extent_id.
@@ -1215,8 +1278,10 @@ impl ExtentNodeStore {
                         forward_work.extend(retry_forward);
                     }
                 }
-                if let Some(notif) = seal_notification {
-                    self.send_extent_update(stream_id, &notif);
+                if let Some(ref notif) = seal_notification {
+                    self.send_extent_update(stream_id, notif);
+                    forward_work
+                        .extend(self.build_checksum_frames(stream_id, notif.sealed_extent_id));
                 }
             }
             self.flush_forward_work(forward_work).await;
@@ -1378,8 +1443,9 @@ impl ExtentNodeStore {
                     forward_work.extend(retry_forward);
                 }
             }
-            if let Some(notif) = seal_notification {
-                self.send_extent_update(stream_id, &notif);
+            if let Some(ref notif) = seal_notification {
+                self.send_extent_update(stream_id, notif);
+                forward_work.extend(self.build_checksum_frames(stream_id, notif.sealed_extent_id));
             }
         }
 
@@ -1638,6 +1704,70 @@ impl ExtentNodeStore {
             },
             None,
         )
+    }
+
+    /// Handle ForwardChecksum (0x0B, flag=0x02) — CRC32 verification for sealed extent.
+    ///
+    /// Computes CRC32 of the local extent's committed data and compares with
+    /// the primary's checksum. Logs a warning on mismatch. Fire-and-forget.
+    fn handle_forward_checksum(&self, frame: Frame) {
+        let (stream_id, extent_id, primary_crc32, primary_committed_bytes) =
+            match &frame.variable_header {
+                VariableHeader::ForwardChecksum {
+                    stream_id,
+                    extent_id,
+                    checksum,
+                    committed_bytes,
+                } => (*stream_id, *extent_id, *checksum, *committed_bytes),
+                _ => return,
+            };
+
+        let stream_ref = match self.streams.get(&stream_id) {
+            Some(s) => s,
+            None => {
+                warn!(
+                    "ForwardChecksum for unknown stream {}, extent {}",
+                    stream_id, extent_id,
+                );
+                return;
+            }
+        };
+
+        let extent = match stream_ref.find_extent(extent_id) {
+            Some(e) => e,
+            None => {
+                warn!(
+                    "ForwardChecksum for unknown extent {} on stream {}",
+                    extent_id, stream_id,
+                );
+                return;
+            }
+        };
+
+        let committed_data = extent.committed_data();
+        let secondary_crc32 = crc32fast::hash(&committed_data);
+        let secondary_committed_bytes = committed_data.len() as u64;
+
+        if secondary_crc32 != primary_crc32
+            || secondary_committed_bytes != primary_committed_bytes
+        {
+            warn!(
+                "CRC32 checksum mismatch: stream={}, extent={}, \
+                 primary_crc32={:#010x}, secondary_crc32={:#010x}, \
+                 primary_bytes={}, secondary_bytes={}",
+                stream_id,
+                extent_id,
+                primary_crc32,
+                secondary_crc32,
+                primary_committed_bytes,
+                secondary_committed_bytes,
+            );
+        } else {
+            info!(
+                "CRC32 checksum verified: stream={}, extent={}, crc32={:#010x}, bytes={}",
+                stream_id, extent_id, primary_crc32, primary_committed_bytes,
+            );
+        }
     }
 
     fn handle_read(&self, frame: Frame) -> Frame {

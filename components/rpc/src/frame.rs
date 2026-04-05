@@ -2,7 +2,8 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_EPOCH_PRESENT, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
-    FLAG_FORWARD_APPEND, FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT,
+    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT,
+    FLAG_OFFSET_PRESENT,
     FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
@@ -175,6 +176,15 @@ pub enum VariableHeader {
         start_offset: Offset,
         extent_capacity: u32,
     },
+    /// CRC32 checksum verification (Forward, flag=0x02). Fire-and-forget.
+    /// Sent by primary after sealing an extent so secondaries can verify
+    /// data integrity of the replicated extent.
+    ForwardChecksum {
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        checksum: u32,
+        committed_bytes: u64,
+    },
     StreamManagerMembershipChange,
     DescribeStream {
         request_id: u32,
@@ -303,6 +313,7 @@ impl Frame {
             VariableHeader::Watermark { .. }
             | VariableHeader::Forward { .. }
             | VariableHeader::ForwardInitExtent { .. }
+            | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::UpdateExtentSealed { .. }
             | VariableHeader::UpdateExtentProgress { .. }
             | VariableHeader::StreamManagerMembershipChange => 0,
@@ -326,6 +337,7 @@ impl Frame {
             | VariableHeader::Watermark { stream_id, .. }
             | VariableHeader::Forward { stream_id, .. }
             | VariableHeader::ForwardInitExtent { stream_id, .. }
+            | VariableHeader::ForwardChecksum { stream_id, .. }
             | VariableHeader::UpdateExtentSealed { stream_id, .. }
             | VariableHeader::UpdateExtentProgress { stream_id, .. }
             | VariableHeader::ReportExtents { stream_id, .. }
@@ -369,6 +381,7 @@ impl Frame {
             | VariableHeader::RegisterExtent { extent_id, .. }
             | VariableHeader::Forward { extent_id, .. }
             | VariableHeader::ForwardInitExtent { extent_id, .. }
+            | VariableHeader::ForwardChecksum { extent_id, .. }
             | VariableHeader::DescribeExtent { extent_id, .. }
             | VariableHeader::Error { extent_id, .. } => *extent_id,
             _ => ExtentId(0),
@@ -455,6 +468,7 @@ impl Frame {
             VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
             VariableHeader::ForwardInitExtent { .. } => FLAG_FORWARD_INIT_EXTENT,
+            VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,
             _ => 0,
         };
         self.header.flags | computed
@@ -564,6 +578,8 @@ impl Frame {
             VariableHeader::Forward { .. } => 8 + 4 + 4 + 8 + 8,
             // stream_id(8) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4)
             VariableHeader::ForwardInitExtent { .. } => 8 + 4 + 4 + 8 + 4,
+            // stream_id(8) + extent_id(4) + checksum(4) + committed_bytes(8)
+            VariableHeader::ForwardChecksum { .. } => 8 + 4 + 4 + 8,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
             // request_id(4) + stream_id(8) + count(4)
@@ -811,6 +827,17 @@ impl Frame {
                 dst.put_u32(epoch.0);
                 dst.put_u64(start_offset.0);
                 dst.put_u32(*extent_capacity);
+            }
+            VariableHeader::ForwardChecksum {
+                stream_id,
+                extent_id,
+                checksum,
+                committed_bytes,
+            } => {
+                dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u32(*checksum);
+                dst.put_u64(*committed_bytes);
             }
             VariableHeader::StreamManagerMembershipChange => {
                 // no variable header fields, just payload
@@ -1219,40 +1246,57 @@ impl Frame {
             Opcode::Forward => {
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
-                let epoch = Epoch(body.get_u32());
                 match flags {
-                    FLAG_FORWARD_APPEND => {
-                        let offset = Offset(body.get_u64());
-                        let byte_pos = body.get_u64();
-                        let payload = Self::read_payload(body);
+                    FLAG_FORWARD_CHECKSUM => {
+                        let checksum = body.get_u32();
+                        let committed_bytes = body.get_u64();
                         Ok((
-                            VariableHeader::Forward {
+                            VariableHeader::ForwardChecksum {
                                 stream_id,
                                 extent_id,
-                                epoch,
-                                offset,
-                                byte_pos,
-                            },
-                            payload,
-                        ))
-                    }
-                    FLAG_FORWARD_INIT_EXTENT => {
-                        let start_offset = Offset(body.get_u64());
-                        let extent_capacity = body.get_u32();
-                        Ok((
-                            VariableHeader::ForwardInitExtent {
-                                stream_id,
-                                extent_id,
-                                epoch,
-                                start_offset,
-                                extent_capacity,
+                                checksum,
+                                committed_bytes,
                             },
                             None,
                         ))
                     }
-                    _ => Err(StorageError::Internal(format!(
-                        "unknown Forward flag: {flags:#x}"
-                    ))),
+                    _ => {
+                        let epoch = Epoch(body.get_u32());
+                        match flags {
+                            FLAG_FORWARD_APPEND => {
+                                let offset = Offset(body.get_u64());
+                                let byte_pos = body.get_u64();
+                                let payload = Self::read_payload(body);
+                                Ok((
+                                    VariableHeader::Forward {
+                                        stream_id,
+                                        extent_id,
+                                        epoch,
+                                        offset,
+                                        byte_pos,
+                                    },
+                                    payload,
+                                ))
+                            }
+                            FLAG_FORWARD_INIT_EXTENT => {
+                                let start_offset = Offset(body.get_u64());
+                                let extent_capacity = body.get_u32();
+                                Ok((
+                                    VariableHeader::ForwardInitExtent {
+                                        stream_id,
+                                        extent_id,
+                                        epoch,
+                                        start_offset,
+                                        extent_capacity,
+                                    },
+                                    None,
+                                ))
+                            }
+                            _ => Err(StorageError::Internal(format!(
+                                "unknown Forward flag: {flags:#x}"
+                            ))),
+                        }
+                    }
                 }
             }
             Opcode::StreamManagerMembershipChange => {
@@ -1455,9 +1499,9 @@ impl VariableHeader {
             | VariableHeader::UpdateExtentProgress { .. } => Opcode::UpdateExtent,
             VariableHeader::ReportExtents { .. } => Opcode::ReportExtents,
             VariableHeader::ReportExtentsResp { .. } => Opcode::ReportExtentsResp,
-            VariableHeader::Forward { .. } | VariableHeader::ForwardInitExtent { .. } => {
-                Opcode::Forward
-            }
+            VariableHeader::Forward { .. }
+            | VariableHeader::ForwardInitExtent { .. }
+            | VariableHeader::ForwardChecksum { .. } => Opcode::Forward,
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
             VariableHeader::DescribeStream { .. } => Opcode::DescribeStream,
             VariableHeader::DescribeStreamResp { .. } => Opcode::DescribeStreamResp,
