@@ -391,7 +391,7 @@ impl RequestHandler for ExtentNodeStore {
                         self.handle_forward_checksum(frame);
                         None // fire-and-forget, no response
                     }
-                    _ => Some(self.handle_forward(frame)),
+                    _ => self.handle_forward(frame),
                 }
             }
             Opcode::Read => Some(self.handle_read(frame)),
@@ -1570,8 +1570,9 @@ impl ExtentNodeStore {
     /// the primary. The stream/extent must already exist (created by a prior
     /// ForwardInitExtent or RegisterExtent).
     ///
-    /// Returns a cumulative Watermark with the contiguous committed offset.
-    fn handle_forward(&self, frame: Frame) -> Frame {
+    /// Returns a cumulative Watermark with the contiguous committed offset,
+    /// or None if the forward cannot be processed (bad frame, unknown stream, etc.).
+    fn handle_forward(&self, frame: Frame) -> Option<Frame> {
         let (stream_id, extent_id, _epoch, offset, byte_pos) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
@@ -1580,16 +1581,7 @@ impl ExtentNodeStore {
                 offset,
                 byte_pos,
             } => (*stream_id, *extent_id, *epoch, *offset, *byte_pos),
-            _ => {
-                return Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id: frame.stream_id(),
-                        extent_id: frame.extent_id(),
-                        offset: Offset(0),
-                    },
-                    None,
-                );
-            }
+            _ => return None,
         };
 
         // Look up the stream — must exist (created by ForwardInitExtent or RegisterExtent).
@@ -1600,14 +1592,7 @@ impl ExtentNodeStore {
                     "Forward for unknown stream {}, extent {} — missing ForwardInitExtent?",
                     stream_id, extent_id,
                 );
-                return Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        extent_id,
-                        offset: Offset(0),
-                    },
-                    None,
-                );
+                return None;
             }
         };
 
@@ -1620,31 +1605,12 @@ impl ExtentNodeStore {
 
         match replicate_result {
             Ok(_r) => {}
-            Err(StorageError::ExtentSealed(_)) | Err(StorageError::ExtentFull(_)) => {
-                let max_offset = stream_ref.max_offset();
-                return Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        extent_id,
-                        offset: max_offset,
-                    },
-                    None,
-                );
-            }
             Err(e) => {
                 warn!(
                     "Forward replicate failed for stream={}, extent={}: {}",
                     stream_id, extent_id, e,
                 );
-                let max_offset = stream_ref.max_offset();
-                return Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        extent_id,
-                        offset: max_offset,
-                    },
-                    None,
-                );
+                return None;
             }
         };
 
@@ -1657,36 +1623,32 @@ impl ExtentNodeStore {
 
         // Check if deferred CRC32 verification can now complete.
         // Also read the contiguous watermark for the response.
-        let watermark = match stream_ref.find_extent(extent_id) {
-            Some(ext) => {
-                match ext.try_verify_checksum() {
-                    Some(true) => {
-                        info!(
-                            "CRC32 checksum verified (deferred): stream={}, extent={}",
-                            stream_id, extent_id,
-                        );
-                    }
-                    Some(false) => {
-                        warn!(
-                            "CRC32 checksum mismatch (deferred): stream={}, extent={}",
-                            stream_id, extent_id,
-                        );
-                    }
-                    None => {} // not ready yet
-                }
-                ext.last_offset().unwrap_or(Offset(0))
+        let extent = stream_ref.find_extent(extent_id)?;
+        match extent.try_verify_checksum() {
+            Some(true) => {
+                info!(
+                    "CRC32 checksum verified (deferred): stream={}, extent={}",
+                    stream_id, extent_id,
+                );
             }
-            None => Offset(0),
-        };
+            Some(false) => {
+                warn!(
+                    "CRC32 checksum mismatch (deferred): stream={}, extent={}",
+                    stream_id, extent_id,
+                );
+            }
+            None => {} // not ready yet
+        }
+        let watermark = extent.last_offset()?;
 
-        Frame::new(
+        Some(Frame::new(
             VariableHeader::Watermark {
                 stream_id,
                 extent_id,
                 offset: watermark,
             },
             None,
-        )
+        ))
     }
 
     /// Handle ForwardChecksum (0x0B, flag=0x02) — CRC32 verification for sealed extent.
@@ -3133,7 +3095,7 @@ mod tests {
         }
 
         // After all late forwards have landed and the extent is fully sealed,
-        // further forwards should be rejected.
+        // further forwards should be rejected (no response).
         let resp = store
             .handle_frame(
                 Frame::new(
@@ -3148,12 +3110,11 @@ mod tests {
                 ),
                 None,
             )
-            .await
-            .unwrap();
-        // The secondary returns Watermark (not Error) for Forward frames
-        // to avoid triggering "unexpected opcode Error" warnings on the primary's
-        // downstream reader.
-        assert_eq!(resp.opcode(), Opcode::Watermark);
+            .await;
+        assert!(
+            resp.is_none(),
+            "forward beyond sealed limit should return None"
+        );
     }
 
     /// Test Bug 2 fix: handle_seal is idempotent — sealing twice returns SealAck both times.
