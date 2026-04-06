@@ -414,21 +414,8 @@ impl Extent {
             }
         }
 
-        // Update cursors via plain store (single-writer on secondary).
-        // Records may arrive out of order due to leader Mutex races. The max()
-        // guards handle this correctly.
-        let new_write_cursor = byte_pos + record_len as u64;
-        let new_count = seq + 1;
-        let current_wc = self.write_cursor.load(Ordering::Relaxed);
-        if new_write_cursor > current_wc {
-            self.write_cursor.store(new_write_cursor, Ordering::Relaxed);
-        }
-
-        // Advance record_count (high-water mark) to max(current, new).
-        let current_rc = self.record_count.load(Ordering::Relaxed);
-        if new_count > current_rc {
-            self.record_count.store(new_count, Ordering::Relaxed);
-        }
+        // Unconditionally increment record_count (each replicate is a distinct record).
+        self.record_count.fetch_add(1, Ordering::Relaxed);
 
         // Record in index before advancing committed state.
         self.index_record(seq, byte_pos);
