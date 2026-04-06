@@ -24,8 +24,10 @@ const MIN_RECORD_SIZE: u32 = 5;
 /// Forward-flags bitmap: checked and cleared under the downstream Mutex
 /// in `flush_forward_work()` to guarantee ordering relative to Forward frames.
 pub const FLAG_INIT_FORWARD: u8 = 0x01;
-/// Send ForwardChecksum after the last Forward for this extent.
-pub const FLAG_PENDING_CHECKSUM: u8 = 0x02;
+
+/// ForwardChecksum has been received from primary (secondary side).
+/// Used by `try_verify_checksum()` to know when to compare.
+const FLAG_CHECKSUM_RECEIVED: u8 = 0x02;
 
 /// Owns the raw heap allocation for an extent's arena buffer.
 /// Wrapped in `Arc` so that `Bytes` slices keep the buffer alive
@@ -159,13 +161,19 @@ pub struct Extent {
     /// Number of records appended. Updated by the single active writer.
     record_count: AtomicU64,
 
-    /// Committed sequence: all records with seq < committed_seq have been fully
-    /// written and are safe to read. Updated by the single active writer.
+    /// Committed sequence counter: all records with seq < committed_seq have been
+    /// fully written and are safe to read (gap-free).
+    /// - **Primary**: advanced inline in `append_inner()` (sequential writes).
+    /// - **Secondary**: advanced by `try_advance_committed()` which walks the index
+    ///   in order, ensuring contiguous progress even with out-of-order arrival.
+    ///   Watermark ACKs use this value to report gap-free progress to the primary.
     committed_seq: AtomicU64,
 
-    /// Committed byte position: the byte offset up to which all records are fully
-    /// written. Readers use this as the upper bound when walking the arena.
-    /// Updated by the single active writer.
+    /// Committed byte position: contiguous byte frontier.
+    /// - **Primary**: byte offset up to which all records are fully written
+    ///   (sequential writes). Readers use this as the upper bound.
+    /// - **Secondary**: advanced by `try_advance_committed()` alongside
+    ///   `committed_seq`, ensuring contiguous progress.
     committed_bytes: AtomicU64,
 
     /// Message limit for this extent.
@@ -182,23 +190,29 @@ pub struct Extent {
     /// Capacity = extent_capacity / MIN_RECORD_SIZE.
     index: Box<[AtomicU32]>,
 
-    /// Bitmap of deferred forward actions, checked under the downstream Mutex
-    /// in `flush_forward_work()`:
+    /// Bitmap of deferred forward actions:
     /// - `FLAG_INIT_FORWARD` (0x01): prepend ForwardInitExtent before first Forward
-    /// - `FLAG_PENDING_CHECKSUM` (0x02): append ForwardChecksum after last Forward
+    ///   (checked under downstream Mutex in `flush_forward_work()`)
+    /// - `FLAG_CHECKSUM_RECEIVED` (0x02): ForwardChecksum received from primary
+    ///   (secondary side, checked by `try_verify_checksum()`)
     forward_flags: AtomicU8,
 
-    /// Incremental CRC32 hasher, updated on every primary append.
-    /// Only valid on the primary side (single-writer guarantee from pipelined
-    /// group commit). Secondary replicas use full-extent hash on verify.
+    /// Incremental CRC32 hasher.
+    ///
+    /// - **Primary**: updated directly in `append_inner()` (single-writer guarantee
+    ///   from pipelined group commit).
+    /// - **Secondary**: updated via `try_advance_committed()` which walks the internal
+    ///   index in sequence order, handling out-of-order record arrival.
     ///
     /// `UnsafeCell` is used instead of `Mutex` because the single-writer
     /// invariant already guarantees exclusive access — same reasoning as
     /// `write_cursor`, `record_count`, etc.
     hasher: UnsafeCell<crc32fast::Hasher>,
 
-    /// Finalized CRC32 checksum, set at seal time on the primary.
-    /// 0 while the extent is still active (not yet sealed).
+    /// Finalized CRC32 checksum.
+    /// - **Primary**: set at seal time after all writers drain.
+    /// - **Secondary**: stores the primary's CRC32 from ForwardChecksum, used as
+    ///   the expected value for verification.
     finalized_crc32: AtomicU32,
 }
 
@@ -273,14 +287,6 @@ impl Extent {
     /// Returns `true` if the flag was set (i.e., caller should prepend ForwardInitExtent).
     pub fn take_init_forward(&self) -> bool {
         self.forward_flags.fetch_and(!FLAG_INIT_FORWARD, Ordering::AcqRel) & FLAG_INIT_FORWARD != 0
-    }
-
-    /// Atomically check and clear the `FLAG_PENDING_CHECKSUM` bit.
-    /// Returns `true` if the flag was set (i.e., caller should append ForwardChecksum).
-    pub fn take_pending_checksum(&self) -> bool {
-        self.forward_flags.fetch_and(!FLAG_PENDING_CHECKSUM, Ordering::AcqRel)
-            & FLAG_PENDING_CHECKSUM
-            != 0
     }
 
     /// Append a message. Returns the assigned logical offset and the byte
@@ -367,9 +373,10 @@ impl Extent {
     /// `byte_pos` and sequence number as the primary, ensuring bit-for-bit
     /// identical arena layouts across replicas.
     ///
-    /// Unlike `append()`, this method is **single-writer** (one secondary
-    /// processes forwards sequentially), so it uses plain `store()` instead
-    /// of `fetch_add`/CAS. No `in_flight` tracking is needed.
+    /// CRC32 is **not** computed inline here because records may arrive out of
+    /// order (multiple leaders race for the downstream `Mutex<FrameWrite>`).
+    /// Instead, `try_advance_committed()` walks the index in sequence order after
+    /// each replicate, hashing as many consecutive records as are available.
     ///
     /// Returns the logical offset (`start_offset + seq`) on success.
     pub fn replicate(
@@ -403,20 +410,9 @@ impl Extent {
             }
         }
 
-        // Update incremental CRC32 (single-writer — secondary processes forwards
-        // sequentially via TCP ordering + single connection read loop).
-        unsafe {
-            let h = &mut *self.hasher.get();
-            h.update(&(payload_len as u32).to_be_bytes());
-            if payload_len > 0 {
-                h.update(&payload);
-            }
-        }
-
         // Update cursors via plain store (single-writer on secondary).
-        // Records arrive in order (TCP ordering + serialized Mutex writes on primary +
-        // sequential frame processing on secondary), so these are always monotonic.
-        // The max() guards are kept as a defensive invariant.
+        // Records may arrive out of order due to leader Mutex races. The max()
+        // guards handle this correctly.
         let new_write_cursor = byte_pos + record_len as u64;
         let new_count = seq + 1;
         let current_wc = self.write_cursor.load(Ordering::Relaxed);
@@ -424,17 +420,19 @@ impl Extent {
             self.write_cursor.store(new_write_cursor, Ordering::Relaxed);
         }
 
-        // Advance record_count to max(current, new).
+        // Advance record_count (high-water mark) to max(current, new).
         let current_rc = self.record_count.load(Ordering::Relaxed);
         if new_count > current_rc {
             self.record_count.store(new_count, Ordering::Relaxed);
         }
 
-        // Update committed state.
-        self.committed_bytes
-            .store(new_write_cursor, Ordering::Release);
+        // Record in index before advancing committed state.
         self.index_record(seq, byte_pos);
-        self.committed_seq.store(new_count, Ordering::Release);
+
+        // Advance committed_seq, committed_bytes, and CRC32 contiguously by
+        // walking the index from the current committed_seq. This ensures
+        // watermark ACKs reflect gap-free progress and CRC32 is in order.
+        self.try_advance_committed();
 
         Ok(AppendResult {
             offset: Offset(self.start_offset.0 + seq),
@@ -578,11 +576,6 @@ impl Extent {
             // Finalize incremental CRC32 (primary path — all writers drained).
             self.finalize_crc32();
 
-            // Signal that ForwardChecksum should be sent after the last Forward
-            // for this extent. Checked under the downstream Mutex in flush_forward_work().
-            self.forward_flags
-                .fetch_or(FLAG_PENDING_CHECKSUM, Ordering::Release);
-
             self.start_offset.0 + final_count
         }
     }
@@ -605,19 +598,120 @@ impl Extent {
 
     /// Finalize the incremental CRC32 hasher and store the result.
     ///
-    /// Called when all records have been written: at seal time on the primary,
-    /// or when `ForwardChecksum` arrives on the secondary (after all Forward
-    /// frames have landed). Safe to call multiple times — subsequent calls
-    /// overwrite with the same value.
+    /// Called at seal time on the primary (all writers drained). On secondaries,
+    /// called by `try_verify_checksum()` after `try_advance_committed()` has caught up.
     ///
     /// # Safety contract
     ///
     /// Must not be called while a writer is concurrently appending/replicating.
     /// On the primary, seal ensures `in_flight == 0`. On the secondary, this is
     /// called from the same sequential connection read loop as `replicate()`.
-    pub fn finalize_crc32(&self) {
+    fn finalize_crc32(&self) {
         let crc = unsafe { (*self.hasher.get()).clone().finalize() };
         self.finalized_crc32.store(crc, Ordering::Release);
+    }
+
+    /// Advance `committed_seq`, `committed_bytes`, and incremental CRC32 by
+    /// walking the index in sequence order from the current `committed_seq`.
+    ///
+    /// For each consecutive populated index entry, reads the record at that
+    /// byte_pos from the arena, hashes `[len:u32 BE][payload]`, and advances
+    /// both committed cursors. Stops at the first gap (unpopulated entry).
+    ///
+    /// On the primary this is a no-op (committed_seq is already advanced inline
+    /// in `append_inner`). On secondaries, records may arrive out of order, so
+    /// this method is the sole mechanism for advancing committed state — ensuring
+    /// watermark ACKs reflect contiguous progress and CRC32 is computed in the
+    /// correct sequence.
+    ///
+    /// Amortized O(1) per replicate call.
+    ///
+    /// # Safety contract
+    ///
+    /// Same as `replicate()` — single connection read loop on secondaries.
+    pub fn try_advance_committed(&self) {
+        let h = unsafe { &mut *self.hasher.get() };
+        let mut seq = self.committed_seq.load(Ordering::Relaxed);
+
+        loop {
+            let idx = seq as usize;
+            if idx >= self.index.len() {
+                break;
+            }
+            let val = self.index[idx].load(Ordering::Acquire);
+            if val == INDEX_UNSET {
+                break; // gap — record not yet replicated
+            }
+            let byte_pos = (val - 1) as usize;
+
+            // Read [len:4 BE][payload] from arena at byte_pos.
+            let len = u32::from_be_bytes(unsafe {
+                [
+                    *self.buf.add(byte_pos),
+                    *self.buf.add(byte_pos + 1),
+                    *self.buf.add(byte_pos + 2),
+                    *self.buf.add(byte_pos + 3),
+                ]
+            });
+            h.update(&len.to_be_bytes());
+            if len > 0 {
+                let payload =
+                    unsafe { std::slice::from_raw_parts(self.buf.add(byte_pos + 4), len as usize) };
+                h.update(payload);
+            }
+
+            let record_end = byte_pos as u64 + 4 + len as u64;
+            seq += 1;
+
+            // Advance committed state.
+            self.committed_bytes.store(record_end, Ordering::Release);
+            self.committed_seq.store(seq, Ordering::Release);
+        }
+    }
+
+    /// Store the primary's CRC32 checksum from a ForwardChecksum frame.
+    ///
+    /// Sets `FLAG_CHECKSUM_RECEIVED` on `forward_flags` to indicate the primary
+    /// checksum has been received on this secondary.
+    ///
+    /// committed_bytes is not stored separately — if CRC32 matches, byte layout
+    /// is guaranteed identical (same byte_pos assignments, same record format).
+    pub fn store_primary_checksum(&self, crc32: u32) {
+        self.finalized_crc32.store(crc32, Ordering::Release);
+        self.forward_flags
+            .fetch_or(FLAG_CHECKSUM_RECEIVED, Ordering::Release);
+    }
+
+    /// Attempt to verify the CRC32 checksum against the primary's value.
+    ///
+    /// Returns:
+    /// - `None` if not ready (ForwardChecksum not received or not all records hashed)
+    /// - `Some(true)` if CRC32 matches the primary's value
+    /// - `Some(false)` if mismatch detected
+    ///
+    /// When ready, finalizes the local hasher and compares with the stored primary CRC32.
+    pub fn try_verify_checksum(&self) -> Option<bool> {
+        // Check if ForwardChecksum has been received.
+        let flags = self.forward_flags.load(Ordering::Acquire);
+        if flags & FLAG_CHECKSUM_RECEIVED == 0 {
+            return None;
+        }
+
+        // Check if we've committed all records up to the sealed limit.
+        let limit = self.limit.load(Ordering::Acquire);
+        if limit == LIMIT_OPEN {
+            return None; // not sealed
+        }
+        let committed = self.committed_seq.load(Ordering::Acquire);
+        if committed < limit {
+            return None; // still have gaps
+        }
+
+        // All records hashed — finalize and compare.
+        let local_crc = unsafe { (*self.hasher.get()).clone().finalize() };
+        let primary_crc = self.finalized_crc32.load(Ordering::Acquire);
+
+        Some(local_crc == primary_crc)
     }
 
     /// Whether this sealed extent can still accept post-seal forwarded writes.
@@ -1029,7 +1123,7 @@ mod tests {
         let r2 = primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
-        // Simulate secondary receiving the same records via replicate().
+        // Simulate secondary receiving the same records via replicate() IN ORDER.
         let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         secondary
             .replicate(0, r0.byte_pos, Bytes::from_static(b"hello"))
@@ -1041,19 +1135,89 @@ mod tests {
             .replicate(2, r2.byte_pos, Bytes::from_static(b"!"))
             .unwrap();
 
-        // Finalize on demand (as handle_forward_checksum would).
-        secondary.finalize_crc32();
-
+        // After in-order replicate, try_advance_committed (called inside replicate)
+        // should have hashed all 3 records.
+        // Seal the secondary to set the limit, then store primary checksum.
+        secondary.seal(Some(3));
         let primary_crc = primary.finalized_crc32().unwrap();
-        let secondary_crc = secondary.finalized_crc32().unwrap();
-        assert_eq!(
-            primary_crc, secondary_crc,
-            "primary CRC32 ({:#010x}) != secondary CRC32 ({:#010x})",
-            primary_crc, secondary_crc,
-        );
+        secondary.store_primary_checksum(primary_crc);
+        secondary.try_advance_committed();
+
+        // Verification should succeed.
+        assert_eq!(secondary.try_verify_checksum(), Some(true));
 
         // Also verify both match the full-extent hash.
         let full_hash = crc32fast::hash(&primary.committed_data());
         assert_eq!(primary_crc, full_hash);
+    }
+
+    #[test]
+    fn crc32_out_of_order_replicate() {
+        // Simulate primary appends to get reference data.
+        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let r0 = primary.append(Bytes::from_static(b"hello")).unwrap();
+        let r1 = primary.append(Bytes::from_static(b"world")).unwrap();
+        let r2 = primary.append(Bytes::from_static(b"!")).unwrap();
+        primary.seal(None);
+
+        // Simulate secondary receiving records OUT OF ORDER (leader Mutex race).
+        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+
+        // Record 2 arrives first.
+        secondary
+            .replicate(2, r2.byte_pos, Bytes::from_static(b"!"))
+            .unwrap();
+
+        // Record 0 arrives next.
+        secondary
+            .replicate(0, r0.byte_pos, Bytes::from_static(b"hello"))
+            .unwrap();
+
+        // Record 1 arrives last.
+        secondary
+            .replicate(1, r1.byte_pos, Bytes::from_static(b"world"))
+            .unwrap();
+
+        // Seal and store primary checksum.
+        secondary.seal(Some(3));
+        let primary_crc = primary.finalized_crc32().unwrap();
+        secondary.store_primary_checksum(primary_crc);
+        secondary.try_advance_committed();
+
+        // Verification should succeed despite out-of-order arrival.
+        assert_eq!(secondary.try_verify_checksum(), Some(true));
+    }
+
+    #[test]
+    fn crc32_forward_checksum_arrives_early() {
+        // ForwardChecksum arrives before all records (leader Mutex race).
+        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let r0 = primary.append(Bytes::from_static(b"hello")).unwrap();
+        let r1 = primary.append(Bytes::from_static(b"world")).unwrap();
+        primary.seal(None);
+
+        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+
+        // Only record 1 arrives first (out of order).
+        secondary
+            .replicate(1, r1.byte_pos, Bytes::from_static(b"world"))
+            .unwrap();
+
+        // ForwardChecksum arrives (but record 0 is still missing).
+        secondary.seal(Some(2));
+        let primary_crc = primary.finalized_crc32().unwrap();
+        secondary.store_primary_checksum(primary_crc);
+        secondary.try_advance_committed();
+
+        // Not ready — record 0 still missing.
+        assert_eq!(secondary.try_verify_checksum(), None);
+
+        // Record 0 arrives.
+        secondary
+            .replicate(0, r0.byte_pos, Bytes::from_static(b"hello"))
+            .unwrap();
+
+        // Now all records present — verification should auto-complete.
+        assert_eq!(secondary.try_verify_checksum(), Some(true));
     }
 }
