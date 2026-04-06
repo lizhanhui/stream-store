@@ -1577,7 +1577,7 @@ impl ExtentNodeStore {
     /// Returns a cumulative Watermark with the contiguous committed offset,
     /// or None if the forward cannot be processed (bad frame, unknown stream, etc.).
     fn handle_forward(&self, frame: Frame) -> Option<Frame> {
-        let (stream_id, extent_id, epoch, offset, byte_pos) = match &frame.variable_header {
+        let (stream_id, extent_id, _epoch, offset, byte_pos) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
                 extent_id,
@@ -1599,41 +1599,6 @@ impl ExtentNodeStore {
                 return None;
             }
         };
-
-        // Lazy extent creation: if the extent doesn't exist on this secondary,
-        // create it now. This handles the race where a new leader on the primary
-        // flushes Forward frames for a new extent before the previous leader's
-        // ForwardInitExtent arrives (due to independent flush_forward_work calls
-        // serializing on the downstream writer Mutex in arbitrary order).
-        if stream_ref.find_extent(extent_id).is_none() {
-            drop(stream_ref);
-            if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-                // Double-check under write lock (another Forward may have created it).
-                if stream_mut.find_extent(extent_id).is_none() {
-                    let start_offset = stream_mut.max_offset();
-                    let capacity = stream_mut.extent_capacity();
-                    stream_mut.register_extent(extent_id, start_offset, capacity, epoch);
-                    info!(
-                        "lazy extent creation on Forward: stream={}, extent={}, start_offset={}, capacity={}",
-                        stream_id, extent_id, start_offset, capacity,
-                    );
-                }
-                drop(stream_mut);
-            }
-            // Re-acquire read ref.
-            match self.streams.get(&stream_id) {
-                Some(s) => {
-                    let replicate_result = s.replicate(
-                        extent_id,
-                        offset,
-                        byte_pos,
-                        frame.payload.clone().unwrap_or_default(),
-                    );
-                    return self.finish_forward(s, stream_id, extent_id, replicate_result, &frame);
-                }
-                None => return None,
-            }
-        }
 
         let replicate_result = stream_ref.replicate(
             extent_id,

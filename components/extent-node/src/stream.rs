@@ -4,6 +4,7 @@ use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, ExtentState, Offset, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use tracing::error;
 
 use crate::extent::{AppendResult, Extent};
 use crate::store::AppendJob;
@@ -125,6 +126,7 @@ impl Stream {
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
         let extent = self.find_extent(extent_id).ok_or_else(|| {
+            error!("Stream: {}, Extent: {} is not found", self.id, extent_id);
             StorageError::Internal(format!(
                 "stream {}: extent {} not found",
                 self.id, extent_id
