@@ -121,23 +121,25 @@ impl DownstreamPool {
     }
 
     /// Get an existing writer or create a new connection.
+    ///
+    /// Holds the connections lock across `create_connection` to prevent multiple
+    /// concurrent TCP connections to the same address. Without this, concurrent
+    /// callers could each create a connection, and Forward frames sent on an
+    /// orphaned (overwritten) connection would arrive at the secondary before
+    /// ForwardInitExtent on the surviving connection — causing permanent gaps.
     pub async fn get_or_create_writer(
         &self,
         addr: &str,
     ) -> Option<Arc<Mutex<FramedWrite<OwnedWriteHalf, FrameCodec>>>> {
-        // Fast path: check if connection already exists.
-        {
-            let conns = self.connections.lock().await;
-            if let Some(writer) = conns.get(addr) {
-                return Some(Arc::clone(writer));
-            }
+        let mut conns = self.connections.lock().await;
+        if let Some(writer) = conns.get(addr) {
+            return Some(Arc::clone(writer));
         }
 
-        // Slow path: create a new connection.
+        // Create connection while holding the lock — no other caller can race us.
         match self.create_connection(addr).await {
             Ok(writer) => {
                 let writer = Arc::new(Mutex::new(writer));
-                let mut conns = self.connections.lock().await;
                 conns.insert(addr.to_string(), Arc::clone(&writer));
                 Some(writer)
             }
