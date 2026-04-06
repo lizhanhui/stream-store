@@ -372,7 +372,7 @@ impl Extent {
     /// Replicate a record at the exact position assigned by the primary.
     ///
     /// This method is used by secondaries to write records at the same
-    /// `byte_pos` and sequence number as the primary, ensuring bit-for-bit
+    /// `byte_pos` and logical offset as the primary, ensuring bit-for-bit
     /// identical arena layouts across replicas.
     ///
     /// CRC32 is **not** computed inline here because records may arrive out of
@@ -380,13 +380,15 @@ impl Extent {
     /// Instead, `try_advance_committed()` walks the index in sequence order after
     /// each replicate, hashing as many consecutive records as are available.
     ///
-    /// Returns the logical offset (`start_offset + seq`) on success.
+    /// Returns the logical offset on success.
     pub fn replicate(
         &self,
-        seq: u64,
+        offset: Offset,
         byte_pos: u64,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
+        let seq = offset.0 - self.start_offset.0;
+
         // Check seal limit.
         let limit = self.limit.load(Ordering::Acquire);
         if limit != LIMIT_OPEN && seq >= limit {
@@ -437,7 +439,7 @@ impl Extent {
         self.try_advance_committed();
 
         Ok(AppendResult {
-            offset: Offset(self.start_offset.0 + seq),
+            offset,
             byte_pos,
         })
     }
@@ -950,16 +952,16 @@ mod tests {
         // Simulate a secondary receiving 3 records from the primary.
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
-        let r0 = ext.replicate(0, 0, Bytes::from_static(b"msg0")).unwrap();
+        let r0 = ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0")).unwrap();
         assert_eq!(r0.offset, Offset(0));
         assert_eq!(r0.byte_pos, 0);
 
         // "msg0" = 4 bytes payload, record = 4 + 4 = 8 bytes
-        let r1 = ext.replicate(1, 8, Bytes::from_static(b"msg1")).unwrap();
+        let r1 = ext.replicate(Offset(1), 8, Bytes::from_static(b"msg1")).unwrap();
         assert_eq!(r1.offset, Offset(1));
         assert_eq!(r1.byte_pos, 8);
 
-        let r2 = ext.replicate(2, 16, Bytes::from_static(b"msg2")).unwrap();
+        let r2 = ext.replicate(Offset(2), 16, Bytes::from_static(b"msg2")).unwrap();
         assert_eq!(r2.offset, Offset(2));
         assert_eq!(r2.byte_pos, 16);
 
@@ -990,7 +992,7 @@ mod tests {
         for payload in &payloads {
             let result = primary.append(payload.clone()).unwrap();
             secondary
-                .replicate(result.offset.0, result.byte_pos, payload.clone())
+                .replicate(result.offset, result.byte_pos, payload.clone())
                 .unwrap();
         }
 
@@ -1002,11 +1004,11 @@ mod tests {
     #[test]
     fn replicate_sealed_extent_rejects() {
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
-        ext.replicate(0, 0, Bytes::from_static(b"msg0")).unwrap();
+        ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0")).unwrap();
         ext.seal(Some(1)); // seal at 1 record
 
-        // Replicate at seq=1 (at limit) should fail.
-        let result = ext.replicate(1, 8, Bytes::from_static(b"msg1"));
+        // Replicate at offset=1 (at limit) should fail.
+        let result = ext.replicate(Offset(1), 8, Bytes::from_static(b"msg1"));
         assert!(matches!(result, Err(StorageError::ExtentSealed(_))));
     }
 
@@ -1129,13 +1131,13 @@ mod tests {
         // Simulate secondary receiving the same records via replicate() IN ORDER.
         let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         secondary
-            .replicate(0, r0.byte_pos, Bytes::from_static(b"hello"))
+            .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
             .unwrap();
         secondary
-            .replicate(1, r1.byte_pos, Bytes::from_static(b"world"))
+            .replicate(Offset(1), r1.byte_pos, Bytes::from_static(b"world"))
             .unwrap();
         secondary
-            .replicate(2, r2.byte_pos, Bytes::from_static(b"!"))
+            .replicate(Offset(2), r2.byte_pos, Bytes::from_static(b"!"))
             .unwrap();
 
         // After in-order replicate, try_advance_committed (called inside replicate)
@@ -1168,17 +1170,17 @@ mod tests {
 
         // Record 2 arrives first.
         secondary
-            .replicate(2, r2.byte_pos, Bytes::from_static(b"!"))
+            .replicate(Offset(2), r2.byte_pos, Bytes::from_static(b"!"))
             .unwrap();
 
         // Record 0 arrives next.
         secondary
-            .replicate(0, r0.byte_pos, Bytes::from_static(b"hello"))
+            .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
             .unwrap();
 
         // Record 1 arrives last.
         secondary
-            .replicate(1, r1.byte_pos, Bytes::from_static(b"world"))
+            .replicate(Offset(1), r1.byte_pos, Bytes::from_static(b"world"))
             .unwrap();
 
         // Seal and store primary checksum.
@@ -1203,7 +1205,7 @@ mod tests {
 
         // Only record 1 arrives first (out of order).
         secondary
-            .replicate(1, r1.byte_pos, Bytes::from_static(b"world"))
+            .replicate(Offset(1), r1.byte_pos, Bytes::from_static(b"world"))
             .unwrap();
 
         // ForwardChecksum arrives (but record 0 is still missing).
@@ -1217,7 +1219,7 @@ mod tests {
 
         // Record 0 arrives.
         secondary
-            .replicate(0, r0.byte_pos, Bytes::from_static(b"hello"))
+            .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
             .unwrap();
 
         // Now all records present — verification should auto-complete.

@@ -1624,7 +1624,6 @@ impl ExtentNodeStore {
                 );
             }
         };
-        let seq = offset.0 - extent.start_offset.0;
         drop(stream_ref);
 
         // Re-acquire read ref for replicate.
@@ -1643,7 +1642,7 @@ impl ExtentNodeStore {
 
         let replicate_result = stream_ref.replicate(
             extent_id,
-            seq,
+            offset,
             byte_pos,
             frame.payload.clone().unwrap_or_default(),
         );
