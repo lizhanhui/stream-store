@@ -396,7 +396,7 @@ impl RequestHandler for ExtentNodeStore {
             }
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
-            Opcode::Seal => Some(self.handle_seal(frame).await),
+            Opcode::Seal => Some(self.handle_seal(frame)),
             Opcode::RegisterExtent => Some(self.handle_register_extent(frame)),
             Opcode::Connect => Some(Frame::new(
                 VariableHeader::ConnectAck {
@@ -683,16 +683,14 @@ impl ExtentNodeStore {
                 forward_work.extend(batch_forward);
                 for notif in &batch_seals {
                     self.send_extent_update(stream_id, notif);
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id)
-                        .await;
+                    forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
                 }
             }
 
             // Send SM notification and ForwardChecksum if we sealed.
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                self.send_forward_checksum(stream_id, notif.sealed_extent_id)
-                    .await;
+                forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
             }
             self.flush_forward_work(forward_work).await;
             return retry_result;
@@ -1048,30 +1046,34 @@ impl ExtentNodeStore {
         }
     }
 
-    /// Send ForwardChecksum to all secondaries for a sealed extent (fire-and-forget).
+    /// Build a ForwardChecksum forward-work item for a sealed extent.
     ///
-    /// Called immediately after primary seal — no need to piggyback on the Forward
-    /// Mutex since the secondary defers verification via `try_verify_checksum()`.
-    async fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
-        let pool = match self.downstream.get() {
-            Some(p) => p,
-            None => return,
-        };
+    /// Returns the (replica_addrs, Frame) pair to be appended to forward_work
+    /// and sent via `flush_forward_work()` alongside Forward frames.
+    /// Fire-and-forget: the secondary defers verification via `try_verify_checksum()`.
+    fn build_forward_checksum(
+        &self,
+        stream_id: StreamId,
+        sealed_extent_id: ExtentId,
+    ) -> Option<(Vec<String>, Frame)> {
         let addrs = match self.replicas.get(&stream_id) {
             Some(ri) if ri.is_primary() && !ri.replica_addrs.is_empty() => {
                 ri.replica_addrs.clone()
             }
-            _ => return,
+            _ => return None,
         };
         let (checksum, committed_bytes) = match self.streams.get(&stream_id) {
             Some(stream_ref) => match stream_ref.find_extent(sealed_extent_id) {
-                Some(ext) => (ext.finalized_crc32().unwrap_or(0), ext.committed_data().len() as u64),
-                None => return,
+                Some(ext) => (
+                    ext.finalized_crc32().unwrap_or(0),
+                    ext.committed_data().len() as u64,
+                ),
+                None => return None,
             },
-            None => return,
+            None => return None,
         };
         info!(
-            "sending ForwardChecksum: stream={}, extent={}, crc32={:#x}, bytes={}",
+            "ForwardChecksum queued: stream={}, extent={}, crc32={:#x}, bytes={}",
             stream_id, sealed_extent_id, checksum, committed_bytes,
         );
         let frame = Frame::new(
@@ -1083,9 +1085,7 @@ impl ExtentNodeStore {
             },
             None,
         );
-        for addr in &addrs {
-            pool.forward(addr, frame.clone()).await;
-        }
+        Some((addrs, frame))
     }
 
     /// Optimized batch append: all frames share the same stream_id/extent_id.
@@ -1241,8 +1241,7 @@ impl ExtentNodeStore {
                 forward_work.extend(batch_forward);
                 for notif in batch_seals {
                     self.send_extent_update(stream_id, &notif);
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id)
-                        .await;
+                    forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
                 }
             }
             if extent_full {
@@ -1265,8 +1264,7 @@ impl ExtentNodeStore {
                 }
                 if let Some(ref notif) = seal_notification {
                     self.send_extent_update(stream_id, notif);
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id)
-                        .await;
+                    forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
                 }
                 self.flush_forward_work(forward_work).await;
             } else {
@@ -1407,8 +1405,7 @@ impl ExtentNodeStore {
             forward_work.extend(batch_forward);
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
-                self.send_forward_checksum(stream_id, notif.sealed_extent_id)
-                    .await;
+                forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
             }
         }
 
@@ -1432,8 +1429,7 @@ impl ExtentNodeStore {
             }
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                self.send_forward_checksum(stream_id, notif.sealed_extent_id)
-                    .await;
+                forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
             }
         }
 
@@ -1926,7 +1922,7 @@ impl ExtentNodeStore {
         )
     }
 
-    async fn handle_seal(&self, frame: Frame) -> Frame {
+    fn handle_seal(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
         let extent_id = frame.extent_id();
         // Extract the committed offset from the Seal frame, if present.
@@ -2010,8 +2006,18 @@ impl ExtentNodeStore {
                     extent_id, stream_id
                 );
                 // Primary seals finalize CRC32 — send checksum to secondaries.
+                // SM-initiated seal has no forward_work batch, so spawn directly.
                 if is_primary_seal {
-                    self.send_forward_checksum(stream_id, extent_id).await;
+                    if let Some((addrs, frame)) = self.build_forward_checksum(stream_id, extent_id) {
+                        if let Some(pool) = self.downstream.get() {
+                            let pool = Arc::clone(pool);
+                            tokio::spawn(async move {
+                                for addr in &addrs {
+                                    pool.forward(addr, frame.clone()).await;
+                                }
+                            });
+                        }
+                    }
                 }
                 Frame::new(
                     VariableHeader::SealAck {
