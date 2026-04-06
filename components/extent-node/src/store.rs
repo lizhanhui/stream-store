@@ -1570,7 +1570,7 @@ impl ExtentNodeStore {
     /// the primary. The stream/extent must already exist (created by a prior
     /// ForwardInitExtent or RegisterExtent).
     ///
-    /// Returns a cumulative Watermark with the highest written offset.
+    /// Returns a cumulative Watermark with the contiguous committed offset.
     fn handle_forward(&self, frame: Frame) -> Frame {
         let (stream_id, extent_id, _epoch, offset, byte_pos) = match &frame.variable_header {
             VariableHeader::Forward {
@@ -1611,43 +1611,6 @@ impl ExtentNodeStore {
             }
         };
 
-        // Compute seq from the extent's start_offset.
-        match stream_ref.find_extent(extent_id) {
-            Some(e) => e,
-            None => {
-                warn!(
-                    "Forward for unknown extent {} on stream {} — missing ForwardInitExtent?",
-                    extent_id, stream_id,
-                );
-                let max_offset = stream_ref.max_offset();
-                drop(stream_ref);
-                return Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        extent_id,
-                        offset: max_offset,
-                    },
-                    None,
-                );
-            }
-        };
-        drop(stream_ref);
-
-        // Re-acquire read ref for replicate.
-        let stream_ref = match self.streams.get(&stream_id) {
-            Some(s) => s,
-            None => {
-                return Frame::new(
-                    VariableHeader::Watermark {
-                        stream_id,
-                        extent_id,
-                        offset: Offset(0),
-                    },
-                    None,
-                );
-            }
-        };
-
         let replicate_result = stream_ref.replicate(
             extent_id,
             offset,
@@ -1656,12 +1619,9 @@ impl ExtentNodeStore {
         );
 
         match replicate_result {
-            Ok(_r) => {
-                drop(stream_ref);
-            }
+            Ok(_r) => {}
             Err(StorageError::ExtentSealed(_)) | Err(StorageError::ExtentFull(_)) => {
                 let max_offset = stream_ref.max_offset();
-                drop(stream_ref);
                 return Frame::new(
                     VariableHeader::Watermark {
                         stream_id,
@@ -1677,7 +1637,6 @@ impl ExtentNodeStore {
                     stream_id, extent_id, e,
                 );
                 let max_offset = stream_ref.max_offset();
-                drop(stream_ref);
                 return Frame::new(
                     VariableHeader::Watermark {
                         stream_id,
@@ -1697,11 +1656,9 @@ impl ExtentNodeStore {
         );
 
         // Check if deferred CRC32 verification can now complete.
-        // This handles the case where ForwardChecksum arrived before all
-        // Forward frames due to leader Mutex races on the primary.
         // Also read the contiguous watermark for the response.
-        let watermark = if let Some(stream_ref) = self.streams.get(&stream_id) {
-            if let Some(ext) = stream_ref.find_extent(extent_id) {
+        let watermark = match stream_ref.find_extent(extent_id) {
+            Some(ext) => {
                 match ext.try_verify_checksum() {
                     Some(true) => {
                         info!(
@@ -1718,11 +1675,8 @@ impl ExtentNodeStore {
                     None => {} // not ready yet
                 }
                 ext.last_offset().unwrap_or(Offset(0))
-            } else {
-                Offset(0)
             }
-        } else {
-            Offset(0)
+            None => Offset(0),
         };
 
         Frame::new(
