@@ -3,7 +3,7 @@ use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::ptr::NonNull;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
@@ -287,7 +287,10 @@ impl Extent {
     /// Atomically check and clear the `FLAG_INIT_FORWARD` bit.
     /// Returns `true` if the flag was set (i.e., caller should prepend ForwardInitExtent).
     pub fn take_init_forward(&self) -> bool {
-        self.forward_flags.fetch_and(!FLAG_INIT_FORWARD, Ordering::AcqRel) & FLAG_INIT_FORWARD != 0
+        self.forward_flags
+            .fetch_and(!FLAG_INIT_FORWARD, Ordering::AcqRel)
+            & FLAG_INIT_FORWARD
+            != 0
     }
 
     /// Append a message. Returns the assigned logical offset and the byte
@@ -388,8 +391,7 @@ impl Extent {
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
         let seq = offset.0 - self.start_offset.0;
-
-        // Check seal limit.
+        // Check seal limit (limit is count-based).
         let limit = self.limit.load(Ordering::Acquire);
         if limit != LIMIT_OPEN && seq >= limit {
             return Err(StorageError::ExtentSealed(self.id));
@@ -425,10 +427,7 @@ impl Extent {
         // watermark ACKs reflect gap-free progress and CRC32 is in order.
         self.try_advance_committed();
 
-        Ok(AppendResult {
-            offset,
-            byte_pos,
-        })
+        Ok(AppendResult { offset, byte_pos })
     }
 
     /// Read `count` records starting from the given byte position in the arena.
@@ -739,11 +738,11 @@ impl Extent {
 
     /// The last valid offset in this extent (inclusive), or None if empty.
     pub fn last_offset(&self) -> Option<Offset> {
-        let co = self.committed_offset.load(Ordering::Acquire);
-        if co <= self.start_offset.0 {
+        let offset = self.committed_offset.load(Ordering::Acquire);
+        if offset <= self.start_offset.0 {
             None
         } else {
-            Some(Offset(co - 1))
+            Some(Offset(offset - 1))
         }
     }
 
@@ -781,7 +780,10 @@ impl std::fmt::Debug for Extent {
             .field("capacity", &self.capacity)
             .field("write_cursor", &self.write_cursor.load(Ordering::Relaxed))
             .field("record_count", &self.record_count.load(Ordering::Relaxed))
-            .field("committed_offset", &self.committed_offset.load(Ordering::Relaxed))
+            .field(
+                "committed_offset",
+                &self.committed_offset.load(Ordering::Relaxed),
+            )
             .field(
                 "committed_bytes",
                 &self.committed_bytes.load(Ordering::Relaxed),
@@ -939,16 +941,22 @@ mod tests {
         // Simulate a secondary receiving 3 records from the primary.
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
-        let r0 = ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0")).unwrap();
+        let r0 = ext
+            .replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            .unwrap();
         assert_eq!(r0.offset, Offset(0));
         assert_eq!(r0.byte_pos, 0);
 
         // "msg0" = 4 bytes payload, record = 4 + 4 = 8 bytes
-        let r1 = ext.replicate(Offset(1), 8, Bytes::from_static(b"msg1")).unwrap();
+        let r1 = ext
+            .replicate(Offset(1), 8, Bytes::from_static(b"msg1"))
+            .unwrap();
         assert_eq!(r1.offset, Offset(1));
         assert_eq!(r1.byte_pos, 8);
 
-        let r2 = ext.replicate(Offset(2), 16, Bytes::from_static(b"msg2")).unwrap();
+        let r2 = ext
+            .replicate(Offset(2), 16, Bytes::from_static(b"msg2"))
+            .unwrap();
         assert_eq!(r2.offset, Offset(2));
         assert_eq!(r2.byte_pos, 16);
 
@@ -991,7 +999,8 @@ mod tests {
     #[test]
     fn replicate_sealed_extent_rejects() {
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
-        ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0")).unwrap();
+        ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            .unwrap();
         ext.seal(Some(1)); // seal at 1 record
 
         // Replicate at offset=1 (at limit) should fail.
@@ -1073,7 +1082,9 @@ mod tests {
         // Seal triggers finalization.
         ext.seal(None);
 
-        let incremental = ext.finalized_crc32().expect("should be finalized after seal");
+        let incremental = ext
+            .finalized_crc32()
+            .expect("should be finalized after seal");
         let full_hash = crc32fast::hash(&ext.committed_data());
         assert_eq!(
             incremental, full_hash,
