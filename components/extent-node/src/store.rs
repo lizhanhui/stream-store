@@ -683,7 +683,8 @@ impl ExtentNodeStore {
                 forward_work.extend(batch_forward);
                 for notif in &batch_seals {
                     self.send_extent_update(stream_id, notif);
-                    forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                    forward_work
+                        .extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
                 }
             }
 
@@ -900,7 +901,10 @@ impl ExtentNodeStore {
     async fn drain_follower_jobs(
         &self,
         stream_id: StreamId,
-    ) -> (Vec<(Vec<String>, Frame)>, Vec<crate::stream::SealNotification>) {
+    ) -> (
+        Vec<(Vec<String>, Frame)>,
+        Vec<crate::stream::SealNotification>,
+    ) {
         let mut all_forward_work = Vec::new();
         let mut all_seal_notifications = Vec::new();
 
@@ -1057,9 +1061,7 @@ impl ExtentNodeStore {
         sealed_extent_id: ExtentId,
     ) -> Option<(Vec<String>, Frame)> {
         let addrs = match self.replicas.get(&stream_id) {
-            Some(ri) if ri.is_primary() && !ri.replica_addrs.is_empty() => {
-                ri.replica_addrs.clone()
-            }
+            Some(ri) if ri.is_primary() && !ri.replica_addrs.is_empty() => ri.replica_addrs.clone(),
             _ => return None,
         };
         let (checksum, committed_bytes) = match self.streams.get(&stream_id) {
@@ -1241,7 +1243,8 @@ impl ExtentNodeStore {
                 forward_work.extend(batch_forward);
                 for notif in batch_seals {
                     self.send_extent_update(stream_id, &notif);
-                    forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                    forward_work
+                        .extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
                 }
             }
             if extent_full {
@@ -1264,7 +1267,8 @@ impl ExtentNodeStore {
                 }
                 if let Some(ref notif) = seal_notification {
                     self.send_extent_update(stream_id, notif);
-                    forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                    forward_work
+                        .extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
                 }
                 self.flush_forward_work(forward_work).await;
             } else {
@@ -1580,6 +1584,7 @@ impl ExtentNodeStore {
                 return Frame::new(
                     VariableHeader::Watermark {
                         stream_id: frame.stream_id(),
+                        extent_id: frame.extent_id(),
                         offset: Offset(0),
                     },
                     None,
@@ -1598,6 +1603,7 @@ impl ExtentNodeStore {
                 return Frame::new(
                     VariableHeader::Watermark {
                         stream_id,
+                        extent_id,
                         offset: Offset(0),
                     },
                     None,
@@ -1606,7 +1612,7 @@ impl ExtentNodeStore {
         };
 
         // Compute seq from the extent's start_offset.
-        let extent = match stream_ref.find_extent(extent_id) {
+        match stream_ref.find_extent(extent_id) {
             Some(e) => e,
             None => {
                 warn!(
@@ -1618,6 +1624,7 @@ impl ExtentNodeStore {
                 return Frame::new(
                     VariableHeader::Watermark {
                         stream_id,
+                        extent_id,
                         offset: max_offset,
                     },
                     None,
@@ -1633,6 +1640,7 @@ impl ExtentNodeStore {
                 return Frame::new(
                     VariableHeader::Watermark {
                         stream_id,
+                        extent_id,
                         offset: Offset(0),
                     },
                     None,
@@ -1665,6 +1673,7 @@ impl ExtentNodeStore {
                 return Frame::new(
                     VariableHeader::Watermark {
                         stream_id,
+                        extent_id,
                         offset: max_offset,
                     },
                     None,
@@ -1680,6 +1689,7 @@ impl ExtentNodeStore {
                 return Frame::new(
                     VariableHeader::Watermark {
                         stream_id,
+                        extent_id,
                         offset: max_offset,
                     },
                     None,
@@ -1720,6 +1730,7 @@ impl ExtentNodeStore {
         Frame::new(
             VariableHeader::Watermark {
                 stream_id,
+                extent_id,
                 offset: result_offset,
             },
             None,
@@ -2007,7 +2018,8 @@ impl ExtentNodeStore {
                 // Primary seals finalize CRC32 — send checksum to secondaries.
                 // SM-initiated seal has no forward_work batch, so spawn directly.
                 if is_primary_seal {
-                    if let Some((addrs, frame)) = self.build_forward_checksum(stream_id, extent_id) {
+                    if let Some((addrs, frame)) = self.build_forward_checksum(stream_id, extent_id)
+                    {
                         if let Some(pool) = self.downstream.get() {
                             let pool = Arc::clone(pool);
                             tokio::spawn(async move {

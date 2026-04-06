@@ -123,6 +123,7 @@ pub enum VariableHeader {
     },
     Watermark {
         stream_id: StreamId,
+        extent_id: ExtentId,
         offset: Offset,
     },
     /// Extent sealed: Primary EN sealed an extent and created a new one (UpdateExtent, flag=0x00).
@@ -382,6 +383,7 @@ impl Frame {
             | VariableHeader::Forward { extent_id, .. }
             | VariableHeader::ForwardInitExtent { extent_id, .. }
             | VariableHeader::ForwardChecksum { extent_id, .. }
+            | VariableHeader::Watermark { extent_id, .. }
             | VariableHeader::DescribeExtent { extent_id, .. }
             | VariableHeader::Error { extent_id, .. } => *extent_id,
             _ => ExtentId(0),
@@ -564,8 +566,8 @@ impl Frame {
             VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4 + 4,
             // request_id(4) + stream_id(8) + extent_id(4)
             VariableHeader::RegisterExtentAck { .. } => 4 + 8 + 4,
-            // stream_id(8) + offset(8) -- no request_id
-            VariableHeader::Watermark { .. } => 8 + 8,
+            // stream_id(8) + extent_id(4) + offset(8) -- no request_id
+            VariableHeader::Watermark { .. } => 8 + 4 + 8,
             // stream_id(8) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4)
             VariableHeader::UpdateExtentSealed { .. } => 8 + 4 + 4 + 8 + 4,
             // stream_id(8) + epoch(4) + extent_id(4) + current_offset(8)
@@ -798,8 +800,13 @@ impl Frame {
                 dst.put_u64(stream_id.0);
                 dst.put_u32(extent_id.0);
             }
-            VariableHeader::Watermark { stream_id, offset } => {
+            VariableHeader::Watermark {
+                stream_id,
+                extent_id,
+                offset,
+            } => {
                 dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
             }
             VariableHeader::Forward {
@@ -1240,8 +1247,16 @@ impl Frame {
             }
             Opcode::Watermark => {
                 let stream_id = StreamId(body.get_u64());
+                let extent_id = ExtentId(body.get_u32());
                 let offset = Offset(body.get_u64());
-                Ok((VariableHeader::Watermark { stream_id, offset }, None))
+                Ok((
+                    VariableHeader::Watermark {
+                        stream_id,
+                        extent_id,
+                        offset,
+                    },
+                    None,
+                ))
             }
             Opcode::Forward => {
                 let stream_id = StreamId(body.get_u64());
@@ -1652,6 +1667,7 @@ mod tests {
         let frame = Frame::new(
             VariableHeader::Watermark {
                 stream_id: StreamId(42),
+                extent_id: ExtentId(7),
                 offset: Offset(100),
             },
             None,
@@ -1659,12 +1675,13 @@ mod tests {
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);
-        // 8 (fixed) + 8 (stream_id) + 8 (offset) = 24 bytes
-        assert_eq!(buf.len(), 24);
+        // 8 (fixed) + 8 (stream_id) + 4 (extent_id) + 8 (offset) = 28 bytes
+        assert_eq!(buf.len(), 28);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
         assert_eq!(decoded.opcode(), Opcode::Watermark);
         assert_eq!(decoded.stream_id(), StreamId(42));
+        assert_eq!(decoded.extent_id(), ExtentId(7));
         assert_eq!(decoded.offset(), Offset(100));
         assert_eq!(decoded.request_id(), 0); // not present on wire
     }
