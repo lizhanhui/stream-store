@@ -973,6 +973,13 @@ impl ExtentNodeStore {
                 // Drop the read guard BEFORE acquiring write guard for seal+create.
                 drop(stream_ref);
 
+                // Flush Forward frames for records that succeeded on the old extent
+                // BEFORE the expensive seal+allocate (~117MB alloc). This lets the
+                // secondary start processing them and returning watermark ACKs while
+                // we allocate the new extent, preventing PendingAck timeout expiry.
+                self.flush_forward_work(std::mem::take(&mut all_forward_work))
+                    .await;
+
                 let seal_notification = self.seal_and_create_on_full(stream_id);
                 if let Some(ref notif) = seal_notification {
                     all_seal_notifications.push(notif.clone());
@@ -1252,6 +1259,11 @@ impl ExtentNodeStore {
                 }
             }
             if extent_full {
+                // Flush any Forward frames from drain_follower_jobs before the
+                // expensive seal+allocate. Prevents PendingAck timeout expiry.
+                self.flush_forward_work(std::mem::take(&mut forward_work))
+                    .await;
+
                 // Autonomous extent creation for batch path — retry all failed frames.
                 let seal_notification = self.seal_and_create_on_full(stream_id);
                 // do_append_and_respond will check the new extent's needs_init_forward flag
@@ -1418,6 +1430,13 @@ impl ExtentNodeStore {
         }
 
         if extent_full {
+            // Flush Forward frames for entries that succeeded on the old extent
+            // BEFORE the expensive seal+allocate (~117MB alloc). This lets the
+            // secondary start processing them and returning watermark ACKs while
+            // we allocate the new extent, preventing PendingAck timeout expiry.
+            self.flush_forward_work(std::mem::take(&mut forward_work))
+                .await;
+
             // Autonomous extent creation for batch path (end of batch) — retry failed frames.
             let seal_notification = self.seal_and_create_on_full(stream_id);
             // do_append_and_respond will check the new extent's needs_init_forward flag
