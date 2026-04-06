@@ -919,7 +919,9 @@ impl ExtentNodeStore {
             let mut batch: Vec<AppendJob> = Vec::new();
 
             // Drain all available jobs from the channel.
-            // Bounded spin if a follower has incremented in_flight but hasn't pushed yet.
+            // Yield the tokio task (not the OS thread) if a follower has incremented
+            // in_flight but hasn't pushed its job yet. This prevents starving other
+            // async tasks (e.g., the downstream watermark reader) on the same thread.
             {
                 let mut spin_count = 0u32;
                 loop {
@@ -934,7 +936,9 @@ impl ExtentNodeStore {
                                     std::hint::spin_loop();
                                     spin_count += 1;
                                 } else {
-                                    std::thread::yield_now();
+                                    // Yield the tokio task so other tasks on this
+                                    // worker thread can make progress.
+                                    tokio::task::yield_now().await;
                                     spin_count = 0;
                                 }
                                 continue;
@@ -1573,7 +1577,7 @@ impl ExtentNodeStore {
     /// Returns a cumulative Watermark with the contiguous committed offset,
     /// or None if the forward cannot be processed (bad frame, unknown stream, etc.).
     fn handle_forward(&self, frame: Frame) -> Option<Frame> {
-        let (stream_id, extent_id, _epoch, offset, byte_pos) = match &frame.variable_header {
+        let (stream_id, extent_id, epoch, offset, byte_pos) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
                 extent_id,
@@ -1596,6 +1600,41 @@ impl ExtentNodeStore {
             }
         };
 
+        // Lazy extent creation: if the extent doesn't exist on this secondary,
+        // create it now. This handles the race where a new leader on the primary
+        // flushes Forward frames for a new extent before the previous leader's
+        // ForwardInitExtent arrives (due to independent flush_forward_work calls
+        // serializing on the downstream writer Mutex in arbitrary order).
+        if stream_ref.find_extent(extent_id).is_none() {
+            drop(stream_ref);
+            if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+                // Double-check under write lock (another Forward may have created it).
+                if stream_mut.find_extent(extent_id).is_none() {
+                    let start_offset = stream_mut.max_offset();
+                    let capacity = stream_mut.extent_capacity();
+                    stream_mut.register_extent(extent_id, start_offset, capacity, epoch);
+                    info!(
+                        "lazy extent creation on Forward: stream={}, extent={}, start_offset={}, capacity={}",
+                        stream_id, extent_id, start_offset, capacity,
+                    );
+                }
+                drop(stream_mut);
+            }
+            // Re-acquire read ref.
+            match self.streams.get(&stream_id) {
+                Some(s) => {
+                    let replicate_result = s.replicate(
+                        extent_id,
+                        offset,
+                        byte_pos,
+                        frame.payload.clone().unwrap_or_default(),
+                    );
+                    return self.finish_forward(s, stream_id, extent_id, replicate_result, &frame);
+                }
+                None => return None,
+            }
+        }
+
         let replicate_result = stream_ref.replicate(
             extent_id,
             offset,
@@ -1603,6 +1642,18 @@ impl ExtentNodeStore {
             frame.payload.clone().unwrap_or_default(),
         );
 
+        self.finish_forward(stream_ref, stream_id, extent_id, replicate_result, &frame)
+    }
+
+    /// Shared tail of handle_forward: process replicate result, update metrics, return watermark.
+    fn finish_forward(
+        &self,
+        stream_ref: dashmap::mapref::one::Ref<'_, StreamId, Stream>,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        replicate_result: Result<crate::extent::AppendResult, StorageError>,
+        frame: &Frame,
+    ) -> Option<Frame> {
         match replicate_result {
             Ok(_r) => {}
             Err(e) => {
