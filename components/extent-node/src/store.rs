@@ -1651,7 +1651,7 @@ impl ExtentNodeStore {
         let result_offset = match replicate_result {
             Ok(_r) => {
                 // replicate() calls try_advance_committed() which advances
-                // committed_seq contiguously. Use last_offset() for the watermark
+                // committed_offset contiguously. Use last_offset() for the watermark
                 // so it reflects gap-free progress (inclusive semantics).
                 let watermark = match stream_ref.find_extent(extent_id) {
                     Some(ext) => ext.last_offset().unwrap_or(Offset(0)),

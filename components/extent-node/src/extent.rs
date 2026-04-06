@@ -127,7 +127,7 @@ pub struct AppendResult {
 ///   │  0                       write_cursor                     │
 ///   └───────────────────────────────────────────────────────────┘
 ///
-///   committed_seq   = number of records fully written (logical offset cursor)
+///   committed_offset = next offset after last contiguously committed record
 ///   committed_bytes = byte position up to which all records are fully written
 /// ```
 ///
@@ -161,19 +161,20 @@ pub struct Extent {
     /// Number of records appended. Updated by the single active writer.
     record_count: AtomicU64,
 
-    /// Committed sequence counter: all records with seq < committed_seq have been
-    /// fully written and are safe to read (gap-free).
+    /// Committed offset: the next logical offset after the last contiguously
+    /// committed record (exclusive). All offsets in [start_offset, committed_offset)
+    /// have been fully written and are safe to read.
     /// - **Primary**: advanced inline in `append_inner()` (sequential writes).
     /// - **Secondary**: advanced by `try_advance_committed()` which walks the index
     ///   in order, ensuring contiguous progress even with out-of-order arrival.
     ///   Watermark ACKs use this value to report gap-free progress to the primary.
-    committed_seq: AtomicU64,
+    committed_offset: AtomicU64,
 
     /// Committed byte position: contiguous byte frontier.
     /// - **Primary**: byte offset up to which all records are fully written
     ///   (sequential writes). Readers use this as the upper bound.
     /// - **Secondary**: advanced by `try_advance_committed()` alongside
-    ///   `committed_seq`, ensuring contiguous progress.
+    ///   `committed_offset`, ensuring contiguous progress.
     committed_bytes: AtomicU64,
 
     /// Message limit for this extent.
@@ -273,7 +274,7 @@ impl Extent {
             capacity,
             write_cursor: AtomicU64::new(0),
             record_count: AtomicU64::new(0),
-            committed_seq: AtomicU64::new(0),
+            committed_offset: AtomicU64::new(start_offset.0),
             committed_bytes: AtomicU64::new(0),
             limit: AtomicU64::new(LIMIT_OPEN),
             index,
@@ -359,7 +360,8 @@ impl Extent {
         self.committed_bytes
             .store(new_committed_bytes, Ordering::Release);
         self.index_record(seq, byte_pos);
-        self.committed_seq.store(seq + 1, Ordering::Release);
+        self.committed_offset
+            .store(self.start_offset.0 + seq + 1, Ordering::Release);
 
         Ok(AppendResult {
             offset: Offset(self.start_offset.0 + seq),
@@ -429,8 +431,8 @@ impl Extent {
         // Record in index before advancing committed state.
         self.index_record(seq, byte_pos);
 
-        // Advance committed_seq, committed_bytes, and CRC32 contiguously by
-        // walking the index from the current committed_seq. This ensures
+        // Advance committed_offset, committed_bytes, and CRC32 contiguously by
+        // walking the index from the current committed_offset. This ensures
         // watermark ACKs reflect gap-free progress and CRC32 is in order.
         self.try_advance_committed();
 
@@ -611,14 +613,14 @@ impl Extent {
         self.finalized_crc32.store(crc, Ordering::Release);
     }
 
-    /// Advance `committed_seq`, `committed_bytes`, and incremental CRC32 by
-    /// walking the index in sequence order from the current `committed_seq`.
+    /// Advance `committed_offset`, `committed_bytes`, and incremental CRC32 by
+    /// walking the index in sequence order from the current `committed_offset`.
     ///
     /// For each consecutive populated index entry, reads the record at that
     /// byte_pos from the arena, hashes `[len:u32 BE][payload]`, and advances
     /// both committed cursors. Stops at the first gap (unpopulated entry).
     ///
-    /// On the primary this is a no-op (committed_seq is already advanced inline
+    /// On the primary this is a no-op (committed_offset is already advanced inline
     /// in `append_inner`). On secondaries, records may arrive out of order, so
     /// this method is the sole mechanism for advancing committed state — ensuring
     /// watermark ACKs reflect contiguous progress and CRC32 is computed in the
@@ -631,7 +633,7 @@ impl Extent {
     /// Same as `replicate()` — single connection read loop on secondaries.
     pub fn try_advance_committed(&self) {
         let h = unsafe { &mut *self.hasher.get() };
-        let mut seq = self.committed_seq.load(Ordering::Relaxed);
+        let mut seq = self.committed_offset.load(Ordering::Relaxed) - self.start_offset.0;
 
         loop {
             let idx = seq as usize;
@@ -665,7 +667,8 @@ impl Extent {
 
             // Advance committed state.
             self.committed_bytes.store(record_end, Ordering::Release);
-            self.committed_seq.store(seq, Ordering::Release);
+            self.committed_offset
+                .store(self.start_offset.0 + seq, Ordering::Release);
         }
     }
 
@@ -702,7 +705,7 @@ impl Extent {
         if limit == LIMIT_OPEN {
             return None; // not sealed
         }
-        let committed = self.committed_seq.load(Ordering::Acquire);
+        let committed = self.committed_offset.load(Ordering::Acquire) - self.start_offset.0;
         if committed < limit {
             return None; // still have gaps
         }
@@ -715,15 +718,15 @@ impl Extent {
     }
 
     /// Whether this sealed extent can still accept post-seal forwarded writes.
-    /// Returns true when sealed and committed_seq < limit,
+    /// Returns true when sealed and committed record count < limit,
     /// meaning there are still outstanding writes that haven't landed yet.
     pub fn accepts_post_seal_writes(&self) -> bool {
         let limit = self.limit.load(Ordering::Acquire);
         if limit == LIMIT_OPEN {
             return false;
         }
-        let current = self.committed_seq.load(Ordering::Acquire);
-        current < limit
+        let count = self.committed_offset.load(Ordering::Acquire) - self.start_offset.0;
+        count < limit
     }
 
     /// The extent state (Active or Sealed).
@@ -737,21 +740,21 @@ impl Extent {
 
     /// Number of committed (fully written, readable) messages in this extent.
     pub fn message_count(&self) -> u64 {
-        self.committed_seq.load(Ordering::Acquire)
+        self.committed_offset.load(Ordering::Acquire) - self.start_offset.0
     }
 
     /// The next logical offset that would be assigned by an append.
     pub fn next_offset(&self) -> Offset {
-        Offset(self.start_offset.0 + self.committed_seq.load(Ordering::Acquire))
+        Offset(self.committed_offset.load(Ordering::Acquire))
     }
 
     /// The last valid offset in this extent (inclusive), or None if empty.
     pub fn last_offset(&self) -> Option<Offset> {
-        let count = self.committed_seq.load(Ordering::Acquire);
-        if count == 0 {
+        let co = self.committed_offset.load(Ordering::Acquire);
+        if co <= self.start_offset.0 {
             None
         } else {
-            Some(Offset(self.start_offset.0 + count - 1))
+            Some(Offset(co - 1))
         }
     }
 
@@ -789,7 +792,7 @@ impl std::fmt::Debug for Extent {
             .field("capacity", &self.capacity)
             .field("write_cursor", &self.write_cursor.load(Ordering::Relaxed))
             .field("record_count", &self.record_count.load(Ordering::Relaxed))
-            .field("committed_seq", &self.committed_seq.load(Ordering::Relaxed))
+            .field("committed_offset", &self.committed_offset.load(Ordering::Relaxed))
             .field(
                 "committed_bytes",
                 &self.committed_bytes.load(Ordering::Relaxed),
@@ -1021,7 +1024,7 @@ mod tests {
         // SM seals with committed_offset=3 (primary committed 3 records).
         ext.seal(Some(3));
         assert!(ext.is_sealed());
-        assert!(ext.accepts_post_seal_writes()); // committed_seq(1) < limit(3)
+        assert!(ext.accepts_post_seal_writes()); // committed count(1) < limit(3)
 
         // Late forwarded appends within the sealed range should succeed.
         let r1 = ext.append(Bytes::from_static(b"msg1")).unwrap();
@@ -1044,7 +1047,7 @@ mod tests {
 
         ext.seal(None);
         assert!(ext.is_sealed());
-        // limit = record_count = 2, committed_seq = 2 → no room.
+        // limit = record_count = 2, committed count = 2 → no room.
         assert!(!ext.accepts_post_seal_writes());
         let result = ext.append(Bytes::from_static(b"should-fail"));
         assert!(matches!(result, Err(StorageError::ExtentSealed(_))));
@@ -1060,7 +1063,7 @@ mod tests {
         ext.append(Bytes::from_static(b"msg0")).unwrap();
         ext.seal(None);
 
-        // Sealed with local count, committed_seq == limit → false.
+        // Sealed with local count, committed count == limit → false.
         assert!(!ext.accepts_post_seal_writes());
     }
 
