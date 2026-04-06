@@ -120,7 +120,7 @@ impl Stream {
     pub fn replicate(
         &self,
         extent_id: ExtentId,
-        seq: u64,
+        offset: Offset,
         byte_pos: u64,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
@@ -130,7 +130,7 @@ impl Stream {
                 self.id, extent_id
             ))
         })?;
-        extent.replicate(seq, byte_pos, payload)
+        extent.replicate(offset, byte_pos, payload)
     }
 
     /// Read `count` messages starting from the given logical `offset` within
