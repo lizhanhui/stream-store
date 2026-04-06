@@ -23,7 +23,6 @@ client = { path = "../client" }
 fastant = { workspace = true }
 crossbeam-channel = { workspace = true }
 crc32fast = { workspace = true }
-smallvec = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }

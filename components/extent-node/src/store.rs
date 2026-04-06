@@ -12,7 +12,6 @@ use futures_util::SinkExt;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
-use smallvec::SmallVec;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -397,7 +396,7 @@ impl RequestHandler for ExtentNodeStore {
             }
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
-            Opcode::Seal => Some(self.handle_seal(frame)),
+            Opcode::Seal => Some(self.handle_seal(frame).await),
             Opcode::RegisterExtent => Some(self.handle_register_extent(frame)),
             Opcode::Connect => Some(Frame::new(
                 VariableHeader::ConnectAck {
@@ -684,12 +683,16 @@ impl ExtentNodeStore {
                 forward_work.extend(batch_forward);
                 for notif in &batch_seals {
                     self.send_extent_update(stream_id, notif);
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id)
+                        .await;
                 }
             }
 
-            // Send SM notification if we sealed.
+            // Send SM notification and ForwardChecksum if we sealed.
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
+                self.send_forward_checksum(stream_id, notif.sealed_extent_id)
+                    .await;
             }
             self.flush_forward_work(forward_work).await;
             return retry_result;
@@ -1045,6 +1048,46 @@ impl ExtentNodeStore {
         }
     }
 
+    /// Send ForwardChecksum to all secondaries for a sealed extent (fire-and-forget).
+    ///
+    /// Called immediately after primary seal — no need to piggyback on the Forward
+    /// Mutex since the secondary defers verification via `try_verify_checksum()`.
+    async fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
+        let pool = match self.downstream.get() {
+            Some(p) => p,
+            None => return,
+        };
+        let addrs = match self.replicas.get(&stream_id) {
+            Some(ri) if ri.is_primary() && !ri.replica_addrs.is_empty() => {
+                ri.replica_addrs.clone()
+            }
+            _ => return,
+        };
+        let (checksum, committed_bytes) = match self.streams.get(&stream_id) {
+            Some(stream_ref) => match stream_ref.find_extent(sealed_extent_id) {
+                Some(ext) => (ext.finalized_crc32().unwrap_or(0), ext.committed_data().len() as u64),
+                None => return,
+            },
+            None => return,
+        };
+        info!(
+            "sending ForwardChecksum: stream={}, extent={}, crc32={:#x}, bytes={}",
+            stream_id, sealed_extent_id, checksum, committed_bytes,
+        );
+        let frame = Frame::new(
+            VariableHeader::ForwardChecksum {
+                stream_id,
+                extent_id: sealed_extent_id,
+                checksum,
+                committed_bytes,
+            },
+            None,
+        );
+        for addr in &addrs {
+            pool.forward(addr, frame.clone()).await;
+        }
+    }
+
     /// Optimized batch append: all frames share the same stream_id/extent_id.
     ///
     /// Amortizes DashMap lookups (3N → 3), leader elections (N → 1),
@@ -1198,6 +1241,8 @@ impl ExtentNodeStore {
                 forward_work.extend(batch_forward);
                 for notif in batch_seals {
                     self.send_extent_update(stream_id, &notif);
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id)
+                        .await;
                 }
             }
             if extent_full {
@@ -1220,6 +1265,8 @@ impl ExtentNodeStore {
                 }
                 if let Some(ref notif) = seal_notification {
                     self.send_extent_update(stream_id, notif);
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id)
+                        .await;
                 }
                 self.flush_forward_work(forward_work).await;
             } else {
@@ -1360,6 +1407,8 @@ impl ExtentNodeStore {
             forward_work.extend(batch_forward);
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
+                self.send_forward_checksum(stream_id, notif.sealed_extent_id)
+                    .await;
             }
         }
 
@@ -1383,6 +1432,8 @@ impl ExtentNodeStore {
             }
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
+                self.send_forward_checksum(stream_id, notif.sealed_extent_id)
+                    .await;
             }
         }
 
@@ -1423,11 +1474,6 @@ impl ExtentNodeStore {
             };
             let mut guard = writer.lock().await;
 
-            // Collect which (stream, extent) pairs have Forward frames in this batch.
-            // Used to decide which extents to check for pending checksum.
-            // SmallVec avoids heap allocation for the common case (1-2 extents).
-            let mut seen_extents: SmallVec<[(StreamId, ExtentId); 2]> = SmallVec::new();
-
             // Under the Mutex: check if any Forward frame targets an extent that
             // needs ForwardInitExtent. Send init frames first to guarantee ordering.
             for f in &frames {
@@ -1438,7 +1484,6 @@ impl ExtentNodeStore {
                     ..
                 } = &f.variable_header
                 {
-                    seen_extents.push((*stream_id, *extent_id));
                     if let Some(stream_ref) = self.streams.get(stream_id) {
                         if let Some(ext) = stream_ref.find_extent(*extent_id) {
                             if ext.take_init_forward() {
@@ -1464,36 +1509,6 @@ impl ExtentNodeStore {
                 if let Err(e) = guard.feed((*frame).clone()).await {
                     warn!("send to secondary {addr} failed: {e}");
                     break;
-                }
-            }
-
-            // Under the Mutex: after all Forwards, send ForwardChecksum for any
-            // sealed extent in THIS batch. Only checking extents we just wrote
-            // Forwards for ensures a racing leader (whose batch has no Forwards
-            // for this extent) won't send the checksum before our Forwards.
-            seen_extents.dedup();
-            for (stream_id, extent_id) in &seen_extents {
-                if let Some(stream_ref) = self.streams.get(stream_id) {
-                    if let Some(ext) = stream_ref.find_extent(*extent_id) {
-                        if ext.take_pending_checksum() {
-                            let checksum = ext.finalized_crc32().unwrap_or(0);
-                            let committed_bytes = ext.committed_data().len() as u64;
-                            info!(
-                                "extent sealed: stream={}, extent={}, crc32={:#x}, bytes={}",
-                                stream_id, extent_id, checksum, committed_bytes,
-                            );
-                            let checksum_frame = Frame::new(
-                                VariableHeader::ForwardChecksum {
-                                    stream_id: *stream_id,
-                                    extent_id: *extent_id,
-                                    checksum,
-                                    committed_bytes,
-                                },
-                                None,
-                            );
-                            let _ = guard.feed(checksum_frame).await;
-                        }
-                    }
                 }
             }
 
@@ -1638,9 +1653,16 @@ impl ExtentNodeStore {
         );
 
         let result_offset = match replicate_result {
-            Ok(r) => {
+            Ok(_r) => {
+                // replicate() calls try_advance_committed() which advances
+                // committed_seq contiguously. Use last_offset() for the watermark
+                // so it reflects gap-free progress (inclusive semantics).
+                let watermark = match stream_ref.find_extent(extent_id) {
+                    Some(ext) => ext.last_offset().unwrap_or(Offset(0)),
+                    None => Offset(0),
+                };
                 drop(stream_ref);
-                r.offset
+                watermark
             }
             Err(StorageError::ExtentSealed(_)) | Err(StorageError::ExtentFull(_)) => {
                 let max_offset = stream_ref.max_offset();
@@ -1677,6 +1699,29 @@ impl ExtentNodeStore {
             Ordering::Relaxed,
         );
 
+        // Check if deferred CRC32 verification can now complete.
+        // This handles the case where ForwardChecksum arrived before all
+        // Forward frames due to leader Mutex races on the primary.
+        if let Some(stream_ref) = self.streams.get(&stream_id) {
+            if let Some(ext) = stream_ref.find_extent(extent_id) {
+                match ext.try_verify_checksum() {
+                    Some(true) => {
+                        info!(
+                            "CRC32 checksum verified (deferred): stream={}, extent={}",
+                            stream_id, extent_id,
+                        );
+                    }
+                    Some(false) => {
+                        warn!(
+                            "CRC32 checksum mismatch (deferred): stream={}, extent={}",
+                            stream_id, extent_id,
+                        );
+                    }
+                    None => {} // not ready yet
+                }
+            }
+        }
+
         Frame::new(
             VariableHeader::Watermark {
                 stream_id,
@@ -1688,10 +1733,12 @@ impl ExtentNodeStore {
 
     /// Handle ForwardChecksum (0x0B, flag=0x02) — CRC32 verification for sealed extent.
     ///
-    /// By the time this frame arrives, all Forward frames for the sealed extent
-    /// have been processed (TCP ordering guarantees this). The incremental CRC32
-    /// hasher has been updated on every `replicate()` call, so finalization is
-    /// O(1) — no arena scan needed. Fire-and-forget.
+    /// Due to leader Mutex races on the primary, this frame may arrive before all
+    /// Forward frames have been processed on the secondary. The primary's checksum
+    /// and committed_bytes are stored in the extent for deferred verification.
+    /// `try_advance_committed()` is called to advance as far as possible, and
+    /// `try_verify_checksum()` checks if all records have been hashed.
+    /// If not yet ready, verification will complete on a subsequent `replicate()` call.
     fn handle_forward_checksum(&self, frame: Frame) {
         let (stream_id, extent_id, primary_crc32, primary_committed_bytes) =
             match &frame.variable_header {
@@ -1726,30 +1773,35 @@ impl ExtentNodeStore {
             }
         };
 
-        // Finalize the secondary's incremental CRC32 — all forwards have arrived.
-        extent.finalize_crc32();
-        let secondary_crc32 = extent.finalized_crc32().unwrap_or(0);
-        let secondary_committed_bytes = extent.committed_data().len() as u64;
+        // Store primary's checksum for deferred comparison.
+        extent.store_primary_checksum(primary_crc32);
 
-        if secondary_crc32 != primary_crc32
-            || secondary_committed_bytes != primary_committed_bytes
-        {
-            warn!(
-                "CRC32 checksum mismatch: stream={}, extent={}, \
-                 primary_crc32={:#010x}, secondary_crc32={:#010x}, \
-                 primary_bytes={}, secondary_bytes={}",
-                stream_id,
-                extent_id,
-                primary_crc32,
-                secondary_crc32,
-                primary_committed_bytes,
-                secondary_committed_bytes,
-            );
-        } else {
-            info!(
-                "CRC32 checksum verified: stream={}, extent={}, crc32={:#010x}, bytes={}",
-                stream_id, extent_id, primary_crc32, primary_committed_bytes,
-            );
+        // Advance incremental CRC32 as far as possible.
+        extent.try_advance_committed();
+
+        // Check if verification can complete now.
+        match extent.try_verify_checksum() {
+            Some(true) => {
+                info!(
+                    "CRC32 checksum verified: stream={}, extent={}, crc32={:#010x}, bytes={}",
+                    stream_id, extent_id, primary_crc32, primary_committed_bytes,
+                );
+            }
+            Some(false) => {
+                warn!(
+                    "CRC32 checksum mismatch: stream={}, extent={}, \
+                     primary_crc32={:#010x}, primary_bytes={} \
+                     (verification will be logged by try_verify_checksum)",
+                    stream_id, extent_id, primary_crc32, primary_committed_bytes,
+                );
+            }
+            None => {
+                info!(
+                    "ForwardChecksum stored (deferred): stream={}, extent={}, \
+                     crc32={:#010x}, bytes={} — waiting for remaining records",
+                    stream_id, extent_id, primary_crc32, primary_committed_bytes,
+                );
+            }
         }
     }
 
@@ -1874,7 +1926,7 @@ impl ExtentNodeStore {
         )
     }
 
-    fn handle_seal(&self, frame: Frame) -> Frame {
+    async fn handle_seal(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
         let extent_id = frame.extent_id();
         // Extract the committed offset from the Seal frame, if present.
@@ -1950,10 +2002,17 @@ impl ExtentNodeStore {
 
         match stream_ref.seal(extent_id, committed_offset) {
             Some((start_offset, end_offset)) => {
+                // Check if this is a primary seal (no committed_offset provided).
+                let is_primary_seal = committed_offset.is_none();
+                drop(stream_ref);
                 info!(
                     "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={end_offset}",
                     extent_id, stream_id
                 );
+                // Primary seals finalize CRC32 — send checksum to secondaries.
+                if is_primary_seal {
+                    self.send_forward_checksum(stream_id, extent_id).await;
+                }
                 Frame::new(
                     VariableHeader::SealAck {
                         request_id: frame.request_id(),
@@ -1973,6 +2032,7 @@ impl ExtentNodeStore {
                 // when the SM seals all replicas concurrently and the primary already
                 // sealed (extent-full path), it must report its committed offset.
                 let end_offset = stream_ref.sealed_end_offset(extent_id);
+                drop(stream_ref);
                 info!(
                     "extent {} for stream {} already sealed, returning end_offset={end_offset} idempotently",
                     extent_id, stream_id
