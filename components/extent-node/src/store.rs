@@ -1655,17 +1655,9 @@ impl ExtentNodeStore {
             frame.payload.clone().unwrap_or_default(),
         );
 
-        let result_offset = match replicate_result {
+        match replicate_result {
             Ok(_r) => {
-                // replicate() calls try_advance_committed() which advances
-                // committed_offset contiguously. Use last_offset() for the watermark
-                // so it reflects gap-free progress (inclusive semantics).
-                let watermark = match stream_ref.find_extent(extent_id) {
-                    Some(ext) => ext.last_offset().unwrap_or(Offset(0)),
-                    None => Offset(0),
-                };
                 drop(stream_ref);
-                watermark
             }
             Err(StorageError::ExtentSealed(_)) | Err(StorageError::ExtentFull(_)) => {
                 let max_offset = stream_ref.max_offset();
@@ -1707,7 +1699,8 @@ impl ExtentNodeStore {
         // Check if deferred CRC32 verification can now complete.
         // This handles the case where ForwardChecksum arrived before all
         // Forward frames due to leader Mutex races on the primary.
-        if let Some(stream_ref) = self.streams.get(&stream_id) {
+        // Also read the contiguous watermark for the response.
+        let watermark = if let Some(stream_ref) = self.streams.get(&stream_id) {
             if let Some(ext) = stream_ref.find_extent(extent_id) {
                 match ext.try_verify_checksum() {
                     Some(true) => {
@@ -1724,14 +1717,19 @@ impl ExtentNodeStore {
                     }
                     None => {} // not ready yet
                 }
+                ext.last_offset().unwrap_or(Offset(0))
+            } else {
+                Offset(0)
             }
-        }
+        } else {
+            Offset(0)
+        };
 
         Frame::new(
             VariableHeader::Watermark {
                 stream_id,
                 extent_id,
-                offset: result_offset,
+                offset: watermark,
             },
             None,
         )
