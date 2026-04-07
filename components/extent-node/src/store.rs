@@ -154,6 +154,7 @@ impl AckQueue {
                 warn!(
                     request_id = ack.request_id,
                     stream_id = %ack.stream_id,
+                    extent_id = %ack.extent_id,
                     offset = ack.assigned_offset,
                     "PendingAck expired after replication timeout",
                 );
@@ -1566,8 +1567,7 @@ impl ExtentNodeStore {
 
         if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
             if stream_mut.find_extent(extent_id).is_none() {
-                let so = stream_mut.max_offset();
-                stream_mut.register_extent(extent_id, so, extent_capacity, epoch);
+                stream_mut.register_extent(extent_id, start_offset, extent_capacity, epoch);
                 info!(
                     "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}",
                     stream_id, extent_id, start_offset, extent_capacity,
