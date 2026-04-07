@@ -746,6 +746,11 @@ impl Extent {
         }
     }
 
+    /// The current committed offset (for diagnostics).
+    pub fn committed_offset(&self) -> u64 {
+        self.committed_offset.load(Ordering::Acquire)
+    }
+
     /// Total bytes written (write_cursor position). Useful for metrics and
     /// size-based seal triggers.
     pub fn bytes_written(&self) -> u64 {
