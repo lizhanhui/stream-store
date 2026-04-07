@@ -1,8 +1,8 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, FLAG_EPOCH_PRESENT, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
-    FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
+    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EPOCH_PRESENT,
+    FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
     FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT,
     FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
@@ -564,7 +564,9 @@ impl Frame {
             // request_id(4) + name_len(2) + name(N) + replication_factor(2) + extent_capacity(4)
             VariableHeader::CreateStream { stream_name, .. } => 4 + 2 + stream_name.len() + 2 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
-            VariableHeader::CreateStreamResp { primary_addr, .. } => 4 + 8 + 4 + 4 + 2 + primary_addr.len(),
+            VariableHeader::CreateStreamResp { primary_addr, .. } => {
+                4 + 8 + 4 + 4 + 2 + primary_addr.len()
+            }
             // request_id(4) + stream_id(8)
             VariableHeader::QueryOffset { .. } => 4 + 8,
             // request_id(4) + stream_id(8) + offset(8)

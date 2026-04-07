@@ -13,8 +13,7 @@ use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{
-    build_connect_payload, build_heartbeat_payload,
-    build_string_payload, parse_extent_info_vec,
+    build_connect_payload, build_heartbeat_payload, build_string_payload, parse_extent_info_vec,
 };
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -263,15 +262,14 @@ impl StreamClient {
             )));
         }
 
-        let addr = if let VariableHeader::CreateStreamResp { primary_addr, .. } =
-            &resp.variable_header
-        {
-            String::from_utf8_lossy(primary_addr).to_string()
-        } else {
-            return Err(StorageError::Internal(
-                "unexpected variable header in CreateStreamResp".into(),
-            ));
-        };
+        let addr =
+            if let VariableHeader::CreateStreamResp { primary_addr, .. } = &resp.variable_header {
+                String::from_utf8_lossy(primary_addr).to_string()
+            } else {
+                return Err(StorageError::Internal(
+                    "unexpected variable header in CreateStreamResp".into(),
+                ));
+            };
 
         let stream_id = resp.stream_id();
         self.cache_primary(stream_id, &addr).await;
@@ -684,8 +682,9 @@ impl StreamClient {
         match self.describe_stream_by_name(stream_name, 1).await {
             Ok((stream_id, _)) => Ok(stream_id),
             Err(StorageError::UnknownStream(_)) => {
-                let (stream_id, _, _, _) =
-                    self.create_stream(stream_name, replication_factor, 0).await?;
+                let (stream_id, _, _, _) = self
+                    .create_stream(stream_name, replication_factor, 0)
+                    .await?;
                 Ok(stream_id)
             }
             Err(e) => Err(e),

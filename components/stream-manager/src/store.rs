@@ -8,9 +8,8 @@ use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use futures_util::future;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{
-    build_register_extent_payload, encode_extent_info_vec,
-    parse_connect_payload, parse_heartbeat_payload,
-    parse_string_payload,
+    build_register_extent_payload, encode_extent_info_vec, parse_connect_payload,
+    parse_heartbeat_payload, parse_string_payload,
 };
 use server::handler::RequestHandler;
 use tracing::{error, info, warn};
