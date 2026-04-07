@@ -797,7 +797,7 @@ stream-store/                          (Workspace root)
     │       └── handler.rs             -- RequestHandler trait, serve_connection, accept_loop
     │
     ├── client/                        -- Client library (depends: common, rpc)
-    │   └── src/lib.rs                 -- StorageClient: connect/disconnect to Extent Node and Stream Manager,
+    │   └── src/lib.rs                 -- StreamClient: connect/disconnect to Extent Node and Stream Manager,
     │                                     append, read, seal, create_stream
     │
     ├── extent-node/                   -- Extent Node library (depends: common, rpc, server, client)

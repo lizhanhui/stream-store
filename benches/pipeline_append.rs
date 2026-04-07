@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use client::StorageClient;
+use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::Epoch;
 use extent_node::ExtentNode;
@@ -88,7 +88,7 @@ async fn main() {
     info!("[setup] Registration complete");
 
     // -- 5. Create a single stream via StreamManager --------------------------
-    let sm_client = StorageClient::connect(&stream_manager_addr)
+    let sm_client = StreamClient::connect(&stream_manager_addr)
         .await
         .expect("connect to StreamManager");
     let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = sm_client
@@ -213,7 +213,7 @@ async fn sender_task(
 
     // Connect to the primary ExtentNode.
     let en_client = Arc::new(
-        StorageClient::connect(&primary_addr)
+        StreamClient::connect(&primary_addr)
             .await
             .unwrap_or_else(|e| panic!("sender {sender_id}: EN connect failed: {e}")),
     );
