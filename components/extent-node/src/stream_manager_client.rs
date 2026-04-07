@@ -236,13 +236,20 @@ impl StreamManagerClient {
         }
 
         // Periodic heartbeat with runtime metrics.
-        let interval = Duration::from_millis(heartbeat_interval_ms as u64);
+        //
+        // Uses `tokio::time::interval` instead of `tokio::time::sleep` to prevent
+        // heartbeat starvation: extent updates drain the channel and `continue`,
+        // which would restart a fresh sleep timer each iteration. With an interval,
+        // the tick deadline is absolute — updates don't push it forward.
+        let interval_duration = Duration::from_millis(heartbeat_interval_ms as u64);
+        let mut heartbeat_interval = tokio::time::interval(interval_duration);
+        heartbeat_interval.tick().await; // consume the first immediate tick
         let mut request_id = 1u32;
 
         loop {
-            // Sleep until the next heartbeat, but also watch for shutdown and extent updates.
+            // Wait for the next heartbeat tick, but also process extent updates and shutdown.
             tokio::select! {
-                _ = tokio::time::sleep(interval) => {}
+                _ = heartbeat_interval.tick() => {}
                 Some(update) = update_rx.recv() => {
                     // Extent update: send on the existing connection (fire-and-forget).
                     Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
