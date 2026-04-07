@@ -8,8 +8,8 @@ use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use futures_util::future;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{
-    build_register_extent_payload, build_string_payload, encode_extent_info_vec,
-    parse_connect_payload, parse_create_stream_payload, parse_heartbeat_payload,
+    build_register_extent_payload, encode_extent_info_vec,
+    parse_connect_payload, parse_heartbeat_payload,
     parse_string_payload,
 };
 use server::handler::RequestHandler;
@@ -677,23 +677,29 @@ impl StreamManagerStore {
     }
 
     /// CreateStream: create stream in metadata, allocate initial extent replica set, notify ExtentNodes.
-    /// Payload = [name_len:u16][stream_name][replication_factor:u16][extent_capacity:u32]
     ///
-    /// If replication_factor=0 in the payload, the server's default_replication_factor is used.
+    /// Variable header carries stream_name, replication_factor, and extent_capacity.
+    /// If replication_factor=0, the server's default_replication_factor is used.
     /// If extent_capacity=0, the default of 64 MiB is used.
     ///
-    /// Response payload: [addr_len:u16][primary_addr]
+    /// Response variable header carries primary_addr.
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
-        let payload = frame.payload.as_deref().unwrap_or_default();
-        let (stream_name, replication_factor, extent_capacity) = match parse_create_stream_payload(
-            payload,
-        ) {
-            Some((name, rf, ec)) => (name, rf, ec),
-            None => {
+        let (stream_name, replication_factor, extent_capacity) = match &frame.variable_header {
+            VariableHeader::CreateStream {
+                stream_name,
+                replication_factor,
+                extent_capacity,
+                ..
+            } => (
+                String::from_utf8_lossy(stream_name).to_string(),
+                *replication_factor,
+                *extent_capacity,
+            ),
+            _ => {
                 return Frame::error_response(
                     frame.request_id(),
                     ErrorCode::InternalError,
-                    "invalid CreateStream payload: expected [name_len:u16][name][replication_factor:u16][extent_capacity:u32]",
+                    "invalid CreateStream frame",
                     ExtentId(0),
                 );
             }
@@ -737,8 +743,9 @@ impl StreamManagerStore {
                     stream_id,
                     extent_id,
                     epoch: Epoch(0),
+                    primary_addr: Bytes::from(primary_addr),
                 },
-                Some(build_string_payload(&primary_addr)),
+                None,
             ),
             Err(e) => {
                 error!("create_stream failed: {e}");
@@ -1187,11 +1194,43 @@ impl StreamManagerStore {
 
     /// DescribeStream: return extent metadata with replica info and node liveness.
     ///
-    /// Payload: [count:u32]  (0 = all extents, N = at most N from latest to earliest)
+    /// When FLAG_DESCRIBE_STREAM_BY_NAME is set, resolves stream_name from the variable
+    /// header to a StreamId first. Otherwise uses stream_id from the header directly.
+    ///
     /// Response: DescribeStreamResp with encoded Vec<ExtentInfo>
     async fn handle_describe_stream(&self, frame: Frame) -> Frame {
-        let stream_id = frame.stream_id();
         let count = frame.count();
+
+        // Resolve stream_id: by name if FLAG_DESCRIBE_STREAM_BY_NAME, else from header.
+        let stream_id = if let VariableHeader::DescribeStream {
+            stream_name: Some(ref name),
+            ..
+        } = frame.variable_header
+        {
+            let name_str = String::from_utf8_lossy(name);
+            match self.store.get_stream_by_name(&name_str).await {
+                Ok(Some(row)) => row.stream_id,
+                Ok(None) => {
+                    return Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::UnknownStream,
+                        &format!("stream not found: {name_str}"),
+                        ExtentId(0),
+                    );
+                }
+                Err(e) => {
+                    error!("get_stream_by_name failed: {e}");
+                    return Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::InternalError,
+                        &e.to_string(),
+                        ExtentId(0),
+                    );
+                }
+            }
+        } else {
+            frame.stream_id()
+        };
 
         match self.store.describe_stream_extents(stream_id, count).await {
             Ok(extents) => {

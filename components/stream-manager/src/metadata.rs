@@ -161,6 +161,25 @@ impl MetadataStore {
         }))
     }
 
+    /// Get a stream by name.
+    pub async fn get_stream_by_name(&self, name: &str) -> Result<Option<StreamRow>, StorageError> {
+        let row = sqlx::query(
+            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity FROM stream WHERE stream_name = ?",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("get_stream_by_name: {e}")))?;
+
+        Ok(row.map(|r| StreamRow {
+            stream_id: StreamId(r.get::<i64, _>("stream_id") as u64),
+            stream_name: r.get("stream_name"),
+            stream_type: r.get("stream_type"),
+            replication_factor: r.get::<i16, _>("replication_factor") as u16,
+            extent_capacity: r.get::<i32, _>("extent_capacity") as u32,
+        }))
+    }
+
     /// Get all streams that have at least one active extent.
     /// Used during SM startup reconciliation to discover streams that may have
     /// extents created autonomously by ENs during SM downtime.

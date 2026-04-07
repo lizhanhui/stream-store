@@ -2,9 +2,9 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_EPOCH_PRESENT, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
-    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT,
-    FLAG_OFFSET_PRESENT, FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode,
-    PROTOCOL_VERSION, StreamId,
+    FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
+    FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT,
+    FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.
@@ -74,12 +74,16 @@ pub enum VariableHeader {
     },
     CreateStream {
         request_id: u32,
+        stream_name: Bytes,
+        replication_factor: u16,
+        extent_capacity: u32,
     },
     CreateStreamResp {
         request_id: u32,
         stream_id: StreamId,
         extent_id: ExtentId,
         epoch: Epoch,
+        primary_addr: Bytes,
     },
     QueryOffset {
         request_id: u32,
@@ -191,6 +195,8 @@ pub enum VariableHeader {
         request_id: u32,
         stream_id: StreamId,
         count: u32,
+        /// Stream name for name-based lookup (FLAG_DESCRIBE_STREAM_BY_NAME).
+        stream_name: Option<Bytes>,
     },
     DescribeStreamResp {
         request_id: u32,
@@ -291,7 +297,7 @@ impl Frame {
             | VariableHeader::ReadResp { request_id, .. }
             | VariableHeader::Seal { request_id, .. }
             | VariableHeader::SealAck { request_id, .. }
-            | VariableHeader::CreateStream { request_id }
+            | VariableHeader::CreateStream { request_id, .. }
             | VariableHeader::CreateStreamResp { request_id, .. }
             | VariableHeader::QueryOffset { request_id, .. }
             | VariableHeader::QueryOffsetResp { request_id, .. }
@@ -471,6 +477,13 @@ impl Frame {
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
             VariableHeader::ForwardInitExtent { .. } => FLAG_FORWARD_INIT_EXTENT,
             VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,
+            VariableHeader::DescribeStream { stream_name, .. } => {
+                if stream_name.is_some() {
+                    FLAG_DESCRIBE_STREAM_BY_NAME
+                } else {
+                    0
+                }
+            }
             _ => 0,
         };
         self.header.flags | computed
@@ -548,10 +561,10 @@ impl Frame {
                 let ep = if epoch.is_some() { 4 } else { 0 };
                 base + ne + ep
             }
-            // request_id(4)
-            VariableHeader::CreateStream { .. } => 4,
-            // request_id(4) + stream_id(8) + extent_id(4) + epoch(4)
-            VariableHeader::CreateStreamResp { .. } => 4 + 8 + 4 + 4,
+            // request_id(4) + name_len(2) + name(N) + replication_factor(2) + extent_capacity(4)
+            VariableHeader::CreateStream { stream_name, .. } => 4 + 2 + stream_name.len() + 2 + 4,
+            // request_id(4) + stream_id(8) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
+            VariableHeader::CreateStreamResp { primary_addr, .. } => 4 + 8 + 4 + 4 + 2 + primary_addr.len(),
             // request_id(4) + stream_id(8)
             VariableHeader::QueryOffset { .. } => 4 + 8,
             // request_id(4) + stream_id(8) + offset(8)
@@ -584,8 +597,12 @@ impl Frame {
             VariableHeader::ForwardChecksum { .. } => 8 + 4 + 4 + 8,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
-            // request_id(4) + stream_id(8) + count(4)
-            VariableHeader::DescribeStream { .. } => 4 + 8 + 4,
+            // request_id(4) + stream_id(8) + count(4) [+ name_len(2) + name(N) if FLAG_DESCRIBE_STREAM_BY_NAME]
+            VariableHeader::DescribeStream { stream_name, .. } => {
+                let base = 4 + 8 + 4;
+                let name = stream_name.as_ref().map_or(0, |n| 2 + n.len());
+                base + name
+            }
             // request_id(4) + stream_id(8)
             VariableHeader::DescribeStreamResp { .. }
             | VariableHeader::DescribeExtentResp { .. } => 4 + 8,
@@ -603,8 +620,6 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::Append { .. }
             | VariableHeader::ReadResp { .. }
-            | VariableHeader::CreateStream { .. }
-            | VariableHeader::CreateStreamResp { .. }
             | VariableHeader::Connect { .. }
             | VariableHeader::Disconnect { .. }
             | VariableHeader::Heartbeat { .. }
@@ -735,19 +750,31 @@ impl Frame {
                     dst.put_u32(ep.0);
                 }
             }
-            VariableHeader::CreateStream { request_id } => {
+            VariableHeader::CreateStream {
+                request_id,
+                stream_name,
+                replication_factor,
+                extent_capacity,
+            } => {
                 dst.put_u32(*request_id);
+                dst.put_u16(stream_name.len() as u16);
+                dst.extend_from_slice(stream_name);
+                dst.put_u16(*replication_factor);
+                dst.put_u32(*extent_capacity);
             }
             VariableHeader::CreateStreamResp {
                 request_id,
                 stream_id,
                 extent_id,
                 epoch,
+                primary_addr,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
+                dst.put_u16(primary_addr.len() as u16);
+                dst.extend_from_slice(primary_addr);
             }
             VariableHeader::QueryOffset {
                 request_id,
@@ -853,10 +880,15 @@ impl Frame {
                 request_id,
                 stream_id,
                 count,
+                stream_name,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
                 dst.put_u32(*count);
+                if let Some(name) = stream_name {
+                    dst.put_u16(name.len() as u16);
+                    dst.extend_from_slice(name);
+                }
             }
             VariableHeader::DescribeStreamResp {
                 request_id,
@@ -1144,23 +1176,36 @@ impl Frame {
             }
             Opcode::CreateStream => {
                 let request_id = body.get_u32();
-                let payload = Self::read_payload(body);
-                Ok((VariableHeader::CreateStream { request_id }, payload))
+                let name_len = body.get_u16() as usize;
+                let stream_name = body.split_to(name_len).freeze();
+                let replication_factor = body.get_u16();
+                let extent_capacity = body.get_u32();
+                Ok((
+                    VariableHeader::CreateStream {
+                        request_id,
+                        stream_name,
+                        replication_factor,
+                        extent_capacity,
+                    },
+                    None,
+                ))
             }
             Opcode::CreateStreamResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
-                let payload = Self::read_payload(body);
+                let addr_len = body.get_u16() as usize;
+                let primary_addr = body.split_to(addr_len).freeze();
                 Ok((
                     VariableHeader::CreateStreamResp {
                         request_id,
                         stream_id,
                         extent_id,
                         epoch,
+                        primary_addr,
                     },
-                    payload,
+                    None,
                 ))
             }
             Opcode::QueryOffset => {
@@ -1322,11 +1367,18 @@ impl Frame {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let count = body.get_u32();
+                let stream_name = if flags & FLAG_DESCRIBE_STREAM_BY_NAME != 0 {
+                    let name_len = body.get_u16() as usize;
+                    Some(body.split_to(name_len).freeze())
+                } else {
+                    None
+                };
                 Ok((
                     VariableHeader::DescribeStream {
                         request_id,
                         stream_id,
                         count,
+                        stream_name,
                     },
                     None,
                 ))
@@ -1897,6 +1949,7 @@ mod tests {
                 request_id: 1,
                 stream_id: StreamId(10),
                 count: 3,
+                stream_name: None,
             },
             None,
         );
@@ -1910,6 +1963,41 @@ mod tests {
     }
 
     #[test]
+    fn create_stream_round_trip() {
+        let frame = Frame::new(
+            VariableHeader::CreateStream {
+                request_id: 5,
+                stream_name: Bytes::from_static(b"my-stream"),
+                replication_factor: 3,
+                extent_capacity: 67_108_864,
+            },
+            None,
+        );
+
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf);
+
+        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.opcode(), Opcode::CreateStream);
+        assert_eq!(decoded.request_id(), 5);
+        match &decoded.variable_header {
+            VariableHeader::CreateStream {
+                stream_name,
+                replication_factor,
+                extent_capacity,
+                ..
+            } => {
+                assert_eq!(stream_name, &Bytes::from_static(b"my-stream"));
+                assert_eq!(*replication_factor, 3);
+                assert_eq!(*extent_capacity, 67_108_864);
+            }
+            _ => panic!("expected CreateStream"),
+        }
+        assert!(decoded.payload.is_none());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
     fn create_stream_resp_round_trip() {
         let frame = Frame::new(
             VariableHeader::CreateStreamResp {
@@ -1917,8 +2005,9 @@ mod tests {
                 stream_id: StreamId(42),
                 extent_id: ExtentId(1),
                 epoch: Epoch(0),
+                primary_addr: Bytes::from_static(b"127.0.0.1:9000"),
             },
-            Some(Bytes::from_static(b"\x00\x0e127.0.0.1:9000")),
+            None,
         );
 
         let mut buf = BytesMut::new();
@@ -1929,10 +2018,44 @@ mod tests {
         assert_eq!(decoded.request_id(), 5);
         assert_eq!(decoded.stream_id(), StreamId(42));
         assert_eq!(decoded.extent_id(), ExtentId(1));
-        assert_eq!(
-            decoded.payload,
-            Some(Bytes::from_static(b"\x00\x0e127.0.0.1:9000"))
+        match &decoded.variable_header {
+            VariableHeader::CreateStreamResp { primary_addr, .. } => {
+                assert_eq!(primary_addr, &Bytes::from_static(b"127.0.0.1:9000"));
+            }
+            _ => panic!("expected CreateStreamResp"),
+        }
+        assert!(decoded.payload.is_none());
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn describe_stream_by_name_round_trip() {
+        let frame = Frame::new(
+            VariableHeader::DescribeStream {
+                request_id: 10,
+                stream_id: StreamId(0),
+                count: 1,
+                stream_name: Some(Bytes::from_static(b"my-stream")),
+            },
+            None,
         );
+
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf);
+
+        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.opcode(), Opcode::DescribeStream);
+        assert_eq!(decoded.flags(), FLAG_DESCRIBE_STREAM_BY_NAME);
+        assert_eq!(decoded.count(), 1);
+        match &decoded.variable_header {
+            VariableHeader::DescribeStream { stream_name, .. } => {
+                assert_eq!(
+                    stream_name.as_ref().unwrap(),
+                    &Bytes::from_static(b"my-stream")
+                );
+            }
+            _ => panic!("expected DescribeStream"),
+        }
         assert!(buf.is_empty());
     }
 
