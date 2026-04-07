@@ -51,6 +51,7 @@ tokio-util = { workspace = true }
 sqlx = { workspace = true }
 dashmap = "6"
 fastant = { workspace = true }
+hdrhistogram = "7.5"
 
 [[bench]]
 name = "concurrent_multi_stream"

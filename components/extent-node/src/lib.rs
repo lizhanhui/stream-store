@@ -69,6 +69,7 @@ impl ExtentNode {
         // Create store first (OnceLock for downstream breaks circular dep).
         let mut store_inner = ExtentNodeStore::new();
         store_inner.set_replication_timeout(Duration::from_millis(config.replication_timeout_ms));
+        store_inner.set_max_extents_per_stream(config.max_extents_per_stream);
 
         // Wire up the extent update channel for autonomous extent creation
         // and periodic progress reporting. The receiver is passed to
