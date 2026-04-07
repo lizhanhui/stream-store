@@ -115,7 +115,10 @@ async fn stream_client_open_integration() {
 
     // Primary address should be cached.
     let primary_addr = sm.cached_primary(stream_id).await;
-    assert!(primary_addr.is_some(), "primary address should be cached after open");
+    assert!(
+        primary_addr.is_some(),
+        "primary address should be cached after open"
+    );
     assert_eq!(
         primary_addr.as_deref().unwrap(),
         &extent_node_addr,
@@ -124,7 +127,10 @@ async fn stream_client_open_integration() {
 
     // ── Part 2: open() returns same stream when it already exists ──
     let stream_id_2 = sm.open("test-stream", 1).await.unwrap();
-    assert_eq!(stream_id, stream_id_2, "open() should return same StreamId for existing stream");
+    assert_eq!(
+        stream_id, stream_id_2,
+        "open() should return same StreamId for existing stream"
+    );
 
     // Primary cache should still be populated.
     let primary_addr_2 = sm.cached_primary(stream_id_2).await;
@@ -132,7 +138,10 @@ async fn stream_client_open_integration() {
 
     // ── Part 3: open() a second distinct stream ──
     let stream_id_b = sm.open("another-stream", 1).await.unwrap();
-    assert_ne!(stream_id, stream_id_b, "different names should yield different StreamIds");
+    assert_ne!(
+        stream_id, stream_id_b,
+        "different names should yield different StreamIds"
+    );
     assert!(sm.cached_primary(stream_id_b).await.is_some());
 
     // ── Part 4: data plane works via cached primary ──
