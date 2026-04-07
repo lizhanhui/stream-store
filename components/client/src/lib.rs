@@ -7,13 +7,13 @@ use bytes::{Buf, Bytes};
 use common::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SM_REQUEST_TIMEOUT_MS};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentInfo, NodeMetrics, Offset, Opcode, StreamId,
+    Epoch, ErrorCode, ExtentId, ExtentInfo, ExtentState, NodeMetrics, Offset, Opcode, StreamId,
 };
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{
-    build_connect_payload, build_create_stream_payload, build_heartbeat_payload,
+    build_connect_payload, build_heartbeat_payload,
     build_string_payload, parse_extent_info_vec,
 };
 use tokio::net::TcpStream;
@@ -48,6 +48,7 @@ struct Inner {
 pub struct StreamClient {
     inner: Arc<Inner>,
     request_timeout: Duration,
+    primary_cache: Mutex<HashMap<StreamId, String>>,
     _reader_handle: JoinHandle<()>,
     _writer_handle: JoinHandle<()>,
 }
@@ -103,6 +104,7 @@ impl StreamClient {
         Ok(Self {
             inner,
             request_timeout,
+            primary_cache: Mutex::new(HashMap::new()),
             _reader_handle: reader_handle,
             _writer_handle: writer_handle,
         })
@@ -233,7 +235,7 @@ impl StreamClient {
     }
 
     /// Create a new stream on the StreamManager.
-    /// Payload carries stream name, per-stream replication factor, and per-stream extent capacity.
+    /// Variable header carries stream name, per-stream replication factor, and per-stream extent capacity.
     /// If replication_factor=0, the StreamManager uses its default.
     /// If extent_capacity=0, the StreamManager uses its default (64 MiB).
     /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
@@ -246,12 +248,11 @@ impl StreamClient {
         let req = Frame::new(
             VariableHeader::CreateStream {
                 request_id: self.alloc_request_id(),
-            },
-            Some(build_create_stream_payload(
-                name,
+                stream_name: Bytes::from(name.to_owned()),
                 replication_factor,
                 extent_capacity,
-            )),
+            },
+            None,
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
@@ -262,13 +263,19 @@ impl StreamClient {
             )));
         }
 
-        // extent_id is in the frame field; payload carries [addr_len:u16][addr]
-        let addr = rpc::payload::parse_string_payload(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| {
-                StorageError::Internal("invalid CreateStreamResp primary_addr payload".into())
-            })?;
+        let addr = if let VariableHeader::CreateStreamResp { primary_addr, .. } =
+            &resp.variable_header
+        {
+            String::from_utf8_lossy(primary_addr).to_string()
+        } else {
+            return Err(StorageError::Internal(
+                "unexpected variable header in CreateStreamResp".into(),
+            ));
+        };
 
-        Ok((resp.stream_id(), resp.extent_id(), resp.epoch(), addr))
+        let stream_id = resp.stream_id();
+        self.cache_primary(stream_id, &addr).await;
+        Ok((stream_id, resp.extent_id(), resp.epoch(), addr))
     }
 
     /// Append a message to a stream. Returns the assigned offset and diagnostics.
@@ -470,6 +477,9 @@ impl StreamClient {
                 .as_ref()
                 .map(|b| String::from_utf8_lossy(b).to_string())
                 .unwrap_or_default();
+            if !addr.is_empty() {
+                self.cache_primary(stream_id, &addr).await;
+            }
             Ok((new_eid, addr))
         } else {
             Err(StorageError::Internal(
@@ -522,6 +532,9 @@ impl StreamClient {
                 .as_ref()
                 .map(|b| String::from_utf8_lossy(b).to_string())
                 .unwrap_or_default();
+            if !addr.is_empty() {
+                self.cache_primary(stream_id, &addr).await;
+            }
             Ok((new_eid, addr, *new_epoch))
         } else {
             Err(StorageError::Internal(
@@ -547,6 +560,7 @@ impl StreamClient {
                 request_id: self.alloc_request_id(),
                 stream_id,
                 count,
+                stream_name: None,
             },
             None,
         );
@@ -558,8 +572,10 @@ impl StreamClient {
                 resp.opcode()
             )));
         }
-        parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid DescribeStreamResp payload".into()))
+        let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
+            .ok_or_else(|| StorageError::Internal("invalid DescribeStreamResp payload".into()))?;
+        self.cache_primary_from_extents(stream_id, &extents).await;
+        Ok(extents)
     }
 
     /// Describe a single extent with replica info and node liveness.
@@ -622,5 +638,80 @@ impl StreamClient {
             .into_iter()
             .next()
             .ok_or_else(|| StorageError::Internal("SeekResp returned empty result".into()))
+    }
+
+    // ── High-level operations ──
+
+    /// Describe a stream by name, returning the resolved StreamId and extent info.
+    pub async fn describe_stream_by_name(
+        &self,
+        name: &str,
+        count: u32,
+    ) -> Result<(StreamId, Vec<ExtentInfo>), StorageError> {
+        let req = Frame::new(
+            VariableHeader::DescribeStream {
+                request_id: self.alloc_request_id(),
+                stream_id: StreamId(0),
+                count,
+                stream_name: Some(Bytes::from(name.to_owned())),
+            },
+            None,
+        );
+        let resp = self.send_request(req).await?;
+        Self::check_error(&resp)?;
+        if resp.opcode() != Opcode::DescribeStreamResp {
+            return Err(StorageError::Internal(format!(
+                "expected DescribeStreamResp, got {:?}",
+                resp.opcode()
+            )));
+        }
+        let stream_id = resp.stream_id();
+        let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
+            .ok_or_else(|| StorageError::Internal("invalid DescribeStreamResp payload".into()))?;
+        self.cache_primary_from_extents(stream_id, &extents).await;
+        Ok((stream_id, extents))
+    }
+
+    /// Open a stream by name: describe if it exists, create if absent.
+    ///
+    /// Returns the `StreamId`. The primary address is cached internally and
+    /// can be retrieved via `cached_primary`.
+    pub async fn open(
+        &self,
+        stream_name: &str,
+        replication_factor: u16,
+    ) -> Result<StreamId, StorageError> {
+        match self.describe_stream_by_name(stream_name, 1).await {
+            Ok((stream_id, _)) => Ok(stream_id),
+            Err(StorageError::UnknownStream(_)) => {
+                let (stream_id, _, _, _) =
+                    self.create_stream(stream_name, replication_factor, 0).await?;
+                Ok(stream_id)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Get the cached primary ExtentNode address for a stream.
+    pub async fn cached_primary(&self, stream_id: StreamId) -> Option<String> {
+        self.primary_cache.lock().await.get(&stream_id).cloned()
+    }
+
+    /// Update the primary address cache for a stream.
+    async fn cache_primary(&self, stream_id: StreamId, addr: &str) {
+        self.primary_cache
+            .lock()
+            .await
+            .insert(stream_id, addr.to_string());
+    }
+
+    /// Extract and cache the primary address from extent info.
+    async fn cache_primary_from_extents(&self, stream_id: StreamId, extents: &[ExtentInfo]) {
+        // Find the active extent's primary replica.
+        if let Some(ext) = extents.iter().find(|e| e.state == ExtentState::Active) {
+            if let Some(primary) = ext.replicas.iter().find(|r| r.role == 0) {
+                self.cache_primary(stream_id, &primary.node_addr).await;
+            }
+        }
     }
 }
