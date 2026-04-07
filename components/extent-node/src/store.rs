@@ -1498,31 +1498,58 @@ impl ExtentNodeStore {
             };
             let mut guard = writer.lock().await;
 
-            // Under the Mutex: check if any Forward frame targets an extent that
-            // needs ForwardInitExtent. Send init frames first to guarantee ordering.
+            // Under the Mutex: check if any Forward or ForwardChecksum frame targets
+            // an extent that needs ForwardInitExtent. Send init frames first to
+            // guarantee the secondary has the extent before receiving data or checksums.
             for f in &frames {
-                if let VariableHeader::Forward {
-                    stream_id,
-                    extent_id,
-                    epoch,
-                    ..
-                } = &f.variable_header
-                {
-                    if let Some(stream_ref) = self.streams.get(stream_id) {
-                        if let Some(ext) = stream_ref.find_extent(*extent_id) {
-                            if ext.take_init_forward() {
-                                let init = Frame::new(
-                                    VariableHeader::ForwardInitExtent {
-                                        stream_id: *stream_id,
-                                        extent_id: *extent_id,
-                                        epoch: *epoch,
-                                        start_offset: ext.start_offset,
-                                        extent_capacity: stream_ref.extent_capacity(),
-                                    },
-                                    None,
-                                );
-                                let _ = guard.feed(init).await;
+                let (stream_id, extent_id, epoch) = match &f.variable_header {
+                    VariableHeader::Forward {
+                        stream_id,
+                        extent_id,
+                        epoch,
+                        ..
+                    } => (stream_id, extent_id, epoch),
+                    VariableHeader::ForwardChecksum {
+                        stream_id,
+                        extent_id,
+                        ..
+                    } => {
+                        // ForwardChecksum doesn't carry epoch; look it up from the extent.
+                        if let Some(stream_ref) = self.streams.get(stream_id) {
+                            if let Some(ext) = stream_ref.find_extent(*extent_id) {
+                                if ext.take_init_forward() {
+                                    let init = Frame::new(
+                                        VariableHeader::ForwardInitExtent {
+                                            stream_id: *stream_id,
+                                            extent_id: *extent_id,
+                                            epoch: ext.epoch,
+                                            start_offset: ext.start_offset,
+                                            extent_capacity: stream_ref.extent_capacity(),
+                                        },
+                                        None,
+                                    );
+                                    let _ = guard.feed(init).await;
+                                }
                             }
+                        }
+                        continue;
+                    }
+                    _ => continue,
+                };
+                if let Some(stream_ref) = self.streams.get(stream_id) {
+                    if let Some(ext) = stream_ref.find_extent(*extent_id) {
+                        if ext.take_init_forward() {
+                            let init = Frame::new(
+                                VariableHeader::ForwardInitExtent {
+                                    stream_id: *stream_id,
+                                    extent_id: *extent_id,
+                                    epoch: *epoch,
+                                    start_offset: ext.start_offset,
+                                    extent_capacity: stream_ref.extent_capacity(),
+                                },
+                                None,
+                            );
+                            let _ = guard.feed(init).await;
                         }
                     }
                 }
