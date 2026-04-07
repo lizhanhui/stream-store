@@ -2,8 +2,7 @@
 //!
 //! Launches a full cluster (1 StreamManager + 3 ExtentNodes), creates a **single stream**
 //! (RF=2), then spawns N concurrent client connections all appending to the same stream.
-//! Each client measures per-append latency; the harness aggregates throughput and
-//! latency percentiles (p50/p99/max).
+//! Stats (throughput, latency percentiles) are reported periodically every `REPORT_INTERVAL`.
 //!
 //! With pipelining enabled, each sender keeps up to `PIPELINE_DEPTH` appends in-flight
 //! concurrently on a single connection, dramatically improving throughput.
@@ -22,8 +21,8 @@
 //! cargo bench --bench pipeline_append
 //! ```
 
-use fastant::Instant;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,20 +30,71 @@ use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::Epoch;
 use extent_node::ExtentNode;
+use hdrhistogram::Histogram;
 use sqlx::mysql::MySqlPoolOptions;
 use stream_manager::StreamManager;
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
 // -- Benchmark Parameters -----------------------------------------------------
 
-const BENCH_DURATION: Duration = Duration::from_secs(5);
+const BENCH_DURATION: Duration = Duration::from_secs(120);
+const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const NUM_SENDERS: usize = 4;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u16 = 2;
 const EXTENT_CAPACITY: u32 = 64 * 1024 * 1024; // 64 MiB
 const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
+const MAX_EXTENTS_PER_STREAM: usize = 4;
+
+// -- Shared counters ----------------------------------------------------------
+
+struct SharedCounters {
+    appends: AtomicU64,
+    bytes: AtomicU64,
+    errors: AtomicU64,
+    /// HDR Histogram for latency recording (microseconds, 3 significant figures).
+    histogram: Mutex<Histogram<u64>>,
+}
+
+impl SharedCounters {
+    fn new() -> Self {
+        // Track latencies from 1us to 60s with 3 significant figures.
+        let hist = Histogram::new_with_bounds(1, 60_000_000, 3).unwrap();
+        Self {
+            appends: AtomicU64::new(0),
+            bytes: AtomicU64::new(0),
+            errors: AtomicU64::new(0),
+            histogram: Mutex::new(hist),
+        }
+    }
+
+    fn record_success(&self, latency: Duration) {
+        self.appends.fetch_add(1, Ordering::Relaxed);
+        self.bytes.fetch_add(PAYLOAD_SIZE as u64, Ordering::Relaxed);
+        let us = latency.as_micros() as u64;
+        let _ = self.histogram.lock().unwrap().record(us);
+    }
+
+    fn record_error(&self) {
+        self.errors.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Snapshot and reset counters. Returns (appends, bytes, errors, histogram_snapshot).
+    fn snapshot_and_reset(&self) -> (u64, u64, u64, Histogram<u64>) {
+        let appends = self.appends.swap(0, Ordering::Relaxed);
+        let bytes = self.bytes.swap(0, Ordering::Relaxed);
+        let errors = self.errors.swap(0, Ordering::Relaxed);
+        let hist = {
+            let mut guard = self.histogram.lock().unwrap();
+            let snapshot = guard.clone();
+            guard.reset();
+            snapshot
+        };
+        (appends, bytes, errors, hist)
+    }
+}
 
 // -- Main ---------------------------------------------------------------------
 
@@ -75,6 +125,7 @@ async fn main() {
             bind_ip: "127.0.0.1".into(),
             port: 0,
             stream_manager_addrs: vec![stream_manager_addr.clone()],
+            max_extents_per_stream: MAX_EXTENTS_PER_STREAM,
             ..Default::default()
         };
         let node = ExtentNode::start(config).await;
@@ -100,197 +151,183 @@ async fn main() {
         stream_id, initial_extent_id, initial_primary_addr
     );
 
-    // -- 6. Spawn sender tasks ------------------------------------------------
-    let start = Instant::now();
+    // -- 6. Shared counters ---------------------------------------------------
+    let counters = Arc::new(SharedCounters::new());
 
-    let mut handles = Vec::with_capacity(NUM_SENDERS);
+    // -- 7. Spawn sender tasks ------------------------------------------------
+    let start = std::time::Instant::now();
+
     for sender_id in 0..NUM_SENDERS {
         let primary_addr = initial_primary_addr.clone();
+        let counters = Arc::clone(&counters);
 
-        handles.push(tokio::spawn(async move {
-            sender_task(sender_id, stream_id, primary_addr, BENCH_DURATION).await
-        }));
+        tokio::spawn(async move {
+            sender_task(sender_id, stream_id, primary_addr, BENCH_DURATION, counters).await;
+        });
     }
 
-    // -- 7. Collect results ---------------------------------------------------
-    let mut total_appends: u64 = 0;
-    let mut total_bytes: u64 = 0;
-    let mut total_errors: u64 = 0;
-    let mut all_latencies: Vec<Duration> = Vec::new();
+    // -- 8. Periodic reporter (runs on main) ----------------------------------
+    print_header();
+    let mut cumulative_appends: u64 = 0;
+    let mut cumulative_bytes: u64 = 0;
+    let mut cumulative_errors: u64 = 0;
+    let mut cumulative_hist = Histogram::<u64>::new_with_bounds(1, 60_000_000, 3).unwrap();
+    let mut interval = tokio::time::interval(REPORT_INTERVAL);
+    interval.tick().await; // first tick fires immediately — skip it
 
-    for handle in handles {
-        match handle.await {
-            Ok(result) => {
-                total_appends += result.total_appends;
-                total_bytes += result.total_bytes;
-                total_errors += result.error_count;
-                all_latencies.extend(result.latencies);
-            }
-            Err(e) => {
-                warn!("[error] Sender task panicked: {e}");
-            }
-        }
+    let total_intervals = (BENCH_DURATION.as_secs() / REPORT_INTERVAL.as_secs()) + 1;
+    for _ in 0..total_intervals {
+        interval.tick().await;
+        let elapsed = start.elapsed();
+        let (appends, bytes, errors, hist) = counters.snapshot_and_reset();
+        cumulative_appends += appends;
+        cumulative_bytes += bytes;
+        cumulative_errors += errors;
+        cumulative_hist.add(&hist).ok();
+        print_interval(elapsed, REPORT_INTERVAL, appends, bytes, errors, &hist);
     }
 
+    // Final summary.
     let elapsed = start.elapsed();
+    let elapsed_secs = elapsed.as_secs_f64();
+    eprintln!(
+        "───────────────────────────────────────────────────────────────────────────────────────────────────────────────"
+    );
+    eprintln!(
+        "  TOTAL    {:>10.0} ops/s  {:>7.2} MB/s  {} appends  {} errors  |  avg {}  p99 {}  p99.9 {}  max {}",
+        cumulative_appends as f64 / elapsed_secs,
+        (cumulative_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs,
+        cumulative_appends,
+        cumulative_errors,
+        format_us(cumulative_hist.mean() as u64),
+        format_us(cumulative_hist.value_at_quantile(0.99)),
+        format_us(cumulative_hist.value_at_quantile(0.999)),
+        format_us(cumulative_hist.max()),
+    );
+    eprintln!(
+        "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"
+    );
 
-    // -- 8. Shutdown ----------------------------------------------------------
+    // -- 9. Shutdown ----------------------------------------------------------
     for node in extent_nodes {
         node.stop().await;
     }
+}
 
-    // -- 9. Report ------------------------------------------------------------
-    all_latencies.sort();
+// -- Reporter -----------------------------------------------------------------
 
-    let elapsed_secs = elapsed.as_secs_f64();
-    let ops_per_sec = total_appends as f64 / elapsed_secs;
-    let mb_per_sec = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
-
-    println!();
-    println!("═══════════════════════════════════════════════════════════════");
-    println!("  Pipeline Append Benchmark Results");
-    println!("═══════════════════════════════════════════════════════════════");
-    println!("  Duration:        {elapsed_secs:.2}s");
-    println!("  Senders:         {NUM_SENDERS} (single stream)");
-    println!("  Payload size:    {PAYLOAD_SIZE} bytes");
-    println!(
-        "  Extent capacity:  {} MiB",
-        EXTENT_CAPACITY / (1024 * 1024)
+fn print_header() {
+    eprintln!();
+    eprintln!(
+        "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
-    println!("  RF:              {REPLICATION_FACTOR}");
-    println!("  Pipeline depth:  {PIPELINE_DEPTH}");
-    println!("───────────────────────────────────────────────────────────────");
-    println!("  Total appends:   {total_appends}");
-    println!(
-        "  Total bytes:     {total_bytes} ({:.2} MB)",
-        total_bytes as f64 / 1_000_000.0
+    eprintln!("  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  max_extents={MAX_EXTENTS_PER_STREAM}");
+    eprintln!(
+        "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
-    println!("  Throughput:      {ops_per_sec:.0} ops/sec");
-    println!("  Throughput:      {mb_per_sec:.2} MB/sec");
-    println!("  Errors:          {total_errors}");
-    println!("───────────────────────────────────────────────────────────────");
+    eprintln!(
+        "  {:>8}  {:>10}  {:>10}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "elapsed", "ops/sec", "MB/sec", "appends", "errors", "avg", "p99", "p99.9", "max"
+    );
+    eprintln!(
+        "  {:>8}  {:>10}  {:>10}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        "--------", "----------", "----------", "--------", "--------",
+        "--------", "--------", "--------", "--------"
+    );
+}
 
-    if !all_latencies.is_empty() {
-        let p50 = all_latencies[all_latencies.len() / 2];
-        let p99 = all_latencies[(all_latencies.len() as f64 * 0.99) as usize];
-        let max = *all_latencies.last().unwrap();
-        println!("  Latency p50:     {p50:?}");
-        println!("  Latency p99:     {p99:?}");
-        println!("  Latency max:     {max:?}");
+fn print_interval(
+    elapsed: Duration,
+    interval_dur: Duration,
+    appends: u64,
+    bytes: u64,
+    errors: u64,
+    hist: &Histogram<u64>,
+) {
+    let secs = interval_dur.as_secs_f64();
+    let ops = if secs > 0.0 {
+        appends as f64 / secs
     } else {
-        println!("  Latency:         (no completed appends)");
+        0.0
+    };
+    let mb = if secs > 0.0 {
+        (bytes as f64 / (1024.0 * 1024.0)) / secs
+    } else {
+        0.0
+    };
+
+    let (avg, p99, p999, max) = if hist.len() > 0 {
+        (
+            format_us(hist.mean() as u64),
+            format_us(hist.value_at_quantile(0.99)),
+            format_us(hist.value_at_quantile(0.999)),
+            format_us(hist.max()),
+        )
+    } else {
+        ("-".into(), "-".into(), "-".into(), "-".into())
+    };
+
+    eprintln!(
+        "  {:>7.1}s  {:>10.0}  {:>7.2} MB  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
+        elapsed.as_secs_f64(),
+        ops, mb, appends, errors, avg, p99, p999, max,
+    );
+}
+
+fn format_us(us: u64) -> String {
+    if us == 0 {
+        "-".into()
+    } else if us < 1000 {
+        format!("{us}us")
+    } else if us < 1_000_000 {
+        format!("{:.1}ms", us as f64 / 1000.0)
+    } else {
+        format!("{:.2}s", us as f64 / 1_000_000.0)
     }
-
-    println!("═══════════════════════════════════════════════════════════════");
-    println!();
 }
 
-// -- Helpers ------------------------------------------------------------------
+// -- Sender -------------------------------------------------------------------
 
-/// Per-sender result.
-struct SenderResult {
-    total_appends: u64,
-    total_bytes: u64,
-    error_count: u64,
-    latencies: Vec<Duration>,
-}
-
-/// Single sender task: connect to the primary, pipeline appends with up to
-/// PIPELINE_DEPTH in-flight requests, measure per-append latency.
-///
-/// Extent-full transitions are transparent -- the Primary handles seal-and-new
-/// autonomously within the current epoch. The client just keeps appending with
-/// the same stream_id; the server accepts appends on whatever the
-/// current active extent is.
 async fn sender_task(
     sender_id: usize,
     stream_id: common::types::StreamId,
     primary_addr: String,
     duration: Duration,
-) -> SenderResult {
+    counters: Arc<SharedCounters>,
+) {
     let payload = Bytes::from(vec![0xABu8; PAYLOAD_SIZE]);
-    let deadline = Instant::now() + duration;
+    let deadline = std::time::Instant::now() + duration;
 
-    // Connect to the primary ExtentNode.
     let en_client = Arc::new(
         StreamClient::connect(&primary_addr)
             .await
             .unwrap_or_else(|e| panic!("sender {sender_id}: EN connect failed: {e}")),
     );
 
-    // Semaphore to cap in-flight requests.
     let semaphore = Arc::new(Semaphore::new(PIPELINE_DEPTH));
 
-    // Channel for collecting results from spawned append tasks.
-    let (result_tx, mut result_rx) = mpsc::unbounded_channel::<AppendOutcome>();
+    while std::time::Instant::now() < deadline {
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
 
-    // Spawn append tasks until deadline.
-    let spawner = {
-        let semaphore = Arc::clone(&semaphore);
         let en_client = Arc::clone(&en_client);
-        let result_tx = result_tx.clone();
+        let payload = payload.clone();
+        let counters = Arc::clone(&counters);
 
         tokio::spawn(async move {
-            while Instant::now() < deadline {
-                // Acquire semaphore permit to limit pipeline depth.
-                let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-                let en_client = Arc::clone(&en_client);
-                let payload = payload.clone();
-                let result_tx = result_tx.clone();
-
-                tokio::spawn(async move {
-                    let t0 = Instant::now();
-                    let outcome = match en_client.append(stream_id, Epoch(0), payload).await {
-                        Ok(_) => AppendOutcome::Ok(t0.elapsed()),
-                        Err(e) => {
-                            warn!("sender {sender_id}: append error: {e}");
-                            AppendOutcome::Error
-                        }
-                    };
-                    let _ = result_tx.send(outcome);
-                    drop(permit);
-                });
+            let t0 = std::time::Instant::now();
+            match en_client.append(stream_id, Epoch(0), payload).await {
+                Ok(_) => counters.record_success(t0.elapsed()),
+                Err(e) => {
+                    warn!("sender {sender_id}: append error: {e}");
+                    counters.record_error();
+                }
             }
-        })
-    };
-
-    // Drop our copy so the channel closes when spawner + all tasks finish.
-    drop(result_tx);
-
-    // Collect results.
-    let mut total_appends: u64 = 0;
-    let mut total_bytes: u64 = 0;
-    let mut error_count: u64 = 0;
-    let mut latencies = Vec::with_capacity(65536);
-
-    while let Some(outcome) = result_rx.recv().await {
-        match outcome {
-            AppendOutcome::Ok(latency) => {
-                latencies.push(latency);
-                total_appends += 1;
-                total_bytes += PAYLOAD_SIZE as u64;
-            }
-            AppendOutcome::Error => {
-                error_count += 1;
-            }
-        }
-    }
-
-    spawner.await.ok();
-
-    SenderResult {
-        total_appends,
-        total_bytes,
-        error_count,
-        latencies,
+            drop(permit);
+        });
     }
 }
 
-enum AppendOutcome {
-    Ok(Duration),
-    Error,
-}
+// -- Helpers ------------------------------------------------------------------
 
 /// Drop all tables for a clean slate.
 async fn clean_database(mysql_url: &str) {

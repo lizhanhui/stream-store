@@ -43,6 +43,10 @@ pub struct Stream {
     /// Extent capacity for autonomously created extents (bytes).
     extent_capacity: u32,
 
+    /// Maximum number of extents to retain. 0 = no limit.
+    /// When exceeded, the oldest sealed extents are dropped to free memory.
+    max_extents: usize,
+
     /// Leader election counter for pipelined group commit (stream-level).
     /// 0 = idle. The leader owns the entire stream, handling extent transitions inline.
     in_flight: AtomicU64,
@@ -62,10 +66,17 @@ impl Stream {
             epoch: Epoch(0),
             next_extent_id: ExtentId(0),
             extent_capacity: 0,
+            max_extents: 0,
             in_flight: AtomicU64::new(0),
             job_tx,
             job_rx,
         }
+    }
+
+    /// Set the maximum number of extents to retain per stream.
+    /// 0 means no limit (default).
+    pub fn set_max_extents(&mut self, max: usize) {
+        self.max_extents = max;
     }
 
     /// Register a new extent on this stream (called when SM sends RegisterExtent).
@@ -86,6 +97,7 @@ impl Stream {
             extent_capacity,
             epoch,
         ));
+        self.evict_oldest_extents();
     }
 
     /// Return the extent capacity configured for this stream.
@@ -241,6 +253,7 @@ impl Stream {
             self.extent_capacity,
             self.epoch,
         ));
+        self.evict_oldest_extents();
         (new_id, end_offset)
     }
 
@@ -293,6 +306,25 @@ impl Stream {
         self.extents.iter().find(|e| e.id == extent_id)
     }
 
+    /// Drop oldest extents when the count exceeds `max_extents`.
+    ///
+    /// Evicts from the front of the extent list (oldest first). The last extent
+    /// (active/current) is never evicted. On secondaries, old extents may not be
+    /// explicitly sealed (the autonomous extent-full path only seals on the Primary),
+    /// so we evict any non-last extent regardless of seal state.
+    fn evict_oldest_extents(&mut self) {
+        if self.max_extents == 0 {
+            return;
+        }
+        while self.extents.len() > self.max_extents && self.extents.len() > 1 {
+            let evicted = self.extents.remove(0);
+            tracing::info!(
+                "evicted extent {} (sealed={}) from stream {} (retained: {})",
+                evicted.id, evicted.is_sealed(), self.id, self.extents.len(),
+            );
+        }
+    }
+
     /// Return the stream-level in_flight counter (for pipelined group commit).
     pub(crate) fn in_flight(&self) -> &AtomicU64 {
         &self.in_flight
@@ -329,6 +361,7 @@ impl Stream {
     pub fn seal_and_create_next(&mut self) -> Option<SealNotification> {
         let active_id = self.active_extent_id()?;
         let (_, end_offset) = self.seal(active_id, None)?;
+        // create_next_extent already calls evict_oldest_extents
         let (new_id, _) = self.create_next_extent();
         Some(SealNotification {
             sealed_extent_id: active_id,
@@ -356,6 +389,7 @@ impl std::fmt::Debug for Stream {
             .field("epoch", &self.epoch)
             .field("next_extent_id", &self.next_extent_id)
             .field("extent_capacity", &self.extent_capacity)
+            .field("max_extents", &self.max_extents)
             .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
             .finish()
     }
@@ -530,5 +564,119 @@ mod tests {
             .unwrap();
         assert_eq!(r.offset, Offset(1));
         assert_eq!(stream.max_offset(), Offset(2));
+    }
+
+    #[test]
+    fn evict_oldest_sealed_extents() {
+        let mut stream = Stream::new(StreamId(1));
+        stream.set_max_extents(2);
+
+        // Register extent 0 and append a message.
+        stream.register_extent(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        stream
+            .append(ExtentId(0), Bytes::from_static(b"msg0"))
+            .unwrap();
+
+        // Seal extent 0, register extent 1.
+        stream.seal(ExtentId(0), None);
+        stream.register_extent(ExtentId(1), Offset(1), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        // 2 extents (sealed + active) — at limit, no eviction.
+        assert!(stream.find_extent(ExtentId(0)).is_some());
+        assert!(stream.find_extent(ExtentId(1)).is_some());
+
+        // Seal extent 1, register extent 2 — now 3 extents, should evict extent 0.
+        stream
+            .append(ExtentId(1), Bytes::from_static(b"msg1"))
+            .unwrap();
+        stream.seal(ExtentId(1), None);
+        stream.register_extent(ExtentId(2), Offset(2), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        assert!(
+            stream.find_extent(ExtentId(0)).is_none(),
+            "extent 0 should be evicted"
+        );
+        assert!(stream.find_extent(ExtentId(1)).is_some());
+        assert!(stream.find_extent(ExtentId(2)).is_some());
+    }
+
+    #[test]
+    fn evict_via_create_next_extent() {
+        let mut stream = Stream::new(StreamId(1));
+        stream.set_max_extents(2);
+
+        stream.register_extent(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        stream
+            .append(ExtentId(0), Bytes::from_static(b"a"))
+            .unwrap();
+
+        // seal_and_create_next triggers eviction via create_next_extent.
+        let notif = stream.seal_and_create_next().unwrap();
+        // 2 extents: sealed extent 0 + new active extent 1. At limit.
+        assert!(stream.find_extent(ExtentId(0)).is_some());
+        assert!(stream.find_extent(notif.new_extent_id).is_some());
+
+        // Append to new extent, then seal_and_create again.
+        stream
+            .append(notif.new_extent_id, Bytes::from_static(b"b"))
+            .unwrap();
+        let notif2 = stream.seal_and_create_next().unwrap();
+        // 3 would exceed limit — extent 0 should be evicted.
+        assert!(
+            stream.find_extent(ExtentId(0)).is_none(),
+            "extent 0 should be evicted"
+        );
+        assert!(stream.find_extent(notif.new_extent_id).is_some());
+        assert!(stream.find_extent(notif2.new_extent_id).is_some());
+    }
+
+    #[test]
+    fn no_eviction_when_limit_is_zero() {
+        let mut stream = Stream::new(StreamId(1));
+        // max_extents = 0 (default) means no limit.
+
+        for i in 0..5u32 {
+            stream.register_extent(
+                ExtentId(i),
+                Offset(i as u64),
+                DEFAULT_EXTENT_CAPACITY,
+                Epoch(0),
+            );
+            stream
+                .append(ExtentId(i), Bytes::from_static(b"x"))
+                .unwrap();
+            stream.seal(ExtentId(i), None);
+        }
+        // Register one more active extent.
+        stream.register_extent(ExtentId(5), Offset(5), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+
+        // All 6 extents should still be present.
+        for i in 0..=5 {
+            assert!(stream.find_extent(ExtentId(i)).is_some());
+        }
+    }
+
+    #[test]
+    fn evict_unsealed_extents_secondary_scenario() {
+        // On secondaries, old extents may not be sealed (autonomous extent-full
+        // only seals on the Primary). Eviction should still work.
+        let mut stream = Stream::new(StreamId(1));
+        stream.set_max_extents(2);
+
+        // Register extent 0 (not sealed — simulating secondary).
+        stream.register_extent(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+
+        // Register extent 1 — 2 extents, at limit.
+        stream.register_extent(ExtentId(1), Offset(100), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        assert!(stream.find_extent(ExtentId(0)).is_some());
+        assert!(stream.find_extent(ExtentId(1)).is_some());
+
+        // Register extent 2 — 3 extents, exceeds limit.
+        // Extent 0 is NOT sealed, but should still be evicted.
+        stream.register_extent(ExtentId(2), Offset(200), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        assert!(
+            stream.find_extent(ExtentId(0)).is_none(),
+            "unsealed extent 0 should be evicted"
+        );
+        assert!(stream.find_extent(ExtentId(1)).is_some());
+        assert!(stream.find_extent(ExtentId(2)).is_some());
     }
 }

@@ -275,6 +275,8 @@ pub struct ExtentNodeStore {
     pub ack_queues: DashMap<StreamId, AckQueue>,
     /// Configurable timeout for replication quorum ACK expiry.
     replication_timeout: Duration,
+    /// Maximum extents to retain per stream (0 = no limit).
+    max_extents_per_stream: usize,
     // -- Metrics counters (reset on each heartbeat snapshot) --
     /// Total appends since last snapshot (atomic, no lock needed).
     append_count: AtomicU64,
@@ -293,6 +295,7 @@ impl ExtentNodeStore {
             update_tx: None,
             ack_queues: DashMap::new(),
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
+            max_extents_per_stream: 0,
             append_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
         }
@@ -301,6 +304,11 @@ impl ExtentNodeStore {
     /// Set the replication timeout (from config). Called once at startup.
     pub fn set_replication_timeout(&mut self, timeout: Duration) {
         self.replication_timeout = timeout;
+    }
+
+    /// Set the maximum extents per stream (from config). Called once at startup.
+    pub fn set_max_extents_per_stream(&mut self, max: usize) {
+        self.max_extents_per_stream = max;
     }
 
     /// Set the downstream connection pool for broadcast replication.
@@ -524,6 +532,7 @@ impl ExtentNodeStore {
             }
         } else {
             let mut stream = Stream::new(stream_id);
+            stream.set_max_extents(self.max_extents_per_stream);
             stream.register_extent(extent_id, Offset(0), extent_capacity, epoch);
             self.streams.insert(stream_id, stream);
             Offset(0)
@@ -1602,6 +1611,7 @@ impl ExtentNodeStore {
             }
         } else {
             let mut stream = Stream::new(stream_id);
+            stream.set_max_extents(self.max_extents_per_stream);
             stream.register_extent(extent_id, start_offset, extent_capacity, epoch);
             self.streams.insert(stream_id, stream);
             self.next_stream_id
