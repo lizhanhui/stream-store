@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use client::StorageClient;
+use client::StreamClient;
 use common::config::StreamManagerConfig;
 use common::types::{Epoch, ExtentState, NodeMetrics, Offset};
 
@@ -120,7 +120,7 @@ async fn describe_stream_rf2_integration() {
     let extent_node_2_addr = start_broadcast_extent_node().await;
     let stream_manager_addr = start_stream_manager_rf2().await;
 
-    let stream_manager = StorageClient::connect(&stream_manager_addr).await.unwrap();
+    let stream_manager = StreamClient::connect(&stream_manager_addr).await.unwrap();
 
     // Register both ExtentNodes with the StreamManager.
     stream_manager
@@ -166,7 +166,7 @@ async fn describe_stream_rf2_integration() {
     sleep(Duration::from_millis(100)).await;
 
     // Append messages to the primary.
-    let en_client = StorageClient::connect(&primary_addr).await.unwrap();
+    let en_client = StreamClient::connect(&primary_addr).await.unwrap();
     for i in 0u64..5 {
         en_client
             .append(
@@ -215,7 +215,7 @@ async fn describe_stream_rf2_integration() {
 
     // Append to new extent.
     sleep(Duration::from_millis(100)).await;
-    let en_client2 = StorageClient::connect(&new_primary_addr).await.unwrap();
+    let en_client2 = StreamClient::connect(&new_primary_addr).await.unwrap();
     for i in 0u64..3 {
         en_client2
             .append(

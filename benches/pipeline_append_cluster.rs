@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use client::StorageClient;
+use client::StreamClient;
 use common::types::Epoch;
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{info, warn};
@@ -53,7 +53,7 @@ async fn main() {
     let stream_manager_addr = "tx.dev:9800".to_string();
 
     // -- 1. Create a single stream via StreamManager --------------------------
-    let stream_manager_client = StorageClient::connect(&stream_manager_addr)
+    let stream_manager_client = StreamClient::connect(&stream_manager_addr)
         .await
         .expect("connect to StreamManager");
     let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = stream_manager_client
@@ -177,7 +177,7 @@ async fn sender_task(
 
     // Connect to the primary ExtentNode.
     let en_client = Arc::new(
-        StorageClient::connect(&primary_addr)
+        StreamClient::connect(&primary_addr)
             .await
             .unwrap_or_else(|e| panic!("sender {sender_id}: EN connect failed: {e}")),
     );

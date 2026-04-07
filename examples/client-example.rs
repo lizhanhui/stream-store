@@ -22,7 +22,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use client::StorageClient;
+use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::{Epoch, ExtentId, Offset};
 use sqlx::mysql::MySqlPoolOptions;
@@ -98,7 +98,7 @@ async fn main() {
     info!("    Registration complete");
 
     // ── 5. Create stream with replication_factor=2 ──
-    let stream_manager_client = StorageClient::connect(&stream_manager_addr.to_string())
+    let stream_manager_client = StreamClient::connect(&stream_manager_addr.to_string())
         .await
         .expect("failed to connect to StreamManager");
 
@@ -113,7 +113,7 @@ async fn main() {
     );
 
     // ── 6. Append records to the primary ExtentNode ──
-    let extent_node_client = StorageClient::connect(&primary_addr)
+    let extent_node_client = StreamClient::connect(&primary_addr)
         .await
         .expect("failed to connect to primary ExtentNode");
 
@@ -170,7 +170,7 @@ async fn main() {
     info!("    New extent_id={new_extent_id_raw}, primary={new_primary_addr}");
 
     // ── 10. Append more records to the new extent ──
-    let extent_node_client_2 = StorageClient::connect(&new_primary_addr)
+    let extent_node_client_2 = StreamClient::connect(&new_primary_addr)
         .await
         .expect("failed to connect to ExtentNode for new extent");
 

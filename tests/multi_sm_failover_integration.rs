@@ -9,7 +9,7 @@
 use std::time::Duration;
 
 use bytes::Bytes;
-use client::StorageClient;
+use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::{ExtentState, Offset};
 use extent_node::ExtentNode;
@@ -180,7 +180,7 @@ async fn multi_sm_leadership_failover() {
     // ── Phase 4: Create stream and append data ──────────────────────────
 
     info!("Phase 4: creating stream and appending data");
-    let sm_client = StorageClient::connect(&sm1_addr)
+    let sm_client = StreamClient::connect(&sm1_addr)
         .await
         .expect("connect to SM-1");
     let (stream_id, _extent_id, epoch, primary_addr) = sm_client
@@ -190,7 +190,7 @@ async fn multi_sm_leadership_failover() {
     info!("Phase 4: stream={stream_id}, primary={primary_addr}");
 
     // Connect to the Primary EN and append messages.
-    let en_client = StorageClient::connect(&primary_addr)
+    let en_client = StreamClient::connect(&primary_addr)
         .await
         .expect("connect to primary EN");
     let num_messages = 10u64;
@@ -228,7 +228,7 @@ async fn multi_sm_leadership_failover() {
 
     // Reconnect to SM-2 and describe the stream — we should see a sealed extent
     // and a new active extent allocated by SM-2's failover.
-    let sm2_client = StorageClient::connect(&sm2_addr)
+    let sm2_client = StreamClient::connect(&sm2_addr)
         .await
         .expect("connect to SM-2");
     let extents = sm2_client
@@ -285,7 +285,7 @@ async fn multi_sm_leadership_failover() {
         .find(|r| r.is_alive)
         .expect("no live replica for sealed extent");
 
-    let reader = StorageClient::connect(&live_replica.node_addr)
+    let reader = StreamClient::connect(&live_replica.node_addr)
         .await
         .expect("connect to live replica for read");
     let messages = reader

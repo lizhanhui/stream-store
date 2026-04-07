@@ -108,7 +108,7 @@ async fn stream_manager_integration() {
 
     // ── Part 1: Connect, heartbeat, disconnect (node lifecycle) ──
     {
-        let c = client::StorageClient::connect(&stream_manager_addr)
+        let c = client::StreamClient::connect(&stream_manager_addr)
             .await
             .unwrap();
 
@@ -130,7 +130,7 @@ async fn stream_manager_integration() {
 
     // ── Part 2: Create stream, append, seal, query offset ──
     {
-        let stream_manager_client = client::StorageClient::connect(&stream_manager_addr)
+        let stream_manager_client = client::StreamClient::connect(&stream_manager_addr)
             .await
             .unwrap();
 
@@ -159,7 +159,7 @@ async fn stream_manager_integration() {
 
         // Append to ExtentNode directly using the SM-assigned stream_id.
         // The EN knows about this stream_id because SM sent RegisterExtent.
-        let en_client = client::StorageClient::connect(&extent_node_addr)
+        let en_client = client::StreamClient::connect(&extent_node_addr)
             .await
             .unwrap();
 
@@ -188,7 +188,7 @@ async fn stream_manager_integration() {
 
         // Append more to the new extent, then seal again.
         // Need a fresh EN client since the stream was sealed and new extent registered.
-        let en_client2 = client::StorageClient::connect(&extent_node_addr)
+        let en_client2 = client::StreamClient::connect(&extent_node_addr)
             .await
             .unwrap();
         for i in 0u64..10 {

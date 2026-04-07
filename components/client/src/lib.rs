@@ -45,21 +45,21 @@ struct Inner {
 ///
 /// Supports pipelining: multiple requests can be in-flight simultaneously.
 /// All public methods take `&self`, enabling shared ownership via `Arc`.
-pub struct StorageClient {
+pub struct StreamClient {
     inner: Arc<Inner>,
     request_timeout: Duration,
     _reader_handle: JoinHandle<()>,
     _writer_handle: JoinHandle<()>,
 }
 
-impl Drop for StorageClient {
+impl Drop for StreamClient {
     fn drop(&mut self) {
         self._reader_handle.abort();
         self._writer_handle.abort();
     }
 }
 
-impl StorageClient {
+impl StreamClient {
     /// Connect to a storage service endpoint with default timeouts.
     pub async fn connect(addr: &str) -> Result<Self, StorageError> {
         Self::connect_with_timeouts(
@@ -115,7 +115,7 @@ impl StorageClient {
     ) {
         while let Some(frame) = write_rx.recv().await {
             if let Err(e) = framed_write.send(frame).await {
-                warn!("StorageClient writer error: {e}");
+                warn!("StreamClient writer error: {e}");
                 break;
             }
         }
@@ -137,7 +137,7 @@ impl StorageClient {
                     }
                 }
                 Some(Err(e)) => {
-                    warn!("StorageClient reader error: {e}");
+                    warn!("StreamClient reader error: {e}");
                     // Notify all pending callers of the error.
                     let mut pending = inner.pending.lock().await;
                     for (_, tx) in pending.drain() {

@@ -29,7 +29,7 @@ async fn seal_extent_node_static(
     committed_offset: Option<u64>,
     start_offset: Option<u64>,
 ) -> Result<u64, StorageError> {
-    let client = client::StorageClient::connect(addr).await.map_err(|e| {
+    let client = client::StreamClient::connect(addr).await.map_err(|e| {
         StorageError::Internal(format!("connect to ExtentNode {addr} for Seal: {e}"))
     })?;
 
@@ -72,7 +72,7 @@ async fn report_extents_from_node_static(
 ) -> Result<Vec<(ExtentId, u64, u64, common::types::ExtentState)>, StorageError> {
     use bytes::Buf;
 
-    let client = client::StorageClient::connect(addr).await.map_err(|e| {
+    let client = client::StreamClient::connect(addr).await.map_err(|e| {
         StorageError::Internal(format!(
             "connect to ExtentNode {addr} for ReportExtents: {e}"
         ))
@@ -338,7 +338,7 @@ impl StreamManagerStore {
         let ec = extent_capacity;
 
         let result = tokio::time::timeout(Duration::from_millis(500), async {
-            let client = client::StorageClient::connect(&addr).await.map_err(|e| {
+            let client = client::StreamClient::connect(&addr).await.map_err(|e| {
                 StorageError::Internal(format!(
                     "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
                 ))
@@ -418,7 +418,7 @@ impl StreamManagerStore {
 
             tokio::spawn(async move {
                 let payload = build_register_extent_payload(&[]); // secondaries get no downstream addrs
-                match client::StorageClient::connect(&addr).await {
+                match client::StreamClient::connect(&addr).await {
                     Ok(client) => {
                         let result = client
                             .send_frame(Frame::new(

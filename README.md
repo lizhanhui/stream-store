@@ -99,7 +99,7 @@ stream-store/
 │   ├── common/                     # Shared types, config, errors
 │   ├── rpc/                        # Custom TCP wire protocol (frame, codec, payload)
 │   ├── server/                     # Server infrastructure (RequestHandler, ServerBuilder)
-│   ├── client/                     # StorageClient for Extent Node & Stream Manager
+│   ├── client/                     # StreamClient for Extent Node & Stream Manager
 │   ├── extent-node/                # Pipelined group commit arena, stream, replication, watermark
 │   └── stream-manager/             # Metadata store, allocator, heartbeat checker
 ├── conf/                           # Example TOML configuration files

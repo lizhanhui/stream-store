@@ -21,7 +21,7 @@ use fastant::Instant;
 use std::time::Duration;
 
 use bytes::Bytes;
-use client::StorageClient;
+use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::Epoch;
 use extent_node::ExtentNode;
@@ -185,7 +185,7 @@ async fn client_task(
     let mut error_count: u64 = 0;
 
     // Connect to StreamManager and create stream.
-    let stream_manager_client = StorageClient::connect(&stream_manager_addr)
+    let stream_manager_client = StreamClient::connect(&stream_manager_addr)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: StreamManager connect failed: {e}"));
 
@@ -195,7 +195,7 @@ async fn client_task(
         .unwrap_or_else(|e| panic!("client {client_id}: create_stream failed: {e}"));
 
     // Connect to primary ExtentNode.
-    let extent_node_client = StorageClient::connect(&initial_primary_addr)
+    let extent_node_client = StreamClient::connect(&initial_primary_addr)
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: ExtentNode connect failed: {e}"));
 
