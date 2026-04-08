@@ -320,7 +320,10 @@ impl Stream {
             let evicted = self.extents.remove(0);
             tracing::info!(
                 "evicted extent {} (sealed={}) from stream {} (retained: {})",
-                evicted.id, evicted.is_sealed(), self.id, self.extents.len(),
+                evicted.id,
+                evicted.is_sealed(),
+                self.id,
+                self.extents.len(),
             );
         }
     }

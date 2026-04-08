@@ -37,6 +37,9 @@ use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
 // -- Benchmark Parameters -----------------------------------------------------
 
 const BENCH_DURATION: Duration = Duration::from_secs(120);
@@ -45,7 +48,7 @@ const NUM_SENDERS: usize = 4;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u16 = 2;
 const EXTENT_CAPACITY: u32 = 64 * 1024 * 1024; // 64 MiB
-const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
+const PIPELINE_DEPTH: usize = 4; // max in-flight appends per sender
 const MAX_EXTENTS_PER_STREAM: usize = 4;
 
 // -- Shared counters ----------------------------------------------------------
@@ -95,6 +98,10 @@ impl SharedCounters {
         (appends, bytes, errors, hist)
     }
 }
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
 
 // -- Main ---------------------------------------------------------------------
 
@@ -221,7 +228,9 @@ fn print_header() {
     eprintln!(
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
-    eprintln!("  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  max_extents={MAX_EXTENTS_PER_STREAM}");
+    eprintln!(
+        "  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  max_extents={MAX_EXTENTS_PER_STREAM}"
+    );
     eprintln!(
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
@@ -231,8 +240,15 @@ fn print_header() {
     );
     eprintln!(
         "  {:>8}  {:>10}  {:>10}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
-        "--------", "----------", "----------", "--------", "--------",
-        "--------", "--------", "--------", "--------"
+        "--------",
+        "----------",
+        "----------",
+        "--------",
+        "--------",
+        "--------",
+        "--------",
+        "--------",
+        "--------"
     );
 }
 
@@ -270,7 +286,14 @@ fn print_interval(
     eprintln!(
         "  {:>7.1}s  {:>10.0}  {:>7.2} MB  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
         elapsed.as_secs_f64(),
-        ops, mb, appends, errors, avg, p99, p999, max,
+        ops,
+        mb,
+        appends,
+        errors,
+        avg,
+        p99,
+        p999,
+        max,
     );
 }
 

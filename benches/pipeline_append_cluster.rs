@@ -181,7 +181,9 @@ fn print_header() {
     eprintln!(
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
-    eprintln!("  Pipeline Append Benchmark (Cluster)  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}");
+    eprintln!(
+        "  Pipeline Append Benchmark (Cluster)  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}"
+    );
     eprintln!(
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
@@ -191,8 +193,15 @@ fn print_header() {
     );
     eprintln!(
         "  {:>8}  {:>10}  {:>10}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
-        "--------", "----------", "----------", "--------", "--------",
-        "--------", "--------", "--------", "--------"
+        "--------",
+        "----------",
+        "----------",
+        "--------",
+        "--------",
+        "--------",
+        "--------",
+        "--------",
+        "--------"
     );
 }
 
@@ -230,7 +239,14 @@ fn print_interval(
     eprintln!(
         "  {:>7.1}s  {:>10.0}  {:>7.2} MB  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}  {:>8}",
         elapsed.as_secs_f64(),
-        ops, mb, appends, errors, avg, p99, p999, max,
+        ops,
+        mb,
+        appends,
+        errors,
+        avg,
+        p99,
+        p999,
+        max,
     );
 }
 
