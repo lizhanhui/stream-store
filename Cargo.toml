@@ -27,6 +27,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "0.8"
 crc32fast = "1.5"
 smallvec = "1.15"
+tikv-jemallocator = "0.6"
 
 [package]
 name = "stream-store"
@@ -44,6 +45,9 @@ stream-manager = { path = "components/stream-manager" }
 server = { path = "components/server" }
 client = { path = "components/client" }
 rpc = { path = "components/rpc" }
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = { workspace = true }
 
 [dev-dependencies]
 futures-util = { workspace = true }

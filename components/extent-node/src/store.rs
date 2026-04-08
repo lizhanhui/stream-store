@@ -8,7 +8,6 @@ use bytes::{BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use dashmap::DashMap;
-use futures_util::SinkExt;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
@@ -1478,13 +1477,10 @@ impl ExtentNodeStore {
 
     /// Flush collected forward work to the downstream pool.
     ///
-    /// Groups frames by destination address and sends each batch directly via TCP.
-    /// This is the point where the async boundary is crossed — all synchronous
-    /// append logic collects forward work, and this method flushes it.
-    ///
-    /// Under the per-destination Mutex, this method also checks extent flags to
-    /// send ForwardInitExtent (before Forwards) and ForwardChecksum (after Forwards),
-    /// guaranteeing wire ordering regardless of leader scheduling.
+    /// Groups frames by destination address, injects ForwardInitExtent on the
+    /// leader side (checked via atomic `take_init_forward`), then pushes all
+    /// frames into the per-address unbounded channel. Returns immediately —
+    /// the dedicated writer task handles TCP encoding and flush independently.
     pub(crate) async fn flush_forward_work(&self, forward_work: Vec<(Vec<String>, Frame)>) {
         if forward_work.is_empty() {
             return;
@@ -1493,89 +1489,70 @@ impl ExtentNodeStore {
             Some(p) => p,
             None => return,
         };
-        // Group by destination address for efficient batching.
-        let mut by_addr: HashMap<&str, Vec<&Frame>> = HashMap::new();
+
+        // Group by destination address, injecting ForwardInitExtent on the leader side.
+        let mut by_addr: HashMap<&str, Vec<Frame>> = HashMap::new();
+
         for (addrs, frame) in &forward_work {
+            // Check if this frame's extent needs ForwardInitExtent.
+            let init_frame = self.maybe_build_init_forward(frame);
+
             for addr in addrs {
-                by_addr.entry(addr.as_str()).or_default().push(frame);
+                let entry = by_addr.entry(addr.as_str()).or_default();
+                if let Some(ref init) = init_frame {
+                    entry.push(init.clone());
+                }
+                entry.push(frame.clone());
             }
         }
+
+        // Fire-and-forget: push frames into per-address channels.
         for (addr, frames) in by_addr {
-            let writer = match pool.get_or_create_writer(addr).await {
-                Some(w) => w,
-                None => continue,
-            };
-            let mut guard = writer.lock().await;
-
-            // Under the Mutex: check if any Forward or ForwardChecksum frame targets
-            // an extent that needs ForwardInitExtent. Send init frames first to
-            // guarantee the secondary has the extent before receiving data or checksums.
-            for f in &frames {
-                let (stream_id, extent_id, epoch) = match &f.variable_header {
-                    VariableHeader::Forward {
-                        stream_id,
-                        extent_id,
-                        epoch,
-                        ..
-                    } => (stream_id, extent_id, epoch),
-                    VariableHeader::ForwardChecksum {
-                        stream_id,
-                        extent_id,
-                        ..
-                    } => {
-                        // ForwardChecksum doesn't carry epoch; look it up from the extent.
-                        if let Some(stream_ref) = self.streams.get(stream_id) {
-                            if let Some(ext) = stream_ref.find_extent(*extent_id) {
-                                if ext.take_init_forward() {
-                                    let init = Frame::new(
-                                        VariableHeader::ForwardInitExtent {
-                                            stream_id: *stream_id,
-                                            extent_id: *extent_id,
-                                            epoch: ext.epoch,
-                                            start_offset: ext.start_offset,
-                                            extent_capacity: stream_ref.extent_capacity(),
-                                        },
-                                        None,
-                                    );
-                                    let _ = guard.feed(init).await;
-                                }
-                            }
-                        }
-                        continue;
-                    }
-                    _ => continue,
-                };
-                if let Some(stream_ref) = self.streams.get(stream_id) {
-                    if let Some(ext) = stream_ref.find_extent(*extent_id) {
-                        if ext.take_init_forward() {
-                            let init = Frame::new(
-                                VariableHeader::ForwardInitExtent {
-                                    stream_id: *stream_id,
-                                    extent_id: *extent_id,
-                                    epoch: *epoch,
-                                    start_offset: ext.start_offset,
-                                    extent_capacity: stream_ref.extent_capacity(),
-                                },
-                                None,
-                            );
-                            let _ = guard.feed(init).await;
-                        }
-                    }
-                }
-            }
-
-            // Write all Forward frames.
-            for frame in &frames {
-                if let Err(e) = guard.feed((*frame).clone()).await {
-                    warn!("send to secondary {addr} failed: {e}");
-                    break;
-                }
-            }
-
-            if let Err(e) = guard.flush().await {
-                warn!("flush to secondary {addr} failed: {e}");
-            }
+            pool.send_frames(addr, frames).await;
         }
+    }
+
+    /// Check if a Forward or ForwardChecksum frame targets an extent that
+    /// needs ForwardInitExtent. Returns the init frame if so.
+    ///
+    /// Called on the leader side before pushing to the channel. FIFO channel
+    /// ordering guarantees ForwardInitExtent arrives before the Forward frame
+    /// on the wire. The atomic `take_init_forward()` ensures exactly-once
+    /// semantics — the init frame is built once and cloned to all secondaries.
+    fn maybe_build_init_forward(&self, frame: &Frame) -> Option<Frame> {
+        let (stream_id, extent_id, epoch) = match &frame.variable_header {
+            VariableHeader::Forward {
+                stream_id,
+                extent_id,
+                epoch,
+                ..
+            } => (*stream_id, *extent_id, Some(*epoch)),
+            VariableHeader::ForwardChecksum {
+                stream_id,
+                extent_id,
+                ..
+            } => (*stream_id, *extent_id, None),
+            _ => return None,
+        };
+
+        let stream_ref = self.streams.get(&stream_id)?;
+        let ext = stream_ref.find_extent(extent_id)?;
+
+        if !ext.take_init_forward() {
+            return None;
+        }
+
+        let epoch = epoch.unwrap_or(ext.epoch);
+        Some(Frame::new(
+            VariableHeader::ForwardInitExtent {
+                stream_id,
+                extent_id,
+                epoch,
+                start_offset: ext.start_offset,
+                extent_capacity: stream_ref.extent_capacity(),
+            },
+            None,
+        ))
     }
 
     /// Handle ForwardInitExtent (0x0B, flag=0x01) — init-extent notification.
@@ -2008,9 +1985,15 @@ impl ExtentNodeStore {
                     {
                         if let Some(pool) = self.downstream.get() {
                             let pool = Arc::clone(pool);
+                            let init_frame = self.maybe_build_init_forward(&frame);
                             tokio::spawn(async move {
                                 for addr in &addrs {
-                                    pool.forward(addr, frame.clone()).await;
+                                    let mut frames = Vec::new();
+                                    if let Some(ref init) = init_frame {
+                                        frames.push(init.clone());
+                                    }
+                                    frames.push(frame.clone());
+                                    pool.send_frames(addr, frames).await;
                                 }
                             });
                         }

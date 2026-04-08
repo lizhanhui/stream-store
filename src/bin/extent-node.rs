@@ -1,6 +1,13 @@
 use common::config::{ExtentNodeConfig, load_config_from_file};
 use extent_node::ExtentNode;
 
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
