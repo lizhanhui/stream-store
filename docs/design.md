@@ -57,7 +57,7 @@ Both paths share the same downstream procedure in Stream Manager: seal in MySQL 
 
 **Why SM waits for Primary RegisterExtentAck**: Multiple clients may seal the same extent concurrently. SM may return the new extent info to the client (or the client may discover it via `DescribeStream`) before the target Primary has processed `RegisterExtent`. Waiting for the Primary's ACK adds only one SM↔EN round-trip (negligible compared to the MySQL transaction already in the seal path) and guarantees the Primary is ready to accept appends by the time any client learns about the new extent. For EN-initiated seal (ExtentFull), this is especially important — clients that received `ExtentFull` are already spinning on `DescribeStream` and would fail repeatedly if the new Primary isn't registered yet.
 
-**Lazy Secondary Extent Creation**: Secondaries create extents on-demand when they receive the **first Forward frame** from the Primary, rather than requiring `RegisterExtent` to arrive first. The Forward frame (opcode 0x0B) carries all information the secondary needs (`stream_id`, `extent_id`, `start_offset`, `offset`, `byte_pos` in the variable header; arena capacity is a node-level config). This eliminates the race where a secondary receives forwards before `RegisterExtent` arrives, and reduces the seal-and-new critical path to a single SM↔Primary round-trip. `RegisterExtent` to secondaries is still sent as a fire-and-forget hint for arena pre-allocation, but is **not required for correctness**.
+**Lazy Secondary Extent Creation**: Secondaries create extents on-demand when they receive the **first Forward frame** from the Primary, rather than requiring `RegisterExtent` to arrive first. The Primary sends a `ForwardInitExtent` (Forward opcode 0x0B, flag=0x01) before the first Forward for a new extent, carrying `stream_id`, `extent_id`, `start_offset`, `extent_capacity`, and `cache_extents`. This eliminates the race where a secondary receives forwards before `RegisterExtent` arrives, and reduces the seal-and-new critical path to a single SM↔Primary round-trip. `RegisterExtent` to secondaries is still sent as a fire-and-forget hint for arena pre-allocation, but is **not required for correctness**.
 
 **ExtentFull handling — Epoch-Based Autonomous Extent Creation**: When the Primary's arena is exhausted, the transition is handled **entirely within the Extent Node** — Stream Manager is not on the critical path. The system uses a **stream epoch** model:
 
@@ -382,16 +382,18 @@ When `FLAG_EPOCH_PRESENT` (0x04) is also set on SealAck (epoch-based seal respon
 
 ##### 0x07 CREATE_STREAM (Client -> Stream Manager)
 
-Create a new stream. If `replication_factor = 0`, Stream Manager uses its default.
+Create a new stream. If `replication_factor = 0`, Stream Manager uses its default. If `extent_capacity = 0`, Stream Manager uses 64 MiB. If `cache_extents = 0`, Stream Manager uses 4.
 
 ```
 Fixed Header (8B)
 Variable Header:
   [request_id         : u32]
-Payload:
   [name_len           : u16]
   [stream_name        : bytes]  -- human-readable stream name
   [replication_factor : u16]
+  [extent_capacity    : u32]    -- per-stream arena size in bytes (0 = default 64 MiB)
+  [cache_extents      : u32]    -- max extents to retain in memory (0 = default 4)
+No Payload.
 ```
 
 ##### 0x0A CREATE_STREAM_RESP (Stream Manager -> Client)
@@ -546,6 +548,8 @@ Variable Header:
   [role                : u8]     -- 0 = Primary, 1+ = Secondary
   [replication_factor  : u16]
   [epoch               : u32]    -- stream epoch for this extent registration
+  [extent_capacity     : u32]    -- per-stream arena size in bytes
+  [cache_extents       : u32]    -- max extents to retain in memory per stream
 Payload:
   [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
   per address:
@@ -1125,7 +1129,7 @@ Footer index enables efficient random reads within an extent without downloading
 ### Post-Flush
 
 1. Stream Manager marks extent as "flushed" with S3 key in metadata.
-2. In-memory replicas eligible for eviction (LRU policy, configurable retention).
+2. In-memory replicas eligible for eviction (per-stream `cache_extents` policy, default 4).
 3. Sealed extents can optionally be erasure-coded (e.g., Reed-Solomon 4+2) to reduce S3 storage from 3x to ~1.5x.
 
 ## Stream Manager Metadata
@@ -1140,6 +1144,8 @@ CREATE TABLE stream (
     stream_name  VARCHAR(512) NOT NULL UNIQUE,  -- human-readable name
     stream_type  VARCHAR(32) NOT NULL DEFAULT 'DATA',  -- 'DATA' or 'INDEX'
     replication_factor SMALLINT NOT NULL DEFAULT 2, -- per-stream RF (1-N)
+    extent_capacity  INT NOT NULL DEFAULT 67108864,  -- per-stream arena size (default 64 MiB)
+    cache_extents    INT NOT NULL DEFAULT 4,          -- max extents retained in memory per stream
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
