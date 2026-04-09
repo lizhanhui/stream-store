@@ -57,10 +57,6 @@ pub struct ExtentNodeConfig {
     pub connect_timeout_ms: u64,
     /// Timeout (ms) for SM-facing RPC request-response round trips. Defaults to 2000ms.
     pub request_timeout_ms: u64,
-    /// Maximum number of extents to retain per stream. When a new extent is created
-    /// and the count exceeds this limit, the oldest sealed extents are dropped to
-    /// free memory. 0 means no limit (default).
-    pub max_extents_per_stream: usize,
 }
 
 impl Default for ExtentNodeConfig {
@@ -75,7 +71,6 @@ impl Default for ExtentNodeConfig {
             replication_timeout_ms: DEFAULT_REPLICATION_TIMEOUT_MS,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
-            max_extents_per_stream: 0,
         }
     }
 }

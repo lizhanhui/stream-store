@@ -131,6 +131,11 @@ impl Stream {
         self.extent_capacity
     }
 
+    /// Return the maximum number of extents to retain (0 = no limit).
+    pub fn max_extents(&self) -> usize {
+        self.max_extents
+    }
+
     /// Append a message to the specified extent. Returns the assigned
     /// offset and byte position within the extent arena.
     ///

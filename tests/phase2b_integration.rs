@@ -81,6 +81,7 @@ async fn register_extent(
                 replication_factor,
                 epoch: Epoch(0),
                 extent_capacity: 64 * 1024 * 1024,
+                cache_extents: 4,
             },
             Some(payload),
         ))
