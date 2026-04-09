@@ -21,8 +21,8 @@ const INDEX_UNSET: u32 = 0;
 const LIMIT_OPEN: u64 = u64::MAX;
 const MIN_RECORD_SIZE: u32 = 5;
 
-/// Forward-flags bitmap: checked and cleared under the downstream Mutex
-/// in `flush_forward_work()` to guarantee ordering relative to Forward frames.
+/// Forward-flags bitmap: checked inline during `send_forward()`
+/// to guarantee ordering relative to Forward frames.
 pub const FLAG_INIT_FORWARD: u8 = 0x01;
 
 /// ForwardChecksum has been received from primary (secondary side).
@@ -193,7 +193,7 @@ pub struct Extent {
 
     /// Bitmap of deferred forward actions:
     /// - `FLAG_INIT_FORWARD` (0x01): prepend ForwardInitExtent before first Forward
-    ///   (checked under downstream Mutex in `flush_forward_work()`)
+    ///   (checked inline during `send_forward()`)
     /// - `FLAG_CHECKSUM_RECEIVED` (0x02): ForwardChecksum received from primary
     ///   (secondary side, checked by `try_verify_checksum()`)
     forward_flags: AtomicU8,
