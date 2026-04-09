@@ -149,7 +149,7 @@ impl ExtentNode {
         // 1. Signal non-heartbeat tasks (accept loop).
         let _ = self.shutdown_tx.send(());
         // 2. Abort downstream reader tasks (they block on TCP reads indefinitely).
-        self.downstream.shutdown().await;
+        self.downstream.shutdown();
         // 3. Stop StreamManagerClient (sends Disconnect, awaits task).
         self.stream_manager_client.stop().await;
         // 4. Await remaining task handles.

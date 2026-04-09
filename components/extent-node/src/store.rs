@@ -570,6 +570,21 @@ impl ExtentNodeStore {
             self.ack_queues.entry(stream_id).or_insert_with(|| {
                 AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout)
             });
+
+            // Cache per-secondary UnboundedSender handles in the Stream so the
+            // hot append path can push Forward frames with zero lookup overhead.
+            if !ri.replica_addrs.is_empty() {
+                if let Some(pool) = self.downstream.get() {
+                    let txs: Vec<_> = ri
+                        .replica_addrs
+                        .iter()
+                        .map(|addr| pool.get_or_create_sender(addr))
+                        .collect();
+                    if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+                        stream_mut.set_downstream_txs(txs);
+                    }
+                }
+            }
         }
 
         self.replicas.insert(stream_id, ri);
@@ -651,8 +666,8 @@ impl ExtentNodeStore {
         let payload = frame.payload.clone().unwrap_or_default();
         let request_id = frame.request_id();
 
-        // Process my own append.
-        let (own_result, extent_full, mut forward_work) = self.do_append_and_respond(
+        // Process my own append. Forward frames are pushed inline by do_append_and_respond.
+        let (own_result, extent_full) = self.do_append_and_respond(
             &stream_ref,
             request_id,
             stream_id,
@@ -668,12 +683,12 @@ impl ExtentNodeStore {
             let seal_notification = self.seal_and_create_on_full(stream_id);
             // Re-acquire read ref and retry the append.
             // The new extent's needs_init_forward flag is set, so do_append_and_respond
-            // will prepend ForwardInitExtent in the same forward_work batch.
+            // will push ForwardInitExtent inline before the Forward frame.
             let stream_ref = match self.streams.get(&stream_id) {
                 Some(s) => s,
                 None => return None,
             };
-            let (retry_result, _, retry_forward) = self.do_append_and_respond(
+            let (retry_result, _) = self.do_append_and_respond(
                 &stream_ref,
                 request_id,
                 stream_id,
@@ -682,27 +697,22 @@ impl ExtentNodeStore {
                 response_tx.cloned(),
             );
 
-            forward_work.extend(retry_forward);
-
             // Drain followers on the (now new) stream.
             let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
             drop(stream_ref); // ← release read guard BEFORE drain
             if remaining > 1 {
-                let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
-                forward_work.extend(batch_forward);
+                let batch_seals = self.drain_follower_jobs(stream_id).await;
                 for notif in &batch_seals {
                     self.send_extent_update(stream_id, notif);
-                    forward_work
-                        .extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
                 }
             }
 
             // Send SM notification and ForwardChecksum if we sealed.
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
             }
-            self.flush_forward_work(forward_work).await;
             return retry_result;
         }
 
@@ -711,25 +721,24 @@ impl ExtentNodeStore {
         drop(stream_ref); // ← release read guard BEFORE drain
         if remaining > 1 {
             // Followers are waiting — drain the batch.
-            let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
-            forward_work.extend(batch_forward);
+            let batch_seals = self.drain_follower_jobs(stream_id).await;
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
             }
         }
-
-        // Flush forward work to downstream pool (direct TCP write, no channel hop).
-        self.flush_forward_work(forward_work).await;
 
         own_result
     }
 
     /// Perform a single append via the stream's active extent and handle replication / ACK.
     ///
-    /// Returns `(Option<Frame>, bool, Vec<(String, Frame)>)`:
+    /// Returns `(Option<Frame>, bool)`:
     /// - Option<Frame>: response frame (None if deferred or sent via channel)
     /// - bool: whether ExtentFull occurred (caller should trigger proactive seal)
-    /// - Vec<(String, Frame)>: forward work to flush via DownstreamPool
+    ///
+    /// Forward frames are pushed **inline** into the stream's cached per-secondary
+    /// mpsc channels, while the leader still holds `in_flight > 0`. This guarantees
+    /// FIFO ordering — no subsequent leader can push frames before us.
     ///
     /// When response_tx is Some, success ACKs are sent via the channel and the
     /// Frame return is None. When response_tx is None, success ACKs are returned
@@ -742,7 +751,7 @@ impl ExtentNodeStore {
         epoch: Epoch,
         payload: Bytes,
         response_tx: Option<mpsc::Sender<Frame>>,
-    ) -> (Option<Frame>, bool, Vec<(Vec<String>, Frame)>) {
+    ) -> (Option<Frame>, bool) {
         let payload_len = payload.len();
         let payload_for_forward = payload.clone();
 
@@ -758,14 +767,14 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(err);
-                    return (None, false, Vec::new());
+                    return (None, false);
                 }
-                return (Some(err), false, Vec::new());
+                return (Some(err), false);
             }
             Err(StorageError::ExtentFull(_)) => {
                 // Don't send error to client — the caller will seal, create a new extent,
                 // and retry the append transparently. Return extent_full=true.
-                return (None, true, Vec::new());
+                return (None, true);
             }
             Err(e) => {
                 let err = Frame::error_response(
@@ -776,9 +785,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(err);
-                    return (None, false, Vec::new());
+                    return (None, false);
                 }
-                return (Some(err), false, Vec::new());
+                return (Some(err), false);
             }
         };
 
@@ -811,9 +820,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(ack);
-                    (None, false, Vec::new())
+                    (None, false)
                 } else {
-                    (Some(ack), false, Vec::new())
+                    (Some(ack), false)
                 }
             }
             Some(ref ri) if ri.is_primary() => {
@@ -831,15 +840,14 @@ impl ExtentNodeStore {
                     );
                     if let Some(ref tx) = response_tx {
                         let _ = tx.try_send(ack);
-                        (None, false, Vec::new())
+                        (None, false)
                     } else {
-                        (Some(ack), false, Vec::new())
+                        (Some(ack), false)
                     }
                 } else {
-                    // RF≥2: build Forward frames for secondaries.
-                    let mut forward_work = Vec::new();
-                    if self.downstream.get().is_some() && !ri.replica_addrs.is_empty() {
-                        let frame = Frame::new(
+                    // RF≥2: push Forward frames inline into per-stream channels.
+                    if stream.has_secondaries() {
+                        let forward_frame = Frame::new(
                             VariableHeader::Forward {
                                 stream_id,
                                 extent_id,
@@ -849,7 +857,11 @@ impl ExtentNodeStore {
                             },
                             Some(payload_for_forward),
                         );
-                        forward_work.push((ri.replica_addrs.clone(), frame));
+                        // Inject ForwardInitExtent if this is the first forward for the extent.
+                        if let Some(init) = self.maybe_build_init_forward(&forward_frame) {
+                            stream.send_forward(init);
+                        }
+                        stream.send_forward(forward_frame);
                     }
 
                     // Queue deferred ACK.
@@ -871,7 +883,7 @@ impl ExtentNodeStore {
                         });
                     }
 
-                    (None, false, forward_work)
+                    (None, false)
                 }
             }
             Some(_) => {
@@ -888,9 +900,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(ack);
-                    (None, false, Vec::new())
+                    (None, false)
                 } else {
-                    (Some(ack), false, Vec::new())
+                    (Some(ack), false)
                 }
             }
         }
@@ -901,20 +913,17 @@ impl ExtentNodeStore {
     /// Called by the active writer after its own append when `in_flight > 1`.
     /// Loops until all followers have been processed.
     ///
+    /// Forward frames are pushed inline by `do_append_and_respond` — this method
+    /// only returns seal notifications for the caller to send SM updates.
+    ///
     /// Unlike the old `drain_append_batch`, this method manages its own DashMap
     /// guard lifecycle: on ExtentFull it drops the read guard, acquires a write
     /// guard for seal+create, then re-acquires a read guard and continues.
     /// This avoids the read→write deadlock on the same DashMap shard.
-    ///
-    /// Returns (forward_work, seal_notifications).
     async fn drain_follower_jobs(
         &self,
         stream_id: StreamId,
-    ) -> (
-        Vec<(Vec<String>, Frame)>,
-        Vec<crate::stream::SealNotification>,
-    ) {
-        let mut all_forward_work = Vec::new();
+    ) -> Vec<crate::stream::SealNotification> {
         let mut all_seal_notifications = Vec::new();
 
         loop {
@@ -962,8 +971,9 @@ impl ExtentNodeStore {
             let mut extent_full_idx: Option<usize> = None;
 
             // Process each job. Stop at the first ExtentFull.
+            // Forward frames are pushed inline by do_append_and_respond.
             for (i, job) in batch.iter().enumerate() {
-                let (_, extent_full, forward_work) = self.do_append_and_respond(
+                let (_, extent_full) = self.do_append_and_respond(
                     &stream_ref,
                     job.request_id,
                     job.stream_id,
@@ -971,7 +981,6 @@ impl ExtentNodeStore {
                     job.payload.clone(),
                     job.response_tx.clone(),
                 );
-                all_forward_work.extend(forward_work);
                 if extent_full {
                     extent_full_idx = Some(i);
                     break;
@@ -982,13 +991,6 @@ impl ExtentNodeStore {
                 // Drop the read guard BEFORE acquiring write guard for seal+create.
                 drop(stream_ref);
 
-                // Flush Forward frames for records that succeeded on the old extent
-                // BEFORE the expensive seal+allocate (~117MB alloc). This lets the
-                // secondary start processing them and returning watermark ACKs while
-                // we allocate the new extent, preventing PendingAck timeout expiry.
-                self.flush_forward_work(std::mem::take(&mut all_forward_work))
-                    .await;
-
                 let seal_notification = self.seal_and_create_on_full(stream_id);
                 if let Some(ref notif) = seal_notification {
                     all_seal_notifications.push(notif.clone());
@@ -998,7 +1000,7 @@ impl ExtentNodeStore {
                 if let Some(stream_ref2) = self.streams.get(&stream_id) {
                     let epoch2 = stream_ref2.epoch();
                     for job in &batch[ef_idx..] {
-                        let (_, _, retry_forward) = self.do_append_and_respond(
+                        let (_, _) = self.do_append_and_respond(
                             &stream_ref2,
                             job.request_id,
                             job.stream_id,
@@ -1006,7 +1008,6 @@ impl ExtentNodeStore {
                             job.payload.clone(),
                             job.response_tx.clone(),
                         );
-                        all_forward_work.extend(retry_forward);
                     }
                     // Decrement in_flight by the full batch size.
                     let remaining = stream_ref2
@@ -1032,7 +1033,7 @@ impl ExtentNodeStore {
             // More followers arrived during processing — loop again.
         }
 
-        (all_forward_work, all_seal_notifications)
+        all_seal_notifications
     }
 
     /// Seal the active extent and create a new one. Used on ExtentFull.
@@ -1070,32 +1071,26 @@ impl ExtentNodeStore {
         }
     }
 
-    /// Build a ForwardChecksum forward-work item for a sealed extent.
+    /// Send a ForwardChecksum for a sealed extent inline via per-stream channels.
     ///
-    /// Returns the (replica_addrs, Frame) pair to be appended to forward_work
-    /// and sent via `flush_forward_work()` alongside Forward frames.
     /// Fire-and-forget: the secondary defers verification via `try_verify_checksum()`.
-    fn build_forward_checksum(
+    fn send_forward_checksum(
         &self,
         stream_id: StreamId,
         sealed_extent_id: ExtentId,
-    ) -> Option<(Vec<String>, Frame)> {
-        let addrs = match self.replicas.get(&stream_id) {
-            Some(ri) if ri.is_primary() && !ri.replica_addrs.is_empty() => ri.replica_addrs.clone(),
-            _ => return None,
-        };
+    ) {
         let (checksum, committed_bytes) = match self.streams.get(&stream_id) {
             Some(stream_ref) => match stream_ref.find_extent(sealed_extent_id) {
                 Some(ext) => (
                     ext.finalized_crc32().unwrap_or(0),
                     ext.committed_data().len() as u64,
                 ),
-                None => return None,
+                None => return,
             },
-            None => return None,
+            None => return,
         };
         info!(
-            "ForwardChecksum queued: stream={}, extent={}, crc32={:#x}, bytes={}",
+            "ForwardChecksum sent: stream={}, extent={}, crc32={:#x}, bytes={}",
             stream_id, sealed_extent_id, checksum, committed_bytes,
         );
         let frame = Frame::new(
@@ -1107,7 +1102,13 @@ impl ExtentNodeStore {
             },
             None,
         );
-        Some((addrs, frame))
+        // Push inline via per-stream channels.
+        if let Some(stream_ref) = self.streams.get(&stream_id) {
+            if let Some(init) = self.maybe_build_init_forward(&frame) {
+                stream_ref.send_forward(init);
+            }
+            stream_ref.send_forward(frame);
+        }
     }
 
     /// Optimized batch append: all frames share the same stream_id/extent_id.
@@ -1250,8 +1251,6 @@ impl ExtentNodeStore {
             }
         }
 
-        let mut forward_work: Vec<(Vec<String>, Frame)> = Vec::new();
-
         if entries.is_empty() {
             // All appends failed — decrement and possibly drain followers.
             let remaining = stream_ref
@@ -1259,27 +1258,19 @@ impl ExtentNodeStore {
                 .fetch_sub(batch_len, Ordering::Release);
             drop(stream_ref); // ← release read guard BEFORE drain
             if remaining > batch_len {
-                let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
-                forward_work.extend(batch_forward);
+                let batch_seals = self.drain_follower_jobs(stream_id).await;
                 for notif in batch_seals {
                     self.send_extent_update(stream_id, &notif);
-                    forward_work
-                        .extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
                 }
             }
             if extent_full {
-                // Flush any Forward frames from drain_follower_jobs before the
-                // expensive seal+allocate. Prevents PendingAck timeout expiry.
-                self.flush_forward_work(std::mem::take(&mut forward_work))
-                    .await;
-
                 // Autonomous extent creation for batch path — retry all failed frames.
                 let seal_notification = self.seal_and_create_on_full(stream_id);
-                // do_append_and_respond will check the new extent's needs_init_forward flag
-                // and prepend ForwardInitExtent in the same forward_work batch.
+                // do_append_and_respond will push ForwardInitExtent + Forward inline.
                 if let Some(stream_ref2) = self.streams.get(&stream_id) {
                     for ff in &failed_frames {
-                        let (_, _, retry_forward) = self.do_append_and_respond(
+                        let (_, _) = self.do_append_and_respond(
                             &stream_ref2,
                             ff.request_id,
                             stream_id,
@@ -1287,17 +1278,12 @@ impl ExtentNodeStore {
                             ff.payload.clone(),
                             response_tx.cloned(),
                         );
-                        forward_work.extend(retry_forward);
                     }
                 }
                 if let Some(ref notif) = seal_notification {
                     self.send_extent_update(stream_id, notif);
-                    forward_work
-                        .extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
                 }
-                self.flush_forward_work(forward_work).await;
-            } else {
-                self.flush_forward_work(forward_work).await;
             }
             return responses;
         }
@@ -1359,10 +1345,10 @@ impl ExtentNodeStore {
                         }
                     }
                 } else {
-                    // RF≥2: build Forward frames for secondaries.
-                    if self.downstream.get().is_some() && !ri.replica_addrs.is_empty() {
+                    // RF≥2: push Forward frames inline into per-stream channels.
+                    if stream_ref.has_secondaries() {
                         for entry in &entries {
-                            let frame = Frame::new(
+                            let forward_frame = Frame::new(
                                 VariableHeader::Forward {
                                     stream_id,
                                     extent_id: entry.extent_id,
@@ -1372,7 +1358,10 @@ impl ExtentNodeStore {
                                 },
                                 Some(entry.payload_for_forward.clone()),
                             );
-                            forward_work.push((ri.replica_addrs.clone(), frame));
+                            if let Some(init) = self.maybe_build_init_forward(&forward_frame) {
+                                stream_ref.send_forward(init);
+                            }
+                            stream_ref.send_forward(forward_frame);
                         }
                     }
 
@@ -1430,29 +1419,20 @@ impl ExtentNodeStore {
             .fetch_sub(batch_len, Ordering::Release);
         drop(stream_ref); // ← release read guard BEFORE drain
         if remaining > batch_len {
-            let (batch_forward, batch_seals) = self.drain_follower_jobs(stream_id).await;
-            forward_work.extend(batch_forward);
+            let batch_seals = self.drain_follower_jobs(stream_id).await;
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
-                forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
             }
         }
 
         if extent_full {
-            // Flush Forward frames for entries that succeeded on the old extent
-            // BEFORE the expensive seal+allocate (~117MB alloc). This lets the
-            // secondary start processing them and returning watermark ACKs while
-            // we allocate the new extent, preventing PendingAck timeout expiry.
-            self.flush_forward_work(std::mem::take(&mut forward_work))
-                .await;
-
             // Autonomous extent creation for batch path (end of batch) — retry failed frames.
             let seal_notification = self.seal_and_create_on_full(stream_id);
-            // do_append_and_respond will check the new extent's needs_init_forward flag
-            // and prepend ForwardInitExtent in the same forward_work batch.
+            // do_append_and_respond will push ForwardInitExtent + Forward inline.
             if let Some(stream_ref2) = self.streams.get(&stream_id) {
                 for ff in &failed_frames {
-                    let (_, _, retry_forward) = self.do_append_and_respond(
+                    let (_, _) = self.do_append_and_respond(
                         &stream_ref2,
                         ff.request_id,
                         stream_id,
@@ -1460,56 +1440,15 @@ impl ExtentNodeStore {
                         ff.payload.clone(),
                         response_tx.cloned(),
                     );
-                    forward_work.extend(retry_forward);
                 }
             }
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
-                forward_work.extend(self.build_forward_checksum(stream_id, notif.sealed_extent_id));
+                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
             }
         }
-
-        // Flush forward work to downstream pool (direct TCP write, no channel hop).
-        self.flush_forward_work(forward_work).await;
 
         responses
-    }
-
-    /// Flush collected forward work to the downstream pool.
-    ///
-    /// Groups frames by destination address, injects ForwardInitExtent on the
-    /// leader side (checked via atomic `take_init_forward`), then pushes all
-    /// frames into the per-address unbounded channel. Returns immediately —
-    /// the dedicated writer task handles TCP encoding and flush independently.
-    pub(crate) async fn flush_forward_work(&self, forward_work: Vec<(Vec<String>, Frame)>) {
-        if forward_work.is_empty() {
-            return;
-        }
-        let pool = match self.downstream.get() {
-            Some(p) => p,
-            None => return,
-        };
-
-        // Group by destination address, injecting ForwardInitExtent on the leader side.
-        let mut by_addr: HashMap<&str, Vec<Frame>> = HashMap::new();
-
-        for (addrs, frame) in &forward_work {
-            // Check if this frame's extent needs ForwardInitExtent.
-            let init_frame = self.maybe_build_init_forward(frame);
-
-            for addr in addrs {
-                let entry = by_addr.entry(addr.as_str()).or_default();
-                if let Some(ref init) = init_frame {
-                    entry.push(init.clone());
-                }
-                entry.push(frame.clone());
-            }
-        }
-
-        // Fire-and-forget: push frames into per-address channels.
-        for (addr, frames) in by_addr {
-            pool.send_frames(addr, frames).await;
-        }
     }
 
     /// Check if a Forward or ForwardChecksum frame targets an extent that
@@ -1978,26 +1917,9 @@ impl ExtentNodeStore {
                     "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={end_offset}",
                     extent_id, stream_id
                 );
-                // Primary seals finalize CRC32 — send checksum to secondaries.
-                // SM-initiated seal has no forward_work batch, so spawn directly.
+                // Primary seals finalize CRC32 — send checksum to secondaries inline.
                 if is_primary_seal {
-                    if let Some((addrs, frame)) = self.build_forward_checksum(stream_id, extent_id)
-                    {
-                        if let Some(pool) = self.downstream.get() {
-                            let pool = Arc::clone(pool);
-                            let init_frame = self.maybe_build_init_forward(&frame);
-                            tokio::spawn(async move {
-                                for addr in &addrs {
-                                    let mut frames = Vec::new();
-                                    if let Some(ref init) = init_frame {
-                                        frames.push(init.clone());
-                                    }
-                                    frames.push(frame.clone());
-                                    pool.send_frames(addr, frames).await;
-                                }
-                            });
-                        }
-                    }
+                    self.send_forward_checksum(stream_id, extent_id);
                 }
                 Frame::new(
                     VariableHeader::SealAck {

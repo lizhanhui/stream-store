@@ -5,24 +5,26 @@
 //! into per-address unbounded mpsc channels and returns immediately (fire-and-
 //! forget), completely decoupling append latency from network I/O.
 //!
+//! Channels are created once per address and outlive individual TCP connections.
+//! On TCP failure, the writer task reconnects in a loop — frames buffered in
+//! the channel survive outages and are drained on reconnect.
+//!
+//! Streams cache cloned `UnboundedSender` handles at RegisterExtent time so
+//! the hot append path pushes directly into channels with zero lookup overhead.
+//!
 //! Each connection also spawns a reader task that processes Watermark ACKs
 //! inline, calling `ack_queue.drain_quorum()` directly on the store.
-//!
-//! Connections are lazily created on first `send_frames()` call. On write
-//! failure the writer task exits; the next `send_frames()` detects the closed
-//! channel and triggers a lazy reconnect.
 
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio_util::codec::FramedRead;
 
 use tokio::net::TcpStream;
-use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
@@ -40,18 +42,24 @@ struct WriterHandle {
 
 /// Channel-based TCP connection pool for broadcast replication.
 ///
-/// One writer task per secondary address. The leader pushes frames into
-/// unbounded mpsc channels; each writer task drains its channel, feeds
-/// frames into `FramedWrite`, and flushes independently.
+/// One writer task per secondary address. Channels are created once per address
+/// and outlive TCP connections. The writer task reconnects forever on failure.
+///
+/// Uses `std::sync::Mutex` (not tokio) because the critical section is a
+/// HashMap lookup + Sender::clone — sub-microsecond, never awaits.
 pub struct DownstreamPool {
-    /// Per-address writer handles. Outer Mutex protects the map for
-    /// get-or-create atomicity (prevents TOCTOU on connection creation).
+    /// Per-address writer handles. Mutex protects the map for
+    /// get-or-create atomicity.
     writers: Mutex<HashMap<String, WriterHandle>>,
     /// Shutdown signal for all spawned tasks (reader + writer).
     shutdown_tx: broadcast::Sender<()>,
     /// Back-reference to the store for inline watermark processing.
     store: Arc<ExtentNodeStore>,
 }
+
+/// Reconnect backoff: start at 100ms, double each attempt, cap at 5s.
+const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
+const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
 impl DownstreamPool {
     /// Create a new pool with a back-reference to the store.
@@ -65,156 +73,184 @@ impl DownstreamPool {
     }
 
     /// Shut down the pool: signal all tasks and clear writer handles.
-    pub async fn shutdown(&self) {
+    pub fn shutdown(&self) {
         let _ = self.shutdown_tx.send(());
-        let mut map = self.writers.lock().await;
+        let mut map = self.writers.lock().unwrap();
         map.clear(); // Drops senders, causing writer tasks to exit on next recv().
     }
 
-    /// Send frames to a secondary address. Fire-and-forget: pushes into
-    /// the per-address unbounded channel. Creates the connection lazily
-    /// if it doesn't exist yet.
+    /// Get or create an `UnboundedSender` for the given secondary address.
     ///
-    /// The map Mutex is held only for HashMap lookup + channel sends in
-    /// the common case (sub-microsecond). On first use or after reconnect,
-    /// it is held across TCP connect to prevent TOCTOU races.
-    pub async fn send_frames(&self, addr: &str, frames: Vec<Frame>) {
-        let mut map = self.writers.lock().await;
-
-        // Check for existing live handle.
-        let need_create = match map.get(addr) {
-            Some(h) if !h.tx.is_closed() => false,
-            _ => true,
-        };
-
-        if need_create {
-            // Remove stale entry if present.
-            map.remove(addr);
-            // Create connection + spawn tasks while holding the lock.
-            match self.create_and_spawn(addr).await {
-                Some(h) => {
-                    map.insert(addr.to_string(), h);
-                }
-                None => return, // connection failed, drop frames
-            }
-        }
-
-        let handle = map.get(addr).unwrap();
-        for frame in frames {
-            if handle.tx.send(frame).is_err() {
-                // Writer task died between the check and here — remove stale handle.
-                map.remove(addr);
-                break;
-            }
-        }
-    }
-
-    /// Create a TCP connection and spawn reader + writer tasks.
+    /// Called at `handle_register_extent` time (cold path). Returns a clone
+    /// of the sender that can be cached in the Stream struct for zero-lookup
+    /// inline pushes on the hot append path.
     ///
-    /// Sets TCP_NODELAY and keepalive. Returns a `WriterHandle` whose
-    /// channel feeds the dedicated writer task.
-    async fn create_and_spawn(&self, addr: &str) -> Option<WriterHandle> {
-        let stream = match TcpStream::connect(addr).await {
-            Ok(s) => s,
-            Err(e) => {
-                error!("failed to connect to secondary {addr}: {e}; dropping frames");
-                return None;
+    /// If the address already has a live channel, returns a clone of the
+    /// existing sender (multiple streams sharing the same secondary reuse
+    /// the same channel). Otherwise creates the channel and spawns the
+    /// writer task (which connects to TCP internally in its reconnect loop).
+    pub fn get_or_create_sender(&self, addr: &str) -> mpsc::UnboundedSender<Frame> {
+        let mut map = self.writers.lock().unwrap();
+
+        // Return existing sender if alive.
+        if let Some(handle) = map.get(addr) {
+            if !handle.tx.is_closed() {
+                return handle.tx.clone();
             }
-        };
-
-        // Disable Nagle's algorithm for low-latency small frames.
-        if let Err(e) = stream.set_nodelay(true) {
-            warn!("set_nodelay failed for {addr}: {e}");
+            // Channel closed (shouldn't happen unless shutdown) — recreate.
         }
 
-        // Set TCP keepalive to detect half-open connections quickly.
-        let sock_ref = SockRef::from(&stream);
-        let keepalive = TcpKeepalive::new()
-            .with_time(Duration::from_secs(5))
-            .with_interval(Duration::from_secs(2));
-        if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
-            warn!("set_tcp_keepalive failed for {addr}: {e}");
-        }
-
-        let (read_half, write_half) = stream.into_split();
-        let framed_write = FramedWrite::new(write_half, FrameCodec);
-
+        // Create channel + spawn writer task.
         let (tx, rx) = mpsc::unbounded_channel::<Frame>();
 
-        // Spawn reader task (handles Watermark ACKs inline — unchanged).
-        let store = Arc::clone(&self.store);
         let addr_owned = addr.to_string();
-        let shutdown_rx_reader = self.shutdown_tx.subscribe();
+        let shutdown_rx = self.shutdown_tx.subscribe();
+        let store = Arc::clone(&self.store);
         tokio::spawn(async move {
-            downstream_reader_inline(addr_owned, read_half, store, shutdown_rx_reader).await;
+            downstream_writer_task(addr_owned, rx, shutdown_rx, store).await;
         });
 
-        // Spawn dedicated writer task.
-        let addr_writer = addr.to_string();
-        let shutdown_rx_writer = self.shutdown_tx.subscribe();
-        tokio::spawn(async move {
-            downstream_writer_task(addr_writer, framed_write, rx, shutdown_rx_writer).await;
-        });
-
-        info!("connected to secondary ExtentNode at {addr}");
-        Some(WriterHandle { tx })
+        let sender = tx.clone();
+        map.insert(addr.to_string(), WriterHandle { tx });
+        info!("created downstream channel for secondary at {addr}");
+        sender
     }
+}
+
+/// Connect to a secondary with TCP_NODELAY and keepalive.
+async fn connect_tcp(addr: &str) -> Result<TcpStream, std::io::Error> {
+    let stream = TcpStream::connect(addr).await?;
+
+    // Disable Nagle's algorithm for low-latency small frames.
+    if let Err(e) = stream.set_nodelay(true) {
+        warn!("set_nodelay failed for {addr}: {e}");
+    }
+
+    // Set TCP keepalive to detect half-open connections quickly.
+    let sock_ref = SockRef::from(&stream);
+    let keepalive = TcpKeepalive::new()
+        .with_time(Duration::from_secs(5))
+        .with_interval(Duration::from_secs(2));
+    if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+        warn!("set_tcp_keepalive failed for {addr}: {e}");
+    }
+
+    Ok(stream)
 }
 
 /// Dedicated writer task for a single secondary address.
 ///
-/// Owns the `FramedWrite` exclusively — no Mutex needed. Drains frames
-/// from the unbounded channel, feeds them into the TCP writer, and flushes.
-/// Batches naturally: after the first blocking `recv()`, drains all
-/// immediately available frames via `try_recv()` before a single `flush()`.
+/// Reconnects forever on TCP failure — the unbounded channel outlives any
+/// individual TCP connection. Frames buffered during outages are drained
+/// on reconnect. Only exits when the channel is closed (all senders dropped)
+/// or the shutdown signal is received.
 ///
-/// On write error, logs and exits. The sender side will detect the closed
-/// channel on the next `send_frames()` call and trigger a lazy reconnect.
+/// Within each TCP session, batches naturally: blocking `recv()` for the
+/// first frame, then `try_recv()` drains all immediately available frames
+/// before a single `flush()`.
 async fn downstream_writer_task(
     addr: String,
-    mut writer: FramedWrite<OwnedWriteHalf, FrameCodec>,
     mut rx: mpsc::UnboundedReceiver<Frame>,
     mut shutdown_rx: broadcast::Receiver<()>,
+    store: Arc<ExtentNodeStore>,
 ) {
-    loop {
-        // Wait for the first frame (or shutdown).
-        let first = tokio::select! {
-            frame = rx.recv() => match frame {
-                Some(f) => f,
-                None => break, // channel closed
-            },
-            _ = shutdown_rx.recv() => break,
-        };
+    let mut backoff = INITIAL_BACKOFF;
 
-        // Feed the first frame.
-        if let Err(e) = writer.feed(first).await {
-            warn!("writer to {addr} feed error: {e}");
-            break;
-        }
+    'outer: loop {
+        // ── Connect phase ──────────────────────────────────────────────
+        let stream = loop {
+            // Check shutdown / channel closed before attempting connect.
+            if rx.is_closed() {
+                break 'outer;
+            }
 
-        // Drain all immediately available frames (batch for single flush).
-        let mut feed_err = false;
-        loop {
-            match rx.try_recv() {
-                Ok(frame) => {
-                    if let Err(e) = writer.feed(frame).await {
-                        warn!("writer to {addr} feed error: {e}");
-                        feed_err = true;
-                        break;
+            tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => break 'outer,
+                result = connect_tcp(&addr) => {
+                    match result {
+                        Ok(s) => {
+                            backoff = INITIAL_BACKOFF; // reset on success
+                            info!("connected to secondary ExtentNode at {addr}");
+                            break s;
+                        }
+                        Err(e) => {
+                            warn!("failed to connect to secondary {addr}: {e}; retrying in {backoff:?}");
+                            tokio::select! {
+                                _ = tokio::time::sleep(backoff) => {}
+                                _ = shutdown_rx.recv() => break 'outer,
+                            }
+                            backoff = (backoff * 2).min(MAX_BACKOFF);
+                        }
                     }
                 }
-                Err(_) => break, // channel empty, proceed to flush
+            }
+        };
+
+        let (read_half, write_half) = stream.into_split();
+        let mut writer = FramedWrite::new(write_half, FrameCodec);
+
+        // Spawn reader task for this TCP session (handles Watermark ACKs).
+        let reader_store = Arc::clone(&store);
+        let reader_addr = addr.clone();
+        let reader_shutdown = shutdown_rx.resubscribe();
+        let reader_handle = tokio::spawn(async move {
+            downstream_reader_inline(reader_addr, read_half, reader_store, reader_shutdown).await;
+        });
+
+        // ── Drain-and-write phase ──────────────────────────────────────
+        let mut should_exit = false;
+        loop {
+            // Wait for the first frame (or shutdown / channel closed).
+            let first = tokio::select! {
+                biased;
+                _ = shutdown_rx.recv() => { should_exit = true; break; }
+                frame = rx.recv() => match frame {
+                    Some(f) => f,
+                    None => { should_exit = true; break; } // channel closed
+                },
+            };
+
+            // Feed the first frame.
+            if let Err(e) = writer.feed(first).await {
+                warn!("writer to {addr} feed error: {e}");
+                break; // TCP error → reconnect
+            }
+
+            // Drain all immediately available frames (batch for single flush).
+            let mut feed_err = false;
+            loop {
+                match rx.try_recv() {
+                    Ok(frame) => {
+                        if let Err(e) = writer.feed(frame).await {
+                            warn!("writer to {addr} feed error: {e}");
+                            feed_err = true;
+                            break;
+                        }
+                    }
+                    Err(_) => break, // channel empty, proceed to flush
+                }
+            }
+            if feed_err {
+                break; // TCP error → reconnect
+            }
+
+            // Single flush for the entire batch.
+            if let Err(e) = writer.flush().await {
+                warn!("writer to {addr} flush error: {e}");
+                break; // TCP error → reconnect
             }
         }
-        if feed_err {
+
+        // Clean up this TCP session's reader task.
+        reader_handle.abort();
+
+        if should_exit {
             break;
         }
 
-        // Single flush for the entire batch.
-        if let Err(e) = writer.flush().await {
-            warn!("writer to {addr} flush error: {e}");
-            break;
-        }
+        // TCP error — loop back to reconnect.
+        warn!("writer to {addr} TCP session ended, reconnecting...");
     }
 
     info!("writer task for {addr} exiting");
@@ -227,10 +263,10 @@ async fn downstream_writer_task(
 /// directly updates the per-stream AckQueue and drains quorum,
 /// eliminating the WatermarkEvent channel hop.
 ///
-/// Exits gracefully when the shutdown signal is received.
+/// Exits gracefully when the shutdown signal is received or the connection closes.
 async fn downstream_reader_inline(
     addr: String,
-    read_half: OwnedReadHalf,
+    read_half: tokio::net::tcp::OwnedReadHalf,
     store: Arc<ExtentNodeStore>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {

@@ -4,6 +4,8 @@ use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, ExtentState, Offset, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
+use rpc::frame::Frame;
+use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::extent::{AppendResult, Extent};
@@ -54,6 +56,11 @@ pub struct Stream {
     /// Channel for followers to submit append jobs to the active writer.
     job_tx: Sender<AppendJob>,
     job_rx: Receiver<AppendJob>,
+
+    /// Cached per-secondary UnboundedSender clones (Primary only).
+    /// Populated at RegisterExtent time from DownstreamPool.
+    /// Vec since RF is small (1-3); iteration is the hot path.
+    downstream_txs: Vec<mpsc::UnboundedSender<Frame>>,
 }
 
 impl Stream {
@@ -70,6 +77,7 @@ impl Stream {
             in_flight: AtomicU64::new(0),
             job_tx,
             job_rx,
+            downstream_txs: Vec::new(),
         }
     }
 
@@ -341,6 +349,33 @@ impl Stream {
     /// Return a reference to the job receiver channel.
     pub(crate) fn job_rx(&self) -> &Receiver<AppendJob> {
         &self.job_rx
+    }
+
+    /// Set cached downstream senders (Primary only, called at RegisterExtent time).
+    pub(crate) fn set_downstream_txs(&mut self, txs: Vec<mpsc::UnboundedSender<Frame>>) {
+        self.downstream_txs = txs;
+    }
+
+    /// Whether this stream has secondary senders (i.e., is Primary with RF >= 2).
+    pub(crate) fn has_secondaries(&self) -> bool {
+        !self.downstream_txs.is_empty()
+    }
+
+    /// Push a frame to all secondary channels. Fire-and-forget.
+    ///
+    /// Called inline from the leader's append path while `in_flight > 0`,
+    /// guaranteeing FIFO ordering — no frame from a subsequent leader can
+    /// appear in the channel before frames from the current leader.
+    pub(crate) fn send_forward(&self, frame: Frame) {
+        let n = self.downstream_txs.len();
+        if n == 0 {
+            return;
+        }
+        // Send clones to all but the last, move the original to the last.
+        for tx in &self.downstream_txs[..n - 1] {
+            let _ = tx.send(frame.clone());
+        }
+        let _ = self.downstream_txs[n - 1].send(frame);
     }
 
     /// Append to the active extent (single-writer, called by stream-level leader).
