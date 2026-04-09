@@ -108,6 +108,7 @@ async fn main() {
             "bench-pipeline-cluster",
             REPLICATION_FACTOR,
             EXTENT_CAPACITY,
+            0,
         )
         .await
         .expect("create_stream");

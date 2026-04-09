@@ -184,7 +184,7 @@ async fn multi_sm_leadership_failover() {
         .await
         .expect("connect to SM-1");
     let (stream_id, _extent_id, epoch, primary_addr) = sm_client
-        .create_stream("failover-test", 2, 0)
+        .create_stream("failover-test", 2, 0, 0)
         .await
         .expect("create_stream");
     info!("Phase 4: stream={stream_id}, primary={primary_addr}");

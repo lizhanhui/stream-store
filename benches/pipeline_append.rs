@@ -49,7 +49,7 @@ const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u16 = 2;
 const EXTENT_CAPACITY: u32 = 64 * 1024 * 1024; // 64 MiB
 const PIPELINE_DEPTH: usize = 4; // max in-flight appends per sender
-const MAX_EXTENTS_PER_STREAM: usize = 4;
+const CACHE_EXTENTS: u32 = 4;
 
 // -- Shared counters ----------------------------------------------------------
 
@@ -132,7 +132,6 @@ async fn main() {
             bind_ip: "127.0.0.1".into(),
             port: 0,
             stream_manager_addrs: vec![stream_manager_addr.clone()],
-            max_extents_per_stream: MAX_EXTENTS_PER_STREAM,
             ..Default::default()
         };
         let node = ExtentNode::start(config).await;
@@ -150,7 +149,7 @@ async fn main() {
         .await
         .expect("connect to StreamManager");
     let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = sm_client
-        .create_stream("bench-pipeline", REPLICATION_FACTOR, EXTENT_CAPACITY)
+        .create_stream("bench-pipeline", REPLICATION_FACTOR, EXTENT_CAPACITY, CACHE_EXTENTS)
         .await
         .expect("create_stream");
     info!(
@@ -229,7 +228,7 @@ fn print_header() {
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
     eprintln!(
-        "  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  max_extents={MAX_EXTENTS_PER_STREAM}"
+        "  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  cache_extents={CACHE_EXTENTS}"
     );
     eprintln!(
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════"

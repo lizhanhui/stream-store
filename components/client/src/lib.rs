@@ -234,15 +234,18 @@ impl StreamClient {
     }
 
     /// Create a new stream on the StreamManager.
-    /// Variable header carries stream name, per-stream replication factor, and per-stream extent capacity.
+    /// Variable header carries stream name, per-stream replication factor, per-stream extent capacity,
+    /// and per-stream cache_extents (max extents to retain in memory).
     /// If replication_factor=0, the StreamManager uses its default.
     /// If extent_capacity=0, the StreamManager uses its default (64 MiB).
+    /// If cache_extents=0, the StreamManager uses its default (4).
     /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
     pub async fn create_stream(
         &self,
         name: &str,
         replication_factor: u16,
         extent_capacity: u32,
+        cache_extents: u32,
     ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
@@ -250,6 +253,7 @@ impl StreamClient {
                 stream_name: Bytes::from(name.to_owned()),
                 replication_factor,
                 extent_capacity,
+                cache_extents,
             },
             None,
         );
@@ -683,7 +687,7 @@ impl StreamClient {
             Ok((stream_id, _)) => Ok(stream_id),
             Err(StorageError::UnknownStream(_)) => {
                 let (stream_id, _, _, _) = self
-                    .create_stream(stream_name, replication_factor, 0)
+                    .create_stream(stream_name, replication_factor, 0, 0)
                     .await?;
                 Ok(stream_id)
             }

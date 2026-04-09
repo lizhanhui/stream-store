@@ -21,6 +21,7 @@ pub struct StreamRow {
     pub stream_type: String,
     pub replication_factor: u16,
     pub extent_capacity: u32,
+    pub cache_extents: u32,
 }
 
 /// A row from the `extent` table.
@@ -118,14 +119,16 @@ impl MetadataStore {
         stream_type: &str,
         replication_factor: u16,
         extent_capacity: u32,
+        cache_extents: u32,
     ) -> Result<StreamId, StorageError> {
         let result = sqlx::query(
-            "INSERT INTO stream (stream_name, stream_type, replication_factor, extent_capacity) VALUES (?, ?, ?, ?)",
+            "INSERT INTO stream (stream_name, stream_type, replication_factor, extent_capacity, cache_extents) VALUES (?, ?, ?, ?, ?)",
         )
         .bind(name)
         .bind(stream_type)
         .bind(replication_factor as i16)
         .bind(extent_capacity as i32)
+        .bind(cache_extents as i32)
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("create_stream: {e}")))?;
@@ -145,7 +148,7 @@ impl MetadataStore {
     /// Get a stream by ID.
     pub async fn get_stream(&self, id: StreamId) -> Result<Option<StreamRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity FROM stream WHERE stream_id = ?",
+            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, cache_extents FROM stream WHERE stream_id = ?",
         )
         .bind(id.0 as i64)
         .fetch_optional(&self.pool)
@@ -158,13 +161,14 @@ impl MetadataStore {
             stream_type: r.get("stream_type"),
             replication_factor: r.get::<i16, _>("replication_factor") as u16,
             extent_capacity: r.get::<i32, _>("extent_capacity") as u32,
+            cache_extents: r.get::<i32, _>("cache_extents") as u32,
         }))
     }
 
     /// Get a stream by name.
     pub async fn get_stream_by_name(&self, name: &str) -> Result<Option<StreamRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity FROM stream WHERE stream_name = ?",
+            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, cache_extents FROM stream WHERE stream_name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -177,6 +181,7 @@ impl MetadataStore {
             stream_type: r.get("stream_type"),
             replication_factor: r.get::<i16, _>("replication_factor") as u16,
             extent_capacity: r.get::<i32, _>("extent_capacity") as u32,
+            cache_extents: r.get::<i32, _>("cache_extents") as u32,
         }))
     }
 
@@ -234,6 +239,20 @@ impl MetadataStore {
             .map_err(|e| StorageError::Internal(format!("get_stream_extent_capacity: {e}")))?;
 
         Ok(row.get::<i32, _>("extent_capacity") as u32)
+    }
+
+    /// Get the cache_extents (max extents to retain in memory) for a stream.
+    pub async fn get_stream_cache_extents(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<u32, StorageError> {
+        let row = sqlx::query("SELECT cache_extents FROM stream WHERE stream_id = ?")
+            .bind(stream_id.0 as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("get_stream_cache_extents: {e}")))?;
+
+        Ok(row.get::<i32, _>("cache_extents") as u32)
     }
 
     // ── Extent operations ──
