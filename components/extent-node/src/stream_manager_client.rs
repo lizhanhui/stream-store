@@ -1,14 +1,21 @@
 //! RAII client for the StreamManager connection lifecycle.
 //!
-//! [`StreamManagerClient`] manages the full lifecycle of the connection to
-//! StreamManager: TCP connect, Connect handshake, periodic Heartbeat,
-//! UPDATE_EXTENT notifications (sealed + progress), reconnection on failure,
-//! and graceful Disconnect on drop.
+//! [`StreamManagerClient`] manages two independent connections to StreamManager:
 //!
-//! Created via [`StreamManagerClient::spawn`], which starts an internal
-//! background task. When the value is dropped, the background task receives
-//! a signal (via `oneshot::Sender` drop) and sends a Disconnect frame before
-//! exiting.
+//! 1. **Heartbeat connection** — dedicated to periodic heartbeats. No extent
+//!    updates touch this connection, so heartbeat latency is bounded by metric
+//!    collection (microseconds) + network RTT + SM MySQL heartbeat queries.
+//!
+//! 2. **Update connection** — dedicated to extent updates (Sealed + Progress).
+//!    Fire-and-forget sends on a separate TCP stream, so slow SM MySQL queries
+//!    cannot cause TCP backpressure on the heartbeat connection.
+//!
+//! Both connections perform their own Connect handshake and reconnect
+//! independently on failure. On shutdown, the heartbeat task sends Disconnect;
+//! the update task simply drops its connection.
+//!
+//! Created via [`StreamManagerClient::spawn`], which starts both background
+//! tasks. When the value is dropped, both tasks receive a signal and shut down.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,7 +27,7 @@ use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{build_connect_payload, build_disconnect_payload, build_heartbeat_payload};
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
@@ -28,37 +35,25 @@ use tracing::{error, info, warn};
 use crate::ExtentNode;
 use crate::store::{ExtentNodeStore, ExtentUpdate};
 
-/// Manages the full lifecycle of the connection to StreamManager:
-/// TCP connect, Connect handshake, periodic Heartbeat, UPDATE_EXTENT
-/// notifications (sealed + progress), reconnection on failure, and graceful
-/// Disconnect on drop (RAII).
+/// Manages the full lifecycle of two connections to StreamManager:
+/// a heartbeat connection and an extent update connection.
 ///
-/// Created via [`StreamManagerClient::spawn`], which starts an internal background
-/// task. When the `StreamManagerClient` value is dropped, the background task
-/// receives a signal and sends a Disconnect frame before exiting.
-///
-/// For guaranteed delivery of the Disconnect frame, call [`stop`](Self::stop)
-/// which awaits the background task. A plain drop signals the task but cannot
-/// await it (Rust's `Drop` is synchronous).
+/// Created via [`StreamManagerClient::spawn`]. When dropped, both background
+/// tasks are signaled to shut down.
 pub struct StreamManagerClient {
-    /// Dropping this sender signals the background task to shut down.
-    /// The implicit drop is the RAII mechanism — no explicit `send()` needed.
-    _shutdown_tx: oneshot::Sender<()>,
-    /// Handle to the background task for explicit join-on-stop.
-    task_handle: JoinHandle<()>,
+    /// Dropping these senders signals the background tasks to shut down.
+    _heartbeat_shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    _update_shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    /// Handles to the background tasks for explicit join-on-stop.
+    heartbeat_handle: JoinHandle<()>,
+    update_handle: JoinHandle<()>,
 }
 
 impl StreamManagerClient {
-    /// Spawn the background connection + heartbeat task.
+    /// Spawn both background tasks: heartbeat and extent update.
     ///
-    /// The task immediately attempts to connect to StreamManager and enters
-    /// the reconnection loop. Returns a handle that, when dropped, triggers
-    /// graceful Disconnect.
-    ///
-    /// `update_rx` receives extent update notifications from the store's
-    /// autonomous extent creation path. These are multiplexed onto the same
-    /// SM connection alongside heartbeats. Progress updates for active extents
-    /// are also sent after each heartbeat.
+    /// The heartbeat task manages the heartbeat connection exclusively.
+    /// The update task manages a separate connection for extent updates.
     pub fn spawn(
         store: Arc<ExtentNodeStore>,
         node_id: String,
@@ -69,16 +64,41 @@ impl StreamManagerClient {
         rpc_request_timeout: Duration,
         update_rx: mpsc::Receiver<ExtentUpdate>,
     ) -> Self {
-        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let (hb_shutdown_tx, hb_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (upd_shutdown_tx, upd_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
-        let task_handle = tokio::spawn(async move {
-            Self::run_loop(
-                store,
-                node_id,
-                advertise_addr,
-                stream_manager_addrs,
+        // Heartbeat task — dedicated connection, no extent updates.
+        let hb_store = Arc::clone(&store);
+        let hb_node_id = node_id.clone();
+        let hb_addr = advertise_addr.clone();
+        let hb_sm_addrs = stream_manager_addrs.clone();
+        let heartbeat_handle = tokio::spawn(async move {
+            Self::heartbeat_loop(
+                hb_store,
+                hb_node_id,
+                hb_addr,
+                hb_sm_addrs,
                 heartbeat_interval_ms,
-                shutdown_rx,
+                hb_shutdown_rx,
+                rpc_connect_timeout,
+                rpc_request_timeout,
+            )
+            .await;
+        });
+
+        // Update task — dedicated connection for extent updates.
+        let upd_store = Arc::clone(&store);
+        let upd_node_id = node_id;
+        let upd_addr = advertise_addr;
+        let upd_sm_addrs = stream_manager_addrs;
+        let update_handle = tokio::spawn(async move {
+            Self::update_loop(
+                upd_store,
+                upd_node_id,
+                upd_addr,
+                upd_sm_addrs,
+                heartbeat_interval_ms,
+                upd_shutdown_rx,
                 rpc_connect_timeout,
                 rpc_request_timeout,
                 update_rx,
@@ -87,56 +107,50 @@ impl StreamManagerClient {
         });
 
         StreamManagerClient {
-            _shutdown_tx: shutdown_tx,
-            task_handle,
+            _heartbeat_shutdown_tx: hb_shutdown_tx,
+            _update_shutdown_tx: upd_shutdown_tx,
+            heartbeat_handle,
+            update_handle,
         }
     }
 
-    /// Explicitly stop and wait for the background task to complete.
-    ///
-    /// Consumes `self`, which drops `_shutdown_tx` and signals the background
-    /// task. Then awaits the task handle so the Disconnect frame is guaranteed
-    /// to be sent (or attempted) before this method returns.
+    /// Explicitly stop and wait for both background tasks to complete.
     pub async fn stop(self) {
-        // Dropping self._shutdown_tx signals the task.
-        // We need to destructure to get task_handle without triggering
-        // implicit Drop ordering issues.
-        let task_handle = self.task_handle;
-        // _shutdown_tx is dropped here when `self` is consumed.
-        drop(self._shutdown_tx);
-        // Wait for the task to finish, but cap at 5 seconds to avoid blocking
-        // shutdown if the task is stuck in an RPC or reconnect wait.
-        match tokio::time::timeout(Duration::from_secs(2), task_handle).await {
+        drop(self._heartbeat_shutdown_tx);
+        drop(self._update_shutdown_tx);
+        match tokio::time::timeout(Duration::from_secs(2), self.heartbeat_handle).await {
             Ok(_) => {}
-            Err(_) => {
-                warn!("StreamManagerClient stop timed out after 5s; abandoning task");
-            }
+            Err(_) => warn!("heartbeat task stop timed out"),
+        }
+        match tokio::time::timeout(Duration::from_secs(2), self.update_handle).await {
+            Ok(_) => {}
+            Err(_) => warn!("update task stop timed out"),
         }
     }
 
-    /// Abort the background task immediately without sending Disconnect.
-    ///
-    /// Used to simulate a crash — SM will detect the node via expired heartbeat.
+    /// Abort both background tasks immediately without sending Disconnect.
     pub fn abort(self) {
-        self.task_handle.abort();
+        self.heartbeat_handle.abort();
+        self.update_handle.abort();
     }
 
-    /// Reconnection loop. Tries SM addresses in round-robin order on failure.
-    async fn run_loop(
+    // ── Heartbeat connection ────────────────────────────────────────────
+
+    /// Reconnection loop for the heartbeat connection.
+    async fn heartbeat_loop(
         store: Arc<ExtentNodeStore>,
         node_id: String,
         advertise_addr: String,
         stream_manager_addrs: Vec<String>,
         heartbeat_interval_ms: u32,
-        mut shutdown_rx: oneshot::Receiver<()>,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
-        mut update_rx: mpsc::Receiver<ExtentUpdate>,
     ) {
         let mut addr_index: usize = 0;
         loop {
             let addr = &stream_manager_addrs[addr_index % stream_manager_addrs.len()];
-            match Self::connect_and_heartbeat(
+            match Self::heartbeat_session(
                 &store,
                 &node_id,
                 &advertise_addr,
@@ -145,27 +159,21 @@ impl StreamManagerClient {
                 &mut shutdown_rx,
                 rpc_connect_timeout,
                 rpc_request_timeout,
-                &mut update_rx,
             )
             .await
             {
                 Ok(true) => {
-                    // Cleanly disconnected via shutdown signal.
                     info!("sent Disconnect to StreamManager; shutting down");
                     return;
                 }
                 Ok(false) => {
-                    info!("StreamManager connection to {addr} closed gracefully");
+                    info!("StreamManager heartbeat connection to {addr} closed gracefully");
                 }
                 Err(e) => {
-                    warn!("StreamManager connection to {addr} failed: {e}");
+                    warn!("StreamManager heartbeat connection to {addr} failed: {e}");
                 }
             }
-
-            // Advance to next SM address for the next attempt.
             addr_index += 1;
-
-            // Wait before reconnecting, but also listen for shutdown.
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_secs(2)) => {}
                 _ = &mut shutdown_rx => {
@@ -176,98 +184,47 @@ impl StreamManagerClient {
         }
     }
 
-    /// Single connection attempt: TCP connect, Connect handshake, heartbeat loop,
-    /// Disconnect on shutdown.
-    ///
-    /// Returns `Ok(true)` if shutdown was handled cleanly (Disconnect sent),
-    /// `Ok(false)` if the connection ended for other reasons.
-    async fn connect_and_heartbeat(
+    /// Single heartbeat session: Connect, heartbeat loop, Disconnect on shutdown.
+    async fn heartbeat_session(
         store: &Arc<ExtentNodeStore>,
         node_id: &str,
         advertise_addr: &str,
         stream_manager_addr: &str,
         heartbeat_interval_ms: u32,
-        shutdown_rx: &mut oneshot::Receiver<()>,
+        shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
-        update_rx: &mut mpsc::Receiver<ExtentUpdate>,
     ) -> Result<bool, StorageError> {
-        let stream =
-            tokio::time::timeout(rpc_connect_timeout, TcpStream::connect(stream_manager_addr))
-                .await
-                .map_err(|_| {
-                    StorageError::Internal(format!("connect timeout to {stream_manager_addr}"))
-                })??;
-        stream
-            .set_nodelay(true)
-            .map_err(|e| StorageError::Internal(format!("set TCP_NODELAY: {e}")))?;
-        let mut framed = Framed::new(stream, FrameCodec);
-        info!("connected to StreamManager at {stream_manager_addr}");
+        let mut framed = Self::connect_and_handshake(
+            node_id,
+            advertise_addr,
+            stream_manager_addr,
+            heartbeat_interval_ms,
+            rpc_connect_timeout,
+            rpc_request_timeout,
+        )
+        .await?;
+        info!("heartbeat connection established to StreamManager at {stream_manager_addr}");
 
-        // Send Connect.
-        let connect_payload = build_connect_payload(node_id, advertise_addr, heartbeat_interval_ms);
-        let connect_frame = Frame::new(
-            VariableHeader::Connect { request_id: 0 },
-            Some(connect_payload),
-        );
-        tokio::time::timeout(rpc_request_timeout, framed.send(connect_frame))
-            .await
-            .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))??;
-
-        match tokio::time::timeout(rpc_request_timeout, framed.next()).await {
-            Ok(Some(Ok(resp))) if resp.opcode() == Opcode::ConnectAck => {
-                info!("registered with StreamManager");
-            }
-            Ok(Some(Ok(resp))) => {
-                error!("unexpected Connect response: {:?}", resp.opcode());
-                return Err(StorageError::Internal("unexpected Connect response".into()));
-            }
-            Ok(Some(Err(e))) => return Err(e),
-            Ok(None) => {
-                return Err(StorageError::Internal(
-                    "StreamManager connection closed after Connect".into(),
-                ));
-            }
-            Err(_) => {
-                return Err(StorageError::Internal(
-                    "timeout waiting for ConnectAck from StreamManager".into(),
-                ));
-            }
-        }
-
-        // Periodic heartbeat with runtime metrics.
-        //
-        // Uses `tokio::time::interval` instead of `tokio::time::sleep` to prevent
-        // heartbeat starvation: extent updates drain the channel and `continue`,
-        // which would restart a fresh sleep timer each iteration. With an interval,
-        // the tick deadline is absolute — updates don't push it forward.
         let interval_duration = Duration::from_millis(heartbeat_interval_ms as u64);
         let mut heartbeat_interval = tokio::time::interval(interval_duration);
         heartbeat_interval.tick().await; // consume the first immediate tick
         let mut request_id = 1u32;
 
         loop {
-            // Wait for the next heartbeat tick, but also process extent updates and shutdown.
             tokio::select! {
                 _ = heartbeat_interval.tick() => {}
-                Some(update) = update_rx.recv() => {
-                    // Extent update: send on the existing connection (fire-and-forget).
-                    Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
-                    // Drain any additional queued updates to batch them.
-                    while let Ok(update) = update_rx.try_recv() {
-                        Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
-                    }
-                    continue;
-                }
                 _ = &mut *shutdown_rx => {
                     // Graceful shutdown: send Disconnect before closing.
                     info!("shutdown signal received; sending Disconnect to StreamManager");
-                    let disconnect_frame = Frame::new(VariableHeader::Disconnect { request_id }, Some(build_disconnect_payload(node_id)));
+                    let disconnect_frame = Frame::new(
+                        VariableHeader::Disconnect { request_id },
+                        Some(build_disconnect_payload(node_id)),
+                    );
                     if let Err(e) = framed.send(disconnect_frame).await {
                         warn!("failed to send Disconnect to StreamManager: {e}");
                         return Ok(true);
                     }
-                    // Wait for DisconnectAck (best-effort, with a short timeout).
                     match tokio::time::timeout(Duration::from_millis(500), framed.next()).await {
                         Ok(Some(Ok(resp))) if resp.opcode() == Opcode::DisconnectAck => {
                             info!("received DisconnectAck from StreamManager");
@@ -292,7 +249,6 @@ impl StreamManagerClient {
             // Snapshot metrics from the store (lock-free: uses atomic swap).
             let (appends, bytes_written, active_count) = store.snapshot_metrics();
 
-            // Compute per-second rates.
             let elapsed_secs = (heartbeat_interval_ms as f64) / 1000.0;
             let appends_per_sec = if elapsed_secs > 0.0 {
                 (appends as f64 / elapsed_secs) as u32
@@ -316,7 +272,6 @@ impl StreamManagerClient {
             };
 
             let heartbeat_payload = build_heartbeat_payload(node_id, &metrics);
-
             let hb_frame = Frame::new(
                 VariableHeader::Heartbeat { request_id },
                 Some(heartbeat_payload),
@@ -346,25 +301,176 @@ impl StreamManagerClient {
                     ));
                 }
             }
+        }
+    }
 
-            // After each heartbeat, send progress updates for all active extents.
-            for (stream_id, extent_id, current_offset, epoch) in store.snapshot_active_extents() {
-                Self::send_extent_update(
-                    &mut framed,
-                    ExtentUpdate::Progress {
-                        stream_id,
-                        extent_id,
-                        current_offset,
-                        epoch,
-                    },
-                    rpc_request_timeout,
-                )
-                .await;
+    // ── Update connection ───────────────────────────────────────────────
+
+    /// Reconnection loop for the extent update connection.
+    async fn update_loop(
+        store: Arc<ExtentNodeStore>,
+        node_id: String,
+        advertise_addr: String,
+        stream_manager_addrs: Vec<String>,
+        heartbeat_interval_ms: u32,
+        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        rpc_connect_timeout: Duration,
+        rpc_request_timeout: Duration,
+        mut update_rx: mpsc::Receiver<ExtentUpdate>,
+    ) {
+        let mut addr_index: usize = 0;
+        loop {
+            let addr = &stream_manager_addrs[addr_index % stream_manager_addrs.len()];
+            match Self::update_session(
+                &store,
+                &node_id,
+                &advertise_addr,
+                addr,
+                heartbeat_interval_ms,
+                &mut shutdown_rx,
+                rpc_connect_timeout,
+                rpc_request_timeout,
+                &mut update_rx,
+            )
+            .await
+            {
+                Ok(()) => {
+                    // Shutdown signal received.
+                    return;
+                }
+                Err(e) => {
+                    warn!("StreamManager update connection to {addr} failed: {e}");
+                }
+            }
+            addr_index += 1;
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                _ = &mut shutdown_rx => {
+                    info!("update loop received shutdown signal during reconnect wait");
+                    return;
+                }
             }
         }
     }
 
-    /// Send a single UPDATE_EXTENT frame on the SM connection.
+    /// Single update session: Connect, drain extent updates, send progress.
+    async fn update_session(
+        store: &Arc<ExtentNodeStore>,
+        node_id: &str,
+        advertise_addr: &str,
+        stream_manager_addr: &str,
+        heartbeat_interval_ms: u32,
+        shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
+        rpc_connect_timeout: Duration,
+        rpc_request_timeout: Duration,
+        update_rx: &mut mpsc::Receiver<ExtentUpdate>,
+    ) -> Result<(), StorageError> {
+        let mut framed = Self::connect_and_handshake(
+            node_id,
+            advertise_addr,
+            stream_manager_addr,
+            heartbeat_interval_ms,
+            rpc_connect_timeout,
+            rpc_request_timeout,
+        )
+        .await?;
+        info!("update connection established to StreamManager at {stream_manager_addr}");
+
+        // Use the heartbeat interval for periodic progress updates too.
+        let interval_duration = Duration::from_millis(heartbeat_interval_ms as u64);
+        let mut progress_interval = tokio::time::interval(interval_duration);
+        progress_interval.tick().await; // consume the first immediate tick
+
+        loop {
+            tokio::select! {
+                Some(update) = update_rx.recv() => {
+                    Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
+                    // Drain any additional queued updates to batch them.
+                    while let Ok(update) = update_rx.try_recv() {
+                        Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
+                    }
+                }
+                _ = progress_interval.tick() => {
+                    // Periodic progress updates for all active extents.
+                    for (stream_id, extent_id, current_offset, epoch) in store.snapshot_active_extents() {
+                        Self::send_extent_update(
+                            &mut framed,
+                            ExtentUpdate::Progress {
+                                stream_id,
+                                extent_id,
+                                current_offset,
+                                epoch,
+                            },
+                            rpc_request_timeout,
+                        )
+                        .await;
+                    }
+                }
+                _ = &mut *shutdown_rx => {
+                    info!("update connection received shutdown signal");
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // ── Shared helpers ──────────────────────────────────────────────────
+
+    /// TCP connect + Connect handshake. Shared by both connections.
+    async fn connect_and_handshake(
+        node_id: &str,
+        advertise_addr: &str,
+        stream_manager_addr: &str,
+        heartbeat_interval_ms: u32,
+        rpc_connect_timeout: Duration,
+        rpc_request_timeout: Duration,
+    ) -> Result<Framed<TcpStream, FrameCodec>, StorageError> {
+        let stream =
+            tokio::time::timeout(rpc_connect_timeout, TcpStream::connect(stream_manager_addr))
+                .await
+                .map_err(|_| {
+                    StorageError::Internal(format!("connect timeout to {stream_manager_addr}"))
+                })??;
+        stream
+            .set_nodelay(true)
+            .map_err(|e| StorageError::Internal(format!("set TCP_NODELAY: {e}")))?;
+        let mut framed = Framed::new(stream, FrameCodec);
+
+        // Send Connect.
+        let connect_payload = build_connect_payload(node_id, advertise_addr, heartbeat_interval_ms);
+        let connect_frame = Frame::new(
+            VariableHeader::Connect { request_id: 0 },
+            Some(connect_payload),
+        );
+        tokio::time::timeout(rpc_request_timeout, framed.send(connect_frame))
+            .await
+            .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))??;
+
+        match tokio::time::timeout(rpc_request_timeout, framed.next()).await {
+            Ok(Some(Ok(resp))) if resp.opcode() == Opcode::ConnectAck => {
+                info!("registered with StreamManager at {stream_manager_addr}");
+            }
+            Ok(Some(Ok(resp))) => {
+                error!("unexpected Connect response: {:?}", resp.opcode());
+                return Err(StorageError::Internal("unexpected Connect response".into()));
+            }
+            Ok(Some(Err(e))) => return Err(e),
+            Ok(None) => {
+                return Err(StorageError::Internal(
+                    "StreamManager connection closed after Connect".into(),
+                ));
+            }
+            Err(_) => {
+                return Err(StorageError::Internal(
+                    "timeout waiting for ConnectAck from StreamManager".into(),
+                ));
+            }
+        }
+
+        Ok(framed)
+    }
+
+    /// Send a single UPDATE_EXTENT frame on an SM connection.
     /// Fire-and-forget: logs and drops on failure.
     async fn send_extent_update(
         framed: &mut Framed<TcpStream, FrameCodec>,

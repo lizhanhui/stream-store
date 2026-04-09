@@ -73,8 +73,8 @@ impl ExtentNode {
 
         // Wire up the extent update channel for autonomous extent creation
         // and periodic progress reporting. The receiver is passed to
-        // StreamManagerClient which sends UPDATE_EXTENT frames on the
-        // existing heartbeat connection.
+        // StreamManagerClient which sends UPDATE_EXTENT frames on a
+        // dedicated connection, separate from heartbeats.
         let (update_tx, update_rx) = mpsc::channel::<ExtentUpdate>(64);
         store_inner.set_update_tx(update_tx);
 
@@ -103,8 +103,7 @@ impl ExtentNode {
         };
 
         // Spawn StreamManagerClient (RAII: sends Disconnect when dropped).
-        // The update_rx channel is passed here so UPDATE_EXTENT frames
-        // are sent on the same connection as heartbeats.
+        // Manages two connections: heartbeat (dedicated) and extent updates (dedicated).
         let stream_manager_client = StreamManagerClient::spawn(
             Arc::clone(&store),
             node_id,
