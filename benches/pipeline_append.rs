@@ -48,7 +48,7 @@ const NUM_SENDERS: usize = 4;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u16 = 2;
 const EXTENT_CAPACITY: u32 = 64 * 1024 * 1024; // 64 MiB
-const PIPELINE_DEPTH: usize = 4; // max in-flight appends per sender
+const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
 const MAX_EXTENTS_PER_STREAM: usize = 4;
 
 // -- Shared counters ----------------------------------------------------------

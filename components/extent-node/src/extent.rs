@@ -164,17 +164,15 @@ pub struct Extent {
     /// Committed offset: the next logical offset after the last contiguously
     /// committed record (exclusive). All offsets in [start_offset, committed_offset)
     /// have been fully written and are safe to read.
-    /// - **Primary**: advanced inline in `append_inner()` (sequential writes).
-    /// - **Secondary**: advanced by `try_advance_committed()` which walks the index
-    ///   in order, ensuring contiguous progress even with out-of-order arrival.
-    ///   Watermark ACKs use this value to report gap-free progress to the primary.
+    /// Advanced inline in both `append_inner()` (primary) and `replicate()`
+    /// (secondary). In-order Forward delivery guarantees sequential processing.
+    /// Watermark ACKs use this value to report progress to the primary.
     committed_offset: AtomicU64,
 
     /// Committed byte position: contiguous byte frontier.
-    /// - **Primary**: byte offset up to which all records are fully written
-    ///   (sequential writes). Readers use this as the upper bound.
-    /// - **Secondary**: advanced by `try_advance_committed()` alongside
-    ///   `committed_offset`, ensuring contiguous progress.
+    /// Byte offset up to which all records are fully written. Readers use
+    /// this as the upper bound. Advanced inline in both `append_inner()`
+    /// (primary) and `replicate()` (secondary).
     committed_bytes: AtomicU64,
 
     /// Message limit for this extent.
@@ -200,10 +198,9 @@ pub struct Extent {
 
     /// Incremental CRC32 hasher.
     ///
-    /// - **Primary**: updated directly in `append_inner()` (single-writer guarantee
-    ///   from pipelined group commit).
-    /// - **Secondary**: updated via `try_advance_committed()` which walks the internal
-    ///   index in sequence order, handling out-of-order record arrival.
+    /// Updated inline in both `append_inner()` (primary) and `replicate()`
+    /// (secondary). In-order Forward delivery guarantees sequential processing
+    /// on secondaries, so CRC32 can be hashed directly from the payload.
     ///
     /// `UnsafeCell` is used instead of `Mutex` because the single-writer
     /// invariant already guarantees exclusive access — same reasoning as
@@ -378,10 +375,10 @@ impl Extent {
     /// `byte_pos` and logical offset as the primary, ensuring bit-for-bit
     /// identical arena layouts across replicas.
     ///
-    /// CRC32 is **not** computed inline here because records may arrive out of
-    /// order (multiple leaders race for the downstream `Mutex<FrameWrite>`).
-    /// Instead, `try_advance_committed()` walks the index in sequence order after
-    /// each replicate, hashing as many consecutive records as are available.
+    /// Forward frames arrive in strict offset order (guaranteed by the
+    /// per-address FIFO mpsc channel), so CRC32 is computed inline and
+    /// committed state is advanced directly — matching `append_inner`
+    /// semantics on the primary.
     ///
     /// Returns the logical offset on success.
     pub fn replicate(
@@ -416,16 +413,28 @@ impl Extent {
             }
         }
 
-        // Unconditionally increment record_count (each replicate is a distinct record).
-        self.record_count.fetch_add(1, Ordering::Relaxed);
+        // Increment record_count (plain store — in-order guarantee means
+        // single-connection sequential processing, same as append_inner).
+        let count = self.record_count.load(Ordering::Relaxed);
+        self.record_count.store(count + 1, Ordering::Relaxed);
 
-        // Record in index before advancing committed state.
+        // Update incremental CRC32 inline (in-order arrival means we can
+        // hash directly from the payload, no arena re-read needed).
+        unsafe {
+            let h = &mut *self.hasher.get();
+            h.update(&(payload_len as u32).to_be_bytes());
+            if payload_len > 0 {
+                h.update(&payload);
+            }
+        }
+
+        // Advance committed state directly (no index walk needed).
+        let new_committed_bytes = byte_pos + record_len as u64;
+        self.committed_bytes
+            .store(new_committed_bytes, Ordering::Release);
         self.index_record(seq, byte_pos);
-
-        // Advance committed_offset, committed_bytes, and CRC32 contiguously by
-        // walking the index from the current committed_offset. This ensures
-        // watermark ACKs reflect gap-free progress and CRC32 is in order.
-        self.try_advance_committed();
+        self.committed_offset
+            .store(self.start_offset.0 + seq + 1, Ordering::Release);
 
         Ok(AppendResult { offset, byte_pos })
     }
@@ -608,11 +617,10 @@ impl Extent {
     /// byte_pos from the arena, hashes `[len:u32 BE][payload]`, and advances
     /// both committed cursors. Stops at the first gap (unpopulated entry).
     ///
-    /// On the primary this is a no-op (committed_offset is already advanced inline
-    /// in `append_inner`). On secondaries, records may arrive out of order, so
-    /// this method is the sole mechanism for advancing committed state — ensuring
-    /// watermark ACKs reflect contiguous progress and CRC32 is computed in the
-    /// correct sequence.
+    /// No longer called from the normal `replicate()` path — with in-order
+    /// Forward delivery, `replicate()` advances committed state and CRC32
+    /// inline (matching `append_inner`). Retained for edge cases such as
+    /// post-seal late writes with `accepts_post_seal_writes`.
     ///
     /// Amortized O(1) per replicate call.
     ///
@@ -1160,7 +1168,7 @@ mod tests {
     }
 
     #[test]
-    fn crc32_out_of_order_replicate() {
+    fn crc32_in_order_replicate() {
         // Simulate primary appends to get reference data.
         let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         let r0 = primary.append(Bytes::from_static(b"hello")).unwrap();
@@ -1168,37 +1176,31 @@ mod tests {
         let r2 = primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
-        // Simulate secondary receiving records OUT OF ORDER (leader Mutex race).
+        // Simulate secondary receiving records IN ORDER (guaranteed by FIFO mpsc).
         let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
-        // Record 2 arrives first.
-        secondary
-            .replicate(Offset(2), r2.byte_pos, Bytes::from_static(b"!"))
-            .unwrap();
-
-        // Record 0 arrives next.
         secondary
             .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
             .unwrap();
-
-        // Record 1 arrives last.
         secondary
             .replicate(Offset(1), r1.byte_pos, Bytes::from_static(b"world"))
+            .unwrap();
+        secondary
+            .replicate(Offset(2), r2.byte_pos, Bytes::from_static(b"!"))
             .unwrap();
 
         // Seal and store primary checksum.
         secondary.seal(Some(3));
         let primary_crc = primary.finalized_crc32().unwrap();
         secondary.store_primary_checksum(primary_crc);
-        secondary.try_advance_committed();
 
-        // Verification should succeed despite out-of-order arrival.
+        // CRC32 was computed inline — verification should succeed immediately.
         assert_eq!(secondary.try_verify_checksum(), Some(true));
     }
 
     #[test]
-    fn crc32_forward_checksum_arrives_early() {
-        // ForwardChecksum arrives before all records (leader Mutex race).
+    fn crc32_forward_checksum_arrives_after_records() {
+        // ForwardChecksum arrives after all records (normal case with FIFO channel).
         let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         let r0 = primary.append(Bytes::from_static(b"hello")).unwrap();
         let r1 = primary.append(Bytes::from_static(b"world")).unwrap();
@@ -1206,26 +1208,20 @@ mod tests {
 
         let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
-        // Only record 1 arrives first (out of order).
+        // Records arrive in order.
+        secondary
+            .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
+            .unwrap();
         secondary
             .replicate(Offset(1), r1.byte_pos, Bytes::from_static(b"world"))
             .unwrap();
 
-        // ForwardChecksum arrives (but record 0 is still missing).
+        // Seal and store primary checksum.
         secondary.seal(Some(2));
         let primary_crc = primary.finalized_crc32().unwrap();
         secondary.store_primary_checksum(primary_crc);
-        secondary.try_advance_committed();
 
-        // Not ready — record 0 still missing.
-        assert_eq!(secondary.try_verify_checksum(), None);
-
-        // Record 0 arrives.
-        secondary
-            .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
-            .unwrap();
-
-        // Now all records present — verification should auto-complete.
+        // All records present, CRC32 hashed inline — verification succeeds.
         assert_eq!(secondary.try_verify_checksum(), Some(true));
     }
 }
