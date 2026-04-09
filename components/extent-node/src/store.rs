@@ -1252,22 +1252,12 @@ impl ExtentNodeStore {
         }
 
         if entries.is_empty() {
-            // All appends failed — decrement and possibly drain followers.
-            let remaining = stream_ref
-                .in_flight()
-                .fetch_sub(batch_len, Ordering::Release);
-            drop(stream_ref); // ← release read guard BEFORE drain
-            if remaining > batch_len {
-                let batch_seals = self.drain_follower_jobs(stream_id).await;
-                for notif in batch_seals {
-                    self.send_extent_update(stream_id, &notif);
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
-                }
-            }
             if extent_full {
-                // Autonomous extent creation for batch path — retry all failed frames.
+                // Extent-full with no successful entries: seal+retry BEFORE releasing
+                // leadership to guarantee Forward frame ordering.
+                drop(stream_ref); // release read guard for seal+create
                 let seal_notification = self.seal_and_create_on_full(stream_id);
-                // do_append_and_respond will push ForwardInitExtent + Forward inline.
+                // Retry failed frames on the new extent — Forward pushed inline.
                 if let Some(stream_ref2) = self.streams.get(&stream_id) {
                     for ff in &failed_frames {
                         let (_, _) = self.do_append_and_respond(
@@ -1279,10 +1269,35 @@ impl ExtentNodeStore {
                             response_tx.cloned(),
                         );
                     }
+                    // Now release leadership after retry pushes are done.
+                    let remaining = stream_ref2
+                        .in_flight()
+                        .fetch_sub(batch_len, Ordering::Release);
+                    drop(stream_ref2);
+                    if remaining > batch_len {
+                        let batch_seals = self.drain_follower_jobs(stream_id).await;
+                        for notif in batch_seals {
+                            self.send_extent_update(stream_id, &notif);
+                            self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                        }
+                    }
                 }
                 if let Some(ref notif) = seal_notification {
                     self.send_extent_update(stream_id, notif);
                     self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                }
+            } else {
+                // All appends failed (not extent-full) — decrement and possibly drain.
+                let remaining = stream_ref
+                    .in_flight()
+                    .fetch_sub(batch_len, Ordering::Release);
+                drop(stream_ref);
+                if remaining > batch_len {
+                    let batch_seals = self.drain_follower_jobs(stream_id).await;
+                    for notif in batch_seals {
+                        self.send_extent_update(stream_id, &notif);
+                        self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                    }
                 }
             }
             return responses;
@@ -1413,23 +1428,13 @@ impl ExtentNodeStore {
         // Drop the replica borrow before we potentially need ack_queues again.
         drop(replica_ref);
 
-        // Check if followers arrived while we were appending.
-        let remaining = stream_ref
-            .in_flight()
-            .fetch_sub(batch_len, Ordering::Release);
-        drop(stream_ref); // ← release read guard BEFORE drain
-        if remaining > batch_len {
-            let batch_seals = self.drain_follower_jobs(stream_id).await;
-            for notif in &batch_seals {
-                self.send_extent_update(stream_id, notif);
-                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
-            }
-        }
-
         if extent_full {
-            // Autonomous extent creation for batch path (end of batch) — retry failed frames.
+            // Extent-full: seal+retry BEFORE releasing leadership to guarantee
+            // Forward frame ordering. stream_ref DashMap guard must be dropped
+            // for seal (write lock), but in_flight is still > 0 so no new leader.
+            drop(stream_ref);
             let seal_notification = self.seal_and_create_on_full(stream_id);
-            // do_append_and_respond will push ForwardInitExtent + Forward inline.
+            // Retry failed frames on the new extent — Forward pushed inline.
             if let Some(stream_ref2) = self.streams.get(&stream_id) {
                 for ff in &failed_frames {
                     let (_, _) = self.do_append_and_respond(
@@ -1441,10 +1446,35 @@ impl ExtentNodeStore {
                         response_tx.cloned(),
                     );
                 }
+                // Now release leadership after retry pushes are done.
+                let remaining = stream_ref2
+                    .in_flight()
+                    .fetch_sub(batch_len, Ordering::Release);
+                drop(stream_ref2);
+                if remaining > batch_len {
+                    let batch_seals = self.drain_follower_jobs(stream_id).await;
+                    for notif in &batch_seals {
+                        self.send_extent_update(stream_id, notif);
+                        self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                    }
+                }
             }
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
                 self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+            }
+        } else {
+            // No extent-full: release leadership and drain followers.
+            let remaining = stream_ref
+                .in_flight()
+                .fetch_sub(batch_len, Ordering::Release);
+            drop(stream_ref);
+            if remaining > batch_len {
+                let batch_seals = self.drain_follower_jobs(stream_id).await;
+                for notif in &batch_seals {
+                    self.send_extent_update(stream_id, notif);
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                }
             }
         }
 
