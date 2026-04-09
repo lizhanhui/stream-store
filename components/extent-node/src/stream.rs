@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -61,6 +62,11 @@ pub struct Stream {
     /// Populated at RegisterExtent time from DownstreamPool.
     /// Vec since RF is small (1-3); iteration is the hot path.
     downstream_txs: Vec<mpsc::UnboundedSender<Frame>>,
+
+    /// Pool of recycled extents ready for reuse. Avoids ~5ms allocation
+    /// on extent-full transitions. Pre-populated at register_extent time;
+    /// replenished by evict_oldest_extents.
+    extent_pool: VecDeque<Extent>,
 }
 
 impl Stream {
@@ -78,6 +84,7 @@ impl Stream {
             job_tx,
             job_rx,
             downstream_txs: Vec::new(),
+            extent_pool: VecDeque::new(),
         }
     }
 
@@ -106,6 +113,17 @@ impl Stream {
             epoch,
         ));
         self.evict_oldest_extents();
+
+        // Pre-allocate one spare extent for the pool so the first
+        // seal-and-create can recycle instead of allocating fresh.
+        if self.max_extents > 0 && self.extent_pool.is_empty() {
+            self.extent_pool.push_back(Extent::with_capacity(
+                ExtentId(0), // placeholder — reset() overwrites on use
+                Offset(0),
+                extent_capacity,
+                Epoch(0),
+            ));
+        }
     }
 
     /// Return the extent capacity configured for this stream.
@@ -255,12 +273,20 @@ impl Stream {
             .unwrap_or(Offset(0));
         let new_id = self.next_extent_id;
         self.next_extent_id = ExtentId(new_id.0 + 1);
-        self.extents.push(Extent::with_capacity(
-            new_id,
-            end_offset,
-            self.extent_capacity,
-            self.epoch,
-        ));
+
+        // Recycle from pool (O(1) reset) or allocate fresh (~5ms).
+        if let Some(mut recycled) = self.extent_pool.pop_front() {
+            recycled.reset(new_id, end_offset, self.epoch);
+            self.extents.push(recycled);
+        } else {
+            self.extents.push(Extent::with_capacity(
+                new_id,
+                end_offset,
+                self.extent_capacity,
+                self.epoch,
+            ));
+        }
+
         self.evict_oldest_extents();
         (new_id, end_offset)
     }
@@ -314,25 +340,34 @@ impl Stream {
         self.extents.iter().find(|e| e.id == extent_id)
     }
 
-    /// Drop oldest extents when the count exceeds `max_extents`.
+    /// Recycle oldest extents into the pool when count exceeds `max_extents`.
     ///
     /// Evicts from the front of the extent list (oldest first). The last extent
-    /// (active/current) is never evicted. On secondaries, old extents may not be
-    /// explicitly sealed (the autonomous extent-full path only seals on the Primary),
-    /// so we evict any non-last extent regardless of seal state.
+    /// (active/current) is never evicted. Recycled extents are pushed to the
+    /// pool for O(1) reuse by `create_next_extent`. If an extent has outstanding
+    /// reader references (Arc refcount > 1), it is dropped instead of recycled.
     fn evict_oldest_extents(&mut self) {
         if self.max_extents == 0 {
             return;
         }
         while self.extents.len() > self.max_extents && self.extents.len() > 1 {
             let evicted = self.extents.remove(0);
-            tracing::info!(
-                "evicted extent {} (sealed={}) from stream {} (retained: {})",
-                evicted.id,
-                evicted.is_sealed(),
-                self.id,
-                self.extents.len(),
-            );
+            if evicted.can_recycle() {
+                tracing::info!(
+                    "recycled extent {} (sealed={}) from stream {} (retained: {}, pool: {})",
+                    evicted.id,
+                    evicted.is_sealed(),
+                    self.id,
+                    self.extents.len(),
+                    self.extent_pool.len() + 1,
+                );
+                self.extent_pool.push_back(evicted);
+            } else {
+                tracing::warn!(
+                    "extent {} has outstanding readers, dropping instead of recycling",
+                    evicted.id,
+                );
+            }
         }
     }
 
