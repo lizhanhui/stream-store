@@ -5,7 +5,8 @@
 //! Stats (throughput, latency percentiles) are reported periodically every `REPORT_INTERVAL`.
 //!
 //! With pipelining enabled, each sender keeps up to `PIPELINE_DEPTH` appends in-flight
-//! concurrently on a single connection, dramatically improving throughput.
+//! concurrently on a single connection using FuturesUnordered (no task-per-append spawning),
+//! dramatically improving throughput while minimizing context switches.
 //!
 //! Extent-full transitions are handled **autonomously by the Primary ExtentNode** within
 //! the current epoch (epoch-based seal-and-new). The client never sees ExtentSealed errors
@@ -33,7 +34,8 @@ use extent_node::ExtentNode;
 use hdrhistogram::Histogram;
 use sqlx::mysql::MySqlPoolOptions;
 use stream_manager::StreamManager;
-use tokio::sync::Semaphore;
+use futures_util::stream::FuturesUnordered;
+use futures_util::StreamExt;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -105,7 +107,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 // -- Main ---------------------------------------------------------------------
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 16)]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
@@ -326,26 +328,36 @@ async fn sender_task(
             .unwrap_or_else(|e| panic!("sender {sender_id}: EN connect failed: {e}")),
     );
 
-    let semaphore = Arc::new(Semaphore::new(PIPELINE_DEPTH));
+    // Pipeline up to PIPELINE_DEPTH appends on this single task using
+    // FuturesUnordered — no tokio::spawn per append, which eliminates
+    // task scheduling overhead and reduces context switches.
+    let mut in_flight = FuturesUnordered::new();
 
-    while std::time::Instant::now() < deadline {
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
-
-        let en_client = Arc::clone(&en_client);
-        let payload = payload.clone();
-        let counters = Arc::clone(&counters);
-
-        tokio::spawn(async move {
-            let t0 = std::time::Instant::now();
-            match en_client.append(stream_id, Epoch(0), payload).await {
-                Ok(_) => counters.record_success(t0.elapsed()),
-                Err(e) => {
-                    warn!("sender {sender_id}: append error: {e}");
-                    counters.record_error();
+    loop {
+        // Fill the pipeline up to PIPELINE_DEPTH while deadline hasn't passed.
+        while in_flight.len() < PIPELINE_DEPTH && std::time::Instant::now() < deadline {
+            let client = Arc::clone(&en_client);
+            let data = payload.clone();
+            let ctrs = Arc::clone(&counters);
+            in_flight.push(async move {
+                let t0 = std::time::Instant::now();
+                match client.append(stream_id, Epoch(0), data).await {
+                    Ok(_) => ctrs.record_success(t0.elapsed()),
+                    Err(e) => {
+                        warn!("sender {sender_id}: append error: {e}");
+                        ctrs.record_error();
+                    }
                 }
-            }
-            drop(permit);
-        });
+            });
+        }
+
+        if in_flight.is_empty() {
+            break;
+        }
+
+        // Wait for any one in-flight append to complete, then loop back
+        // to refill the pipeline.
+        in_flight.next().await;
     }
 }
 
