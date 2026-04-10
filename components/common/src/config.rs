@@ -66,6 +66,14 @@ pub struct ExtentNodeConfig {
     pub connect_timeout_ms: u64,
     /// Timeout (ms) for SM-facing RPC request-response round trips. Defaults to 2000ms.
     pub request_timeout_ms: u64,
+    /// CPU core IDs for worker threads. Each worker runs its own single-threaded
+    /// tokio runtime pinned to the specified core. One worker per core ID.
+    ///
+    /// Examples (TOML):
+    ///   `worker_cores = [1, 2, 3]`     — 3 workers pinned to cores 1, 2, 3
+    ///   `worker_cores = [4, 5, 6, 7]`  — 4 workers pinned to cores 4-7
+    ///   `worker_cores = []`            — auto-detect: cores 1..num_cpus
+    pub worker_cores: Vec<usize>,
 }
 
 impl Default for ExtentNodeConfig {
@@ -80,6 +88,7 @@ impl Default for ExtentNodeConfig {
             replication_timeout_ms: DEFAULT_REPLICATION_TIMEOUT_MS,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
+            worker_cores: Vec::new(),
         }
     }
 }

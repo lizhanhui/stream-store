@@ -31,11 +31,11 @@ use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::Epoch;
 use extent_node::ExtentNode;
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use hdrhistogram::Histogram;
 use sqlx::mysql::MySqlPoolOptions;
 use stream_manager::StreamManager;
-use futures_util::stream::FuturesUnordered;
-use futures_util::StreamExt;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
@@ -134,6 +134,7 @@ async fn main() {
             bind_ip: "127.0.0.1".into(),
             port: 0,
             stream_manager_addrs: vec![stream_manager_addr.clone()],
+            worker_cores: vec![i * 3 + 1, i * 3 + 2, i * 3 + 3],
             ..Default::default()
         };
         let node = ExtentNode::start(config).await;
@@ -151,7 +152,12 @@ async fn main() {
         .await
         .expect("connect to StreamManager");
     let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = sm_client
-        .create_stream("bench-pipeline", REPLICATION_FACTOR, EXTENT_CAPACITY, CACHE_EXTENTS)
+        .create_stream(
+            "bench-pipeline",
+            REPLICATION_FACTOR,
+            EXTENT_CAPACITY,
+            CACHE_EXTENTS,
+        )
         .await
         .expect("create_stream");
     info!(
