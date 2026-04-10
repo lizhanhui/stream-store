@@ -6,6 +6,7 @@ pub mod stream_manager_client;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::config::{ExtentNodeConfig, resolve_advertise_ip};
@@ -114,7 +115,8 @@ impl ExtentNode {
             update_rx,
         );
 
-        // Spawn accept loop.
+        // Spawn accept loop (plain tokio::spawn — worker pinning is handled
+        // at the runtime level via on_thread_start core affinity).
         let server_shutdown = shutdown_tx.subscribe();
         task_handles.push(tokio::spawn(async move {
             server::Server::builder("ExtentNode")
@@ -169,4 +171,48 @@ impl ExtentNode {
         self.stream_manager_client.abort();
         // Drop everything else — TCP connections will be reset.
     }
+}
+
+/// Build a tokio multi-thread runtime with worker threads pinned to the
+/// configured CPU cores via `core_affinity`.
+///
+/// If `config.worker_cores` is empty, uses all available cores (no pinning).
+/// Otherwise, creates exactly `len(worker_cores)` worker threads, each pinned
+/// to the corresponding core ID.
+///
+/// The main thread (running the accept loop, SM client, etc.) is NOT pinned —
+/// only tokio worker threads are pinned.
+pub fn build_runtime(config: &ExtentNodeConfig) -> tokio::runtime::Runtime {
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder.enable_all();
+
+    if config.worker_cores.is_empty() {
+        // No pinning — use default tokio behavior.
+        tracing::info!("tokio runtime: default worker threads (no core pinning)");
+    } else {
+        let cores = config.worker_cores.clone();
+        let num_workers = cores.len();
+        let next_idx = Arc::new(AtomicUsize::new(0));
+
+        builder.worker_threads(num_workers);
+        builder.on_thread_start(move || {
+            let idx = next_idx.fetch_add(1, Ordering::SeqCst);
+            if idx < cores.len() {
+                let core_id = core_affinity::CoreId { id: cores[idx] };
+                if core_affinity::set_for_current(core_id) {
+                    tracing::info!("tokio worker thread pinned to core {}", cores[idx]);
+                } else {
+                    tracing::warn!("failed to pin tokio worker thread to core {}", cores[idx]);
+                }
+            }
+        });
+
+        tracing::info!(
+            "tokio runtime: {} worker threads pinned to cores {:?}",
+            num_workers,
+            config.worker_cores
+        );
+    }
+
+    builder.build().expect("failed to build tokio runtime")
 }

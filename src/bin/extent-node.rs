@@ -8,8 +8,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-#[tokio::main]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -26,14 +25,19 @@ async fn main() {
 
     tracing::info!("ExtentNode starting with config: {:?}", config);
 
-    let node = ExtentNode::start(config).await;
+    // Build runtime with core-pinned worker threads (if configured).
+    let rt = extent_node::build_runtime(&config);
 
-    // Wait for Ctrl+C, then gracefully shut down.
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to listen for ctrl_c");
+    rt.block_on(async {
+        let node = ExtentNode::start(config).await;
 
-    node.stop().await;
+        // Wait for Ctrl+C, then gracefully shut down.
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl_c");
+
+        node.stop().await;
+    });
 }
 
 fn parse_config_path() -> Option<String> {
