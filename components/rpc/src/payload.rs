@@ -139,9 +139,8 @@ pub fn parse_heartbeat_payload(payload: &[u8]) -> Option<(String, NodeMetrics)> 
 
 /// Replication role constants.
 pub const ROLE_PRIMARY: u8 = 0;
+pub const ROLE_SECONDARY: u8 = 1;
 
-/// Build a RegisterExtent payload for broadcast replication.
-///
 /// Build a RegisterExtent payload containing the replica addresses.
 ///
 /// Wire format (payload only — stream_id, extent_id, role, replication_factor

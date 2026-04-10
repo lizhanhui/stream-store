@@ -3,6 +3,7 @@ use std::time::Duration;
 use crate::allocator::Allocator;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
+use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use futures_util::future;
@@ -13,12 +14,6 @@ use rpc::payload::{
 };
 use server::handler::RequestHandler;
 use tracing::{error, info, warn};
-
-/// Default extent capacity: 64 MiB.
-const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
-
-/// Default cache_extents: max extents to retain in memory per stream.
-const DEFAULT_CACHE_EXTENTS: u32 = 4;
 
 /// Seal an ExtentNode's extent and return the committed end_offset.
 ///
