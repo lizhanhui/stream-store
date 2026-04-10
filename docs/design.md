@@ -276,6 +276,7 @@ Fixed Header (8B)
 Variable Header:
   [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
+  [extent_id    : u32]    -- target extent
   [offset       : u64]    -- start logical offset
   [count        : u32]    -- number of messages to read
 No Payload.
@@ -403,13 +404,13 @@ Response to CREATE_STREAM. Returns the newly created stream ID, initial extent I
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]
-  [extent_id   : u32]
-  [epoch       : u32]    -- initial stream epoch (always 0 for new streams)
-Payload:
-  [addr_len      : u16]
-  [primary_addr  : bytes]  -- address of the initial extent's Primary node
+  [request_id   : u32]
+  [stream_id    : u64]
+  [extent_id    : u32]
+  [epoch        : u32]    -- initial stream epoch (always 0 for new streams)
+  [addr_len     : u16]
+  [primary_addr : bytes]  -- address of the initial extent's Primary node
+No Payload.
 ```
 
 ##### 0x08 QUERY_OFFSET (Client -> Extent Node / Stream Manager)
@@ -439,20 +440,47 @@ No Payload.
 
 ##### 0x0B FORWARD (Primary -> Secondary)
 
-Dedicated opcode for Primary→Secondary broadcast replication. Carries all metadata including the primary-assigned `byte_pos` so the secondary writes each record at the exact same arena position as the primary, enabling bit-for-bit identical replicas and cross-replica checksum verification. Fire-and-forget: no `request_id`; secondary responds with cumulative `Watermark`.
+Dedicated opcode for Primary→Secondary broadcast replication. Uses flags to distinguish three variants:
+
+**flag=0x00 Forward** — Per-record replication. Carries the primary-assigned `byte_pos` so the secondary writes each record at the exact same arena position, enabling bit-for-bit identical replicas. Fire-and-forget: no `request_id`; secondary responds with cumulative `Watermark`.
 
 ```
-Fixed Header (8B)
-Variable Header (40B):
+Fixed Header (8B)    -- flags=0x00
+Variable Header (32B):
   [stream_id    : u64]    -- target stream
   [extent_id    : u32]    -- target extent
-  [epoch        : u32]    -- stream epoch (for secondary lazy creation)
-  [start_offset : u64]    -- extent base offset (for lazy creation)
+  [epoch        : u32]    -- stream epoch
   [offset       : u64]    -- primary-assigned logical offset for this record
   [byte_pos     : u64]    -- primary-assigned byte position in arena
 Payload:
   [payload_len  : u32]    -- length of message bytes
   [payload      : bytes]  -- message body
+```
+
+**flag=0x01 ForwardInitExtent** — Sent once by the Primary before the first Forward frame for a new extent. Carries extent metadata so the secondary can create the extent with the correct capacity. No payload, no response.
+
+```
+Fixed Header (8B)    -- flags=0x01
+Variable Header (32B):
+  [stream_id        : u64]    -- target stream
+  [extent_id        : u32]    -- new extent
+  [epoch            : u32]    -- stream epoch
+  [start_offset     : u64]    -- extent base offset
+  [extent_capacity  : u32]    -- arena size in bytes
+  [cache_extents    : u32]    -- max extents to retain in memory
+No Payload.
+```
+
+**flag=0x02 ForwardChecksum** — Sent by the Primary after sealing an extent so secondaries can verify data integrity. No response.
+
+```
+Fixed Header (8B)    -- flags=0x02
+Variable Header (24B):
+  [stream_id        : u64]    -- target stream
+  [extent_id        : u32]    -- sealed extent
+  [checksum         : u32]    -- CRC32 of the extent's committed data
+  [committed_bytes  : u64]    -- byte count of committed data
+No Payload.
 ```
 
 **Lifecycle (0x10-0x1F) -- Extent Node <-> Stream Manager**
@@ -576,24 +604,39 @@ Cumulative ACK from Secondary to Primary. Primary uses watermark ACKs from all s
 
 ```
 Fixed Header (8B)
-Variable Header:
+Variable Header (20B):
   [stream_id    : u64]    -- stream the watermark applies to
+  [extent_id    : u32]    -- extent the watermark applies to
   [offset       : u64]    -- highest committed offset (inclusive, cumulative)
 No Payload.
 ```
 
-##### 0x18 NOTIFY_SEALED_EXTENT (Primary ExtentNode -> Stream Manager)
+##### 0x18 UPDATE_EXTENT (Primary ExtentNode -> Stream Manager)
 
-Async notification from Primary EN after autonomous extent creation (extent-full within an epoch). Fire-and-forget: no response expected. SM updates metadata asynchronously.
+Async notification from Primary EN. Fire-and-forget: no response expected. Uses flags to distinguish two variants:
+
+**flag=0x00 UpdateExtentSealed** — Sent after autonomous extent creation (extent-full within an epoch). SM updates metadata asynchronously.
 
 ```
-Fixed Header (8B)
+Fixed Header (8B)    -- flags=0x00
 Variable Header (28B):
   [stream_id           : u64]    -- stream that was sealed
   [epoch               : u32]    -- current epoch at time of seal
   [sealed_extent_id    : u32]    -- extent that was sealed
   [end_offset          : u64]    -- committed end_offset of sealed extent
   [new_extent_id       : u32]    -- newly created extent (same epoch, same replica set)
+No Payload.
+```
+
+**flag=0x01 UpdateExtentProgress** — Periodic progress report for the active extent. SM uses this for monitoring and offset queries.
+
+```
+Fixed Header (8B)    -- flags=0x01
+Variable Header (24B):
+  [stream_id        : u64]    -- stream being reported
+  [epoch            : u32]    -- current epoch
+  [extent_id        : u32]    -- active extent
+  [current_offset   : u64]    -- current committed offset
 No Payload.
 ```
 
@@ -650,12 +693,17 @@ Payload:
 
 Describe a stream's extents with replica info and node liveness.
 
+When `FLAG_DESCRIBE_STREAM_BY_NAME` (0x01) is set, the frame includes `stream_name` for name-based lookup; `stream_id` is ignored.
+
 ```
 Fixed Header (8B)
 Variable Header:
   [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- target stream
+  [stream_id    : u64]    -- target stream (ignored when flag 0x01 set)
   [count        : u32]    -- 0 = all extents, 1 = active only, N = at most N from latest
+  If FLAG_DESCRIBE_STREAM_BY_NAME (0x01):
+    [name_len   : u16]
+    [stream_name: bytes]  -- resolve stream by name instead of stream_id
 No Payload.
 ```
 
@@ -758,6 +806,9 @@ Variable Header:
   [request_id   : u32]    -- correlates with the request that caused the error
   [error_code   : u16]    -- 0=Ok, 1=UnknownStream, 2=InvalidOffset,
                               3=ExtentSealed, 4=InternalError, 5=EpochStale
+                           -- Note: ExtentFull (formerly 5) was removed from the wire
+                           -- protocol — the server handles extent rotation internally,
+                           -- so clients never observe that condition.
   [extent_id    : u32]    -- relevant extent (0 when not applicable)
 Payload:
   [payload_len  : u32]
@@ -1146,6 +1197,7 @@ CREATE TABLE stream (
     replication_factor SMALLINT NOT NULL DEFAULT 2, -- per-stream RF (1-N)
     extent_capacity  INT NOT NULL DEFAULT 67108864,  -- per-stream arena size (default 64 MiB)
     cache_extents    INT NOT NULL DEFAULT 4,          -- max extents retained in memory per stream
+    epoch        INT NOT NULL DEFAULT 0,              -- current stream epoch (bumped on replica set change)
     created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -1155,6 +1207,7 @@ CREATE TABLE extent (
     start_offset  BIGINT NOT NULL DEFAULT 0,    -- first logical offset in this extent
     end_offset    BIGINT NOT NULL DEFAULT 0,   -- exclusive upper bound (updated on seal; equals start_offset while active)
     state         TINYINT NOT NULL DEFAULT 1,   -- ExtentState: 0=Unspecified, 1=Active, 2=Sealed, 3=Flushed
+    epoch         INT NOT NULL DEFAULT 0,       -- epoch under which this extent was created
     s3_key        VARCHAR(1024),                -- set after flush
     created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     sealed_at     TIMESTAMP NULL,

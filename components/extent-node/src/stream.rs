@@ -476,7 +476,7 @@ impl std::fmt::Debug for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
+    use common::config::DEFAULT_EXTENT_CAPACITY;
 
     /// Helper: create a stream with one active extent (simulating RegisterExtent from SM).
     fn new_stream_with_extent(id: StreamId) -> Stream {

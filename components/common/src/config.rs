@@ -14,6 +14,15 @@ pub const DEFAULT_SM_REQUEST_TIMEOUT_MS: u64 = 2000;
 /// Default timeout for replication quorum ACK (Primary waiting for Secondary watermarks).
 pub const DEFAULT_REPLICATION_TIMEOUT_MS: u64 = 500;
 
+/// Default extent capacity: 64 MiB per extent arena.
+pub const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
+
+/// Default cache_extents: max extents to retain in memory per stream.
+pub const DEFAULT_CACHE_EXTENTS: u32 = 4;
+
+/// Maximum supported replication factor (RF is normally 1-3).
+pub const MAX_REPLICATION_FACTOR: usize = 5;
+
 /// Base server configuration (shared fields).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -190,8 +199,6 @@ where
     toml::from_str(&content).map_err(|e| format!("failed to parse config file '{}': {}", path, e))
 }
 
-/// Detect the primary non-loopback IPv4 address of this machine.
-///
 /// Detect the primary non-loopback IPv4 address of this machine.
 ///
 /// Enumerates network interfaces via `getifaddrs` and filters out:

@@ -92,9 +92,17 @@ impl AckQueue {
         if required == 1 {
             return self.secondary_acked.values().copied().max();
         }
-        // General case: use a stack-allocated array (RF rarely exceeds 4).
+        // General case: use a stack-allocated array for secondary offsets.
+        // MAX_REPLICATION_FACTOR includes the Primary, so max secondaries = MAX_RF - 1.
         // Collect into a fixed buffer, sort descending, pick the required-th.
-        let mut offsets = [0u64; 8];
+        const MAX_SECONDARIES: usize = common::config::MAX_REPLICATION_FACTOR - 1;
+        debug_assert!(
+            self.secondary_acked.len() <= MAX_SECONDARIES,
+            "secondary count {} exceeds MAX_SECONDARIES {}",
+            self.secondary_acked.len(),
+            MAX_SECONDARIES,
+        );
+        let mut offsets = [0u64; MAX_SECONDARIES];
         let mut count = 0;
         for &offset in self.secondary_acked.values() {
             if count < offsets.len() {
@@ -1988,9 +1996,7 @@ impl ExtentNodeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
-    const DEFAULT_CACHE_EXTENTS: u32 = 4;
+    use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY};
 
     /// Register a stream on the ExtentNode via RegisterExtent (RF=1, Primary, no secondaries).
     /// This is the production path: StreamManager assigns a stream_id and sends RegisterExtent.
