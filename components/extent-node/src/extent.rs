@@ -308,10 +308,12 @@ impl Extent {
         self.epoch = epoch;
         self.write_cursor.store(0, Ordering::Relaxed);
         self.record_count.store(0, Ordering::Relaxed);
-        self.committed_offset.store(start_offset.0, Ordering::Relaxed);
+        self.committed_offset
+            .store(start_offset.0, Ordering::Relaxed);
         self.committed_bytes.store(0, Ordering::Relaxed);
         self.limit.store(LIMIT_OPEN, Ordering::Relaxed);
-        self.forward_flags.store(FLAG_INIT_FORWARD, Ordering::Relaxed);
+        self.forward_flags
+            .store(FLAG_INIT_FORWARD, Ordering::Relaxed);
         self.finalized_crc32.store(0, Ordering::Relaxed);
         // SAFETY: exclusive access via &mut self — no concurrent readers/writers.
         unsafe {

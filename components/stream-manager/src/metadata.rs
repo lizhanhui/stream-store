@@ -4,7 +4,7 @@ use common::errors::StorageError;
 use common::types::{
     Epoch, ExtentId, ExtentInfo, ExtentState, NodeMetrics, NodeState, ReplicaDetail, StreamId,
 };
-use sqlx::mysql::MySqlPoolOptions;
+use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{Acquire, MySqlPool, Row};
 use tracing::info;
 
@@ -78,13 +78,28 @@ pub struct MetadataStore {
 impl MetadataStore {
     /// Connect to MySQL and return a MetadataStore.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
+        // MySQL servers with binary collation (e.g. utf8mb4_0900_bin) return
+        // VARCHAR columns as VARBINARY, which sqlx cannot decode into Rust
+        // String. Append charset to URL and set on options for belt-and-suspenders.
+        let sqlx_url = if url.contains('?') {
+            format!("{url}&charset=utf8mb4")
+        } else {
+            format!("{url}?charset=utf8mb4")
+        };
+        let options: MySqlConnectOptions = sqlx_url
+            .parse()
+            .map_err(|e| StorageError::Internal(format!("parse MySQL URL: {e}")))?;
+        let options = options.charset("utf8mb4");
+
         let pool = MySqlPoolOptions::new()
             .max_connections(10)
-            .connect(url)
+            .connect_with(options)
             .await
             .map_err(|e| StorageError::Internal(format!("MySQL connect: {e}")))?;
         Ok(Self {
             pool,
+            // Store the base URL (without charset) for Refinery migrations
+            // (mysql_async doesn't support the charset URL parameter).
             url: url.to_string(),
         })
     }
@@ -242,10 +257,7 @@ impl MetadataStore {
     }
 
     /// Get the cache_extents (max extents to retain in memory) for a stream.
-    pub async fn get_stream_cache_extents(
-        &self,
-        stream_id: StreamId,
-    ) -> Result<u32, StorageError> {
+    pub async fn get_stream_cache_extents(&self, stream_id: StreamId) -> Result<u32, StorageError> {
         let row = sqlx::query("SELECT cache_extents FROM stream WHERE stream_id = ?")
             .bind(stream_id.0 as i64)
             .fetch_one(&self.pool)

@@ -689,28 +689,29 @@ impl StreamManagerStore {
     ///
     /// Response variable header carries primary_addr.
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
-        let (stream_name, replication_factor, extent_capacity, cache_extents) = match &frame.variable_header {
-            VariableHeader::CreateStream {
-                stream_name,
-                replication_factor,
-                extent_capacity,
-                cache_extents,
-                ..
-            } => (
-                String::from_utf8_lossy(stream_name).to_string(),
-                *replication_factor,
-                *extent_capacity,
-                *cache_extents,
-            ),
-            _ => {
-                return Frame::error_response(
-                    frame.request_id(),
-                    ErrorCode::InternalError,
-                    "invalid CreateStream frame",
-                    ExtentId(0),
-                );
-            }
-        };
+        let (stream_name, replication_factor, extent_capacity, cache_extents) =
+            match &frame.variable_header {
+                VariableHeader::CreateStream {
+                    stream_name,
+                    replication_factor,
+                    extent_capacity,
+                    cache_extents,
+                    ..
+                } => (
+                    String::from_utf8_lossy(stream_name).to_string(),
+                    *replication_factor,
+                    *extent_capacity,
+                    *cache_extents,
+                ),
+                _ => {
+                    return Frame::error_response(
+                        frame.request_id(),
+                        ErrorCode::InternalError,
+                        "invalid CreateStream frame",
+                        ExtentId(0),
+                    );
+                }
+            };
 
         // Use server default if client sends replication_factor=0.
         let replication_factor = if replication_factor == 0 {

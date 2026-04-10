@@ -30,9 +30,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StreamClient;
 use common::types::Epoch;
-use hdrhistogram::Histogram;
-use futures_util::stream::FuturesUnordered;
 use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
+use hdrhistogram::Histogram;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 

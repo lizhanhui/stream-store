@@ -566,7 +566,9 @@ impl Frame {
                 base + ne + ep
             }
             // request_id(4) + name_len(2) + name(N) + replication_factor(2) + extent_capacity(4) + cache_extents(4)
-            VariableHeader::CreateStream { stream_name, .. } => 4 + 2 + stream_name.len() + 2 + 4 + 4,
+            VariableHeader::CreateStream { stream_name, .. } => {
+                4 + 2 + stream_name.len() + 2 + 4 + 4
+            }
             // request_id(4) + stream_id(8) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
             VariableHeader::CreateStreamResp { primary_addr, .. } => {
                 4 + 8 + 4 + 4 + 2 + primary_addr.len()
