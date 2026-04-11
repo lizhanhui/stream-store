@@ -1,8 +1,9 @@
 //! Pipeline Append Benchmark (External Cluster)
 //!
 //! Connects to an **already-running** cluster (StreamManager at tx.dev:9800),
-//! creates a single stream (RF=2), then spawns N concurrent client connections all
-//! appending to the same stream. Stats (throughput, latency percentiles) are reported
+//! opens a single stream (creating it if absent), then spawns N concurrent client
+//! connections all appending to the same stream. Stats (throughput, latency
+//! percentiles) are reported
 //! periodically every `REPORT_INTERVAL`.
 //!
 //! With pipelining enabled, each sender keeps up to `PIPELINE_DEPTH` appends in-flight
@@ -102,22 +103,26 @@ async fn main() {
 
     let stream_manager_addr = "tx.dev:9800".to_string();
 
-    // -- 1. Create a single stream via StreamManager --------------------------
+    // -- 1. Open a single stream via StreamManager ----------------------------
     let stream_manager_client = StreamClient::connect(&stream_manager_addr)
         .await
         .expect("connect to StreamManager");
-    let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = stream_manager_client
-        .create_stream(
+    let stream_id = stream_manager_client
+        .open(
             "bench-pipeline-cluster",
             REPLICATION_FACTOR,
             EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
         )
         .await
-        .expect("create_stream");
+        .expect("open stream");
+    let initial_primary_addr = stream_manager_client
+        .cached_primary(stream_id)
+        .await
+        .expect("primary address cached after open");
     info!(
-        "[setup] Stream {} created: extent={}, primary={}",
-        stream_id, initial_extent_id, initial_primary_addr
+        "[setup] Stream {} opened with primary={}",
+        stream_id, initial_primary_addr
     );
 
     // -- 2. Shared counters ---------------------------------------------------

@@ -676,18 +676,26 @@ impl StreamClient {
 
     /// Open a stream by name: describe if it exists, create if absent.
     ///
+    /// The creation path exposes the same per-stream settings as `create_stream`.
     /// Returns the `StreamId`. The primary address is cached internally and
     /// can be retrieved via `cached_primary`.
     pub async fn open(
         &self,
         stream_name: &str,
         replication_factor: u16,
+        extent_capacity: u32,
+        cache_extents: u32,
     ) -> Result<StreamId, StorageError> {
         match self.describe_stream_by_name(stream_name, 1).await {
             Ok((stream_id, _)) => Ok(stream_id),
             Err(StorageError::UnknownStream(_)) => {
                 let (stream_id, _, _, _) = self
-                    .create_stream(stream_name, replication_factor, 0, 0)
+                    .create_stream(
+                        stream_name,
+                        replication_factor,
+                        extent_capacity,
+                        cache_extents,
+                    )
                     .await?;
                 Ok(stream_id)
             }
