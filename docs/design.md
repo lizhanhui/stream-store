@@ -29,7 +29,7 @@ When a trigger fires (size threshold, time interval, node failure, or **extent f
 
 For **extent full**: handled autonomously by the Primary Extent Node within the current epoch — see "ExtentFull handling" below. Stream Manager is not involved.
 
-For **client timeout or failure recovery**: the `SEAL` opcode (0x05) is used. `Flags` distinguish the seal variant:
+For **client timeout or failure recovery**: the `SEAL` opcode (0x06) is used. `Flags` distinguish the seal variant:
 
 **Client Seal (`FLAG_EPOCH_PRESENT = 1`)**:
 1. Client sends `Seal(stream_id, epoch)` to Stream Manager (client seals by epoch, not extent_id).
@@ -57,7 +57,7 @@ Both paths share the same downstream procedure in Stream Manager: seal in MySQL 
 
 **Why SM waits for Primary RegisterExtentAck**: Multiple clients may seal the same extent concurrently. SM may return the new extent info to the client (or the client may discover it via `DescribeStream`) before the target Primary has processed `RegisterExtent`. Waiting for the Primary's ACK adds only one SM↔EN round-trip (negligible compared to the MySQL transaction already in the seal path) and guarantees the Primary is ready to accept appends by the time any client learns about the new extent. For EN-initiated seal (ExtentFull), this is especially important — clients that received `ExtentFull` are already spinning on `DescribeStream` and would fail repeatedly if the new Primary isn't registered yet.
 
-**Lazy Secondary Extent Creation**: Secondaries create extents on-demand when they receive the **first Forward frame** from the Primary, rather than requiring `RegisterExtent` to arrive first. The Primary sends a `ForwardInitExtent` (Forward opcode 0x0B, flag=0x01) before the first Forward for a new extent, carrying `stream_id`, `extent_id`, `start_offset`, `extent_capacity`, and `cache_extents`. This eliminates the race where a secondary receives forwards before `RegisterExtent` arrives, and reduces the seal-and-new critical path to a single SM↔Primary round-trip. `RegisterExtent` to secondaries is still sent as a fire-and-forget hint for arena pre-allocation, but is **not required for correctness**.
+**Lazy Secondary Extent Creation**: Secondaries create extents on-demand when they receive the **first Forward frame** from the Primary, rather than requiring `RegisterExtent` to arrive first. The Primary sends a `ForwardInitExtent` (Forward opcode 0x05, flag=0x01) before the first Forward for a new extent, carrying `stream_id`, `extent_id`, `start_offset`, `extent_capacity`, and `cache_extents`. This eliminates the race where a secondary receives forwards before `RegisterExtent` arrives, and reduces the seal-and-new critical path to a single SM↔Primary round-trip. `RegisterExtent` to secondaries is still sent as a fire-and-forget hint for arena pre-allocation, but is **not required for correctness**.
 
 **ExtentFull handling — Epoch-Based Autonomous Extent Creation**: When the Primary's arena is exhausted, the transition is handled **entirely within the Extent Node** — Stream Manager is not on the critical path. The system uses a **stream epoch** model:
 
@@ -239,9 +239,41 @@ Grouped by category with gaps for future growth.
 
 **Data path (0x01-0x0F) -- Client <-> Extent Node**
 
-##### 0x01 APPEND (Client -> Primary)
+##### 0x01 CREATE_STREAM (Client -> Stream Manager)
 
-Append a message to a data stream. The client targets a stream by `(stream_id, epoch)` — the epoch identifies the replica set. The Primary routes the append to the current active extent; the client does not choose which extent to write to. If the epoch is stale (the replica set was reassigned via an epoch bump), the server returns `EpochStale`. Client-only operation; replication uses the dedicated Forward opcode (0x0B).
+Create a new stream. If `replication_factor = 0`, Stream Manager uses its default. If `extent_capacity = 0`, Stream Manager uses 64 MiB. If `cache_extents = 0`, Stream Manager uses 4.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [request_id         : u32]
+  [name_len           : u16]
+  [stream_name        : bytes]  -- human-readable stream name
+  [replication_factor : u16]
+  [extent_capacity    : u32]    -- per-stream arena size in bytes (0 = default 64 MiB)
+  [cache_extents      : u32]    -- max extents to retain in memory (0 = default 4)
+No Payload.
+```
+
+##### 0x02 CREATE_STREAM_RESP (Stream Manager -> Client)
+
+Response to CREATE_STREAM. Returns the newly created stream ID, initial extent ID, and the Primary Extent Node address. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][error_code:u16]`, and the payload carries the error message.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [request_id   : u32]
+  [stream_id    : u64]
+  [extent_id    : u32]
+  [epoch        : u32]    -- initial stream epoch (always 0 for new streams)
+  [addr_len     : u16]
+  [primary_addr : bytes]  -- address of the initial extent's Primary node
+No Payload.
+```
+
+##### 0x03 APPEND (Client -> Primary)
+
+Append a message to a data stream. The client targets a stream by `(stream_id, epoch)` — the epoch identifies the replica set. The Primary routes the append to the current active extent; the client does not choose which extent to write to. If the epoch is stale (the replica set was reassigned via an epoch bump), the server returns `EpochStale`. Client-only operation; replication uses the dedicated Forward opcode (0x05).
 
 ```
 Fixed Header (8B)
@@ -254,7 +286,7 @@ Payload:
   [payload      : bytes]  -- message body (application data)
 ```
 
-##### 0x02 APPEND_ACK (Primary -> Client)
+##### 0x04 APPEND_ACK (Primary -> Client)
 
 Confirms a successful append after quorum ACK is achieved. The response includes the epoch and extent_id the record landed on for diagnostics — the client can verify the epoch matches and log which extent was used. On failure, the Primary still returns opcode `APPEND_ACK`, but sets `FLAG_RESPONSE_ERROR = 0x80` and uses the error header layout shown below.
 
@@ -282,38 +314,52 @@ Payload:
   [payload      : bytes]  -- human-readable error message
 ```
 
-##### 0x03 READ (Client -> Extent Node)
+##### 0x05 FORWARD (Primary -> Secondary)
 
-Read messages from a stream starting at a given logical offset. The server resolves the byte position internally via its index stream, so clients only need to provide the logical offset.
+Dedicated opcode for Primary→Secondary broadcast replication. Uses flags to distinguish three variants:
+
+**flag=0x00 Forward** — Per-record replication. Carries the primary-assigned `byte_pos` so the secondary writes each record at the exact same arena position, enabling bit-for-bit identical replicas. Fire-and-forget: no `request_id`; secondary responds with cumulative `Watermark`.
 
 ```
-Fixed Header (8B)
-Variable Header:
-  [request_id   : u32]    -- correlates request/response
+Fixed Header (8B)    -- flags=0x00
+Variable Header (32B):
   [stream_id    : u64]    -- target stream
   [extent_id    : u32]    -- target extent
-  [offset       : u64]    -- start logical offset
-  [count        : u32]    -- number of messages to read
+  [epoch        : u32]    -- stream epoch
+  [offset       : u64]    -- primary-assigned logical offset for this record
+  [byte_pos     : u64]    -- primary-assigned byte position in arena
+Payload:
+  [payload_len  : u32]    -- length of message bytes
+  [payload      : bytes]  -- message body
+```
+
+**flag=0x01 ForwardInitExtent** — Sent once by the Primary before the first Forward frame for a new extent. Carries extent metadata so the secondary can create the extent with the correct capacity. No payload, no response.
+
+```
+Fixed Header (8B)    -- flags=0x01
+Variable Header (32B):
+  [stream_id        : u64]    -- target stream
+  [extent_id        : u32]    -- new extent
+  [epoch            : u32]    -- stream epoch
+  [start_offset     : u64]    -- extent base offset
+  [extent_capacity  : u32]    -- arena size in bytes
+  [cache_extents    : u32]    -- max extents to retain in memory
 No Payload.
 ```
 
-##### 0x04 READ_RESP (Extent Node -> Client)
-
-Read response carrying message data.
+**flag=0x02 ForwardChecksum** — Sent by the Primary after sealing an extent so secondaries can verify data integrity. No response.
 
 ```
-Fixed Header (8B)
-Variable Header:
-  [request_id   : u32]    -- correlates with original READ request
-  [stream_id    : u64]    -- stream that was read from
-  [offset       : u64]    -- starting offset of the returned batch
-  [count        : u32]    -- actual number of messages returned
-Payload:
-  [payload_len  : u32]    -- total length of all encoded messages
-  [payload      : bytes]  -- repeated [msg_len:u32][msg_bytes] per message
+Fixed Header (8B)    -- flags=0x02
+Variable Header (24B):
+  [stream_id        : u64]    -- target stream
+  [extent_id        : u32]    -- sealed extent
+  [checksum         : u32]    -- CRC32 of the extent's committed data
+  [committed_bytes  : u64]    -- byte count of committed data
+No Payload.
 ```
 
-##### 0x05 SEAL (Client -> Stream Manager; Extent Node -> Stream Manager; Stream Manager -> Extent Node)
+##### 0x06 SEAL (Client -> Stream Manager; Extent Node -> Stream Manager; Stream Manager -> Extent Node)
 
 Seal an extent. A single opcode covers all trigger sources; `Flags` distinguish the seal variant:
 
@@ -360,7 +406,7 @@ FLAG_EPOCH_PRESENT = 4 (client epoch-based seal):
   No Payload.
 ```
 
-##### 0x06 SEAL_ACK (Extent Node -> Stream Manager; Stream Manager -> Client)
+##### 0x07 SEAL_ACK (Extent Node -> Stream Manager; Stream Manager -> Client)
 
 **Extent Node -> Stream Manager**: Seal confirmation from an individual EN. Carries the committed offset so Stream Manager can compute quorum.
 
@@ -409,39 +455,7 @@ Payload:
   [payload      : bytes]  -- human-readable error message
 ```
 
-##### 0x07 CREATE_STREAM (Client -> Stream Manager)
-
-Create a new stream. If `replication_factor = 0`, Stream Manager uses its default. If `extent_capacity = 0`, Stream Manager uses 64 MiB. If `cache_extents = 0`, Stream Manager uses 4.
-
-```
-Fixed Header (8B)
-Variable Header:
-  [request_id         : u32]
-  [name_len           : u16]
-  [stream_name        : bytes]  -- human-readable stream name
-  [replication_factor : u16]
-  [extent_capacity    : u32]    -- per-stream arena size in bytes (0 = default 64 MiB)
-  [cache_extents      : u32]    -- max extents to retain in memory (0 = default 4)
-No Payload.
-```
-
-##### 0x08 CREATE_STREAM_RESP (Stream Manager -> Client)
-
-Response to CREATE_STREAM. Returns the newly created stream ID, initial extent ID, and the Primary Extent Node address. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][error_code:u16]`, and the payload carries the error message.
-
-```
-Fixed Header (8B)
-Variable Header:
-  [request_id   : u32]
-  [stream_id    : u64]
-  [extent_id    : u32]
-  [epoch        : u32]    -- initial stream epoch (always 0 for new streams)
-  [addr_len     : u16]
-  [primary_addr : bytes]  -- address of the initial extent's Primary node
-No Payload.
-```
-
-##### 0x09 QUERY_OFFSET (Client -> Extent Node / Stream Manager)
+##### 0x08 QUERY_OFFSET (Client -> Extent Node / Stream Manager)
 
 Query the max offset (exclusive) for a stream.
 
@@ -453,7 +467,7 @@ Variable Header:
 No Payload.
 ```
 
-##### 0x0A QUERY_OFFSET_RESP (Extent Node / Stream Manager -> Client)
+##### 0x09 QUERY_OFFSET_RESP (Extent Node / Stream Manager -> Client)
 
 Returns the current max offset. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][stream_id:u64][error_code:u16]`, and the payload carries the error message.
 
@@ -466,49 +480,35 @@ Variable Header:
 No Payload.
 ```
 
-##### 0x0B FORWARD (Primary -> Secondary)
+##### 0x0A READ (Client -> Extent Node)
 
-Dedicated opcode for Primary→Secondary broadcast replication. Uses flags to distinguish three variants:
-
-**flag=0x00 Forward** — Per-record replication. Carries the primary-assigned `byte_pos` so the secondary writes each record at the exact same arena position, enabling bit-for-bit identical replicas. Fire-and-forget: no `request_id`; secondary responds with cumulative `Watermark`.
+Read messages from a stream starting at a given logical offset. The server resolves the byte position internally via its index stream, so clients only need to provide the logical offset.
 
 ```
-Fixed Header (8B)    -- flags=0x00
-Variable Header (32B):
+Fixed Header (8B)
+Variable Header:
+  [request_id   : u32]    -- correlates request/response
   [stream_id    : u64]    -- target stream
   [extent_id    : u32]    -- target extent
-  [epoch        : u32]    -- stream epoch
-  [offset       : u64]    -- primary-assigned logical offset for this record
-  [byte_pos     : u64]    -- primary-assigned byte position in arena
+  [offset       : u64]    -- start logical offset
+  [count        : u32]    -- number of messages to read
+No Payload.
+```
+
+##### 0x0B READ_RESP (Extent Node -> Client)
+
+Read response carrying message data.
+
+```
+Fixed Header (8B)
+Variable Header:
+  [request_id   : u32]    -- correlates with original READ request
+  [stream_id    : u64]    -- stream that was read from
+  [offset       : u64]    -- starting offset of the returned batch
+  [count        : u32]    -- actual number of messages returned
 Payload:
-  [payload_len  : u32]    -- length of message bytes
-  [payload      : bytes]  -- message body
-```
-
-**flag=0x01 ForwardInitExtent** — Sent once by the Primary before the first Forward frame for a new extent. Carries extent metadata so the secondary can create the extent with the correct capacity. No payload, no response.
-
-```
-Fixed Header (8B)    -- flags=0x01
-Variable Header (32B):
-  [stream_id        : u64]    -- target stream
-  [extent_id        : u32]    -- new extent
-  [epoch            : u32]    -- stream epoch
-  [start_offset     : u64]    -- extent base offset
-  [extent_capacity  : u32]    -- arena size in bytes
-  [cache_extents    : u32]    -- max extents to retain in memory
-No Payload.
-```
-
-**flag=0x02 ForwardChecksum** — Sent by the Primary after sealing an extent so secondaries can verify data integrity. No response.
-
-```
-Fixed Header (8B)    -- flags=0x02
-Variable Header (24B):
-  [stream_id        : u64]    -- target stream
-  [extent_id        : u32]    -- sealed extent
-  [checksum         : u32]    -- CRC32 of the extent's committed data
-  [committed_bytes  : u64]    -- byte count of committed data
-No Payload.
+  [payload_len  : u32]    -- total length of all encoded messages
+  [payload      : bytes]  -- repeated [msg_len:u32][msg_bytes] per message
 ```
 
 **Lifecycle (0x10-0x1F) -- Extent Node <-> Stream Manager**
@@ -955,7 +955,7 @@ CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)
 ```
 
 1. Client sends APPEND to Primary. Primary assigns monotonic sequence number, buffers in memory.
-2. Primary broadcasts the append to **all Secondaries in parallel** using the dedicated Forward opcode (0x0B), which carries the primary-assigned `byte_pos` for deterministic replication.
+2. Primary broadcasts the append to **all Secondaries in parallel** using the dedicated Forward opcode (0x05), which carries the primary-assigned `byte_pos` for deterministic replication.
 3. Each Secondary buffers the append and sends a cumulative WATERMARK ACK back to Primary with its highest committed offset.
 4. Primary tracks per-secondary watermarks in an AckQueue. It computes the quorum offset: sorts secondary watermarks descending, takes the k-th value where `k = RF/2`.
 5. Primary ACKs all pending clients whose offset <= quorum offset (deferred response via per-connection channel).

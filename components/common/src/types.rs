@@ -107,20 +107,20 @@ impl Display for NodeId {
 #[repr(u8)]
 pub enum Opcode {
     // -- Data path (0x01-0x0F): Client <-> ExtentNode --
-    Append = 0x01,
-    AppendAck = 0x02,
-    Read = 0x03,
-    ReadResp = 0x04,
-    Seal = 0x05,
-    SealAck = 0x06,
-    CreateStream = 0x07,
-    CreateStreamResp = 0x08,
-    QueryOffset = 0x09,
-    QueryOffsetResp = 0x0A,
+    CreateStream = 0x01,
+    CreateStreamResp = 0x02,
+    Append = 0x03,
+    AppendAck = 0x04,
     /// Dedicated forward opcode for Primary→Secondary replication.
     /// Carries all metadata (including byte_pos) so the secondary writes
     /// each record at the exact same position as the primary.
-    Forward = 0x0B,
+    Forward = 0x05,
+    Seal = 0x06,
+    SealAck = 0x07,
+    QueryOffset = 0x08,
+    QueryOffsetResp = 0x09,
+    Read = 0x0A,
+    ReadResp = 0x0B,
 
     // -- Lifecycle (0x10-0x1F): ExtentNode <-> StreamManager --
     Connect = 0x10,
@@ -155,17 +155,17 @@ impl Opcode {
     pub fn from_u8(value: u8) -> Option<Opcode> {
         match value {
             // Data path
-            0x01 => Some(Opcode::Append),
-            0x02 => Some(Opcode::AppendAck),
-            0x03 => Some(Opcode::Read),
-            0x04 => Some(Opcode::ReadResp),
-            0x05 => Some(Opcode::Seal),
-            0x06 => Some(Opcode::SealAck),
-            0x07 => Some(Opcode::CreateStream),
-            0x08 => Some(Opcode::CreateStreamResp),
-            0x09 => Some(Opcode::QueryOffset),
-            0x0A => Some(Opcode::QueryOffsetResp),
-            0x0B => Some(Opcode::Forward),
+            0x01 => Some(Opcode::CreateStream),
+            0x02 => Some(Opcode::CreateStreamResp),
+            0x03 => Some(Opcode::Append),
+            0x04 => Some(Opcode::AppendAck),
+            0x05 => Some(Opcode::Forward),
+            0x06 => Some(Opcode::Seal),
+            0x07 => Some(Opcode::SealAck),
+            0x08 => Some(Opcode::QueryOffset),
+            0x09 => Some(Opcode::QueryOffsetResp),
+            0x0A => Some(Opcode::Read),
+            0x0B => Some(Opcode::ReadResp),
             // Lifecycle
             0x10 => Some(Opcode::Connect),
             0x11 => Some(Opcode::ConnectAck),
