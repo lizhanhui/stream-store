@@ -29,6 +29,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use client::StreamClient;
+use common::config::DEFAULT_CACHE_EXTENTS;
 use common::types::Epoch;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -110,7 +111,7 @@ async fn main() {
             "bench-pipeline-cluster",
             REPLICATION_FACTOR,
             EXTENT_CAPACITY,
-            0,
+            DEFAULT_CACHE_EXTENTS,
         )
         .await
         .expect("create_stream");
