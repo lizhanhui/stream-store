@@ -70,6 +70,3 @@ harness = false
 name = "pipeline_append_cluster"
 harness = false
 
-[profile.release]
-lto = true
-codegen-units = 1

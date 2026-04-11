@@ -10,11 +10,9 @@
 //! dramatically improving throughput while minimizing context switches.
 //!
 //! Extent-full transitions are handled **autonomously by the Primary ExtentNode** within
-//! the current epoch (epoch-based seal-and-new). The client never sees ExtentSealed errors
-//! during normal operation -- the Primary seals the full extent, creates a new one with the
-//! next sequential ID (same replica set, same epoch), and retries the triggering append
-//! transparently. Stream Manager is notified asynchronously via fire-and-forget
-//! NOTIFY_SEALED_EXTENT. Clients just keep appending; extent transitions are invisible.
+//! the current epoch (epoch-based seal-and-new). If a sender observes a recoverable routing
+//! error such as `ExtentSealed` or `EpochStale`, it re-describes the stream through the
+//! Stream Manager, reconnects to the current primary, and retries the append.
 //!
 //! **Prerequisites**: MySQL running at the default StreamManagerConfig URL.
 //!
@@ -30,6 +28,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
+use common::errors::StorageError;
 use common::types::Epoch;
 use extent_node::ExtentNode;
 use futures_util::StreamExt;
@@ -178,10 +177,19 @@ async fn main() {
 
     for sender_id in 0..NUM_SENDERS {
         let primary_addr = initial_primary_addr.clone();
+        let stream_manager_addr = stream_manager_addr.clone();
         let counters = Arc::clone(&counters);
 
         tokio::spawn(async move {
-            sender_task(sender_id, stream_id, primary_addr, BENCH_DURATION, counters).await;
+            sender_task(
+                sender_id,
+                stream_id,
+                primary_addr,
+                stream_manager_addr,
+                BENCH_DURATION,
+                counters,
+            )
+            .await;
         });
     }
 
@@ -327,13 +335,14 @@ async fn sender_task(
     sender_id: usize,
     stream_id: common::types::StreamId,
     primary_addr: String,
+    stream_manager_addr: String,
     duration: Duration,
     counters: Arc<SharedCounters>,
 ) {
     let payload = Bytes::from(vec![0xABu8; PAYLOAD_SIZE]);
     let deadline = std::time::Instant::now() + duration;
 
-    let en_client = Arc::new(
+    let mut en_client = Arc::new(
         StreamClient::connect(&primary_addr)
             .await
             .unwrap_or_else(|e| panic!("sender {sender_id}: EN connect failed: {e}")),
@@ -349,16 +358,10 @@ async fn sender_task(
         while in_flight.len() < PIPELINE_DEPTH && std::time::Instant::now() < deadline {
             let client = Arc::clone(&en_client);
             let data = payload.clone();
-            let ctrs = Arc::clone(&counters);
             in_flight.push(async move {
-                let t0 = std::time::Instant::now();
-                match client.append(stream_id, Epoch(0), data).await {
-                    Ok(_) => ctrs.record_success(t0.elapsed()),
-                    Err(e) => {
-                        warn!("sender {sender_id}: append error: {e}");
-                        ctrs.record_error();
-                    }
-                }
+                let started_at = std::time::Instant::now();
+                let result = client.append(stream_id, Epoch(0), data.clone()).await;
+                (data, started_at, result)
             });
         }
 
@@ -366,10 +369,49 @@ async fn sender_task(
             break;
         }
 
-        // Wait for any one in-flight append to complete, then loop back
-        // to refill the pipeline.
-        in_flight.next().await;
+        let (data, started_at, result) = in_flight.next().await.expect("in-flight append result");
+        match result {
+            Ok(_) => counters.record_success(started_at.elapsed()),
+            Err(StorageError::ExtentSealed(_)) | Err(StorageError::EpochStale(_, _)) => {
+                match reconnect_to_active_primary(&stream_manager_addr, stream_id).await {
+                    Ok((client, _primary_addr)) => {
+                        en_client = client;
+                        match en_client.append(stream_id, Epoch(0), data).await {
+                            Ok(_) => counters.record_success(started_at.elapsed()),
+                            Err(e) => {
+                                warn!("sender {sender_id}: append retry after refresh failed: {e}");
+                                counters.record_error();
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("sender {sender_id}: refresh primary after append error failed: {e}");
+                        counters.record_error();
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("sender {sender_id}: append error: {e}");
+                counters.record_error();
+            }
+        }
     }
+}
+
+async fn reconnect_to_active_primary(
+    stream_manager_addr: &str,
+    stream_id: common::types::StreamId,
+) -> Result<(Arc<StreamClient>, String), StorageError> {
+    let sm_client = StreamClient::connect(stream_manager_addr).await?;
+    sm_client.describe_stream(stream_id, 1).await?;
+    let primary_addr = sm_client.cached_primary(stream_id).await.ok_or_else(|| {
+        StorageError::Internal(format!(
+            "stream {} missing primary after describe_stream",
+            stream_id
+        ))
+    })?;
+    let en_client = Arc::new(StreamClient::connect(&primary_addr).await?);
+    Ok((en_client, primary_addr))
 }
 
 // -- Helpers ------------------------------------------------------------------
