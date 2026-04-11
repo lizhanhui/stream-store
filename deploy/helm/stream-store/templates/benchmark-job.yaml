@@ -42,4 +42,8 @@ spec:
               value: {{ .Values.benchmark.durationSecs | quote }}
             - name: RUST_LOG
               value: "info"
+          {{- with .Values.benchmark.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
 {{- end }}

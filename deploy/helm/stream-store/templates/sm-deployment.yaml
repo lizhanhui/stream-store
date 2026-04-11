@@ -43,6 +43,10 @@ spec:
               port: {{ .Values.streamManager.port }}
             initialDelaySeconds: 5
             periodSeconds: 5
+          {{- with .Values.streamManager.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       volumes:
         - name: config
           configMap:

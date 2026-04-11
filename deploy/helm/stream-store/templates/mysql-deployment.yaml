@@ -39,6 +39,10 @@ spec:
                 - localhost
             initialDelaySeconds: 10
             periodSeconds: 5
+          {{- with .Values.mysql.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       volumes:
         - name: init-sql
           configMap:

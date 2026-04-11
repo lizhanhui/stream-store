@@ -50,6 +50,10 @@ spec:
               port: {{ .Values.extentNode.port }}
             initialDelaySeconds: 5
             periodSeconds: 5
+          {{- with .Values.extentNode.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
       volumes:
         - name: entrypoint
           configMap:
