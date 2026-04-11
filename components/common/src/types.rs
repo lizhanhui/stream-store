@@ -114,9 +114,9 @@ pub enum Opcode {
     Seal = 0x05,
     SealAck = 0x06,
     CreateStream = 0x07,
-    QueryOffset = 0x08,
-    QueryOffsetResp = 0x09,
-    CreateStreamResp = 0x0A,
+    CreateStreamResp = 0x08,
+    QueryOffset = 0x09,
+    QueryOffsetResp = 0x0A,
     /// Dedicated forward opcode for Primary→Secondary replication.
     /// Carries all metadata (including byte_pos) so the secondary writes
     /// each record at the exact same position as the primary.
@@ -162,9 +162,9 @@ impl Opcode {
             0x05 => Some(Opcode::Seal),
             0x06 => Some(Opcode::SealAck),
             0x07 => Some(Opcode::CreateStream),
-            0x08 => Some(Opcode::QueryOffset),
-            0x09 => Some(Opcode::QueryOffsetResp),
-            0x0A => Some(Opcode::CreateStreamResp),
+            0x08 => Some(Opcode::CreateStreamResp),
+            0x09 => Some(Opcode::QueryOffset),
+            0x0A => Some(Opcode::QueryOffsetResp),
             0x0B => Some(Opcode::Forward),
             // Lifecycle
             0x10 => Some(Opcode::Connect),
