@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::StreamManagerConfig;
+use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY, StreamManagerConfig};
 use common::types::{Epoch, ExtentState, NodeMetrics};
 
 /// Initialize tracing for tests.
@@ -110,7 +110,15 @@ async fn stream_client_open_integration() {
     sm.heartbeat("en-1", &NodeMetrics::default()).await.unwrap();
 
     // ── Part 1: open() creates stream when absent ──
-    let stream_id = sm.open("test-stream", 1).await.unwrap();
+    let stream_id = sm
+        .open(
+            "test-stream",
+            1,
+            DEFAULT_EXTENT_CAPACITY,
+            DEFAULT_CACHE_EXTENTS,
+        )
+        .await
+        .unwrap();
     assert!(stream_id.0 > 0, "stream_id should be non-zero");
 
     // Primary address should be cached.
@@ -126,7 +134,15 @@ async fn stream_client_open_integration() {
     );
 
     // ── Part 2: open() returns same stream when it already exists ──
-    let stream_id_2 = sm.open("test-stream", 1).await.unwrap();
+    let stream_id_2 = sm
+        .open(
+            "test-stream",
+            1,
+            DEFAULT_EXTENT_CAPACITY,
+            DEFAULT_CACHE_EXTENTS,
+        )
+        .await
+        .unwrap();
     assert_eq!(
         stream_id, stream_id_2,
         "open() should return same StreamId for existing stream"
@@ -137,7 +153,15 @@ async fn stream_client_open_integration() {
     assert_eq!(primary_addr, primary_addr_2);
 
     // ── Part 3: open() a second distinct stream ──
-    let stream_id_b = sm.open("another-stream", 1).await.unwrap();
+    let stream_id_b = sm
+        .open(
+            "another-stream",
+            1,
+            DEFAULT_EXTENT_CAPACITY,
+            DEFAULT_CACHE_EXTENTS,
+        )
+        .await
+        .unwrap();
     assert_ne!(
         stream_id, stream_id_b,
         "different names should yield different StreamIds"

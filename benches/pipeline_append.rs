@@ -1,7 +1,8 @@
 //! Pipeline Append Benchmark
 //!
-//! Launches a full cluster (1 StreamManager + 3 ExtentNodes), creates a **single stream**
-//! (RF=2), then spawns N concurrent client connections all appending to the same stream.
+//! Launches a full cluster (1 StreamManager + 3 ExtentNodes), opens a **single stream**
+//! (creating it if absent, RF=2), then spawns N concurrent client connections all appending
+//! to the same stream.
 //! Stats (throughput, latency percentiles) are reported periodically every `REPORT_INTERVAL`.
 //!
 //! With pipelining enabled, each sender keeps up to `PIPELINE_DEPTH` appends in-flight
@@ -147,22 +148,26 @@ async fn main() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     info!("[setup] Registration complete");
 
-    // -- 5. Create a single stream via StreamManager --------------------------
+    // -- 5. Open a single stream via StreamManager ----------------------------
     let sm_client = StreamClient::connect(&stream_manager_addr)
         .await
         .expect("connect to StreamManager");
-    let (stream_id, initial_extent_id, _epoch, initial_primary_addr) = sm_client
-        .create_stream(
+    let stream_id = sm_client
+        .open(
             "bench-pipeline",
             REPLICATION_FACTOR,
             EXTENT_CAPACITY,
             CACHE_EXTENTS,
         )
         .await
-        .expect("create_stream");
+        .expect("open stream");
+    let initial_primary_addr = sm_client
+        .cached_primary(stream_id)
+        .await
+        .expect("primary address cached after open");
     info!(
-        "[setup] Stream {} created: extent={}, primary={}",
-        stream_id, initial_extent_id, initial_primary_addr
+        "[setup] Stream {} opened with primary={}",
+        stream_id, initial_primary_addr
     );
 
     // -- 6. Shared counters ---------------------------------------------------
