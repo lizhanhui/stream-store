@@ -353,11 +353,20 @@ impl Stream {
     /// reader references (Arc refcount > 1), it is dropped instead of recycled.
     fn evict_oldest_extents(&mut self) {
         if self.max_extents == 0 {
+            if self.extents.len() > 4 {
+                tracing::warn!(
+                    "stream {} has {} extents but max_extents=0 (no eviction); \
+                     memory will grow unbounded",
+                    self.id,
+                    self.extents.len(),
+                );
+            }
             return;
         }
         while self.extents.len() > self.max_extents && self.extents.len() > 1 {
             let evicted = self.extents.remove(0);
-            if evicted.can_recycle() {
+            // Cap the pool at 2 spares to bound memory. Beyond that, just drop.
+            if evicted.can_recycle() && self.extent_pool.len() < 2 {
                 tracing::info!(
                     "recycled extent {} (sealed={}) from stream {} (retained: {}, pool: {})",
                     evicted.id,
@@ -368,9 +377,12 @@ impl Stream {
                 );
                 self.extent_pool.push_back(evicted);
             } else {
-                tracing::warn!(
-                    "extent {} has outstanding readers, dropping instead of recycling",
+                tracing::info!(
+                    "dropping extent {} from stream {} (retained: {}, pool: {})",
                     evicted.id,
+                    self.id,
+                    self.extents.len(),
+                    self.extent_pool.len(),
                 );
             }
         }
