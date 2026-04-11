@@ -760,12 +760,12 @@ impl ExtentNodeStore {
         // Write locally via single-writer append on the active extent.
         let (append_result, extent_id) = match stream.try_append_active(payload) {
             Ok(r) => r,
-            Err(StorageError::ExtentSealed(_)) => {
+            Err(StorageError::ExtentSealed(extent_id)) => {
                 let err = Frame::error_response(
                     request_id,
                     ErrorCode::ExtentSealed,
                     "extent is sealed",
-                    ExtentId(0),
+                    extent_id,
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(err);
@@ -1212,12 +1212,12 @@ impl ExtentNodeStore {
                         extent_id: eid,
                     });
                 }
-                Err(StorageError::ExtentSealed(_)) => {
+                Err(StorageError::ExtentSealed(extent_id)) => {
                     let err = Frame::error_response(
                         request_id,
                         ErrorCode::ExtentSealed,
                         "extent is sealed",
-                        ExtentId(0),
+                        extent_id,
                     );
                     if let Some(tx) = response_tx {
                         let _ = tx.try_send(err);
@@ -2070,6 +2070,36 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.opcode(), Opcode::Error);
+    }
+
+    #[tokio::test]
+    async fn append_to_sealed_stream_reports_extent_id() {
+        let store = ExtentNodeStore::new();
+        let sid = register_stream(&store, 1, 1).await;
+
+        {
+            let mut stream = store.streams.get_mut(&sid).unwrap();
+            assert_eq!(stream.seal(ExtentId(1), None), Some((0, 0)));
+        }
+
+        let resp = store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::Append {
+                        request_id: 2,
+                        stream_id: sid,
+                        epoch: Epoch(0),
+                    },
+                    Some(Bytes::from_static(b"sealed")),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(resp.opcode(), Opcode::Error);
+        assert_eq!(resp.error_code(), ErrorCode::ExtentSealed as u16);
+        assert_eq!(resp.extent_id(), ExtentId(1));
     }
 
     #[tokio::test]
