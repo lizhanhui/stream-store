@@ -220,16 +220,18 @@ A DB-based leadership lease (`stream_manager_leadership` table) ensures that onl
 | Field | Size | Description |
 |-------|------|-------------|
 | Magic | 1B | `0xEF` -- protocol identification |
-| Version | 1B | Protocol version (currently 1) |
+| Version | 1B | Protocol version (currently 2) |
 | Opcode | 1B | Operation type (see below) |
-| Flags | 1B | Per-opcode flags (e.g., `FLAG_OFFSET_PRESENT = 0x01` for Seal) |
+| Flags | 1B | Per-opcode flags. `0x80` is reserved as `FLAG_RESPONSE_ERROR` on response opcodes; lower bits remain opcode-specific. |
 | Remaining Length | 4B | Total bytes of variable header + payload section that follow the fixed header |
 
 **Variable Header**: Determined entirely by the Opcode (and sometimes Flags). Each opcode section below specifies the exact fields and their order. Fields carry protocol-level metadata specific to the operation (stream IDs, offsets, extent IDs, counts, request IDs, etc.). Only the fields meaningful for that opcode appear on the wire. Request ID is a variable header field present in request-response opcodes, absent in fire-and-forget opcodes (e.g., WATERMARK, SM_MEMBERSHIP_CHANGE).
 
-**Payload**: Carries arbitrary application data from the ultimate user (e.g., message bytes for APPEND, error description for ERROR). When present, a 4-byte `Payload Length` prefix precedes the payload bytes. Opcodes that carry no application payload omit both the length prefix and the payload bytes entirely.
+**Payload**: Carries arbitrary application data from the ultimate user (e.g., message bytes for APPEND, encoded read batches for READ_RESP, or an error description when a response is flagged with `FLAG_RESPONSE_ERROR`). When present, a 4-byte `Payload Length` prefix precedes the payload bytes. Opcodes that carry no application payload omit both the length prefix and the payload bytes entirely.
 
-**Rust Representation**: The `Frame` type uses a `FixedHeader` + `VariableHeader` enum + `Option<Bytes>` payload design. Each opcode is a distinct `VariableHeader` variant containing only the fields valid for that opcode — invalid field combinations are rejected at compile time. Flag-dependent fields (e.g., `Seal.offset`, `SealAck.new_extent_id`) use `Option<T>`; the flags byte is computed during encode from the `Option` state, eliminating stale-flag bugs.
+**Rust Representation**: The `Frame` type uses a `FixedHeader` + `VariableHeader` enum + `Option<Bytes>` payload design. Each opcode is a distinct `VariableHeader` variant containing only the fields valid for that opcode — invalid field combinations are rejected at compile time. Flag-dependent fields (e.g., `Seal.offset`, `SealAck.new_extent_id`, response error headers) use distinct variants or `Option<T>` fields so the flags byte is derived from the variable-header shape during encode.
+
+**Flagged response errors**: The protocol no longer uses a standalone `ERROR` opcode. Instead, a failed RPC returns the normal response opcode with `FLAG_RESPONSE_ERROR = 0x80` set. The opcode still identifies the response family (`APPEND_ACK`, `SEAL_ACK`, `DESCRIBE_STREAM_RESP`, etc.), while the error flag switches the variable header to that response family's dedicated `*Error` layout. The payload then carries a human-readable error message.
 
 #### Opcodes
 
@@ -254,9 +256,10 @@ Payload:
 
 ##### 0x02 APPEND_ACK (Primary -> Client)
 
-Confirms a successful append after quorum ACK is achieved. The response includes the epoch and extent_id the record landed on for diagnostics — the client can verify the epoch matches and log which extent was used.
+Confirms a successful append after quorum ACK is achieved. The response includes the epoch and extent_id the record landed on for diagnostics — the client can verify the epoch matches and log which extent was used. On failure, the Primary still returns opcode `APPEND_ACK`, but sets `FLAG_RESPONSE_ERROR = 0x80` and uses the error header layout shown below.
 
 ```
+Success form
 Fixed Header (8B)
 Variable Header:
   [request_id   : u32]    -- correlates with original APPEND request
@@ -265,6 +268,18 @@ Variable Header:
   [extent_id    : u32]    -- extent that was appended to (diagnostics)
   [offset       : u64]    -- assigned logical sequence number
 No Payload.
+
+Error form (Flags |= 0x80 / FLAG_RESPONSE_ERROR)
+Fixed Header (8B)
+Variable Header:
+  [request_id   : u32]
+  [stream_id    : u64]
+  [epoch        : u32]
+  [extent_id    : u32]
+  [error_code   : u16]
+Payload:
+  [payload_len  : u32]
+  [payload      : bytes]  -- human-readable error message
 ```
 
 ##### 0x03 READ (Client -> Extent Node)
@@ -360,7 +375,7 @@ Variable Header:
 No Payload.
 ```
 
-**Stream Manager -> Client**: Returns new extent info after seal-and-new allocation. Uses `FLAG_NEW_EXTENT_PRESENT` (0x01) to carry the new extent info in the variable header.
+**Stream Manager -> Client**: Returns new extent info after seal-and-new allocation. Uses `FLAG_NEW_EXTENT_PRESENT` (0x01) to carry the new extent info in the variable header. On failure, it still returns opcode `SEAL_ACK`, but sets `FLAG_RESPONSE_ERROR = 0x80` and uses the error header layout below.
 
 ```
 Fixed Header (8B)
@@ -381,6 +396,19 @@ When `FLAG_EPOCH_PRESENT` (0x04) is also set on SealAck (epoch-based seal respon
   [epoch        : u32]    -- new epoch after epoch bump
 ```
 
+Error form (Flags = 0x80 / FLAG_RESPONSE_ERROR):
+```
+Fixed Header (8B)
+Variable Header:
+  [request_id   : u32]
+  [stream_id    : u64]
+  [extent_id    : u32]
+  [error_code   : u16]
+Payload:
+  [payload_len  : u32]
+  [payload      : bytes]  -- human-readable error message
+```
+
 ##### 0x07 CREATE_STREAM (Client -> Stream Manager)
 
 Create a new stream. If `replication_factor = 0`, Stream Manager uses its default. If `extent_capacity = 0`, Stream Manager uses 64 MiB. If `cache_extents = 0`, Stream Manager uses 4.
@@ -399,7 +427,7 @@ No Payload.
 
 ##### 0x0A CREATE_STREAM_RESP (Stream Manager -> Client)
 
-Response to CREATE_STREAM. Returns the newly created stream ID, initial extent ID, and the Primary Extent Node address.
+Response to CREATE_STREAM. Returns the newly created stream ID, initial extent ID, and the Primary Extent Node address. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][error_code:u16]`, and the payload carries the error message.
 
 ```
 Fixed Header (8B)
@@ -427,7 +455,7 @@ No Payload.
 
 ##### 0x09 QUERY_OFFSET_RESP (Extent Node / Stream Manager -> Client)
 
-Returns the current max offset.
+Returns the current max offset. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][stream_id:u64][error_code:u16]`, and the payload carries the error message.
 
 ```
 Fixed Header (8B)
@@ -709,7 +737,7 @@ No Payload.
 
 ##### 0x31 DESCRIBE_STREAM_RESP (Stream Manager -> Client)
 
-Response to DESCRIBE_STREAM. Payload = encoded `Vec<ExtentInfo>`, ordered by extent_id **descending** (latest first). When `count > 0`, at most `count` extents are returned starting from the latest.
+Response to DESCRIBE_STREAM. Payload = encoded `Vec<ExtentInfo>`, ordered by extent_id **descending** (latest first). When `count > 0`, at most `count` extents are returned starting from the latest. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][stream_id:u64][error_code:u16]`, and the payload carries the error message.
 
 ```
 Fixed Header (8B)
@@ -736,7 +764,7 @@ No Payload.
 
 ##### 0x33 DESCRIBE_EXTENT_RESP (Stream Manager -> Client)
 
-Response to DESCRIBE_EXTENT. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry.
+Response to DESCRIBE_EXTENT. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][stream_id:u64][extent_id:u32][error_code:u16]`, and the payload carries the error message.
 
 ```
 Fixed Header (8B)
@@ -763,7 +791,7 @@ No Payload.
 
 ##### 0x35 SEEK_RESP (Stream Manager -> Client)
 
-Response to SEEK. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry.
+Response to SEEK. Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][stream_id:u64][offset:u64][error_code:u16]`, and the payload carries the error message.
 
 ```
 Fixed Header (8B)
@@ -794,26 +822,6 @@ Fields:
 - `role`: 0=Primary, 1+=Secondary
 - `is_alive`: 1 if the ExtentNode's heartbeat is current (node.state=Alive), 0 otherwise
 
-**Control (0xFE-0xFF)**
-
-##### 0xFF ERROR (Any -> Any)
-
-Error response. Variable header carries the error code and the relevant extent ID (for ExtentSealed errors so the client can identify which extent triggered the error without a round-trip).
-
-```
-Fixed Header (8B)
-Variable Header:
-  [request_id   : u32]    -- correlates with the request that caused the error
-  [error_code   : u16]    -- 0=Ok, 1=UnknownStream, 2=InvalidOffset,
-                              3=ExtentSealed, 4=InternalError, 5=EpochStale
-                           -- Note: ExtentFull (formerly 5) was removed from the wire
-                           -- protocol — the server handles extent rotation internally,
-                           -- so clients never observe that condition.
-  [extent_id    : u32]    -- relevant extent (0 when not applicable)
-Payload:
-  [payload_len  : u32]
-  [payload      : bytes]  -- human-readable error message (UTF-8)
-```
 
 #### Connection Model
 

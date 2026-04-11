@@ -165,11 +165,13 @@ impl AckQueue {
                     offset = ack.assigned_offset,
                     "PendingAck expired after replication timeout",
                 );
-                let frame = Frame::error_response(
+                let frame = Frame::append_ack_error(
                     ack.request_id,
+                    ack.stream_id,
+                    ack.epoch,
+                    ack.extent_id,
                     ErrorCode::InternalError,
                     "replication timeout",
-                    ExtentId(0),
                 );
                 let _ = ack.response_tx.try_send(frame);
             } else {
@@ -419,20 +421,28 @@ impl RequestHandler for ExtentNodeStore {
                 None,
             )),
             Opcode::ReportExtents => Some(self.handle_report_extents(frame)),
-            Opcode::ReportExtentsResp | Opcode::UpdateExtent => {
+            Opcode::ReportExtentsResp
+            | Opcode::UpdateExtent
+            | Opcode::ConnectAck
+            | Opcode::DisconnectAck
+            | Opcode::RegisterExtentAck
+            | Opcode::Watermark
+            | Opcode::QueryOffsetResp
+            | Opcode::CreateStreamResp
+            | Opcode::ReadResp
+            | Opcode::SealAck
+            | Opcode::DescribeStreamResp
+            | Opcode::DescribeExtentResp
+            | Opcode::SeekResp
+            | Opcode::StreamManagerMembershipChange => {
                 warn!(
                     opcode = ?frame.opcode(),
                     "EN received unexpected opcode that should not be sent to ExtentNode"
                 );
-                Some(Frame::error_response(
-                    frame.request_id(),
-                    ErrorCode::InternalError,
-                    "unexpected opcode",
-                    ExtentId(0),
-                ))
+                None
             }
-            _ => Some(Frame::error_response(
-                frame.request_id(),
+            _ => Some(Frame::error_from_request(
+                &frame,
                 ErrorCode::InternalError,
                 "unsupported opcode",
                 ExtentId(0),
@@ -494,8 +504,8 @@ impl ExtentNodeStore {
                     *cache_extents,
                 ),
                 _ => {
-                    return Frame::error_response(
-                        frame.request_id(),
+                    return Frame::error_from_request(
+                        &frame,
                         ErrorCode::InternalError,
                         "invalid RegisterExtent frame",
                         ExtentId(0),
@@ -508,8 +518,8 @@ impl ExtentNodeStore {
             match parse_register_extent_payload(frame.payload.as_deref().unwrap_or_default()) {
                 Some(addrs) => addrs,
                 None => {
-                    return Frame::error_response(
-                        frame.request_id(),
+                    return Frame::error_from_request(
+                        &frame,
                         ErrorCode::InternalError,
                         "invalid RegisterExtent payload",
                         ExtentId(0),
@@ -625,8 +635,8 @@ impl ExtentNodeStore {
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
             None => {
-                return Some(Frame::error_response(
-                    frame.request_id(),
+                return Some(Frame::error_from_request(
+                    &frame,
                     ErrorCode::UnknownStream,
                     &format!("stream {} not found", stream_id),
                     ExtentId(0),
@@ -637,8 +647,8 @@ impl ExtentNodeStore {
         // Epoch validation: reject if the client's epoch doesn't match the stream's.
         let epoch = stream_ref.epoch();
         if client_epoch != Epoch(0) && client_epoch != epoch {
-            return Some(Frame::error_response(
-                frame.request_id(),
+            return Some(Frame::error_from_request(
+                &frame,
                 ErrorCode::EpochStale,
                 &format!("epoch stale: client={}, current={}", client_epoch, epoch),
                 ExtentId(0),
@@ -761,11 +771,13 @@ impl ExtentNodeStore {
         let (append_result, extent_id) = match stream.try_append_active(payload) {
             Ok(r) => r,
             Err(StorageError::ExtentSealed(extent_id)) => {
-                let err = Frame::error_response(
+                let err = Frame::append_ack_error(
                     request_id,
+                    stream_id,
+                    epoch,
+                    extent_id,
                     ErrorCode::ExtentSealed,
                     "extent is sealed",
-                    extent_id,
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(err);
@@ -779,11 +791,13 @@ impl ExtentNodeStore {
                 return (None, true);
             }
             Err(e) => {
-                let err = Frame::error_response(
+                let err = Frame::append_ack_error(
                     request_id,
+                    stream_id,
+                    epoch,
+                    ExtentId(0),
                     ErrorCode::InternalError,
                     &e.to_string(),
-                    ExtentId(0),
                 );
                 if let Some(ref tx) = response_tx {
                     let _ = tx.try_send(err);
@@ -1127,8 +1141,8 @@ impl ExtentNodeStore {
             Some(s) => s,
             None => {
                 for frame in frames {
-                    responses.push(Frame::error_response(
-                        frame.request_id(),
+                    responses.push(Frame::error_from_request(
+                        frame,
                         ErrorCode::UnknownStream,
                         &format!("stream {} not found", stream_id),
                         ExtentId(0),
@@ -1213,11 +1227,13 @@ impl ExtentNodeStore {
                     });
                 }
                 Err(StorageError::ExtentSealed(extent_id)) => {
-                    let err = Frame::error_response(
+                    let err = Frame::append_ack_error(
                         request_id,
+                        stream_id,
+                        epoch,
+                        extent_id,
                         ErrorCode::ExtentSealed,
                         "extent is sealed",
-                        extent_id,
                     );
                     if let Some(tx) = response_tx {
                         let _ = tx.try_send(err);
@@ -1234,11 +1250,13 @@ impl ExtentNodeStore {
                     });
                 }
                 Err(e) => {
-                    let err = Frame::error_response(
+                    let err = Frame::append_ack_error(
                         request_id,
+                        stream_id,
+                        epoch,
+                        ExtentId(0),
                         ErrorCode::InternalError,
                         &e.to_string(),
-                        ExtentId(0),
                     );
                     if let Some(tx) = response_tx {
                         let _ = tx.try_send(err);
@@ -1750,8 +1768,8 @@ impl ExtentNodeStore {
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
             None => {
-                return Frame::error_response(
-                    frame.request_id(),
+                return Frame::error_from_request(
+                    &frame,
                     ErrorCode::UnknownStream,
                     &format!("stream {} not found", stream_id),
                     ExtentId(0),
@@ -1779,8 +1797,8 @@ impl ExtentNodeStore {
                     Some(payload.freeze()),
                 )
             }
-            Err(e) => Frame::error_response(
-                frame.request_id(),
+            Err(e) => Frame::error_from_request(
+                &frame,
                 ErrorCode::InternalError,
                 &e.to_string(),
                 ExtentId(0),
@@ -1793,8 +1811,8 @@ impl ExtentNodeStore {
         let stream_ref = match self.streams.get(&stream_id) {
             Some(s) => s,
             None => {
-                return Frame::error_response(
-                    frame.request_id(),
+                return Frame::error_from_request(
+                    &frame,
                     ErrorCode::UnknownStream,
                     &format!("stream {} not found", stream_id),
                     ExtentId(0),
@@ -1820,8 +1838,8 @@ impl ExtentNodeStore {
                 stream_id, epoch, ..
             } => (*stream_id, *epoch),
             _ => {
-                return Frame::error_response(
-                    frame.request_id(),
+                return Frame::error_from_request(
+                    &frame,
                     ErrorCode::InternalError,
                     "invalid ReportExtents frame",
                     ExtentId(0),
@@ -1909,8 +1927,8 @@ impl ExtentNodeStore {
                         None,
                     );
                 }
-                return Frame::error_response(
-                    frame.request_id(),
+                return Frame::error_from_request(
+                    &frame,
                     ErrorCode::UnknownStream,
                     &format!("stream {} not found", stream_id),
                     ExtentId(0),
@@ -2069,7 +2087,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::Error);
+        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert!(resp.is_error_response());
     }
 
     #[tokio::test]
@@ -2097,7 +2116,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.opcode(), Opcode::Error);
+        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert!(resp.is_error_response());
         assert_eq!(resp.error_code(), ErrorCode::ExtentSealed as u16);
         assert_eq!(resp.extent_id(), ExtentId(1));
     }
@@ -2569,7 +2589,8 @@ mod tests {
 
         // First PendingAck should have been expired with an error.
         let err_frame = resp_rx.try_recv().unwrap();
-        assert_eq!(err_frame.opcode(), Opcode::Error);
+        assert_eq!(err_frame.opcode(), Opcode::AppendAck);
+        assert!(err_frame.is_error_response());
         assert_eq!(err_frame.request_id(), 42);
 
         // Second PendingAck should still be pending (not expired).

@@ -3,7 +3,7 @@ use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EPOCH_PRESENT,
     FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
-    FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT,
+    FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, FLAG_RESPONSE_ERROR,
     FLAG_START_OFFSET_PRESENT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
@@ -39,6 +39,13 @@ pub enum VariableHeader {
         extent_id: ExtentId,
         offset: Offset,
     },
+    AppendAckError {
+        request_id: u32,
+        stream_id: StreamId,
+        epoch: Epoch,
+        extent_id: ExtentId,
+        error_code: ErrorCode,
+    },
     Read {
         request_id: u32,
         stream_id: StreamId,
@@ -51,6 +58,13 @@ pub enum VariableHeader {
         stream_id: StreamId,
         offset: Offset,
         count: u32,
+    },
+    ReadRespError {
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        offset: Offset,
+        error_code: ErrorCode,
     },
     Seal {
         request_id: u32,
@@ -72,6 +86,12 @@ pub enum VariableHeader {
         /// New epoch after an epoch bump (FLAG_EPOCH_PRESENT on SealAck).
         epoch: Option<Epoch>,
     },
+    SealAckError {
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        error_code: ErrorCode,
+    },
     CreateStream {
         request_id: u32,
         stream_name: Bytes,
@@ -86,6 +106,10 @@ pub enum VariableHeader {
         epoch: Epoch,
         primary_addr: Bytes,
     },
+    CreateStreamRespError {
+        request_id: u32,
+        error_code: ErrorCode,
+    },
     QueryOffset {
         request_id: u32,
         stream_id: StreamId,
@@ -95,11 +119,20 @@ pub enum VariableHeader {
         stream_id: StreamId,
         offset: Offset,
     },
+    QueryOffsetRespError {
+        request_id: u32,
+        stream_id: StreamId,
+        error_code: ErrorCode,
+    },
     Connect {
         request_id: u32,
     },
     ConnectAck {
         request_id: u32,
+    },
+    ConnectAckError {
+        request_id: u32,
+        error_code: ErrorCode,
     },
     Disconnect {
         request_id: u32,
@@ -107,8 +140,16 @@ pub enum VariableHeader {
     DisconnectAck {
         request_id: u32,
     },
+    DisconnectAckError {
+        request_id: u32,
+        error_code: ErrorCode,
+    },
     Heartbeat {
         request_id: u32,
+    },
+    HeartbeatError {
+        request_id: u32,
+        error_code: ErrorCode,
     },
     RegisterExtent {
         request_id: u32,
@@ -127,6 +168,12 @@ pub enum VariableHeader {
         request_id: u32,
         stream_id: StreamId,
         extent_id: ExtentId,
+    },
+    RegisterExtentAckError {
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        error_code: ErrorCode,
     },
     Watermark {
         stream_id: StreamId,
@@ -161,6 +208,12 @@ pub enum VariableHeader {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
+    },
+    ReportExtentsRespError {
+        request_id: u32,
+        stream_id: StreamId,
+        epoch: Epoch,
+        error_code: ErrorCode,
     },
     /// Per-record replication (Forward, flag=0x00).
     /// Carries byte_pos so the secondary writes each record at the exact same
@@ -206,6 +259,11 @@ pub enum VariableHeader {
         request_id: u32,
         stream_id: StreamId,
     },
+    DescribeStreamRespError {
+        request_id: u32,
+        stream_id: StreamId,
+        error_code: ErrorCode,
+    },
     DescribeExtent {
         request_id: u32,
         stream_id: StreamId,
@@ -214,6 +272,12 @@ pub enum VariableHeader {
     DescribeExtentResp {
         request_id: u32,
         stream_id: StreamId,
+    },
+    DescribeExtentRespError {
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        error_code: ErrorCode,
     },
     Seek {
         request_id: u32,
@@ -225,10 +289,11 @@ pub enum VariableHeader {
         stream_id: StreamId,
         offset: Offset,
     },
-    Error {
+    SeekRespError {
         request_id: u32,
-        error_code: u16,
-        extent_id: ExtentId,
+        stream_id: StreamId,
+        offset: Offset,
+        error_code: ErrorCode,
     },
 }
 
@@ -258,15 +323,11 @@ impl Default for Frame {
     fn default() -> Self {
         Frame {
             header: FixedHeader {
-                opcode: Opcode::Error,
+                opcode: Opcode::ConnectAck,
                 version: PROTOCOL_VERSION,
                 flags: 0,
             },
-            variable_header: VariableHeader::Error {
-                request_id: 0,
-                error_code: 0,
-                extent_id: ExtentId(0),
-            },
+            variable_header: VariableHeader::ConnectAck { request_id: 0 },
             payload: None,
         }
     }
@@ -297,30 +358,42 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::Append { request_id, .. }
             | VariableHeader::AppendAck { request_id, .. }
+            | VariableHeader::AppendAckError { request_id, .. }
             | VariableHeader::Read { request_id, .. }
             | VariableHeader::ReadResp { request_id, .. }
+            | VariableHeader::ReadRespError { request_id, .. }
             | VariableHeader::Seal { request_id, .. }
             | VariableHeader::SealAck { request_id, .. }
+            | VariableHeader::SealAckError { request_id, .. }
             | VariableHeader::CreateStream { request_id, .. }
             | VariableHeader::CreateStreamResp { request_id, .. }
+            | VariableHeader::CreateStreamRespError { request_id, .. }
             | VariableHeader::QueryOffset { request_id, .. }
             | VariableHeader::QueryOffsetResp { request_id, .. }
+            | VariableHeader::QueryOffsetRespError { request_id, .. }
             | VariableHeader::Connect { request_id }
             | VariableHeader::ConnectAck { request_id }
+            | VariableHeader::ConnectAckError { request_id, .. }
             | VariableHeader::Disconnect { request_id }
             | VariableHeader::DisconnectAck { request_id }
+            | VariableHeader::DisconnectAckError { request_id, .. }
             | VariableHeader::Heartbeat { request_id }
+            | VariableHeader::HeartbeatError { request_id, .. }
             | VariableHeader::RegisterExtent { request_id, .. }
             | VariableHeader::RegisterExtentAck { request_id, .. }
+            | VariableHeader::RegisterExtentAckError { request_id, .. }
             | VariableHeader::ReportExtents { request_id, .. }
             | VariableHeader::ReportExtentsResp { request_id, .. }
+            | VariableHeader::ReportExtentsRespError { request_id, .. }
             | VariableHeader::DescribeStream { request_id, .. }
             | VariableHeader::DescribeStreamResp { request_id, .. }
+            | VariableHeader::DescribeStreamRespError { request_id, .. }
             | VariableHeader::DescribeExtent { request_id, .. }
             | VariableHeader::DescribeExtentResp { request_id, .. }
+            | VariableHeader::DescribeExtentRespError { request_id, .. }
             | VariableHeader::Seek { request_id, .. }
             | VariableHeader::SeekResp { request_id, .. }
-            | VariableHeader::Error { request_id, .. } => *request_id,
+            | VariableHeader::SeekRespError { request_id, .. } => *request_id,
             VariableHeader::Watermark { .. }
             | VariableHeader::Forward { .. }
             | VariableHeader::ForwardInitExtent { .. }
@@ -336,14 +409,19 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::Append { stream_id, .. }
             | VariableHeader::AppendAck { stream_id, .. }
+            | VariableHeader::AppendAckError { stream_id, .. }
             | VariableHeader::Read { stream_id, .. }
             | VariableHeader::ReadResp { stream_id, .. }
+            | VariableHeader::ReadRespError { stream_id, .. }
             | VariableHeader::Seal { stream_id, .. }
             | VariableHeader::SealAck { stream_id, .. }
+            | VariableHeader::SealAckError { stream_id, .. }
             | VariableHeader::CreateStreamResp { stream_id, .. }
             | VariableHeader::QueryOffset { stream_id, .. }
             | VariableHeader::QueryOffsetResp { stream_id, .. }
+            | VariableHeader::QueryOffsetRespError { stream_id, .. }
             | VariableHeader::RegisterExtentAck { stream_id, .. }
+            | VariableHeader::RegisterExtentAckError { stream_id, .. }
             | VariableHeader::RegisterExtent { stream_id, .. }
             | VariableHeader::Watermark { stream_id, .. }
             | VariableHeader::Forward { stream_id, .. }
@@ -353,12 +431,16 @@ impl Frame {
             | VariableHeader::UpdateExtentProgress { stream_id, .. }
             | VariableHeader::ReportExtents { stream_id, .. }
             | VariableHeader::ReportExtentsResp { stream_id, .. }
+            | VariableHeader::ReportExtentsRespError { stream_id, .. }
             | VariableHeader::DescribeStream { stream_id, .. }
             | VariableHeader::DescribeStreamResp { stream_id, .. }
+            | VariableHeader::DescribeStreamRespError { stream_id, .. }
             | VariableHeader::DescribeExtent { stream_id, .. }
             | VariableHeader::DescribeExtentResp { stream_id, .. }
+            | VariableHeader::DescribeExtentRespError { stream_id, .. }
             | VariableHeader::Seek { stream_id, .. }
-            | VariableHeader::SeekResp { stream_id, .. } => *stream_id,
+            | VariableHeader::SeekResp { stream_id, .. }
+            | VariableHeader::SeekRespError { stream_id, .. } => *stream_id,
             _ => StreamId(0),
         }
     }
@@ -368,12 +450,14 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::AppendAck { offset, .. }
             | VariableHeader::ReadResp { offset, .. }
+            | VariableHeader::ReadRespError { offset, .. }
             | VariableHeader::SealAck { offset, .. }
             | VariableHeader::QueryOffsetResp { offset, .. }
             | VariableHeader::Watermark { offset, .. }
             | VariableHeader::Forward { offset, .. }
             | VariableHeader::Seek { offset, .. }
-            | VariableHeader::SeekResp { offset, .. } => *offset,
+            | VariableHeader::SeekResp { offset, .. }
+            | VariableHeader::SeekRespError { offset, .. } => *offset,
             VariableHeader::Read { offset, .. } => *offset,
             VariableHeader::Seal { offset, .. } => offset.unwrap_or(Offset(0)),
             _ => Offset(0),
@@ -384,18 +468,22 @@ impl Frame {
     pub fn extent_id(&self) -> ExtentId {
         match &self.variable_header {
             VariableHeader::AppendAck { extent_id, .. }
+            | VariableHeader::AppendAckError { extent_id, .. }
             | VariableHeader::Read { extent_id, .. }
+            | VariableHeader::ReadRespError { extent_id, .. }
             | VariableHeader::Seal { extent_id, .. }
             | VariableHeader::SealAck { extent_id, .. }
+            | VariableHeader::SealAckError { extent_id, .. }
             | VariableHeader::CreateStreamResp { extent_id, .. }
             | VariableHeader::RegisterExtentAck { extent_id, .. }
+            | VariableHeader::RegisterExtentAckError { extent_id, .. }
             | VariableHeader::RegisterExtent { extent_id, .. }
             | VariableHeader::Forward { extent_id, .. }
             | VariableHeader::ForwardInitExtent { extent_id, .. }
             | VariableHeader::ForwardChecksum { extent_id, .. }
             | VariableHeader::Watermark { extent_id, .. }
             | VariableHeader::DescribeExtent { extent_id, .. }
-            | VariableHeader::Error { extent_id, .. } => *extent_id,
+            | VariableHeader::DescribeExtentRespError { extent_id, .. } => *extent_id,
             _ => ExtentId(0),
         }
     }
@@ -405,6 +493,7 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::Append { epoch, .. }
             | VariableHeader::AppendAck { epoch, .. }
+            | VariableHeader::AppendAckError { epoch, .. }
             | VariableHeader::CreateStreamResp { epoch, .. } => *epoch,
             VariableHeader::Seal { epoch, .. } | VariableHeader::SealAck { epoch, .. } => {
                 epoch.unwrap_or(Epoch(0))
@@ -415,7 +504,8 @@ impl Frame {
             VariableHeader::Forward { epoch, .. }
             | VariableHeader::ForwardInitExtent { epoch, .. } => *epoch,
             VariableHeader::ReportExtents { epoch, .. }
-            | VariableHeader::ReportExtentsResp { epoch, .. } => *epoch,
+            | VariableHeader::ReportExtentsResp { epoch, .. }
+            | VariableHeader::ReportExtentsRespError { epoch, .. } => *epoch,
             _ => Epoch(0),
         }
     }
@@ -430,12 +520,28 @@ impl Frame {
         }
     }
 
-    /// Get the error_code for this frame (0 for non-Error opcodes).
+    /// Get the error_code for this frame (0 for non-error frames).
     pub fn error_code(&self) -> u16 {
         match &self.variable_header {
-            VariableHeader::Error { error_code, .. } => *error_code,
+            VariableHeader::AppendAckError { error_code, .. }
+            | VariableHeader::ReadRespError { error_code, .. }
+            | VariableHeader::SealAckError { error_code, .. }
+            | VariableHeader::CreateStreamRespError { error_code, .. }
+            | VariableHeader::QueryOffsetRespError { error_code, .. }
+            | VariableHeader::ConnectAckError { error_code, .. }
+            | VariableHeader::DisconnectAckError { error_code, .. }
+            | VariableHeader::HeartbeatError { error_code, .. }
+            | VariableHeader::RegisterExtentAckError { error_code, .. }
+            | VariableHeader::ReportExtentsRespError { error_code, .. }
+            | VariableHeader::DescribeStreamRespError { error_code, .. }
+            | VariableHeader::DescribeExtentRespError { error_code, .. }
+            | VariableHeader::SeekRespError { error_code, .. } => *error_code as u16,
             _ => 0,
         }
+    }
+
+    pub fn is_error_response(&self) -> bool {
+        self.flags() & FLAG_RESPONSE_ERROR != 0
     }
 
     /// Get the flags byte for this frame on the wire.
@@ -444,6 +550,19 @@ impl Frame {
     /// (eliminating stale-flag bugs). For other opcodes, returns `header.flags`.
     pub fn flags(&self) -> u8 {
         let computed = match &self.variable_header {
+            VariableHeader::AppendAckError { .. }
+            | VariableHeader::ReadRespError { .. }
+            | VariableHeader::SealAckError { .. }
+            | VariableHeader::CreateStreamRespError { .. }
+            | VariableHeader::QueryOffsetRespError { .. }
+            | VariableHeader::ConnectAckError { .. }
+            | VariableHeader::DisconnectAckError { .. }
+            | VariableHeader::HeartbeatError { .. }
+            | VariableHeader::RegisterExtentAckError { .. }
+            | VariableHeader::ReportExtentsRespError { .. }
+            | VariableHeader::DescribeStreamRespError { .. }
+            | VariableHeader::DescribeExtentRespError { .. }
+            | VariableHeader::SeekRespError { .. } => FLAG_RESPONSE_ERROR,
             VariableHeader::Seal {
                 offset,
                 start_offset,
@@ -493,24 +612,343 @@ impl Frame {
         self.header.flags | computed
     }
 
-    /// Create an error response frame.
-    ///
-    /// For ExtentSealed errors, pass the relevant extent_id so the
-    /// client can identify which extent triggered the error without a round-trip.
-    pub fn error_response(
+    pub fn append_ack_error(
         request_id: u32,
-        code: ErrorCode,
-        message: &str,
+        stream_id: StreamId,
+        epoch: Epoch,
         extent_id: ExtentId,
+        error_code: ErrorCode,
+        message: &str,
     ) -> Frame {
         Frame::new(
-            VariableHeader::Error {
+            VariableHeader::AppendAckError {
                 request_id,
-                error_code: code as u16,
+                stream_id,
+                epoch,
                 extent_id,
+                error_code,
             },
             Some(Bytes::copy_from_slice(message.as_bytes())),
         )
+    }
+
+    pub fn read_resp_error(
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        offset: Offset,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::ReadRespError {
+                request_id,
+                stream_id,
+                extent_id,
+                offset,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn seal_ack_error(
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::SealAckError {
+                request_id,
+                stream_id,
+                extent_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn create_stream_resp_error(
+        request_id: u32,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::CreateStreamRespError {
+                request_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn query_offset_resp_error(
+        request_id: u32,
+        stream_id: StreamId,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::QueryOffsetRespError {
+                request_id,
+                stream_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn connect_ack_error(request_id: u32, error_code: ErrorCode, message: &str) -> Frame {
+        Frame::new(
+            VariableHeader::ConnectAckError {
+                request_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn disconnect_ack_error(request_id: u32, error_code: ErrorCode, message: &str) -> Frame {
+        Frame::new(
+            VariableHeader::DisconnectAckError {
+                request_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn heartbeat_error(request_id: u32, error_code: ErrorCode, message: &str) -> Frame {
+        Frame::new(
+            VariableHeader::HeartbeatError {
+                request_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn register_extent_ack_error(
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::RegisterExtentAckError {
+                request_id,
+                stream_id,
+                extent_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn report_extents_resp_error(
+        request_id: u32,
+        stream_id: StreamId,
+        epoch: Epoch,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::ReportExtentsRespError {
+                request_id,
+                stream_id,
+                epoch,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn describe_stream_resp_error(
+        request_id: u32,
+        stream_id: StreamId,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::DescribeStreamRespError {
+                request_id,
+                stream_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn describe_extent_resp_error(
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::DescribeExtentRespError {
+                request_id,
+                stream_id,
+                extent_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn seek_resp_error(
+        request_id: u32,
+        stream_id: StreamId,
+        offset: Offset,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::SeekRespError {
+                request_id,
+                stream_id,
+                offset,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn error_from_request(
+        request: &Frame,
+        error_code: ErrorCode,
+        message: &str,
+        extent_id: ExtentId,
+    ) -> Frame {
+        let effective_extent_id = if extent_id != ExtentId(0) {
+            extent_id
+        } else {
+            request.extent_id()
+        };
+        match &request.variable_header {
+            VariableHeader::Append {
+                request_id,
+                stream_id,
+                epoch,
+            } => Self::append_ack_error(
+                *request_id,
+                *stream_id,
+                *epoch,
+                effective_extent_id,
+                error_code,
+                message,
+            ),
+            VariableHeader::Read {
+                request_id,
+                stream_id,
+                extent_id,
+                offset,
+                ..
+            } => Self::read_resp_error(
+                *request_id,
+                *stream_id,
+                if effective_extent_id != ExtentId(0) {
+                    effective_extent_id
+                } else {
+                    *extent_id
+                },
+                *offset,
+                error_code,
+                message,
+            ),
+            VariableHeader::Seal {
+                request_id,
+                stream_id,
+                extent_id,
+                ..
+            } => Self::seal_ack_error(
+                *request_id,
+                *stream_id,
+                if effective_extent_id != ExtentId(0) {
+                    effective_extent_id
+                } else {
+                    *extent_id
+                },
+                error_code,
+                message,
+            ),
+            VariableHeader::CreateStream { request_id, .. } => {
+                Self::create_stream_resp_error(*request_id, error_code, message)
+            }
+            VariableHeader::QueryOffset {
+                request_id,
+                stream_id,
+            } => Self::query_offset_resp_error(*request_id, *stream_id, error_code, message),
+            VariableHeader::Connect { request_id } => {
+                Self::connect_ack_error(*request_id, error_code, message)
+            }
+            VariableHeader::Disconnect { request_id } => {
+                Self::disconnect_ack_error(*request_id, error_code, message)
+            }
+            VariableHeader::Heartbeat { request_id } => {
+                Self::heartbeat_error(*request_id, error_code, message)
+            }
+            VariableHeader::RegisterExtent {
+                request_id,
+                stream_id,
+                extent_id,
+                ..
+            } => Self::register_extent_ack_error(
+                *request_id,
+                *stream_id,
+                if effective_extent_id != ExtentId(0) {
+                    effective_extent_id
+                } else {
+                    *extent_id
+                },
+                error_code,
+                message,
+            ),
+            VariableHeader::ReportExtents {
+                request_id,
+                stream_id,
+                epoch,
+            } => Self::report_extents_resp_error(
+                *request_id,
+                *stream_id,
+                *epoch,
+                error_code,
+                message,
+            ),
+            VariableHeader::DescribeStream {
+                request_id,
+                stream_id,
+                ..
+            } => Self::describe_stream_resp_error(*request_id, *stream_id, error_code, message),
+            VariableHeader::DescribeExtent {
+                request_id,
+                stream_id,
+                extent_id,
+            } => Self::describe_extent_resp_error(
+                *request_id,
+                *stream_id,
+                if effective_extent_id != ExtentId(0) {
+                    effective_extent_id
+                } else {
+                    *extent_id
+                },
+                error_code,
+                message,
+            ),
+            VariableHeader::Seek {
+                request_id,
+                stream_id,
+                offset,
+            } => Self::seek_resp_error(*request_id, *stream_id, *offset, error_code, message),
+            _ => panic!(
+                "no error response mapping for opcode {:?}",
+                request.opcode()
+            ),
+        }
     }
 
     /// Compute the remaining length (variable header + payload) for this frame.
@@ -531,10 +969,14 @@ impl Frame {
             VariableHeader::Append { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + epoch(4) + extent_id(4) + offset(8)
             VariableHeader::AppendAck { .. } => 4 + 8 + 4 + 4 + 8,
+            // request_id(4) + stream_id(8) + epoch(4) + extent_id(4) + error_code(2)
+            VariableHeader::AppendAckError { .. } => 4 + 8 + 4 + 4 + 2,
             // request_id(4) + stream_id(8) + extent_id(4) + offset(8) + count(4)
             VariableHeader::Read { .. } => 4 + 8 + 4 + 8 + 4,
             // request_id(4) + stream_id(8) + offset(8) + count(4)
             VariableHeader::ReadResp { .. } => 4 + 8 + 8 + 4,
+            // request_id(4) + stream_id(8) + extent_id(4) + offset(8) + error_code(2)
+            VariableHeader::ReadRespError { .. } => 4 + 8 + 4 + 8 + 2,
             // request_id(4) + stream_id(8) + extent_id(4) [+ offset(8) if present]
             VariableHeader::Seal {
                 offset,
@@ -565,6 +1007,8 @@ impl Frame {
                 let ep = if epoch.is_some() { 4 } else { 0 };
                 base + ne + ep
             }
+            // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
+            VariableHeader::SealAckError { .. } => 4 + 8 + 4 + 2,
             // request_id(4) + name_len(2) + name(N) + replication_factor(2) + extent_capacity(4) + cache_extents(4)
             VariableHeader::CreateStream { stream_name, .. } => {
                 4 + 2 + stream_name.len() + 2 + 4 + 4
@@ -573,20 +1017,30 @@ impl Frame {
             VariableHeader::CreateStreamResp { primary_addr, .. } => {
                 4 + 8 + 4 + 4 + 2 + primary_addr.len()
             }
+            // request_id(4) + error_code(2)
+            VariableHeader::CreateStreamRespError { .. } => 4 + 2,
             // request_id(4) + stream_id(8)
             VariableHeader::QueryOffset { .. } => 4 + 8,
             // request_id(4) + stream_id(8) + offset(8)
             VariableHeader::QueryOffsetResp { .. } => 4 + 8 + 8,
+            // request_id(4) + stream_id(8) + error_code(2)
+            VariableHeader::QueryOffsetRespError { .. } => 4 + 8 + 2,
             // request_id(4)
             VariableHeader::Connect { .. }
             | VariableHeader::ConnectAck { .. }
             | VariableHeader::Disconnect { .. }
             | VariableHeader::DisconnectAck { .. }
             | VariableHeader::Heartbeat { .. } => 4,
+            // request_id(4) + error_code(2)
+            VariableHeader::ConnectAckError { .. }
+            | VariableHeader::DisconnectAckError { .. }
+            | VariableHeader::HeartbeatError { .. } => 4 + 2,
             // request_id(4) + stream_id(8) + extent_id(4) + role(1) + replication_factor(2) + epoch(4) + extent_capacity(4) + cache_extents(4)
             VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4 + 4 + 4,
             // request_id(4) + stream_id(8) + extent_id(4)
             VariableHeader::RegisterExtentAck { .. } => 4 + 8 + 4,
+            // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
+            VariableHeader::RegisterExtentAckError { .. } => 4 + 8 + 4 + 2,
             // stream_id(8) + extent_id(4) + offset(8) -- no request_id
             VariableHeader::Watermark { .. } => 8 + 4 + 8,
             // stream_id(8) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4)
@@ -597,6 +1051,8 @@ impl Frame {
             VariableHeader::ReportExtents { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + epoch(4)
             VariableHeader::ReportExtentsResp { .. } => 4 + 8 + 4,
+            // request_id(4) + stream_id(8) + epoch(4) + error_code(2)
+            VariableHeader::ReportExtentsRespError { .. } => 4 + 8 + 4 + 2,
             // stream_id(8) + extent_id(4) + epoch(4) + offset(8) + byte_pos(8)
             VariableHeader::Forward { .. } => 8 + 4 + 4 + 8 + 8,
             // stream_id(8) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(4)
@@ -614,12 +1070,16 @@ impl Frame {
             // request_id(4) + stream_id(8)
             VariableHeader::DescribeStreamResp { .. }
             | VariableHeader::DescribeExtentResp { .. } => 4 + 8,
+            // request_id(4) + stream_id(8) + error_code(2)
+            VariableHeader::DescribeStreamRespError { .. } => 4 + 8 + 2,
+            // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
+            VariableHeader::DescribeExtentRespError { .. } => 4 + 8 + 4 + 2,
             // request_id(4) + stream_id(8) + extent_id(4)
             VariableHeader::DescribeExtent { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + offset(8)
             VariableHeader::Seek { .. } | VariableHeader::SeekResp { .. } => 4 + 8 + 8,
-            // request_id(4) + error_code(2) + extent_id(4)
-            VariableHeader::Error { .. } => 4 + 2 + 4,
+            // request_id(4) + stream_id(8) + offset(8) + error_code(2)
+            VariableHeader::SeekRespError { .. } => 4 + 8 + 8 + 2,
         }
     }
 
@@ -628,17 +1088,29 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::Append { .. }
             | VariableHeader::ReadResp { .. }
+            | VariableHeader::ReadRespError { .. }
             | VariableHeader::Connect { .. }
             | VariableHeader::Disconnect { .. }
             | VariableHeader::Heartbeat { .. }
+            | VariableHeader::HeartbeatError { .. }
             | VariableHeader::RegisterExtent { .. }
             | VariableHeader::Forward { .. }
             | VariableHeader::StreamManagerMembershipChange
             | VariableHeader::ReportExtentsResp { .. }
+            | VariableHeader::ReportExtentsRespError { .. }
             | VariableHeader::DescribeStreamResp { .. }
+            | VariableHeader::DescribeStreamRespError { .. }
             | VariableHeader::DescribeExtentResp { .. }
+            | VariableHeader::DescribeExtentRespError { .. }
             | VariableHeader::SeekResp { .. }
-            | VariableHeader::Error { .. } => true,
+            | VariableHeader::SeekRespError { .. }
+            | VariableHeader::AppendAckError { .. }
+            | VariableHeader::SealAckError { .. }
+            | VariableHeader::CreateStreamRespError { .. }
+            | VariableHeader::QueryOffsetRespError { .. }
+            | VariableHeader::ConnectAckError { .. }
+            | VariableHeader::DisconnectAckError { .. }
+            | VariableHeader::RegisterExtentAckError { .. } => true,
             _ => false,
         }
     }
@@ -690,6 +1162,19 @@ impl Frame {
                 dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
             }
+            VariableHeader::AppendAckError {
+                request_id,
+                stream_id,
+                epoch,
+                extent_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u32(epoch.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u16(*error_code as u16);
+            }
             VariableHeader::Read {
                 request_id,
                 stream_id,
@@ -713,6 +1198,19 @@ impl Frame {
                 dst.put_u64(stream_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u32(*count);
+            }
+            VariableHeader::ReadRespError {
+                request_id,
+                stream_id,
+                extent_id,
+                offset,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u64(offset.0);
+                dst.put_u16(*error_code as u16);
             }
             VariableHeader::Seal {
                 request_id,
@@ -758,6 +1256,17 @@ impl Frame {
                     dst.put_u32(ep.0);
                 }
             }
+            VariableHeader::SealAckError {
+                request_id,
+                stream_id,
+                extent_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u16(*error_code as u16);
+            }
             VariableHeader::CreateStream {
                 request_id,
                 stream_name,
@@ -786,6 +1295,13 @@ impl Frame {
                 dst.put_u16(primary_addr.len() as u16);
                 dst.extend_from_slice(primary_addr);
             }
+            VariableHeader::CreateStreamRespError {
+                request_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u16(*error_code as u16);
+            }
             VariableHeader::QueryOffset {
                 request_id,
                 stream_id,
@@ -801,6 +1317,15 @@ impl Frame {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
                 dst.put_u64(offset.0);
+            }
+            VariableHeader::QueryOffsetRespError {
+                request_id,
+                stream_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u16(*error_code as u16);
             }
             VariableHeader::Connect { request_id }
             | VariableHeader::Disconnect { request_id }
@@ -830,6 +1355,21 @@ impl Frame {
             | VariableHeader::DisconnectAck { request_id } => {
                 dst.put_u32(*request_id);
             }
+            VariableHeader::ConnectAckError {
+                request_id,
+                error_code,
+            }
+            | VariableHeader::DisconnectAckError {
+                request_id,
+                error_code,
+            }
+            | VariableHeader::HeartbeatError {
+                request_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u16(*error_code as u16);
+            }
             VariableHeader::RegisterExtentAck {
                 request_id,
                 stream_id,
@@ -838,6 +1378,17 @@ impl Frame {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
                 dst.put_u32(extent_id.0);
+            }
+            VariableHeader::RegisterExtentAckError {
+                request_id,
+                stream_id,
+                extent_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u16(*error_code as u16);
             }
             VariableHeader::Watermark {
                 stream_id,
@@ -915,6 +1466,26 @@ impl Frame {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
             }
+            VariableHeader::DescribeStreamRespError {
+                request_id,
+                stream_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u16(*error_code as u16);
+            }
+            VariableHeader::DescribeExtentRespError {
+                request_id,
+                stream_id,
+                extent_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u16(*error_code as u16);
+            }
             VariableHeader::DescribeExtent {
                 request_id,
                 stream_id,
@@ -941,6 +1512,17 @@ impl Frame {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
                 dst.put_u64(offset.0);
+            }
+            VariableHeader::SeekRespError {
+                request_id,
+                stream_id,
+                offset,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u64(offset.0);
+                dst.put_u16(*error_code as u16);
             }
             VariableHeader::UpdateExtentSealed {
                 stream_id,
@@ -984,14 +1566,16 @@ impl Frame {
                 dst.put_u64(stream_id.0);
                 dst.put_u32(epoch.0);
             }
-            VariableHeader::Error {
+            VariableHeader::ReportExtentsRespError {
                 request_id,
+                stream_id,
+                epoch,
                 error_code,
-                extent_id,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u16(*error_code);
-                dst.put_u32(extent_id.0);
+                dst.put_u64(stream_id.0);
+                dst.put_u32(epoch.0);
+                dst.put_u16(*error_code as u16);
             }
         }
     }
@@ -1077,17 +1661,34 @@ impl Frame {
                 let stream_id = StreamId(body.get_u64());
                 let epoch = Epoch(body.get_u32());
                 let extent_id = ExtentId(body.get_u32());
-                let offset = Offset(body.get_u64());
-                Ok((
-                    VariableHeader::AppendAck {
-                        request_id,
-                        stream_id,
-                        epoch,
-                        extent_id,
-                        offset,
-                    },
-                    None,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown AppendAck error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::AppendAckError {
+                            request_id,
+                            stream_id,
+                            epoch,
+                            extent_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let offset = Offset(body.get_u64());
+                    Ok((
+                        VariableHeader::AppendAck {
+                            request_id,
+                            stream_id,
+                            epoch,
+                            extent_id,
+                            offset,
+                        },
+                        None,
+                    ))
+                }
             }
             Opcode::Read => {
                 let request_id = body.get_u32();
@@ -1109,18 +1710,37 @@ impl Frame {
             Opcode::ReadResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
-                let offset = Offset(body.get_u64());
-                let count = body.get_u32();
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::ReadResp {
-                        request_id,
-                        stream_id,
-                        offset,
-                        count,
-                    },
-                    payload,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let extent_id = ExtentId(body.get_u32());
+                    let offset = Offset(body.get_u64());
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown ReadResp error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::ReadRespError {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            offset,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let offset = Offset(body.get_u64());
+                    let count = body.get_u32();
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::ReadResp {
+                            request_id,
+                            stream_id,
+                            offset,
+                            count,
+                        },
+                        payload,
+                    ))
+                }
             }
             Opcode::Seal => {
                 let request_id = body.get_u32();
@@ -1157,36 +1777,54 @@ impl Frame {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
-                let offset = Offset(body.get_u64());
-                let (new_extent_id, primary_addr) = if flags & FLAG_NEW_EXTENT_PRESENT != 0 {
-                    let neid = ExtentId(body.get_u32());
-                    let addr_len = body.get_u16() as usize;
-                    let addr = if body.remaining() >= addr_len {
-                        Some(body.split_to(addr_len).freeze())
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown SealAck error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::SealAckError {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let response_flags = flags & !FLAG_RESPONSE_ERROR;
+                    let offset = Offset(body.get_u64());
+                    let (new_extent_id, primary_addr) =
+                        if response_flags & FLAG_NEW_EXTENT_PRESENT != 0 {
+                            let neid = ExtentId(body.get_u32());
+                            let addr_len = body.get_u16() as usize;
+                            let addr = if body.remaining() >= addr_len {
+                                Some(body.split_to(addr_len).freeze())
+                            } else {
+                                None
+                            };
+                            (Some(neid), addr)
+                        } else {
+                            (None, None)
+                        };
+                    let epoch = if response_flags & FLAG_EPOCH_PRESENT != 0 {
+                        Some(Epoch(body.get_u32()))
                     } else {
                         None
                     };
-                    (Some(neid), addr)
-                } else {
-                    (None, None)
-                };
-                let epoch = if flags & FLAG_EPOCH_PRESENT != 0 {
-                    Some(Epoch(body.get_u32()))
-                } else {
-                    None
-                };
-                Ok((
-                    VariableHeader::SealAck {
-                        request_id,
-                        stream_id,
-                        extent_id,
-                        offset,
-                        new_extent_id,
-                        primary_addr,
-                        epoch,
-                    },
-                    None,
-                ))
+                    Ok((
+                        VariableHeader::SealAck {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            offset,
+                            new_extent_id,
+                            primary_addr,
+                            epoch,
+                        },
+                        None,
+                    ))
+                }
             }
             Opcode::CreateStream => {
                 let request_id = body.get_u32();
@@ -1208,21 +1846,35 @@ impl Frame {
             }
             Opcode::CreateStreamResp => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let extent_id = ExtentId(body.get_u32());
-                let epoch = Epoch(body.get_u32());
-                let addr_len = body.get_u16() as usize;
-                let primary_addr = body.split_to(addr_len).freeze();
-                Ok((
-                    VariableHeader::CreateStreamResp {
-                        request_id,
-                        stream_id,
-                        extent_id,
-                        epoch,
-                        primary_addr,
-                    },
-                    None,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown CreateStreamResp error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::CreateStreamRespError {
+                            request_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let stream_id = StreamId(body.get_u64());
+                    let extent_id = ExtentId(body.get_u32());
+                    let epoch = Epoch(body.get_u32());
+                    let addr_len = body.get_u16() as usize;
+                    let primary_addr = body.split_to(addr_len).freeze();
+                    Ok((
+                        VariableHeader::CreateStreamResp {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            epoch,
+                            primary_addr,
+                        },
+                        None,
+                    ))
+                }
             }
             Opcode::QueryOffset => {
                 let request_id = body.get_u32();
@@ -1238,15 +1890,30 @@ impl Frame {
             Opcode::QueryOffsetResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
-                let offset = Offset(body.get_u64());
-                Ok((
-                    VariableHeader::QueryOffsetResp {
-                        request_id,
-                        stream_id,
-                        offset,
-                    },
-                    None,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown QueryOffsetResp error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::QueryOffsetRespError {
+                            request_id,
+                            stream_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let offset = Offset(body.get_u64());
+                    Ok((
+                        VariableHeader::QueryOffsetResp {
+                            request_id,
+                            stream_id,
+                            offset,
+                        },
+                        None,
+                    ))
+                }
             }
             Opcode::Connect => {
                 let request_id = body.get_u32();
@@ -1260,8 +1927,22 @@ impl Frame {
             }
             Opcode::Heartbeat => {
                 let request_id = body.get_u32();
-                let payload = Self::read_payload(body);
-                Ok((VariableHeader::Heartbeat { request_id }, payload))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown Heartbeat error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::HeartbeatError {
+                            request_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let payload = Self::read_payload(body);
+                    Ok((VariableHeader::Heartbeat { request_id }, payload))
+                }
             }
             Opcode::RegisterExtent => {
                 let request_id = body.get_u32();
@@ -1289,24 +1970,68 @@ impl Frame {
             }
             Opcode::ConnectAck => {
                 let request_id = body.get_u32();
-                Ok((VariableHeader::ConnectAck { request_id }, None))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown ConnectAck error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::ConnectAckError {
+                            request_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    Ok((VariableHeader::ConnectAck { request_id }, None))
+                }
             }
             Opcode::DisconnectAck => {
                 let request_id = body.get_u32();
-                Ok((VariableHeader::DisconnectAck { request_id }, None))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown DisconnectAck error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::DisconnectAckError {
+                            request_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    Ok((VariableHeader::DisconnectAck { request_id }, None))
+                }
             }
             Opcode::RegisterExtentAck => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
-                Ok((
-                    VariableHeader::RegisterExtentAck {
-                        request_id,
-                        stream_id,
-                        extent_id,
-                    },
-                    None,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown RegisterExtentAck error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::RegisterExtentAckError {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    Ok((
+                        VariableHeader::RegisterExtentAck {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                        },
+                        None,
+                    ))
+                }
             }
             Opcode::Watermark => {
                 let stream_id = StreamId(body.get_u64());
@@ -1406,14 +2131,29 @@ impl Frame {
             Opcode::DescribeStreamResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::DescribeStreamResp {
-                        request_id,
-                        stream_id,
-                    },
-                    payload,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown DescribeStreamResp error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::DescribeStreamRespError {
+                            request_id,
+                            stream_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::DescribeStreamResp {
+                            request_id,
+                            stream_id,
+                        },
+                        payload,
+                    ))
+                }
             }
             Opcode::DescribeExtent => {
                 let request_id = body.get_u32();
@@ -1431,14 +2171,31 @@ impl Frame {
             Opcode::DescribeExtentResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::DescribeExtentResp {
-                        request_id,
-                        stream_id,
-                    },
-                    payload,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let extent_id = ExtentId(body.get_u32());
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown DescribeExtentResp error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::DescribeExtentRespError {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::DescribeExtentResp {
+                            request_id,
+                            stream_id,
+                        },
+                        payload,
+                    ))
+                }
             }
             Opcode::Seek => {
                 let request_id = body.get_u32();
@@ -1457,15 +2214,31 @@ impl Frame {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let offset = Offset(body.get_u64());
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::SeekResp {
-                        request_id,
-                        stream_id,
-                        offset,
-                    },
-                    payload,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown SeekResp error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::SeekRespError {
+                            request_id,
+                            stream_id,
+                            offset,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::SeekResp {
+                            request_id,
+                            stream_id,
+                            offset,
+                        },
+                        payload,
+                    ))
+                }
             }
             Opcode::UpdateExtent => {
                 let stream_id = StreamId(body.get_u64());
@@ -1521,29 +2294,31 @@ impl Frame {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let epoch = Epoch(body.get_u32());
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::ReportExtentsResp {
-                        request_id,
-                        stream_id,
-                        epoch,
-                    },
-                    payload,
-                ))
-            }
-            Opcode::Error => {
-                let request_id = body.get_u32();
-                let error_code = body.get_u16();
-                let extent_id = ExtentId(body.get_u32());
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::Error {
-                        request_id,
-                        error_code,
-                        extent_id,
-                    },
-                    payload,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown ReportExtentsResp error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::ReportExtentsRespError {
+                            request_id,
+                            stream_id,
+                            epoch,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::ReportExtentsResp {
+                            request_id,
+                            stream_id,
+                            epoch,
+                        },
+                        payload,
+                    ))
+                }
             }
         }
     }
@@ -1565,38 +2340,55 @@ impl VariableHeader {
     pub fn opcode(&self) -> Opcode {
         match self {
             VariableHeader::Append { .. } => Opcode::Append,
-            VariableHeader::AppendAck { .. } => Opcode::AppendAck,
+            VariableHeader::AppendAck { .. } | VariableHeader::AppendAckError { .. } => {
+                Opcode::AppendAck
+            }
             VariableHeader::Read { .. } => Opcode::Read,
-            VariableHeader::ReadResp { .. } => Opcode::ReadResp,
+            VariableHeader::ReadResp { .. } | VariableHeader::ReadRespError { .. } => {
+                Opcode::ReadResp
+            }
             VariableHeader::Seal { .. } => Opcode::Seal,
-            VariableHeader::SealAck { .. } => Opcode::SealAck,
+            VariableHeader::SealAck { .. } | VariableHeader::SealAckError { .. } => Opcode::SealAck,
             VariableHeader::CreateStream { .. } => Opcode::CreateStream,
-            VariableHeader::CreateStreamResp { .. } => Opcode::CreateStreamResp,
+            VariableHeader::CreateStreamResp { .. }
+            | VariableHeader::CreateStreamRespError { .. } => Opcode::CreateStreamResp,
             VariableHeader::QueryOffset { .. } => Opcode::QueryOffset,
-            VariableHeader::QueryOffsetResp { .. } => Opcode::QueryOffsetResp,
+            VariableHeader::QueryOffsetResp { .. }
+            | VariableHeader::QueryOffsetRespError { .. } => Opcode::QueryOffsetResp,
             VariableHeader::Connect { .. } => Opcode::Connect,
-            VariableHeader::ConnectAck { .. } => Opcode::ConnectAck,
+            VariableHeader::ConnectAck { .. } | VariableHeader::ConnectAckError { .. } => {
+                Opcode::ConnectAck
+            }
             VariableHeader::Disconnect { .. } => Opcode::Disconnect,
-            VariableHeader::DisconnectAck { .. } => Opcode::DisconnectAck,
-            VariableHeader::Heartbeat { .. } => Opcode::Heartbeat,
+            VariableHeader::DisconnectAck { .. } | VariableHeader::DisconnectAckError { .. } => {
+                Opcode::DisconnectAck
+            }
+            VariableHeader::Heartbeat { .. } | VariableHeader::HeartbeatError { .. } => {
+                Opcode::Heartbeat
+            }
             VariableHeader::RegisterExtent { .. } => Opcode::RegisterExtent,
-            VariableHeader::RegisterExtentAck { .. } => Opcode::RegisterExtentAck,
+            VariableHeader::RegisterExtentAck { .. }
+            | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterExtentAck,
             VariableHeader::Watermark { .. } => Opcode::Watermark,
             VariableHeader::UpdateExtentSealed { .. }
             | VariableHeader::UpdateExtentProgress { .. } => Opcode::UpdateExtent,
             VariableHeader::ReportExtents { .. } => Opcode::ReportExtents,
-            VariableHeader::ReportExtentsResp { .. } => Opcode::ReportExtentsResp,
+            VariableHeader::ReportExtentsResp { .. }
+            | VariableHeader::ReportExtentsRespError { .. } => Opcode::ReportExtentsResp,
             VariableHeader::Forward { .. }
             | VariableHeader::ForwardInitExtent { .. }
             | VariableHeader::ForwardChecksum { .. } => Opcode::Forward,
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
             VariableHeader::DescribeStream { .. } => Opcode::DescribeStream,
-            VariableHeader::DescribeStreamResp { .. } => Opcode::DescribeStreamResp,
+            VariableHeader::DescribeStreamResp { .. }
+            | VariableHeader::DescribeStreamRespError { .. } => Opcode::DescribeStreamResp,
             VariableHeader::DescribeExtent { .. } => Opcode::DescribeExtent,
-            VariableHeader::DescribeExtentResp { .. } => Opcode::DescribeExtentResp,
+            VariableHeader::DescribeExtentResp { .. }
+            | VariableHeader::DescribeExtentRespError { .. } => Opcode::DescribeExtentResp,
             VariableHeader::Seek { .. } => Opcode::Seek,
-            VariableHeader::SeekResp { .. } => Opcode::SeekResp,
-            VariableHeader::Error { .. } => Opcode::Error,
+            VariableHeader::SeekResp { .. } | VariableHeader::SeekRespError { .. } => {
+                Opcode::SeekResp
+            }
         }
     }
 }
@@ -1927,16 +2719,25 @@ mod tests {
     }
 
     #[test]
-    fn error_response_frame() {
-        let frame =
-            Frame::error_response(42, ErrorCode::ExtentSealed, "extent sealed", ExtentId(7));
+    fn append_ack_error_frame() {
+        let frame = Frame::append_ack_error(
+            42,
+            StreamId(9),
+            Epoch(3),
+            ExtentId(7),
+            ErrorCode::ExtentSealed,
+            "extent sealed",
+        );
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.opcode(), Opcode::Error);
+        assert_eq!(decoded.opcode(), Opcode::AppendAck);
+        assert!(decoded.is_error_response());
         assert_eq!(decoded.request_id(), 42);
+        assert_eq!(decoded.stream_id(), StreamId(9));
+        assert_eq!(decoded.epoch(), Epoch(3));
         assert_eq!(decoded.error_code(), ErrorCode::ExtentSealed as u16);
         assert_eq!(decoded.extent_id(), ExtentId(7));
         assert_eq!(decoded.payload, Some(Bytes::from_static(b"extent sealed")));
