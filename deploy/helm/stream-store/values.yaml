@@ -4,17 +4,11 @@ image:
   pullPolicy: IfNotPresent
 
 mysql:
-  image: mysql:8.0
-  rootPassword: password
-  database: stream_store
+  host: ""          # REQUIRED: external MySQL host (e.g., mysql.cdb.myqcloud.com)
   port: 3306
-  resources:
-    requests:
-      cpu: 500m
-      memory: 512Mi
-    limits:
-      cpu: "1"
-      memory: 1Gi
+  username: root
+  password: password
+  database: stream_store
 
 streamManager:
   replicas: 1

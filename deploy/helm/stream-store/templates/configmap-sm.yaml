@@ -9,10 +9,10 @@ data:
   config.toml: |
     bind_ip = "0.0.0.0"
     port = {{ .Values.streamManager.port }}
-    mysql_host = "{{ .Release.Name }}-mysql"
+    mysql_host = {{ required "mysql.host is required" .Values.mysql.host | quote }}
     mysql_port = {{ .Values.mysql.port }}
-    mysql_username = "root"
-    mysql_password = {{ .Values.mysql.rootPassword | quote }}
+    mysql_username = {{ .Values.mysql.username | quote }}
+    mysql_password = {{ .Values.mysql.password | quote }}
     mysql_database = {{ .Values.mysql.database | quote }}
     default_replication_factor = {{ .Values.streamManager.replicationFactor }}
     heartbeat_check_interval_ms = {{ .Values.streamManager.heartbeatCheckIntervalMs }}

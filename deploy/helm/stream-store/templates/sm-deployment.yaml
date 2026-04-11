@@ -17,17 +17,6 @@ spec:
         app.kubernetes.io/instance: {{ .Release.Name }}
         app.kubernetes.io/component: stream-manager
     spec:
-      initContainers:
-        - name: wait-for-mysql
-          image: {{ .Values.mysql.image }}
-          command:
-            - sh
-            - -c
-            - |
-              until mysqladmin ping -h {{ .Release.Name }}-mysql --silent; do
-                echo "waiting for mysql..."
-                sleep 2
-              done
       containers:
         - name: stream-manager
           image: {{ include "stream-store.image" . }}
