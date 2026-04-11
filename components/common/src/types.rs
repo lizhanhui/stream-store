@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter, Result};
 pub const MAGIC: u8 = 0xEF;
 
 /// Current protocol version.
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 2;
 
 /// Fixed header length in bytes (Magic 1 + Version 1 + Opcode 1 + Flags 1
 /// + RemainingLength 4 = 8).
@@ -45,6 +45,10 @@ pub const FLAG_FORWARD_CHECKSUM: u8 = 0x02;
 /// Flag on DESCRIBE_STREAM: lookup by stream name instead of stream_id.
 /// When set, variable header carries [name_len:u16][name_bytes] after count.
 pub const FLAG_DESCRIBE_STREAM_BY_NAME: u8 = 0x01;
+
+/// Shared flag on response opcodes indicating the response carries an
+/// opcode-specific error header instead of the success header layout.
+pub const FLAG_RESPONSE_ERROR: u8 = 0x80;
 
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -145,9 +149,6 @@ pub enum Opcode {
     DescribeExtentResp = 0x33,
     Seek = 0x34,
     SeekResp = 0x35,
-
-    // -- Control (0xFE-0xFF) --
-    Error = 0xFF,
 }
 
 impl Opcode {
@@ -186,8 +187,6 @@ impl Opcode {
             0x33 => Some(Opcode::DescribeExtentResp),
             0x34 => Some(Opcode::Seek),
             0x35 => Some(Opcode::SeekResp),
-            // Control
-            0xFF => Some(Opcode::Error),
             _ => None,
         }
     }

@@ -217,20 +217,18 @@ impl StreamClient {
     }
 
     fn check_error(resp: &Frame) -> Result<(), StorageError> {
-        if resp.opcode() == Opcode::Error {
-            let error_code = ErrorCode::from_u16(resp.error_code());
-            let msg =
-                String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
-            return Err(match error_code {
-                Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id()),
-                Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id()),
-                Some(ErrorCode::EpochStale) => {
-                    StorageError::EpochStale(resp.stream_id(), resp.epoch())
-                }
-                _ => StorageError::Internal(msg),
-            });
+        if !resp.is_error_response() {
+            return Ok(());
         }
-        Ok(())
+
+        let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
+        let error_code = ErrorCode::from_u16(resp.error_code());
+        Err(match error_code {
+            Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id()),
+            Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id()),
+            Some(ErrorCode::EpochStale) => StorageError::EpochStale(resp.stream_id(), resp.epoch()),
+            _ => StorageError::Internal(msg),
+        })
     }
 
     /// Create a new stream on the StreamManager.

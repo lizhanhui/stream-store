@@ -45,7 +45,7 @@ async fn seal_extent_node_static(
         .await
         .map_err(|e| StorageError::Internal(format!("Seal to ExtentNode {addr}: {e}")))?;
 
-    if resp.opcode() == Opcode::Error {
+    if resp.is_error_response() {
         let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
         return Err(StorageError::Internal(format!(
             "ExtentNode {addr} rejected Seal: {msg}"
@@ -87,7 +87,7 @@ async fn report_extents_from_node_static(
         .await
         .map_err(|e| StorageError::Internal(format!("ReportExtents to ExtentNode {addr}: {e}")))?;
 
-    if resp.opcode() == Opcode::Error {
+    if resp.is_error_response() {
         let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
         return Err(StorageError::Internal(format!(
             "ExtentNode {addr} rejected ReportExtents: {msg}"
@@ -364,7 +364,7 @@ impl StreamManagerStore {
                     ))
                 })?;
 
-            if resp.opcode() == Opcode::Error {
+            if resp.is_error_response() {
                 let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default())
                     .to_string();
                 return Err(StorageError::Internal(format!(
@@ -438,7 +438,7 @@ impl StreamManagerStore {
                             ))
                             .await;
                         match result {
-                            Ok(resp) if resp.opcode() == Opcode::Error => {
+                            Ok(resp) if resp.is_error_response() => {
                                 let msg = String::from_utf8_lossy(
                                     resp.payload.as_deref().unwrap_or_default(),
                                 );
@@ -557,8 +557,26 @@ impl RequestHandler for StreamManagerStore {
                     Opcode::DescribeExtent => self.handle_describe_extent(frame).await,
                     Opcode::Seek => self.handle_seek(frame).await,
                     Opcode::ReportExtents => self.handle_report_extents(frame).await,
-                    _ => Frame::error_response(
-                        frame.request_id(),
+                    Opcode::ConnectAck
+                    | Opcode::DisconnectAck
+                    | Opcode::RegisterExtent
+                    | Opcode::RegisterExtentAck
+                    | Opcode::Watermark
+                    | Opcode::UpdateExtent
+                    | Opcode::ReportExtentsResp
+                    | Opcode::CreateStreamResp
+                    | Opcode::QueryOffsetResp
+                    | Opcode::ReadResp
+                    | Opcode::SealAck
+                    | Opcode::DescribeStreamResp
+                    | Opcode::DescribeExtentResp
+                    | Opcode::SeekResp
+                    | Opcode::StreamManagerMembershipChange => {
+                        warn!(opcode = ?frame.opcode(), "SM received unexpected response/fire-and-forget opcode");
+                        return None;
+                    }
+                    _ => Frame::error_from_request(
+                        &frame,
                         ErrorCode::InternalError,
                         &format!("StreamManager: unsupported opcode {:?}", frame.opcode()),
                         ExtentId(0),
@@ -590,8 +608,8 @@ impl StreamManagerStore {
                     }
                     Err(e) => {
                         error!("register_node failed: {e}");
-                        Frame::error_response(
-                            frame.request_id(),
+                        Frame::error_from_request(
+                            &frame,
                             ErrorCode::InternalError,
                             &e.to_string(),
                             ExtentId(0),
@@ -599,8 +617,8 @@ impl StreamManagerStore {
                     }
                 }
             }
-            None => Frame::error_response(
-                frame.request_id(),
+            None => Frame::error_from_request(
+                &frame,
                 ErrorCode::InternalError,
                 "invalid Connect payload",
                 ExtentId(0),
@@ -629,8 +647,8 @@ impl StreamManagerStore {
                     }
                     Err(e) => {
                         error!("update_heartbeat failed: {e}");
-                        Frame::error_response(
-                            frame.request_id(),
+                        Frame::error_from_request(
+                            &frame,
                             ErrorCode::InternalError,
                             &e.to_string(),
                             ExtentId(0),
@@ -638,8 +656,8 @@ impl StreamManagerStore {
                     }
                 }
             }
-            None => Frame::error_response(
-                frame.request_id(),
+            None => Frame::error_from_request(
+                &frame,
                 ErrorCode::InternalError,
                 "invalid Heartbeat payload",
                 ExtentId(0),
@@ -664,16 +682,16 @@ impl StreamManagerStore {
                 }
                 Err(e) => {
                     error!("mark_node_dead on disconnect failed: {e}");
-                    Frame::error_response(
-                        frame.request_id(),
+                    Frame::error_from_request(
+                        &frame,
                         ErrorCode::InternalError,
                         &e.to_string(),
                         ExtentId(0),
                     )
                 }
             },
-            None => Frame::error_response(
-                frame.request_id(),
+            None => Frame::error_from_request(
+                &frame,
                 ErrorCode::InternalError,
                 "invalid Disconnect payload",
                 ExtentId(0),
@@ -704,8 +722,8 @@ impl StreamManagerStore {
                     *cache_extents,
                 ),
                 _ => {
-                    return Frame::error_response(
-                        frame.request_id(),
+                    return Frame::error_from_request(
+                        &frame,
                         ErrorCode::InternalError,
                         "invalid CreateStream frame",
                         ExtentId(0),
@@ -764,8 +782,8 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("create_stream failed: {e}");
-                Frame::error_response(
-                    frame.request_id(),
+                Frame::error_from_request(
+                    &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -820,8 +838,8 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("seal failed: {e}");
-                Frame::error_response(
-                    frame.request_id(),
+                Frame::error_from_request(
+                    &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -1198,8 +1216,8 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("query_offset failed: {e}");
-                Frame::error_response(
-                    frame.request_id(),
+                Frame::error_from_request(
+                    &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -1229,8 +1247,8 @@ impl StreamManagerStore {
             match self.store.get_stream_by_name(&name_str).await {
                 Ok(Some(row)) => row.stream_id,
                 Ok(None) => {
-                    return Frame::error_response(
-                        frame.request_id(),
+                    return Frame::error_from_request(
+                        &frame,
                         ErrorCode::UnknownStream,
                         &format!("stream not found: {name_str}"),
                         ExtentId(0),
@@ -1238,8 +1256,8 @@ impl StreamManagerStore {
                 }
                 Err(e) => {
                     error!("get_stream_by_name failed: {e}");
-                    return Frame::error_response(
-                        frame.request_id(),
+                    return Frame::error_from_request(
+                        &frame,
                         ErrorCode::InternalError,
                         &e.to_string(),
                         ExtentId(0),
@@ -1263,8 +1281,8 @@ impl StreamManagerStore {
             }
             Err(e) => {
                 error!("describe_stream failed: {e}");
-                Frame::error_response(
-                    frame.request_id(),
+                Frame::error_from_request(
+                    &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -1292,8 +1310,8 @@ impl StreamManagerStore {
                     Some(payload),
                 )
             }
-            Ok(None) => Frame::error_response(
-                frame.request_id(),
+            Ok(None) => Frame::error_from_request(
+                &frame,
                 ErrorCode::UnknownStream,
                 &format!(
                     "extent not found: stream={}, extent={}",
@@ -1303,8 +1321,8 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("describe_extent failed: {e}");
-                Frame::error_response(
-                    frame.request_id(),
+                Frame::error_from_request(
+                    &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -1333,8 +1351,8 @@ impl StreamManagerStore {
                     Some(payload),
                 )
             }
-            Ok(None) => Frame::error_response(
-                frame.request_id(),
+            Ok(None) => Frame::error_from_request(
+                &frame,
                 ErrorCode::InvalidOffset,
                 &format!(
                     "no extent contains offset {} for stream {:?}",
@@ -1344,8 +1362,8 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("seek failed: {e}");
-                Frame::error_response(
-                    frame.request_id(),
+                Frame::error_from_request(
+                    &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
                     ExtentId(0),
@@ -1369,19 +1387,21 @@ impl StreamManagerStore {
         let active = match self.store.get_active_extent(stream_id).await {
             Ok(Some(ext)) => ext,
             Ok(None) => {
-                return Frame::error_response(
+                return Frame::seal_ack_error(
                     request_id,
+                    stream_id,
+                    ExtentId(0),
                     ErrorCode::InternalError,
                     "no active extent for epoch seal",
-                    ExtentId(0),
                 );
             }
             Err(e) => {
-                return Frame::error_response(
+                return Frame::seal_ack_error(
                     request_id,
+                    stream_id,
+                    ExtentId(0),
                     ErrorCode::InternalError,
                     &format!("get_active_extent: {e}"),
-                    ExtentId(0),
                 );
             }
         };
@@ -1389,11 +1409,12 @@ impl StreamManagerStore {
         let replicas = match self.store.get_replicas(stream_id, active.extent_id).await {
             Ok(r) => r,
             Err(e) => {
-                return Frame::error_response(
+                return Frame::seal_ack_error(
                     request_id,
+                    stream_id,
+                    active.extent_id,
                     ErrorCode::InternalError,
                     &format!("get_replicas: {e}"),
-                    ExtentId(0),
                 );
             }
         };
@@ -1405,11 +1426,12 @@ impl StreamManagerStore {
             .unwrap_or_default();
 
         if primary_addr.is_empty() {
-            return Frame::error_response(
+            return Frame::seal_ack_error(
                 request_id,
+                stream_id,
+                active.extent_id,
                 ErrorCode::InternalError,
                 "no primary replica found for epoch seal",
-                ExtentId(0),
             );
         }
 
@@ -1433,11 +1455,12 @@ impl StreamManagerStore {
                 let new_epoch = match self.store.bump_epoch(stream_id).await {
                     Ok(e) => e,
                     Err(e) => {
-                        return Frame::error_response(
+                        return Frame::seal_ack_error(
                             request_id,
+                            stream_id,
+                            active.extent_id,
                             ErrorCode::InternalError,
                             &format!("epoch seal fallback: bump_epoch failed: {e}"),
-                            ExtentId(0),
                         );
                     }
                 };
@@ -1462,11 +1485,12 @@ impl StreamManagerStore {
                         );
                     }
                     Err(e2) => {
-                        return Frame::error_response(
+                        return Frame::seal_ack_error(
                             request_id,
+                            stream_id,
+                            active.extent_id,
                             ErrorCode::InternalError,
                             &format!("epoch seal fallback failed: {e2}"),
-                            ExtentId(0),
                         );
                     }
                 }
@@ -1480,11 +1504,12 @@ impl StreamManagerStore {
             Ok(e) => e,
             Err(e) => {
                 error!("epoch seal: bump_epoch failed: {e}");
-                return Frame::error_response(
+                return Frame::seal_ack_error(
                     request_id,
+                    stream_id,
+                    sealed_extent_id,
                     ErrorCode::InternalError,
                     &format!("epoch seal: bump_epoch: {e}"),
-                    ExtentId(0),
                 );
             }
         };
@@ -1508,11 +1533,12 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("epoch seal metadata update failed: {e}");
-                Frame::error_response(
+                Frame::seal_ack_error(
                     request_id,
+                    stream_id,
+                    sealed_extent_id,
                     ErrorCode::InternalError,
                     &format!("epoch seal: {e}"),
-                    ExtentId(0),
                 )
             }
         }
@@ -1583,8 +1609,8 @@ impl StreamManagerStore {
     ///
     /// Not yet implemented — returns an error response.
     async fn handle_report_extents(&self, frame: Frame) -> Frame {
-        Frame::error_response(
-            frame.request_id(),
+        Frame::error_from_request(
+            &frame,
             ErrorCode::InternalError,
             "ReportExtents not yet implemented",
             ExtentId(0),
