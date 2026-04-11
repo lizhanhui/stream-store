@@ -1,0 +1,25 @@
+image:
+  repository: stream-store
+  tag: latest
+  pullPolicy: IfNotPresent
+
+mysql:
+  image: mysql:8.0
+  rootPassword: password
+  database: stream_store
+  port: 3306
+
+streamManager:
+  replicas: 1
+  port: 9800
+  replicationFactor: 2
+  heartbeatCheckIntervalMs: 3000
+
+extentNode:
+  replicas: 3
+  port: 9801
+  heartbeatIntervalMs: 5000
+
+benchmark:
+  enabled: true
+  durationSecs: 120
