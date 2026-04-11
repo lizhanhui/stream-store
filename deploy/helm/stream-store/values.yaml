@@ -1,5 +1,5 @@
 image:
-  repository: stream-store
+  repository: ccr.ccs.tencentyun.com/zhanhuili/stream-store:latest
   tag: latest
   pullPolicy: IfNotPresent
 
