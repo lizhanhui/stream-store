@@ -17,11 +17,11 @@ streamManager:
   heartbeatCheckIntervalMs: 3000
   resources:
     requests:
-      cpu: 500m
-      memory: 512Mi
+      cpu: "2"
+      memory: 4Gi
     limits:
-      cpu: "1"
-      memory: 1Gi
+      cpu: "2"
+      memory: 4Gi
 
 extentNode:
   replicas: 3
@@ -29,19 +29,19 @@ extentNode:
   heartbeatIntervalMs: 5000
   resources:
     requests:
-      cpu: "1"
-      memory: 1Gi
+      cpu: "4"
+      memory: 8Gi
     limits:
-      cpu: "2"
-      memory: 2Gi
+      cpu: "4"
+      memory: 8Gi
 
 benchmark:
   enabled: true
-  durationSecs: 120
+  durationSecs: 300
   resources:
     requests:
-      cpu: 500m
-      memory: 256Mi
+      cpu: "2"
+      memory: 4Gi
     limits:
-      cpu: "1"
-      memory: 512Mi
+      cpu: "2"
+      memory: 4Gi
