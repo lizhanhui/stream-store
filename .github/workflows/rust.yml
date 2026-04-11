@@ -26,3 +26,7 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Run Benchmarks
+      env:
+        RUST_LOG: "warn"
+      run: cargo bench --bench pipeline_append
