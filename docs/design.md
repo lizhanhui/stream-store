@@ -425,7 +425,7 @@ Variable Header:
 No Payload.
 ```
 
-##### 0x0A CREATE_STREAM_RESP (Stream Manager -> Client)
+##### 0x08 CREATE_STREAM_RESP (Stream Manager -> Client)
 
 Response to CREATE_STREAM. Returns the newly created stream ID, initial extent ID, and the Primary Extent Node address. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][error_code:u16]`, and the payload carries the error message.
 
@@ -441,7 +441,7 @@ Variable Header:
 No Payload.
 ```
 
-##### 0x08 QUERY_OFFSET (Client -> Extent Node / Stream Manager)
+##### 0x09 QUERY_OFFSET (Client -> Extent Node / Stream Manager)
 
 Query the max offset (exclusive) for a stream.
 
@@ -453,7 +453,7 @@ Variable Header:
 No Payload.
 ```
 
-##### 0x09 QUERY_OFFSET_RESP (Extent Node / Stream Manager -> Client)
+##### 0x0A QUERY_OFFSET_RESP (Extent Node / Stream Manager -> Client)
 
 Returns the current max offset. On failure, the same opcode is returned with `FLAG_RESPONSE_ERROR = 0x80`, variable header `[request_id:u32][stream_id:u64][error_code:u16]`, and the payload carries the error message.
 
