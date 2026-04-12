@@ -41,6 +41,10 @@ Start with **explicit configuration** — a `stream_class` or `tier` field in `C
 - Should tier transitions (hot -> warm -> cold) be automatic or operator-driven?
 - How does lazy arena allocation interact with the epoch-based autonomous extent creation? The Primary needs an arena before it can accept appends, but allocation adds latency to the first append after idle.
 
+### Resolution
+
+See [docs/adaptive-capacity.md](adaptive-capacity.md) for the detailed design: adaptive extent capacity with tick-as-append for idle shrink. Replaces the explicit tier model with a heuristic approach that automatically scales arena size based on usage patterns.
+
 ---
 
 ## Issue 2: Extent Count Explosion Under Time-Based Seal
