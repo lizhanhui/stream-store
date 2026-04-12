@@ -304,6 +304,86 @@ This is **not a critical issue** with the current design, but worth monitoring.
 
 ---
 
+## Issue 6: MQTT Topic-to-Stream Mapping Strategy
+
+### Problem
+
+MQTT deployments routinely have millions of topics. Mapping one topic to one stream is infeasible — each stream requires an arena, extent metadata in MySQL, a replica set, and seal-and-new lifecycle. Even with tiered arena sizing (Issue 1), millions of streams means millions of MySQL rows, millions of extent allocations, and unmanageable metadata overhead.
+
+### Proposed Solution: Fan-In Shared Streams + Fan-Out via Index Streams
+
+**Fan-in**: The MQTT protocol adapter hashes topics into a fixed number of shared data streams:
+
+```
+stream_id = hash(topic_name) % num_streams
+```
+
+For example, 1024 shared streams can absorb millions of topics. Each message in the shared stream carries the original topic name in its metadata (requires the structured message envelope from Issue 3d). The storage layer is unaware of MQTT topics — it just appends and reads bytes.
+
+This gives predictable, bounded resource usage regardless of topic count:
+- 1024 streams x 64 MiB arena = 64 GB (manageable)
+- 1024 extent rows per seal cycle (trivial for MySQL)
+
+**Fan-out**: Consumers subscribe to specific topics (or wildcard patterns like `sensor/+/temperature`). Two strategies for efficient reads:
+
+**Strategy A — Client-side filtering**: Consumer reads the shared data stream and discards messages for other topics. Simple, but suffers read amplification — a consumer interested in one low-volume topic in a stream shared with 100 high-volume topics reads and discards most data.
+
+**Strategy B — Per-subscription index stream** (recommended): The multi-dispatch index stream design (Phase 4 in design.md) becomes the primary mechanism:
+
+1. On publish: write message body to the shared data stream, get back `(stream_id, offset)`.
+2. For each matching subscription, append a lightweight index entry `(data_stream_id, offset)` to that subscription's index stream.
+3. Consumer reads from its index stream and resolves data references — O(1) reads with no scanning.
+
+Index streams are tiny (each entry is ~20 bytes) and can use small arenas with aggressive time-based seal. A million subscriptions with index streams at 4 KB each = 4 GB, which is feasible.
+
+```
+MQTT Publisher                  Storage Layer
+     |
+     | PUBLISH "sensor/floor3/temp" payload=72.5
+     |
+     v
+[Protocol Adapter]
+     |
+     |-- append(data_stream_47, envelope{topic="sensor/floor3/temp", body=72.5})
+     |       --> offset=9001
+     |
+     |-- append(index_stream_for_sub_A, pointer{data_stream=47, offset=9001})
+     |       (sub_A matches "sensor/+/temp")
+     |
+     |-- append(index_stream_for_sub_B, pointer{data_stream=47, offset=9001})
+     |       (sub_B matches "sensor/floor3/#")
+     |
+     v
+[Consumer A reads index_stream_A -> resolves data_stream_47:9001 -> gets message]
+```
+
+### Grouping Strategy Considerations
+
+- **Hash-based** (`hash(topic) % N`): Simple, even distribution, but unrelated topics share streams. Works well for general MQTT workloads.
+- **Prefix-based** (group by topic prefix, e.g., `sensor/*` -> stream A, `device/*` -> stream B): Better locality for wildcard subscriptions, but requires configuration or adaptive bucketing.
+- **Hybrid**: Hash-based by default, with explicit overrides for high-volume topics that deserve dedicated streams.
+
+### Consumer Offset Management
+
+A consumer subscribed to topic `sensor/temperature` reads from its per-subscription index stream. The committed offset advances linearly in the index stream, so the existing `stream_offset` model works directly — no gaps, no skipping.
+
+### Interaction with Other Issues
+
+- **Issue 1 (Tiered arenas)**: Shared data streams are hot (Tier 1). Index streams for active subscriptions are warm (Tier 2). Index streams for idle subscriptions are cold (Tier 3). This is the primary use case for tiered stream classes.
+- **Issue 2 (Extent compaction)**: Index streams with aggressive time-based seal produce many tiny extents. Compaction is essential for index stream lifecycle.
+- **Issue 3d (Structured envelope)**: Required — the topic name must be in the message envelope for the protocol adapter to build index entries and for Strategy A filtering.
+- **Phase 4 (Multi-dispatch)**: This issue elevates multi-dispatch from a "nice to have" to a **core requirement** for MQTT support. The index stream design should be prioritized accordingly.
+
+### Open Questions
+
+- How many shared data streams is the right default? 1024? 4096? Should it be configurable per MQTT namespace?
+- Should high-volume topics be automatically promoted to dedicated streams (auto-splitting), or is explicit configuration sufficient?
+- How does wildcard subscription matching (e.g., `sensor/+/temp`, `device/#`) interact with the fan-in model? The protocol adapter needs to evaluate filters against the full topic name at publish time to determine which index streams to append to.
+- What is the latency impact of the two-hop write path (data stream append + index stream appends) compared to direct single-stream append?
+- Should index stream entries be batched (multiple pointers per append) to reduce per-message overhead?
+
+---
+
 ## Priority Matrix
 
 | Priority | Issue | Rationale |
@@ -316,4 +396,5 @@ This is **not a critical issue** with the current design, but worth monitoring.
 | **P1** | Issue 4: Seal storm mitigation | Required for operational stability at scale |
 | **P2** | Issue 3c: Retained message KV store | MQTT-specific |
 | **P2** | Issue 3b: Per-message ACK tracking | MQTT QoS1/2, AMQP — may be protocol adapter concern |
+| **P1** | Issue 6: MQTT topic-to-stream fan-in + index stream fan-out | Millions of MQTT topics require fan-in; elevates multi-dispatch to core requirement |
 | **P2** | Issue 5: Connection scalability | Current design likely sufficient; needs benchmarking |
