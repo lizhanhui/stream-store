@@ -1,0 +1,49 @@
+{{- if .Values.benchmark.enabled }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ .Release.Name }}-benchmark
+  labels:
+    {{- include "stream-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: benchmark
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: benchmark
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-cluster
+          image: {{ include "stream-store.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              echo "waiting for stream-manager..."
+              until nc -z {{ .Release.Name }}-stream-manager {{ .Values.streamManager.port }} 2>/dev/null; do
+                sleep 2
+              done
+              echo "waiting for extent-nodes to register (15s)..."
+              sleep 15
+              echo "cluster ready"
+      containers:
+        - name: benchmark
+          image: {{ include "stream-store.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/pipeline_append_cluster"]
+          env:
+            - name: STREAM_MANAGER_ADDR
+              value: "{{ .Release.Name }}-stream-manager:{{ .Values.streamManager.port }}"
+            - name: BENCH_DURATION_SECS
+              value: {{ .Values.benchmark.durationSecs | quote }}
+            - name: RUST_LOG
+              value: "info"
+          {{- with .Values.benchmark.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+{{- end }}

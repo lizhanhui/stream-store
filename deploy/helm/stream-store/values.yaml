@@ -1,0 +1,47 @@
+image:
+  repository: ccr.ccs.tencentyun.com/zhanhuili/stream-store:latest
+  tag: latest
+  pullPolicy: IfNotPresent
+
+mysql:
+  host: ""          # REQUIRED: external MySQL host (e.g., mysql.cdb.myqcloud.com)
+  port: 3306
+  username: root
+  password: password
+  database: stream_store
+
+streamManager:
+  replicas: 1
+  port: 9800
+  replicationFactor: 2
+  heartbeatCheckIntervalMs: 3000
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi
+
+extentNode:
+  replicas: 3
+  port: 9801
+  heartbeatIntervalMs: 5000
+  resources:
+    requests:
+      cpu: "4"
+      memory: 8Gi
+    limits:
+      cpu: "4"
+      memory: 8Gi
+
+benchmark:
+  enabled: true
+  durationSecs: 300
+  resources:
+    requests:
+      cpu: "2"
+      memory: 4Gi
+    limits:
+      cpu: "2"
+      memory: 4Gi

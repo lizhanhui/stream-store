@@ -160,7 +160,8 @@ async fn main() {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
 
-    let stream_manager_addr = "tx.dev:9800".to_string();
+    let stream_manager_addr = std::env::var("STREAM_MANAGER_ADDR")
+        .unwrap_or_else(|_| "tx.dev:9800".to_string());
     let duration = bench_duration();
 
     // -- 1. Open a single stream via StreamManager ----------------------------

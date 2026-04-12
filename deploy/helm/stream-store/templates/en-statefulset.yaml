@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-extent-node
+  labels:
+    {{- include "stream-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: extent-node
+spec:
+  serviceName: {{ .Release.Name }}-extent-node
+  replicas: {{ .Values.extentNode.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: extent-node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: extent-node
+    spec:
+      initContainers:
+        - name: wait-for-sm
+          image: {{ include "stream-store.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command:
+            - sh
+            - -c
+            - |
+              until nc -z {{ .Release.Name }}-stream-manager {{ .Values.streamManager.port }} 2>/dev/null; do
+                echo "waiting for stream-manager..."
+                sleep 2
+              done
+      containers:
+        - name: extent-node
+          image: {{ include "stream-store.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/bin/bash", "/etc/stream-store/entrypoint.sh"]
+          ports:
+            - containerPort: {{ .Values.extentNode.port }}
+          env:
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          volumeMounts:
+            - name: entrypoint
+              mountPath: /etc/stream-store
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.extentNode.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          {{- with .Values.extentNode.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: entrypoint
+          configMap:
+            name: {{ .Release.Name }}-en-entrypoint
+            defaultMode: 0755
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-extent-node
+  labels:
+    {{- include "stream-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: extent-node
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: extent-node
+  ports:
+    - port: {{ .Values.extentNode.port }}
+      targetPort: {{ .Values.extentNode.port }}

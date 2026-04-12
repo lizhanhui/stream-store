@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-stream-manager
+  labels:
+    {{- include "stream-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stream-manager
+spec:
+  replicas: {{ .Values.streamManager.replicas }}
+  selector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: stream-manager
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: stream-manager
+    spec:
+      containers:
+        - name: stream-manager
+          image: {{ include "stream-store.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["/app/stream-manager", "--config", "/etc/stream-store/config.toml"]
+          ports:
+            - containerPort: {{ .Values.streamManager.port }}
+          volumeMounts:
+            - name: config
+              mountPath: /etc/stream-store
+          readinessProbe:
+            tcpSocket:
+              port: {{ .Values.streamManager.port }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          {{- with .Values.streamManager.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-sm-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-stream-manager
+  labels:
+    {{- include "stream-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stream-manager
+spec:
+  selector:
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: stream-manager
+  ports:
+    - port: {{ .Values.streamManager.port }}
+      targetPort: {{ .Values.streamManager.port }}

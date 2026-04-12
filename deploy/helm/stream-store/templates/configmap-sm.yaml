@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-sm-config
+  labels:
+    {{- include "stream-store.labels" . | nindent 4 }}
+    app.kubernetes.io/component: stream-manager
+data:
+  config.toml: |
+    bind_ip = "0.0.0.0"
+    port = {{ .Values.streamManager.port }}
+    mysql_host = {{ required "mysql.host is required" .Values.mysql.host | quote }}
+    mysql_port = {{ .Values.mysql.port }}
+    mysql_username = {{ .Values.mysql.username | quote }}
+    mysql_password = {{ .Values.mysql.password | quote }}
+    mysql_database = {{ .Values.mysql.database | quote }}
+    default_replication_factor = {{ .Values.streamManager.replicationFactor }}
+    heartbeat_check_interval_ms = {{ .Values.streamManager.heartbeatCheckIntervalMs }}

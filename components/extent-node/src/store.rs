@@ -532,11 +532,9 @@ impl ExtentNodeStore {
         // lazily created by a forwarded append that arrived before this RegisterExtent).
         let _start_offset = if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
             // RegisterExtent is the authoritative source for cache policy.
-            // The stream may have been lazily created by ForwardInitExtent
-            // before this arrives, so always apply the limit.
-            if cache_extents > 0 {
-                stream_mut.set_max_extents(cache_extents as usize);
-            }
+            // Always apply — the stream may have been lazily created by
+            // ForwardInitExtent before this arrives with max_extents=0.
+            stream_mut.set_max_extents(cache_extents as usize);
             if stream_mut.find_extent(extent_id).is_none() {
                 let so = stream_mut.max_offset();
                 stream_mut.register_extent(extent_id, so, extent_capacity, epoch);
