@@ -43,6 +43,30 @@ struct ArenaBuffer {
 unsafe impl Send for ArenaBuffer {}
 unsafe impl Sync for ArenaBuffer {}
 
+impl ArenaBuffer {
+    /// Resize the arena buffer to a new capacity via `realloc`.
+    ///
+    /// # Safety
+    /// Must only be called on buffers with no outstanding `Bytes` references
+    /// (i.e., `Arc::strong_count == 1`). The caller must update any derived
+    /// pointers (`buf`) after this call since `realloc` may move the allocation.
+    fn resize(&mut self, new_capacity: u32) {
+        let new_layout =
+            Layout::from_size_align(new_capacity as usize, 8).expect("invalid layout");
+        // SAFETY: ptr and layout were produced by alloc() in with_capacity().
+        // new_capacity > 0 (enforced by caller).
+        let new_ptr = unsafe {
+            std::alloc::realloc(self.ptr.as_ptr(), self.layout, new_capacity as usize)
+        };
+        if new_ptr.is_null() {
+            std::alloc::handle_alloc_error(new_layout);
+        }
+        self.ptr = NonNull::new(new_ptr).unwrap();
+        self.capacity = new_capacity;
+        self.layout = new_layout;
+    }
+}
+
 impl Drop for ArenaBuffer {
     fn drop(&mut self) {
         // SAFETY: ptr and layout were produced by alloc() in ArenaBuffer::new().
@@ -319,6 +343,43 @@ impl Extent {
         unsafe {
             *self.hasher.get() = crc32fast::Hasher::new();
         }
+    }
+
+    /// Resize this extent's arena and index for a new capacity.
+    ///
+    /// Uses `realloc` for the arena (may extend in-place) and reallocates
+    /// the index array. Must only be called on pool extents (not in the active
+    /// extent list, no outstanding `Bytes` references). Requires `&mut self`.
+    ///
+    /// After resize, the extent must be `reset()` before use — stale data
+    /// from the old capacity is not cleared (overwritten on use).
+    pub fn resize(&mut self, new_capacity: u32) {
+        debug_assert!(
+            Arc::strong_count(&self.arena) == 1,
+            "cannot resize arena with outstanding references"
+        );
+        // Resize the arena buffer via realloc.
+        Arc::get_mut(&mut self.arena)
+            .expect("arena has outstanding references")
+            .resize(new_capacity);
+        self.buf = self.arena.ptr.as_ptr();
+        self.capacity = new_capacity;
+
+        // Reallocate the index array for the new capacity.
+        let index_capacity = (new_capacity / MIN_RECORD_SIZE) as usize;
+        let index_layout = Layout::from_size_align(
+            index_capacity * std::mem::size_of::<AtomicU32>(),
+            std::mem::align_of::<AtomicU32>(),
+        )
+        .expect("invalid index layout");
+        let index_ptr = unsafe { std::alloc::alloc_zeroed(index_layout) };
+        if index_ptr.is_null() {
+            std::alloc::handle_alloc_error(index_layout);
+        }
+        self.index = unsafe {
+            Vec::from_raw_parts(index_ptr as *mut AtomicU32, index_capacity, index_capacity)
+        }
+        .into_boxed_slice();
     }
 
     /// Append a message. Returns the assigned logical offset and the byte
@@ -1254,5 +1315,45 @@ mod tests {
 
         // All records present, CRC32 hashed inline — verification succeeds.
         assert_eq!(secondary.try_verify_checksum(), Some(true));
+    }
+
+    #[test]
+    fn resize_basic() {
+        // Create a small extent and resize it larger.
+        let mut ext = Extent::with_capacity(ExtentId(1), Offset(0), 1024, Epoch(0));
+        assert_eq!(ext.capacity(), 1024);
+
+        // Resize to 4096.
+        ext.resize(4096);
+        assert_eq!(ext.capacity(), 4096);
+        // Index should be resized too.
+        let expected_index_len = (4096 / MIN_RECORD_SIZE) as usize;
+        assert_eq!(ext.index.len(), expected_index_len);
+
+        // After resize + reset, the extent should work normally.
+        ext.reset(ExtentId(2), Offset(100), Epoch(1));
+        let r0 = ext.append(Bytes::from_static(b"after-resize")).unwrap();
+        assert_eq!(r0.offset, Offset(100));
+        let msgs = ext.read(r0.byte_pos, 1).unwrap();
+        assert_eq!(msgs[0], Bytes::from_static(b"after-resize"));
+    }
+
+    #[test]
+    fn resize_shrink() {
+        // Create a larger extent and resize it smaller.
+        let mut ext = Extent::with_capacity(ExtentId(1), Offset(0), 8192, Epoch(0));
+        assert_eq!(ext.capacity(), 8192);
+
+        ext.resize(2048);
+        assert_eq!(ext.capacity(), 2048);
+        let expected_index_len = (2048 / MIN_RECORD_SIZE) as usize;
+        assert_eq!(ext.index.len(), expected_index_len);
+
+        // After resize + reset, the extent should work with reduced capacity.
+        ext.reset(ExtentId(3), Offset(0), Epoch(0));
+        let r = ext.append(Bytes::from_static(b"shrunk")).unwrap();
+        assert_eq!(r.offset, Offset(0));
+        let msgs = ext.read(r.byte_pos, 1).unwrap();
+        assert_eq!(msgs[0], Bytes::from_static(b"shrunk"));
     }
 }

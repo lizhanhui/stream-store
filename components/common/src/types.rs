@@ -50,6 +50,10 @@ pub const FLAG_DESCRIBE_STREAM_BY_NAME: u8 = 0x01;
 /// opcode-specific error header instead of the success header layout.
 pub const FLAG_RESPONSE_ERROR: u8 = 0x80;
 
+/// Flag on APPEND: system-generated tick for capacity scaling.
+/// When set, the append is synthetic (no payload), flagged for special handling.
+pub const FLAG_SYSTEM_TICK: u8 = 0x01;
+
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u64);

@@ -15,13 +15,31 @@ pub const DEFAULT_SM_REQUEST_TIMEOUT_MS: u64 = 2000;
 pub const DEFAULT_REPLICATION_TIMEOUT_MS: u64 = 500;
 
 /// Default extent capacity: 64 MiB per extent arena.
+/// Used as a convenient default in tests. Production code uses
+/// DEFAULT_MIN_EXTENT_CAPACITY and DEFAULT_MAX_EXTENT_CAPACITY.
 pub const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
+
+/// Default minimum extent capacity: 8 MiB (floor for adaptive sizing).
+/// New streams start at this capacity and scale up on demand.
+pub const DEFAULT_MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024;
+
+/// Default maximum extent capacity: 256 MiB (ceiling for adaptive sizing).
+/// Hot streams grow up to this capacity via 2x doubling on extent-full.
+pub const DEFAULT_MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024;
 
 /// Default cache_extents: max extents to retain in memory per stream.
 pub const DEFAULT_CACHE_EXTENTS: u32 = 4;
 
 /// Maximum supported replication factor (RF is normally 1-3).
 pub const MAX_REPLICATION_FACTOR: usize = 5;
+
+/// Default interval (seconds) between system tick injections for idle-shrink.
+pub const DEFAULT_IDLE_SHRINK_INTERVAL_SECS: u64 = 60;
+
+/// Default threshold (seconds) before an under-utilized extent is shrunk.
+/// If an extent hasn't reached 50% fill within this duration, a system tick
+/// triggers seal-and-create with a smaller capacity.
+pub const DEFAULT_IDLE_SHRINK_THRESHOLD_SECS: u64 = 300;
 
 /// Base server configuration (shared fields).
 #[derive(Debug, Clone, Deserialize)]

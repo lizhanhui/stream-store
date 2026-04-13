@@ -5,6 +5,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
+use common::config::{DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use dashmap::DashMap;
@@ -16,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::downstream::DownstreamPool;
-use crate::stream::Stream;
+use crate::stream::{SealReason, Stream};
 
 // ── Broadcast replication types ──────────────────────────────────────────────
 
@@ -191,6 +192,7 @@ pub enum ExtentUpdate {
         sealed_extent_id: ExtentId,
         end_offset: u64,
         new_extent_id: ExtentId,
+        new_extent_capacity: u32,
         epoch: Epoch,
     },
     /// Periodic progress report for an active extent (observability).
@@ -537,7 +539,7 @@ impl ExtentNodeStore {
             stream_mut.set_max_extents(cache_extents as usize);
             if stream_mut.find_extent(extent_id).is_none() {
                 let so = stream_mut.max_offset();
-                stream_mut.register_extent(extent_id, so, extent_capacity, epoch);
+                stream_mut.register_extent(extent_id, so, extent_capacity, epoch, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY);
                 so
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
@@ -548,7 +550,7 @@ impl ExtentNodeStore {
         } else {
             let mut stream = Stream::new(stream_id);
             stream.set_max_extents(cache_extents as usize);
-            stream.register_extent(extent_id, Offset(0), extent_capacity, epoch);
+            stream.register_extent(extent_id, Offset(0), extent_capacity, epoch, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY);
             self.streams.insert(stream_id, stream);
             Offset(0)
         };
@@ -1065,7 +1067,7 @@ impl ExtentNodeStore {
         stream_id: StreamId,
     ) -> Option<crate::stream::SealNotification> {
         if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-            let notif = stream_mut.seal_and_create_next();
+            let notif = stream_mut.seal_and_create_next(SealReason::ExtentFull);
             // Update ReplicaInfo to point to new extent_id.
             if let Some(ref n) = notif {
                 if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
@@ -1086,6 +1088,7 @@ impl ExtentNodeStore {
                 sealed_extent_id: notif.sealed_extent_id,
                 end_offset: notif.end_offset,
                 new_extent_id: notif.new_extent_id,
+                new_extent_capacity: notif.new_extent_capacity,
                 epoch: notif.epoch,
             });
         }
@@ -1576,7 +1579,7 @@ impl ExtentNodeStore {
                 stream_mut.set_max_extents(cache_extents as usize);
             }
             if stream_mut.find_extent(extent_id).is_none() {
-                stream_mut.register_extent(extent_id, start_offset, extent_capacity, epoch);
+                stream_mut.register_extent(extent_id, start_offset, extent_capacity, epoch, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY);
                 info!(
                     "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}",
                     stream_id, extent_id, start_offset, extent_capacity,
@@ -1585,7 +1588,7 @@ impl ExtentNodeStore {
         } else {
             let mut stream = Stream::new(stream_id);
             stream.set_max_extents(cache_extents as usize);
-            stream.register_extent(extent_id, start_offset, extent_capacity, epoch);
+            stream.register_extent(extent_id, start_offset, extent_capacity, epoch, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY);
             self.streams.insert(stream_id, stream);
             self.next_stream_id
                 .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
@@ -2042,6 +2045,8 @@ mod tests {
                         replication_factor: 1,
                         epoch: Epoch(0),
                         extent_capacity: DEFAULT_EXTENT_CAPACITY,
+                        min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2249,6 +2254,8 @@ mod tests {
                         replication_factor: 2,
                         epoch: Epoch(0),
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
+                        min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2294,6 +2301,8 @@ mod tests {
                         replication_factor: 2,
                         epoch: Epoch(0),
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
+                        min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2334,6 +2343,8 @@ mod tests {
                         replication_factor: 1,
                         epoch: Epoch(0),
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
+                        min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2395,6 +2406,8 @@ mod tests {
                         replication_factor: 3,
                         epoch: Epoch(0),
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
+                        min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2478,6 +2491,8 @@ mod tests {
                         replication_factor: 2,
                         epoch: Epoch(0),
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
+                        min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -3086,6 +3101,8 @@ mod tests {
                         replication_factor: 2,
                         epoch: Epoch(0),
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
+                        min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
