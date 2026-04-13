@@ -1133,9 +1133,7 @@ impl StreamManagerStore {
             self.store.get_stream_replication_factor(stream_id).await? as usize;
         let _extent_capacity = self.store.get_stream_extent_capacity(stream_id).await?;
         let cache_extents = self.store.get_stream_cache_extents(stream_id).await?;
-        // TODO: Update schema to store min/max_extent_capacity; use defaults for now
-        let min_extent_capacity = DEFAULT_MIN_EXTENT_CAPACITY;
-        let max_extent_capacity = DEFAULT_MAX_EXTENT_CAPACITY;
+        let (min_extent_capacity, max_extent_capacity) = self.store.get_stream_capacity_bounds(stream_id).await?;
         let nodes = self.allocator.pick_nodes(replication_factor).await?;
 
         let new_replicas: Vec<(String, u8)> = nodes
