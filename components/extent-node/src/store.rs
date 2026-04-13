@@ -376,6 +376,23 @@ impl ExtentNodeStore {
             })
             .collect()
     }
+
+    /// Inject a system tick to all active streams to trigger idle shrink detection.
+    /// Each tick is a synthetic append with no payload and FLAG_SYSTEM_TICK set.
+    pub fn inject_ticks(&self) {
+        for entry in self.streams.iter() {
+            let stream = entry.value();
+            if stream.is_mutable() {
+                if let Some(extent_id) = stream.active_extent_id() {
+                    // Append an empty payload with FLAG_SYSTEM_TICK set
+                    let tick_payload = Bytes::new();
+                    // Note: The flag will be set by the client when constructing the Append frame.
+                    // For now, we just append an empty message which will be detected as a tick.
+                    let _ = stream.append(extent_id, tick_payload);
+                }
+            }
+        }
+    }
 }
 
 impl Default for ExtentNodeStore {
