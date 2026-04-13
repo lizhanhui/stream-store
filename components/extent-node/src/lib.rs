@@ -115,6 +115,26 @@ impl ExtentNode {
             update_rx,
         );
 
+        // Spawn tick injection task (periodic system ticks for idle shrink detection).
+        // Ticks are synthetic appends to all active streams, flagged with FLAG_SYSTEM_TICK.
+        let tick_store = Arc::clone(&store);
+        let mut tick_shutdown = shutdown_tx.subscribe();
+        let tick_interval_ms = config.heartbeat_interval_ms; // Same cadence as heartbeats
+        task_handles.push(tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(tick_interval_ms as u64));
+            loop {
+                tokio::select! {
+                    _ = ticker.tick() => {
+                        tick_store.inject_ticks();
+                    }
+                    _ = tick_shutdown.recv() => {
+                        info!("tick injection task received shutdown signal");
+                        break;
+                    }
+                }
+            }
+        }));
+
         // Spawn accept loop (plain tokio::spawn — worker pinning is handled
         // at the runtime level via on_thread_start core affinity).
         let server_shutdown = shutdown_tx.subscribe();
