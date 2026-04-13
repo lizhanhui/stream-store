@@ -54,7 +54,8 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const NUM_SENDERS: usize = 4;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u16 = 2;
-const EXTENT_CAPACITY: u32 = 64 * 1024 * 1024; // 64 MiB
+const MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024; // 8 MiB
+const MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024; // 256 MiB
 const PIPELINE_DEPTH: usize = 4; // max in-flight appends per sender
 const CACHE_EXTENTS: u32 = 4;
 
@@ -191,7 +192,8 @@ async fn main() {
         .open(
             "bench-pipeline",
             REPLICATION_FACTOR,
-            EXTENT_CAPACITY,
+            MIN_EXTENT_CAPACITY,
+            MAX_EXTENT_CAPACITY,
             CACHE_EXTENTS,
         )
         .await

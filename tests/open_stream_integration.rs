@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY, StreamManagerConfig};
+use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY, StreamManagerConfig};
 use common::types::{Epoch, ExtentState, NodeMetrics};
 
 /// Initialize tracing for tests.
@@ -114,7 +114,8 @@ async fn stream_client_open_integration() {
         .open(
             "test-stream",
             1,
-            DEFAULT_EXTENT_CAPACITY,
+            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
         )
         .await
@@ -138,7 +139,8 @@ async fn stream_client_open_integration() {
         .open(
             "test-stream",
             1,
-            DEFAULT_EXTENT_CAPACITY,
+            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
         )
         .await
@@ -157,7 +159,8 @@ async fn stream_client_open_integration() {
         .open(
             "another-stream",
             1,
-            DEFAULT_EXTENT_CAPACITY,
+            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
         )
         .await
