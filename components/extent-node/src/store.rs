@@ -377,18 +377,46 @@ impl ExtentNodeStore {
             .collect()
     }
 
-    /// Inject a system tick to all active streams to trigger idle shrink detection.
-    /// Each tick is a synthetic append with no payload and FLAG_SYSTEM_TICK set.
-    pub fn inject_ticks(&self) {
-        for entry in self.streams.iter() {
-            let stream = entry.value();
-            if stream.is_mutable() {
-                if let Some(extent_id) = stream.active_extent_id() {
-                    // Append an empty payload with FLAG_SYSTEM_TICK set
-                    let tick_payload = Bytes::new();
-                    // Note: The flag will be set by the client when constructing the Append frame.
-                    // For now, we just append an empty message which will be detected as a tick.
-                    let _ = stream.append(extent_id, tick_payload);
+    /// Inject system ticks to trigger idle-shrink for under-utilized streams.
+    ///
+    /// Iterates all active streams and checks the 5-minute rule. For eligible
+    /// streams (idle > threshold, < 50% full), seals the active extent and
+    /// creates a new one with reduced capacity. Uses the existing seal-and-create
+    /// machinery including SM notification and ForwardChecksum to secondaries.
+    pub fn inject_ticks(&self, idle_threshold: Duration) {
+        // First pass: collect candidates (read guards only).
+        let candidates: Vec<StreamId> = self
+            .streams
+            .iter()
+            .filter_map(|entry| {
+                let stream = entry.value();
+                if stream.should_idle_shrink(idle_threshold) {
+                    Some(*entry.key())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        // Second pass: seal-and-create for each candidate (write guard).
+        for stream_id in candidates {
+            if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
+                // Re-check under write guard (may have changed between passes).
+                if !stream_mut.should_idle_shrink(idle_threshold) {
+                    continue;
+                }
+                if let Some(notif) = stream_mut.seal_and_create_next(SealReason::IdleShrink) {
+                    // Update ReplicaInfo to point to new extent_id.
+                    if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
+                        ri.extent_id = notif.new_extent_id;
+                    }
+                    drop(stream_mut); // release write guard before sending notifications
+                    self.send_extent_update(stream_id, &notif);
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                    info!(
+                        "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
+                        stream_id, notif.sealed_extent_id, notif.new_extent_id, notif.new_extent_capacity,
+                    );
                 }
             }
         }
