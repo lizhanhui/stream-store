@@ -232,17 +232,19 @@ impl StreamClient {
     }
 
     /// Create a new stream on the StreamManager.
-    /// Variable header carries stream name, per-stream replication factor, per-stream extent capacity,
+    /// Variable header carries stream name, per-stream replication factor, per-stream extent capacity bounds,
     /// and per-stream cache_extents (max extents to retain in memory).
     /// If replication_factor=0, the StreamManager uses its default.
-    /// If extent_capacity=0, the StreamManager uses its default (64 MiB).
+    /// If min_extent_capacity=0, the StreamManager uses its default (8 MiB).
+    /// If max_extent_capacity=0, the StreamManager uses its default (256 MiB).
     /// If cache_extents=0, the StreamManager uses its default (4).
     /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
     pub async fn create_stream(
         &self,
         name: &str,
         replication_factor: u16,
-        extent_capacity: u32,
+        min_extent_capacity: u32,
+        max_extent_capacity: u32,
         cache_extents: u32,
     ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
@@ -250,7 +252,8 @@ impl StreamClient {
                 request_id: self.alloc_request_id(),
                 stream_name: Bytes::from(name.to_owned()),
                 replication_factor,
-                extent_capacity,
+                min_extent_capacity,
+                max_extent_capacity,
                 cache_extents,
             },
             None,
@@ -681,7 +684,8 @@ impl StreamClient {
         &self,
         stream_name: &str,
         replication_factor: u16,
-        extent_capacity: u32,
+        min_extent_capacity: u32,
+        max_extent_capacity: u32,
         cache_extents: u32,
     ) -> Result<StreamId, StorageError> {
         match self.describe_stream_by_name(stream_name, 1).await {
@@ -691,7 +695,8 @@ impl StreamClient {
                     .create_stream(
                         stream_name,
                         replication_factor,
-                        extent_capacity,
+                        min_extent_capacity,
+                        max_extent_capacity,
                         cache_extents,
                     )
                     .await?;

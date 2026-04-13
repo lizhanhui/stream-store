@@ -483,6 +483,7 @@ impl StreamManagerClient {
                 sealed_extent_id,
                 end_offset,
                 new_extent_id,
+                new_extent_capacity,
                 epoch,
             } => (
                 Frame::new(
@@ -492,6 +493,7 @@ impl StreamManagerClient {
                         sealed_extent_id,
                         end_offset: Offset(end_offset),
                         new_extent_id,
+                        new_extent_capacity,
                     },
                     None,
                 ),

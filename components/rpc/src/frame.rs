@@ -96,7 +96,10 @@ pub enum VariableHeader {
         request_id: u32,
         stream_name: Bytes,
         replication_factor: u16,
-        extent_capacity: u32,
+        /// Minimum extent capacity for new extents (0 = use default min).
+        min_extent_capacity: u32,
+        /// Maximum extent capacity for new extents (0 = use default max).
+        max_extent_capacity: u32,
         cache_extents: u32,
     },
     CreateStreamResp {
@@ -163,6 +166,10 @@ pub enum VariableHeader {
         extent_capacity: u32,
         /// Maximum extents to retain in memory for this stream. 0 = no limit.
         cache_extents: u32,
+        /// Minimum extent capacity for this stream (0 = use default min).
+        min_extent_capacity: u32,
+        /// Maximum extent capacity for this stream (0 = use default max).
+        max_extent_capacity: u32,
     },
     RegisterExtentAck {
         request_id: u32,
@@ -188,6 +195,8 @@ pub enum VariableHeader {
         sealed_extent_id: ExtentId,
         end_offset: Offset,
         new_extent_id: ExtentId,
+        /// Capacity of the newly created extent (may be different due to adaptive scaling).
+        new_extent_capacity: u32,
     },
     /// Active extent progress report (UpdateExtent, flag=0x01).
     /// Fire-and-forget periodic update of current offset for observability.
@@ -1009,9 +1018,9 @@ impl Frame {
             }
             // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
             VariableHeader::SealAckError { .. } => 4 + 8 + 4 + 2,
-            // request_id(4) + name_len(2) + name(N) + replication_factor(2) + extent_capacity(4) + cache_extents(4)
+            // request_id(4) + name_len(2) + name(N) + replication_factor(2) + min_extent_capacity(4) + max_extent_capacity(4) + cache_extents(4)
             VariableHeader::CreateStream { stream_name, .. } => {
-                4 + 2 + stream_name.len() + 2 + 4 + 4
+                4 + 2 + stream_name.len() + 2 + 4 + 4 + 4
             }
             // request_id(4) + stream_id(8) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
             VariableHeader::CreateStreamResp { primary_addr, .. } => {
@@ -1035,16 +1044,16 @@ impl Frame {
             VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
-            // request_id(4) + stream_id(8) + extent_id(4) + role(1) + replication_factor(2) + epoch(4) + extent_capacity(4) + cache_extents(4)
-            VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4 + 4 + 4,
+            // request_id(4) + stream_id(8) + extent_id(4) + role(1) + replication_factor(2) + epoch(4) + extent_capacity(4) + cache_extents(4) + min_extent_capacity(4) + max_extent_capacity(4)
+            VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4 + 4 + 4 + 4 + 4,
             // request_id(4) + stream_id(8) + extent_id(4)
             VariableHeader::RegisterExtentAck { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
             VariableHeader::RegisterExtentAckError { .. } => 4 + 8 + 4 + 2,
             // stream_id(8) + extent_id(4) + offset(8) -- no request_id
             VariableHeader::Watermark { .. } => 8 + 4 + 8,
-            // stream_id(8) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4)
-            VariableHeader::UpdateExtentSealed { .. } => 8 + 4 + 4 + 8 + 4,
+            // stream_id(8) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4) + new_extent_capacity(4)
+            VariableHeader::UpdateExtentSealed { .. } => 8 + 4 + 4 + 8 + 4 + 4,
             // stream_id(8) + epoch(4) + extent_id(4) + current_offset(8)
             VariableHeader::UpdateExtentProgress { .. } => 8 + 4 + 4 + 8,
             // request_id(4) + stream_id(8) + epoch(4)
@@ -1271,14 +1280,16 @@ impl Frame {
                 request_id,
                 stream_name,
                 replication_factor,
-                extent_capacity,
+                min_extent_capacity,
+                max_extent_capacity,
                 cache_extents,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u16(stream_name.len() as u16);
                 dst.extend_from_slice(stream_name);
                 dst.put_u16(*replication_factor);
-                dst.put_u32(*extent_capacity);
+                dst.put_u32(*min_extent_capacity);
+                dst.put_u32(*max_extent_capacity);
                 dst.put_u32(*cache_extents);
             }
             VariableHeader::CreateStreamResp {
@@ -1341,6 +1352,8 @@ impl Frame {
                 epoch,
                 extent_capacity,
                 cache_extents,
+                min_extent_capacity,
+                max_extent_capacity,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
@@ -1350,6 +1363,8 @@ impl Frame {
                 dst.put_u32(epoch.0);
                 dst.put_u32(*extent_capacity);
                 dst.put_u32(*cache_extents);
+                dst.put_u32(*min_extent_capacity);
+                dst.put_u32(*max_extent_capacity);
             }
             VariableHeader::ConnectAck { request_id }
             | VariableHeader::DisconnectAck { request_id } => {
@@ -1530,12 +1545,14 @@ impl Frame {
                 sealed_extent_id,
                 end_offset,
                 new_extent_id,
+                new_extent_capacity,
             } => {
                 dst.put_u64(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(sealed_extent_id.0);
                 dst.put_u64(end_offset.0);
                 dst.put_u32(new_extent_id.0);
+                dst.put_u32(*new_extent_capacity);
             }
             VariableHeader::UpdateExtentProgress {
                 stream_id,
@@ -1831,14 +1848,16 @@ impl Frame {
                 let name_len = body.get_u16() as usize;
                 let stream_name = body.split_to(name_len).freeze();
                 let replication_factor = body.get_u16();
-                let extent_capacity = body.get_u32();
+                let min_extent_capacity = body.get_u32();
+                let max_extent_capacity = body.get_u32();
                 let cache_extents = body.get_u32();
                 Ok((
                     VariableHeader::CreateStream {
                         request_id,
                         stream_name,
                         replication_factor,
-                        extent_capacity,
+                        min_extent_capacity,
+                        max_extent_capacity,
                         cache_extents,
                     },
                     None,
@@ -1953,6 +1972,8 @@ impl Frame {
                 let epoch = Epoch(body.get_u32());
                 let extent_capacity = body.get_u32();
                 let cache_extents = body.get_u32();
+                let min_extent_capacity = body.get_u32();
+                let max_extent_capacity = body.get_u32();
                 let payload = Self::read_payload(body);
                 Ok((
                     VariableHeader::RegisterExtent {
@@ -1964,6 +1985,8 @@ impl Frame {
                         epoch,
                         extent_capacity,
                         cache_extents,
+                        min_extent_capacity,
+                        max_extent_capacity,
                     },
                     payload,
                 ))
@@ -2248,6 +2271,7 @@ impl Frame {
                         let sealed_extent_id = ExtentId(body.get_u32());
                         let end_offset = Offset(body.get_u64());
                         let new_extent_id = ExtentId(body.get_u32());
+                        let new_extent_capacity = body.get_u32();
                         Ok((
                             VariableHeader::UpdateExtentSealed {
                                 stream_id,
@@ -2255,6 +2279,7 @@ impl Frame {
                                 sealed_extent_id,
                                 end_offset,
                                 new_extent_id,
+                                new_extent_capacity,
                             },
                             None,
                         ))
@@ -2790,7 +2815,8 @@ mod tests {
                 request_id: 5,
                 stream_name: Bytes::from_static(b"my-stream"),
                 replication_factor: 3,
-                extent_capacity: 67_108_864,
+                min_extent_capacity: 8_388_608,
+                max_extent_capacity: 268_435_456,
                 cache_extents: 4,
             },
             None,
@@ -2806,13 +2832,15 @@ mod tests {
             VariableHeader::CreateStream {
                 stream_name,
                 replication_factor,
-                extent_capacity,
+                min_extent_capacity,
+                max_extent_capacity,
                 cache_extents,
                 ..
             } => {
                 assert_eq!(stream_name, &Bytes::from_static(b"my-stream"));
                 assert_eq!(*replication_factor, 3);
-                assert_eq!(*extent_capacity, 67_108_864);
+                assert_eq!(*min_extent_capacity, 8_388_608);
+                assert_eq!(*max_extent_capacity, 268_435_456);
                 assert_eq!(*cache_extents, 4);
             }
             _ => panic!("expected CreateStream"),
