@@ -773,8 +773,7 @@ impl StreamManagerStore {
 
         let result = async {
             // 1. Create stream in metadata with per-stream replication factor and extent capacity.
-            // TODO: Update schema to store min/max_extent_capacity; pass max for now
-            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u16, max_extent_capacity, cache_extents).await?;
+            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u16, min_extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents).await?;
 
             // 2. Allocate first extent replica set and notify ExtentNodes.
             let (extent_id, primary_addr) =
