@@ -195,6 +195,7 @@ async fn client_task(
             REPLICATION_FACTOR,
             0,
             0,
+            0,
         )
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: create_stream failed: {e}"));

@@ -82,6 +82,8 @@ async fn register_extent(
                 epoch: Epoch(0),
                 extent_capacity: 64 * 1024 * 1024,
                 cache_extents: 4,
+                min_extent_capacity: 8 * 1024 * 1024,
+                max_extent_capacity: 256 * 1024 * 1024,
             },
             Some(payload),
         ))

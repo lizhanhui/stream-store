@@ -7,7 +7,10 @@
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY, StreamManagerConfig};
+use common::config::{
+    DEFAULT_CACHE_EXTENTS, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
+    StreamManagerConfig,
+};
 use common::types::{Epoch, ExtentState, NodeMetrics};
 
 /// Initialize tracing for tests.

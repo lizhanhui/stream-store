@@ -51,13 +51,11 @@ impl ArenaBuffer {
     /// (i.e., `Arc::strong_count == 1`). The caller must update any derived
     /// pointers (`buf`) after this call since `realloc` may move the allocation.
     fn resize(&mut self, new_capacity: u32) {
-        let new_layout =
-            Layout::from_size_align(new_capacity as usize, 8).expect("invalid layout");
+        let new_layout = Layout::from_size_align(new_capacity as usize, 8).expect("invalid layout");
         // SAFETY: ptr and layout were produced by alloc() in with_capacity().
         // new_capacity > 0 (enforced by caller).
-        let new_ptr = unsafe {
-            std::alloc::realloc(self.ptr.as_ptr(), self.layout, new_capacity as usize)
-        };
+        let new_ptr =
+            unsafe { std::alloc::realloc(self.ptr.as_ptr(), self.layout, new_capacity as usize) };
         if new_ptr.is_null() {
             std::alloc::handle_alloc_error(new_layout);
         }
