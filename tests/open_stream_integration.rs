@@ -8,8 +8,8 @@
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{
-    DEFAULT_CACHE_EXTENTS, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
-    StreamManagerConfig,
+    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
+    DEFAULT_MIN_EXTENT_CAPACITY, StreamManagerConfig,
 };
 use common::types::{Epoch, ExtentState, NodeMetrics};
 
@@ -120,7 +120,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MIN_EXTENT_CAPACITY,
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
-            0,
+            DEFAULT_EXTENT_GROWTH_FACTOR,
         )
         .await
         .unwrap();
@@ -146,7 +146,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MIN_EXTENT_CAPACITY,
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
-            0,
+            DEFAULT_EXTENT_GROWTH_FACTOR,
         )
         .await
         .unwrap();
@@ -167,7 +167,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MIN_EXTENT_CAPACITY,
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
-            0,
+            DEFAULT_EXTENT_GROWTH_FACTOR,
         )
         .await
         .unwrap();

@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::DEFAULT_CACHE_EXTENTS;
+use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR};
 use common::errors::StorageError;
 use common::types::{Epoch, StreamId};
 use futures_util::StreamExt;
@@ -176,7 +176,7 @@ async fn main() {
             MIN_EXTENT_CAPACITY,
             MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
-            0,
+            DEFAULT_EXTENT_GROWTH_FACTOR,
         )
         .await
         .expect("open stream");

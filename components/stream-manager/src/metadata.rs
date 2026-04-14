@@ -301,16 +301,12 @@ impl MetadataStore {
     }
 
     /// Get the extent growth factor for a stream.
-    pub async fn get_stream_growth_factor(
-        &self,
-        stream_id: StreamId,
-    ) -> Result<u32, StorageError> {
-        let row =
-            sqlx::query("SELECT extent_growth_factor FROM stream WHERE stream_id = ?")
-                .bind(stream_id.0 as i64)
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|e| StorageError::Internal(format!("get_stream_growth_factor: {e}")))?;
+    pub async fn get_stream_growth_factor(&self, stream_id: StreamId) -> Result<u32, StorageError> {
+        let row = sqlx::query("SELECT extent_growth_factor FROM stream WHERE stream_id = ?")
+            .bind(stream_id.0 as i64)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|e| StorageError::Internal(format!("get_stream_growth_factor: {e}")))?;
 
         Ok(row.get::<i32, _>("extent_growth_factor") as u32)
     }
