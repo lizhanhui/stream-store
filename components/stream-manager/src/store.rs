@@ -3,7 +3,9 @@ use std::time::Duration;
 use crate::allocator::Allocator;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
-use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY};
+use common::config::{
+    DEFAULT_CACHE_EXTENTS, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
+};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use futures_util::future;
@@ -718,31 +720,36 @@ impl StreamManagerStore {
     ///
     /// Response variable header carries primary_addr.
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
-        let (stream_name, replication_factor, min_extent_capacity, max_extent_capacity, cache_extents) =
-            match &frame.variable_header {
-                VariableHeader::CreateStream {
-                    stream_name,
-                    replication_factor,
-                    min_extent_capacity,
-                    max_extent_capacity,
-                    cache_extents,
-                    ..
-                } => (
-                    String::from_utf8_lossy(stream_name).to_string(),
-                    *replication_factor,
-                    *min_extent_capacity,
-                    *max_extent_capacity,
-                    *cache_extents,
-                ),
-                _ => {
-                    return Frame::error_from_request(
-                        &frame,
-                        ErrorCode::InternalError,
-                        "invalid CreateStream frame",
-                        ExtentId(0),
-                    );
-                }
-            };
+        let (
+            stream_name,
+            replication_factor,
+            min_extent_capacity,
+            max_extent_capacity,
+            cache_extents,
+        ) = match &frame.variable_header {
+            VariableHeader::CreateStream {
+                stream_name,
+                replication_factor,
+                min_extent_capacity,
+                max_extent_capacity,
+                cache_extents,
+                ..
+            } => (
+                String::from_utf8_lossy(stream_name).to_string(),
+                *replication_factor,
+                *min_extent_capacity,
+                *max_extent_capacity,
+                *cache_extents,
+            ),
+            _ => {
+                return Frame::error_from_request(
+                    &frame,
+                    ErrorCode::InternalError,
+                    "invalid CreateStream frame",
+                    ExtentId(0),
+                );
+            }
+        };
 
         // Use server default if client sends replication_factor=0.
         let replication_factor = if replication_factor == 0 {
@@ -1133,7 +1140,8 @@ impl StreamManagerStore {
             self.store.get_stream_replication_factor(stream_id).await? as usize;
         let _extent_capacity = self.store.get_stream_extent_capacity(stream_id).await?;
         let cache_extents = self.store.get_stream_cache_extents(stream_id).await?;
-        let (min_extent_capacity, max_extent_capacity) = self.store.get_stream_capacity_bounds(stream_id).await?;
+        let (min_extent_capacity, max_extent_capacity) =
+            self.store.get_stream_capacity_bounds(stream_id).await?;
         let nodes = self.allocator.pick_nodes(replication_factor).await?;
 
         let new_replicas: Vec<(String, u8)> = nodes

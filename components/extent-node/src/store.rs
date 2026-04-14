@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::config::{DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY};
+use common::config::{DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY};
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
 use dashmap::DashMap;
@@ -17,7 +17,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::downstream::DownstreamPool;
-use crate::stream::{SealReason, Stream};
+use crate::stream::{SealNotification, SealReason, Stream};
 
 // ── Broadcast replication types ──────────────────────────────────────────────
 
@@ -377,49 +377,21 @@ impl ExtentNodeStore {
             .collect()
     }
 
-    /// Inject system ticks to trigger idle-shrink for under-utilized streams.
+    /// Return stream IDs eligible for idle-shrink (read-only scan).
     ///
-    /// Iterates all active streams and checks the 5-minute rule. For eligible
-    /// streams (idle > threshold, < 50% full), seals the active extent and
-    /// creates a new one with reduced capacity. Uses the existing seal-and-create
-    /// machinery including SM notification and ForwardChecksum to secondaries.
-    pub fn inject_ticks(&self, idle_threshold: Duration) {
-        // First pass: collect candidates (read guards only).
-        let candidates: Vec<StreamId> = self
-            .streams
+    /// A stream is a candidate when its active extent has been under-utilized
+    /// (< 50% full) for longer than `idle_threshold`.
+    pub fn idle_shrink_candidates(&self, idle_threshold: Duration) -> Vec<StreamId> {
+        self.streams
             .iter()
             .filter_map(|entry| {
-                let stream = entry.value();
-                if stream.should_idle_shrink(idle_threshold) {
+                if entry.value().should_idle_shrink(idle_threshold) {
                     Some(*entry.key())
                 } else {
                     None
                 }
             })
-            .collect();
-
-        // Second pass: seal-and-create for each candidate (write guard).
-        for stream_id in candidates {
-            if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-                // Re-check under write guard (may have changed between passes).
-                if !stream_mut.should_idle_shrink(idle_threshold) {
-                    continue;
-                }
-                if let Some(notif) = stream_mut.seal_and_create_next(SealReason::IdleShrink) {
-                    // Update ReplicaInfo to point to new extent_id.
-                    if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
-                        ri.extent_id = notif.new_extent_id;
-                    }
-                    drop(stream_mut); // release write guard before sending notifications
-                    self.send_extent_update(stream_id, &notif);
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
-                    info!(
-                        "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
-                        stream_id, notif.sealed_extent_id, notif.new_extent_id, notif.new_extent_capacity,
-                    );
-                }
-            }
-        }
+            .collect()
     }
 }
 
@@ -584,7 +556,14 @@ impl ExtentNodeStore {
             stream_mut.set_max_extents(cache_extents as usize);
             if stream_mut.find_extent(extent_id).is_none() {
                 let so = stream_mut.max_offset();
-                stream_mut.register_extent(extent_id, so, extent_capacity, epoch, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY);
+                stream_mut.register_extent(
+                    extent_id,
+                    so,
+                    extent_capacity,
+                    epoch,
+                    DEFAULT_MIN_EXTENT_CAPACITY,
+                    DEFAULT_MAX_EXTENT_CAPACITY,
+                );
                 so
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
@@ -595,7 +574,14 @@ impl ExtentNodeStore {
         } else {
             let mut stream = Stream::new(stream_id);
             stream.set_max_extents(cache_extents as usize);
-            stream.register_extent(extent_id, Offset(0), extent_capacity, epoch, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY);
+            stream.register_extent(
+                extent_id,
+                Offset(0),
+                extent_capacity,
+                epoch,
+                DEFAULT_MIN_EXTENT_CAPACITY,
+                DEFAULT_MAX_EXTENT_CAPACITY,
+            );
             self.streams.insert(stream_id, stream);
             Offset(0)
         };
@@ -743,7 +729,7 @@ impl ExtentNodeStore {
         if extent_full {
             // Drop read ref, acquire write ref for seal+create.
             drop(stream_ref);
-            let seal_notification = self.seal_and_create_on_full(stream_id);
+            let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
             // Re-acquire read ref and retry the append.
             // The new extent's needs_init_forward flag is set, so do_append_and_respond
             // will push ForwardInitExtent inline before the Forward frame.
@@ -987,10 +973,7 @@ impl ExtentNodeStore {
     /// guard lifecycle: on ExtentFull it drops the read guard, acquires a write
     /// guard for seal+create, then re-acquires a read guard and continues.
     /// This avoids the read→write deadlock on the same DashMap shard.
-    async fn drain_follower_jobs(
-        &self,
-        stream_id: StreamId,
-    ) -> Vec<crate::stream::SealNotification> {
+    async fn drain_follower_jobs(&self, stream_id: StreamId) -> Vec<SealNotification> {
         let mut all_seal_notifications = Vec::new();
 
         loop {
@@ -1058,9 +1041,9 @@ impl ExtentNodeStore {
                 // Drop the read guard BEFORE acquiring write guard for seal+create.
                 drop(stream_ref);
 
-                let seal_notification = self.seal_and_create_on_full(stream_id);
-                if let Some(ref notif) = seal_notification {
-                    all_seal_notifications.push(notif.clone());
+                let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
+                if let Some(ref notification) = seal_notification {
+                    all_seal_notifications.push(notification.clone());
                 }
 
                 // Re-acquire read guard to retry the failed job and remaining jobs on the new extent.
@@ -1103,38 +1086,47 @@ impl ExtentNodeStore {
         all_seal_notifications
     }
 
-    /// Seal the active extent and create a new one. Used on ExtentFull.
+    /// Seal the active extent and create a new one.
     ///
     /// Acquires DashMap write lock on the stream. Returns the seal notification
     /// if a seal+create occurred, or None if already sealed / stream not found.
-    fn seal_and_create_on_full(
+    pub fn seal_and_create(
         &self,
         stream_id: StreamId,
-    ) -> Option<crate::stream::SealNotification> {
+        reason: SealReason,
+    ) -> Option<SealNotification> {
         if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
-            let notif = stream_mut.seal_and_create_next(SealReason::ExtentFull);
+            // For IdleShrink, re-check eligibility under write guard.
+            if matches!(reason, SealReason::IdleShrink)
+                && !stream_mut.should_idle_shrink(Duration::from_secs(
+                    common::config::DEFAULT_IDLE_SHRINK_THRESHOLD_SECS,
+                ))
+            {
+                return None;
+            }
+            let notification = stream_mut.seal_and_create_next(reason);
             // Update ReplicaInfo to point to new extent_id.
-            if let Some(ref n) = notif {
+            if let Some(ref n) = notification {
                 if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
                     ri.extent_id = n.new_extent_id;
                 }
             }
-            notif
+            notification
         } else {
             None
         }
     }
 
     /// Send an async UPDATE_EXTENT (Sealed) to SM (fire-and-forget).
-    fn send_extent_update(&self, stream_id: StreamId, notif: &crate::stream::SealNotification) {
+    pub fn send_extent_update(&self, stream_id: StreamId, notification: &SealNotification) {
         if let Some(ref tx) = self.update_tx {
             let _ = tx.try_send(ExtentUpdate::Sealed {
                 stream_id,
-                sealed_extent_id: notif.sealed_extent_id,
-                end_offset: notif.end_offset,
-                new_extent_id: notif.new_extent_id,
-                new_extent_capacity: notif.new_extent_capacity,
-                epoch: notif.epoch,
+                sealed_extent_id: notification.sealed_extent_id,
+                end_offset: notification.end_offset,
+                new_extent_id: notification.new_extent_id,
+                new_extent_capacity: notification.new_extent_capacity,
+                epoch: notification.epoch,
             });
         }
     }
@@ -1142,7 +1134,7 @@ impl ExtentNodeStore {
     /// Send a ForwardChecksum for a sealed extent inline via per-stream channels.
     ///
     /// Fire-and-forget: the secondary defers verification via `try_verify_checksum()`.
-    fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
+    pub fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
         let (checksum, committed_bytes) = match self.streams.get(&stream_id) {
             Some(stream_ref) => match stream_ref.find_extent(sealed_extent_id) {
                 Some(ext) => (
@@ -1324,7 +1316,7 @@ impl ExtentNodeStore {
                 // Extent-full with no successful entries: seal+retry BEFORE releasing
                 // leadership to guarantee Forward frame ordering.
                 drop(stream_ref); // release read guard for seal+create
-                let seal_notification = self.seal_and_create_on_full(stream_id);
+                let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
                 // Retry failed frames on the new extent — Forward pushed inline.
                 if let Some(stream_ref2) = self.streams.get(&stream_id) {
                     for ff in &failed_frames {
@@ -1501,7 +1493,7 @@ impl ExtentNodeStore {
             // Forward frame ordering. stream_ref DashMap guard must be dropped
             // for seal (write lock), but in_flight is still > 0 so no new leader.
             drop(stream_ref);
-            let seal_notification = self.seal_and_create_on_full(stream_id);
+            let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
             // Retry failed frames on the new extent — Forward pushed inline.
             if let Some(stream_ref2) = self.streams.get(&stream_id) {
                 for ff in &failed_frames {
@@ -1624,7 +1616,14 @@ impl ExtentNodeStore {
                 stream_mut.set_max_extents(cache_extents as usize);
             }
             if stream_mut.find_extent(extent_id).is_none() {
-                stream_mut.register_extent(extent_id, start_offset, extent_capacity, epoch, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY);
+                stream_mut.register_extent(
+                    extent_id,
+                    start_offset,
+                    extent_capacity,
+                    epoch,
+                    DEFAULT_MIN_EXTENT_CAPACITY,
+                    DEFAULT_MAX_EXTENT_CAPACITY,
+                );
                 info!(
                     "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}",
                     stream_id, extent_id, start_offset, extent_capacity,
@@ -1633,7 +1632,14 @@ impl ExtentNodeStore {
         } else {
             let mut stream = Stream::new(stream_id);
             stream.set_max_extents(cache_extents as usize);
-            stream.register_extent(extent_id, start_offset, extent_capacity, epoch, DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_MAX_EXTENT_CAPACITY);
+            stream.register_extent(
+                extent_id,
+                start_offset,
+                extent_capacity,
+                epoch,
+                DEFAULT_MIN_EXTENT_CAPACITY,
+                DEFAULT_MAX_EXTENT_CAPACITY,
+            );
             self.streams.insert(stream_id, stream);
             self.next_stream_id
                 .fetch_max(stream_id.0 + 1, Ordering::Relaxed);

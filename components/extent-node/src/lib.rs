@@ -9,14 +9,16 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use common::config::{ExtentNodeConfig, resolve_advertise_ip};
+use common::config::{DEFAULT_IDLE_SHRINK_THRESHOLD_SECS, ExtentNodeConfig, resolve_advertise_ip};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time::interval;
 use tracing::info;
 
 use crate::downstream::DownstreamPool;
 use crate::store::{ExtentNodeStore, ExtentUpdate};
+use crate::stream::SealReason;
 use crate::stream_manager_client::StreamManagerClient;
 
 /// A running ExtentNode with lifecycle management.
@@ -115,21 +117,31 @@ impl ExtentNode {
             update_rx,
         );
 
-        // Spawn tick injection task (periodic system ticks for idle shrink detection).
-        // Checks all active streams and triggers seal-and-shrink for idle ones.
+        // Spawn idle-shrink task (periodic scan for under-utilized streams).
+        // Finds idle candidates, then seals and creates new extents with reduced capacity
+        // using the same seal-and-create machinery as the append path.
         let tick_store = Arc::clone(&store);
         let mut tick_shutdown = shutdown_tx.subscribe();
         let tick_interval_ms = config.heartbeat_interval_ms; // Same cadence as heartbeats
-        let idle_threshold = Duration::from_secs(common::config::DEFAULT_IDLE_SHRINK_THRESHOLD_SECS);
+        let idle_threshold = Duration::from_secs(DEFAULT_IDLE_SHRINK_THRESHOLD_SECS);
         task_handles.push(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_millis(tick_interval_ms as u64));
+            let mut ticker = interval(Duration::from_millis(tick_interval_ms as u64));
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
-                        tick_store.inject_ticks(idle_threshold);
+                        for stream_id in tick_store.idle_shrink_candidates(idle_threshold) {
+                            if let Some(notification) = tick_store.seal_and_create(stream_id, SealReason::IdleShrink) {
+                                tick_store.send_extent_update(stream_id, &notification);
+                                tick_store.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                                info!(
+                                    "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
+                                    stream_id, notification.sealed_extent_id, notification.new_extent_id, notification.new_extent_capacity,
+                                );
+                            }
+                        }
                     }
                     _ = tick_shutdown.recv() => {
-                        info!("tick injection task received shutdown signal");
+                        info!("idle-shrink task received shutdown signal");
                         break;
                     }
                 }

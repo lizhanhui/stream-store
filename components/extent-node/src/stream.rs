@@ -177,7 +177,14 @@ impl Stream {
         extent_capacity: u32,
         epoch: Epoch,
     ) {
-        self.register_extent(id, start_offset, extent_capacity, epoch, extent_capacity, extent_capacity);
+        self.register_extent(
+            id,
+            start_offset,
+            extent_capacity,
+            epoch,
+            extent_capacity,
+            extent_capacity,
+        );
     }
 
     /// Return the extent capacity configured for this stream.

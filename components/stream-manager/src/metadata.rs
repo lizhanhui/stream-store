@@ -277,14 +277,18 @@ impl MetadataStore {
         Ok(row.get::<i32, _>("cache_extents") as u32)
     }
 
-
     /// Get the min and max extent capacity bounds for a stream.
-    pub async fn get_stream_capacity_bounds(&self, stream_id: StreamId) -> Result<(u32, u32), StorageError> {
-        let row = sqlx::query("SELECT min_extent_capacity, max_extent_capacity FROM stream WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|e| StorageError::Internal(format!("get_stream_capacity_bounds: {e}")))?;
+    pub async fn get_stream_capacity_bounds(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<(u32, u32), StorageError> {
+        let row = sqlx::query(
+            "SELECT min_extent_capacity, max_extent_capacity FROM stream WHERE stream_id = ?",
+        )
+        .bind(stream_id.0 as i64)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| StorageError::Internal(format!("get_stream_capacity_bounds: {e}")))?;
 
         let min = row.get::<i32, _>("min_extent_capacity") as u32;
         let max = row.get::<i32, _>("max_extent_capacity") as u32;
