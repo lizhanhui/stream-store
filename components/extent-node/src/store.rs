@@ -5,15 +5,17 @@ use std::time::Duration;
 use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::config::{DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY};
+use common::config::{
+    DEFAULT_IDLE_SHRINK_THRESHOLD_SECS, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
+};
 use common::errors::StorageError;
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, Opcode, StreamId};
 use dashmap::DashMap;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::Sender;
 use tracing::{info, warn};
 
 use crate::downstream::DownstreamPool;
@@ -33,7 +35,7 @@ pub struct PendingAck {
     /// The stream the append was written to.
     pub stream_id: StreamId,
     /// Channel back to the client connection's write task.
-    pub response_tx: mpsc::Sender<Frame>,
+    pub response_tx: Sender<Frame>,
     /// The offset assigned to this append.
     pub assigned_offset: u64,
     /// The extent the record landed on (for diagnostics in AppendAck).
@@ -252,7 +254,7 @@ pub(crate) struct AppendJob {
     pub payload: Bytes,
     /// Channel back to the client connection for sending response frames.
     /// `None` in test mode (no client connection).
-    pub response_tx: Option<mpsc::Sender<Frame>>,
+    pub response_tx: Option<Sender<Frame>>,
 }
 
 // ── ExtentNodeStore ──────────────────────────────────────────────────────────
@@ -280,7 +282,7 @@ pub struct ExtentNodeStore {
     downstream: OnceLock<Arc<DownstreamPool>>,
     /// Channel to send ExtentUpdate notifications to SM (Primary only).
     /// The SM connection task receives these and sends UPDATE_EXTENT frames.
-    update_tx: Option<mpsc::Sender<ExtentUpdate>>,
+    update_tx: Option<Sender<ExtentUpdate>>,
     /// Per-stream ACK queues for the Primary (only used when this node is Primary for a stream).
     /// Fine-grained per-stream locking.
     pub ack_queues: DashMap<StreamId, AckQueue>,
@@ -322,7 +324,7 @@ impl ExtentNodeStore {
     }
 
     /// Set the seal request channel (called during ExtentNode bootstrap).
-    pub fn set_update_tx(&mut self, update_tx: mpsc::Sender<ExtentUpdate>) {
+    pub fn set_update_tx(&mut self, update_tx: Sender<ExtentUpdate>) {
         self.update_tx = Some(update_tx);
     }
 
@@ -377,21 +379,14 @@ impl ExtentNodeStore {
             .collect()
     }
 
-    /// Return stream IDs eligible for idle-shrink (read-only scan).
+    /// Lightweight iterator over (StreamId, Epoch) for all active streams.
     ///
-    /// A stream is a candidate when its active extent has been under-utilized
-    /// (< 50% full) for longer than `idle_threshold`.
-    pub fn idle_shrink_candidates(&self, idle_threshold: Duration) -> Vec<StreamId> {
+    /// Used by the idle-shrink tick task to construct system tick frames.
+    /// Pure read-only scan — no write guards, no idle-shrink checks.
+    pub fn stream_epochs(&self) -> impl Iterator<Item = (StreamId, Epoch)> + '_ {
         self.streams
             .iter()
-            .filter_map(|entry| {
-                if entry.value().should_idle_shrink(idle_threshold) {
-                    Some(*entry.key())
-                } else {
-                    None
-                }
-            })
-            .collect()
+            .map(|entry| (*entry.key(), entry.value().epoch()))
     }
 }
 
@@ -405,7 +400,7 @@ impl RequestHandler for ExtentNodeStore {
     async fn handle_frame(
         &self,
         frame: Frame,
-        response_tx: Option<&mpsc::Sender<Frame>>,
+        response_tx: Option<&Sender<Frame>>,
     ) -> Option<Frame> {
         match frame.opcode() {
             Opcode::Append => self.handle_append(frame, response_tx).await,
@@ -479,7 +474,7 @@ impl RequestHandler for ExtentNodeStore {
     async fn handle_append_batch(
         &self,
         frames: &[Frame],
-        response_tx: Option<&mpsc::Sender<Frame>>,
+        response_tx: Option<&Sender<Frame>>,
     ) -> Vec<Frame> {
         if frames.is_empty() {
             return Vec::new();
@@ -663,7 +658,7 @@ impl ExtentNodeStore {
     async fn handle_append(
         &self,
         frame: Frame,
-        response_tx: Option<&mpsc::Sender<Frame>>,
+        response_tx: Option<&Sender<Frame>>,
     ) -> Option<Frame> {
         let stream_id = frame.stream_id();
         let client_epoch = frame.epoch();
@@ -694,9 +689,16 @@ impl ExtentNodeStore {
 
         // Leader election: fetch_add(1, Acquire) on the stream's in_flight counter.
         // try_append_active() always routes to the current active extent.
+        let is_tick = frame.flags() & FLAG_SYSTEM_TICK != 0;
         let prev = stream_ref.in_flight().fetch_add(1, Ordering::Acquire);
 
         if prev > 0 {
+            if is_tick {
+                // System tick lost leader election — drop silently.
+                // Fire-and-forget: next interval will retry.
+                stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+                return None;
+            }
             // SLOW PATH: active writer exists. Push job to channel and return None.
             let job = AppendJob {
                 request_id: frame.request_id(),
@@ -712,6 +714,39 @@ impl ExtentNodeStore {
         }
 
         // FAST PATH: I'm the active writer (prev == 0).
+
+        // System tick: check idle-shrink eligibility, don't write to arena.
+        if is_tick {
+            let should_shrink = stream_ref
+                .should_idle_shrink(Duration::from_secs(DEFAULT_IDLE_SHRINK_THRESHOLD_SECS));
+            // Drain followers (real appends that arrived concurrently).
+            let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+            drop(stream_ref);
+            if remaining > 1 {
+                let batch_seals = self.drain_follower_jobs(stream_id).await;
+                for notification in &batch_seals {
+                    self.send_extent_update(stream_id, notification);
+                    self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                }
+            }
+            if should_shrink {
+                if let Some(ref notification) =
+                    self.seal_and_create(stream_id, SealReason::IdleShrink)
+                {
+                    self.send_extent_update(stream_id, notification);
+                    self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                    info!(
+                        "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
+                        stream_id,
+                        notification.sealed_extent_id,
+                        notification.new_extent_id,
+                        notification.new_extent_capacity,
+                    );
+                }
+            }
+            return None; // No response for system ticks
+        }
+
         let payload = frame.payload.clone().unwrap_or_default();
         let request_id = frame.request_id();
 
@@ -751,16 +786,16 @@ impl ExtentNodeStore {
             drop(stream_ref); // ← release read guard BEFORE drain
             if remaining > 1 {
                 let batch_seals = self.drain_follower_jobs(stream_id).await;
-                for notif in &batch_seals {
-                    self.send_extent_update(stream_id, notif);
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                for notification in &batch_seals {
+                    self.send_extent_update(stream_id, notification);
+                    self.send_forward_checksum(stream_id, notification.sealed_extent_id);
                 }
             }
 
             // Send SM notification and ForwardChecksum if we sealed.
-            if let Some(ref notif) = seal_notification {
-                self.send_extent_update(stream_id, notif);
-                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+            if let Some(ref notification) = seal_notification {
+                self.send_extent_update(stream_id, notification);
+                self.send_forward_checksum(stream_id, notification.sealed_extent_id);
             }
             return retry_result;
         }
@@ -771,8 +806,8 @@ impl ExtentNodeStore {
         if remaining > 1 {
             // Followers are waiting — drain the batch.
             let batch_seals = self.drain_follower_jobs(stream_id).await;
-            for notif in &batch_seals {
-                self.send_extent_update(stream_id, notif);
+            for notification in &batch_seals {
+                self.send_extent_update(stream_id, notification);
             }
         }
 
@@ -799,7 +834,7 @@ impl ExtentNodeStore {
         stream_id: StreamId,
         epoch: Epoch,
         payload: Bytes,
-        response_tx: Option<mpsc::Sender<Frame>>,
+        response_tx: Option<Sender<Frame>>,
     ) -> (Option<Frame>, bool) {
         let payload_len = payload.len();
         let payload_for_forward = payload.clone();
@@ -1090,17 +1125,12 @@ impl ExtentNodeStore {
     ///
     /// Acquires DashMap write lock on the stream. Returns the seal notification
     /// if a seal+create occurred, or None if already sealed / stream not found.
-    pub fn seal_and_create(
-        &self,
-        stream_id: StreamId,
-        reason: SealReason,
-    ) -> Option<SealNotification> {
+    fn seal_and_create(&self, stream_id: StreamId, reason: SealReason) -> Option<SealNotification> {
         if let Some(mut stream_mut) = self.streams.get_mut(&stream_id) {
             // For IdleShrink, re-check eligibility under write guard.
             if matches!(reason, SealReason::IdleShrink)
-                && !stream_mut.should_idle_shrink(Duration::from_secs(
-                    common::config::DEFAULT_IDLE_SHRINK_THRESHOLD_SECS,
-                ))
+                && !stream_mut
+                    .should_idle_shrink(Duration::from_secs(DEFAULT_IDLE_SHRINK_THRESHOLD_SECS))
             {
                 return None;
             }
@@ -1118,7 +1148,7 @@ impl ExtentNodeStore {
     }
 
     /// Send an async UPDATE_EXTENT (Sealed) to SM (fire-and-forget).
-    pub fn send_extent_update(&self, stream_id: StreamId, notification: &SealNotification) {
+    fn send_extent_update(&self, stream_id: StreamId, notification: &SealNotification) {
         if let Some(ref tx) = self.update_tx {
             let _ = tx.try_send(ExtentUpdate::Sealed {
                 stream_id,
@@ -1134,7 +1164,7 @@ impl ExtentNodeStore {
     /// Send a ForwardChecksum for a sealed extent inline via per-stream channels.
     ///
     /// Fire-and-forget: the secondary defers verification via `try_verify_checksum()`.
-    pub fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
+    fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
         let (checksum, committed_bytes) = match self.streams.get(&stream_id) {
             Some(stream_ref) => match stream_ref.find_extent(sealed_extent_id) {
                 Some(ext) => (
@@ -1175,7 +1205,7 @@ impl ExtentNodeStore {
     async fn handle_append_batch_inner(
         &self,
         frames: &[Frame],
-        response_tx: Option<&mpsc::Sender<Frame>>,
+        response_tx: Option<&Sender<Frame>>,
     ) -> Vec<Frame> {
         let stream_id = frames[0].stream_id();
         let mut responses = Vec::new();
@@ -2077,6 +2107,7 @@ impl ExtentNodeStore {
 mod tests {
     use super::*;
     use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY};
+    use tokio::sync::mpsc;
 
     /// Register a stream on the ExtentNode via RegisterExtent (RF=1, Primary, no secondaries).
     /// This is the production path: StreamManager assigns a stream_id and sends RegisterExtent.
