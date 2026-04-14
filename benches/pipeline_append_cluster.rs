@@ -176,6 +176,7 @@ async fn main() {
             MIN_EXTENT_CAPACITY,
             MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
+            0,
         )
         .await
         .expect("open stream");

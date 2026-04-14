@@ -6,7 +6,7 @@ use std::time::Instant;
 
 use bytes::{BufMut, Bytes, BytesMut};
 use common::config::{
-    DEFAULT_IDLE_SHRINK_THRESHOLD_SECS, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
+    DEFAULT_IDLE_SHRINK_THRESHOLD_SECS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, Opcode, StreamId};
@@ -497,7 +497,7 @@ impl ExtentNodeStore {
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
     fn handle_register_extent(&self, frame: Frame) -> Frame {
         // Extract stream_id, extent_id, role, replication_factor from the variable header.
-        let (stream_id, extent_id, role, replication_factor, epoch, extent_capacity, cache_extents) =
+        let (stream_id, extent_id, role, replication_factor, epoch, extent_capacity, cache_extents, extent_growth_factor) =
             match &frame.variable_header {
                 VariableHeader::RegisterExtent {
                     stream_id,
@@ -507,6 +507,7 @@ impl ExtentNodeStore {
                     epoch,
                     extent_capacity,
                     cache_extents,
+                    extent_growth_factor,
                     ..
                 } => (
                     *stream_id,
@@ -516,6 +517,7 @@ impl ExtentNodeStore {
                     *epoch,
                     *extent_capacity,
                     *cache_extents,
+                    *extent_growth_factor,
                 ),
                 _ => {
                     return Frame::error_from_request(
@@ -558,6 +560,7 @@ impl ExtentNodeStore {
                     epoch,
                     DEFAULT_MIN_EXTENT_CAPACITY,
                     DEFAULT_MAX_EXTENT_CAPACITY,
+                    extent_growth_factor,
                 );
                 so
             } else {
@@ -576,6 +579,7 @@ impl ExtentNodeStore {
                 epoch,
                 DEFAULT_MIN_EXTENT_CAPACITY,
                 DEFAULT_MAX_EXTENT_CAPACITY,
+                extent_growth_factor,
             );
             self.streams.insert(stream_id, stream);
             Offset(0)
@@ -1653,6 +1657,7 @@ impl ExtentNodeStore {
                     epoch,
                     DEFAULT_MIN_EXTENT_CAPACITY,
                     DEFAULT_MAX_EXTENT_CAPACITY,
+                    DEFAULT_EXTENT_GROWTH_FACTOR,
                 );
                 info!(
                     "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}",
@@ -1669,6 +1674,7 @@ impl ExtentNodeStore {
                 epoch,
                 DEFAULT_MIN_EXTENT_CAPACITY,
                 DEFAULT_MAX_EXTENT_CAPACITY,
+                DEFAULT_EXTENT_GROWTH_FACTOR,
             );
             self.streams.insert(stream_id, stream);
             self.next_stream_id
@@ -2129,6 +2135,7 @@ mod tests {
                         extent_capacity: DEFAULT_EXTENT_CAPACITY,
                         min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                         max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                        extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2338,6 +2345,7 @@ mod tests {
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                         min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                         max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                        extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2385,6 +2393,7 @@ mod tests {
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                         min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                         max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                        extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2427,6 +2436,7 @@ mod tests {
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                         min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                         max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                        extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2490,6 +2500,7 @@ mod tests {
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                         min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                         max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                        extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -2575,6 +2586,7 @@ mod tests {
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                         min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                         max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                        extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),
@@ -3185,6 +3197,7 @@ mod tests {
                         extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                         min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                         max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                        extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                         cache_extents: DEFAULT_CACHE_EXTENTS,
                     },
                     Some(payload),

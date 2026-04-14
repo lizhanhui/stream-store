@@ -58,6 +58,7 @@ const MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024; // 8 MiB
 const MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024; // 256 MiB
 const PIPELINE_DEPTH: usize = 4; // max in-flight appends per sender
 const CACHE_EXTENTS: u32 = 4;
+const EXTENT_GROWTH_FACTOR: u32 = 8; // 8x growth: 8→64→256 MiB (2 transitions vs 5 with 2x)
 
 // -- Shared counters ----------------------------------------------------------
 
@@ -195,6 +196,7 @@ async fn main() {
             MIN_EXTENT_CAPACITY,
             MAX_EXTENT_CAPACITY,
             CACHE_EXTENTS,
+            EXTENT_GROWTH_FACTOR,
         )
         .await
         .expect("open stream");
@@ -298,7 +300,7 @@ fn print_header() {
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
     eprintln!(
-        "  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  cache_extents={CACHE_EXTENTS}"
+        "  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  cache_extents={CACHE_EXTENTS}  growth={EXTENT_GROWTH_FACTOR}x"
     );
     eprintln!(
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
