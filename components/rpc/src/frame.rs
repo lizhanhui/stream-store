@@ -102,6 +102,9 @@ pub enum VariableHeader {
         /// Maximum extent capacity for new extents (0 = use default max).
         max_extent_capacity: u32,
         cache_extents: u32,
+        /// Growth factor for adaptive capacity scaling (0 = use default).
+        /// On extent-full, next_capacity = min(current * growth_factor, max).
+        extent_growth_factor: u32,
     },
     CreateStreamResp {
         request_id: u32,
@@ -171,6 +174,8 @@ pub enum VariableHeader {
         min_extent_capacity: u32,
         /// Maximum extent capacity for this stream (0 = use default max).
         max_extent_capacity: u32,
+        /// Growth factor for adaptive capacity scaling (0 = use default).
+        extent_growth_factor: u32,
     },
     RegisterExtentAck {
         request_id: u32,
@@ -1040,9 +1045,9 @@ impl Frame {
             }
             // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
             VariableHeader::SealAckError { .. } => 4 + 8 + 4 + 2,
-            // request_id(4) + name_len(2) + name(N) + replication_factor(2) + min_extent_capacity(4) + max_extent_capacity(4) + cache_extents(4)
+            // request_id(4) + name_len(2) + name(N) + replication_factor(2) + min_extent_capacity(4) + max_extent_capacity(4) + cache_extents(4) + extent_growth_factor(4)
             VariableHeader::CreateStream { stream_name, .. } => {
-                4 + 2 + stream_name.len() + 2 + 4 + 4 + 4
+                4 + 2 + stream_name.len() + 2 + 4 + 4 + 4 + 4
             }
             // request_id(4) + stream_id(8) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
             VariableHeader::CreateStreamResp { primary_addr, .. } => {
@@ -1066,8 +1071,8 @@ impl Frame {
             VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
-            // request_id(4) + stream_id(8) + extent_id(4) + role(1) + replication_factor(2) + epoch(4) + extent_capacity(4) + cache_extents(4) + min_extent_capacity(4) + max_extent_capacity(4)
-            VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4 + 4 + 4 + 4 + 4,
+            // request_id(4) + stream_id(8) + extent_id(4) + role(1) + replication_factor(2) + epoch(4) + extent_capacity(4) + cache_extents(4) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(4)
+            VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4 + 4 + 4 + 4 + 4 + 4,
             // request_id(4) + stream_id(8) + extent_id(4)
             VariableHeader::RegisterExtentAck { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
@@ -1305,6 +1310,7 @@ impl Frame {
                 min_extent_capacity,
                 max_extent_capacity,
                 cache_extents,
+                extent_growth_factor,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u16(stream_name.len() as u16);
@@ -1313,6 +1319,7 @@ impl Frame {
                 dst.put_u32(*min_extent_capacity);
                 dst.put_u32(*max_extent_capacity);
                 dst.put_u32(*cache_extents);
+                dst.put_u32(*extent_growth_factor);
             }
             VariableHeader::CreateStreamResp {
                 request_id,
@@ -1376,6 +1383,7 @@ impl Frame {
                 cache_extents,
                 min_extent_capacity,
                 max_extent_capacity,
+                extent_growth_factor,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
@@ -1387,6 +1395,7 @@ impl Frame {
                 dst.put_u32(*cache_extents);
                 dst.put_u32(*min_extent_capacity);
                 dst.put_u32(*max_extent_capacity);
+                dst.put_u32(*extent_growth_factor);
             }
             VariableHeader::ConnectAck { request_id }
             | VariableHeader::DisconnectAck { request_id } => {
@@ -1873,6 +1882,7 @@ impl Frame {
                 let min_extent_capacity = body.get_u32();
                 let max_extent_capacity = body.get_u32();
                 let cache_extents = body.get_u32();
+                let extent_growth_factor = body.get_u32();
                 Ok((
                     VariableHeader::CreateStream {
                         request_id,
@@ -1881,6 +1891,7 @@ impl Frame {
                         min_extent_capacity,
                         max_extent_capacity,
                         cache_extents,
+                        extent_growth_factor,
                     },
                     None,
                 ))
@@ -1996,6 +2007,7 @@ impl Frame {
                 let cache_extents = body.get_u32();
                 let min_extent_capacity = body.get_u32();
                 let max_extent_capacity = body.get_u32();
+                let extent_growth_factor = body.get_u32();
                 let payload = Self::read_payload(body);
                 Ok((
                     VariableHeader::RegisterExtent {
@@ -2009,6 +2021,7 @@ impl Frame {
                         cache_extents,
                         min_extent_capacity,
                         max_extent_capacity,
+                        extent_growth_factor,
                     },
                     payload,
                 ))
@@ -2840,6 +2853,7 @@ mod tests {
                 min_extent_capacity: 8_388_608,
                 max_extent_capacity: 268_435_456,
                 cache_extents: 4,
+                extent_growth_factor: 8,
             },
             None,
         );
@@ -2857,6 +2871,7 @@ mod tests {
                 min_extent_capacity,
                 max_extent_capacity,
                 cache_extents,
+                extent_growth_factor,
                 ..
             } => {
                 assert_eq!(stream_name, &Bytes::from_static(b"my-stream"));
@@ -2864,6 +2879,7 @@ mod tests {
                 assert_eq!(*min_extent_capacity, 8_388_608);
                 assert_eq!(*max_extent_capacity, 268_435_456);
                 assert_eq!(*cache_extents, 4);
+                assert_eq!(*extent_growth_factor, 8);
             }
             _ => panic!("expected CreateStream"),
         }

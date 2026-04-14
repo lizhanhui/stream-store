@@ -24,8 +24,14 @@ pub const DEFAULT_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024;
 pub const DEFAULT_MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024;
 
 /// Default maximum extent capacity: 256 MiB (ceiling for adaptive sizing).
-/// Hot streams grow up to this capacity via 2x doubling on extent-full.
+/// Hot streams grow up to this capacity via doubling on extent-full.
 pub const DEFAULT_MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024;
+
+/// Default growth factor for adaptive extent capacity scaling.
+/// On extent-full, `next_extent_capacity = min(current * growth_factor, max)`.
+/// Higher values (e.g. 8) reach steady-state faster with fewer extent transitions,
+/// reducing tail latency from allocation/resize during ramp-up.
+pub const DEFAULT_EXTENT_GROWTH_FACTOR: u32 = 2;
 
 /// Default cache_extents: max extents to retain in memory per stream.
 pub const DEFAULT_CACHE_EXTENTS: u32 = 4;

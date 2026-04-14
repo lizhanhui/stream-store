@@ -66,9 +66,15 @@ pub struct Stream {
     max_extent_capacity: u32,
 
     /// Capacity to use for the next autonomously created extent.
-    /// Adaptive: doubles on extent-full, halves on idle-shrink.
+    /// Adaptive: grows by `growth_factor` on extent-full, halves on idle-shrink.
     /// Clamped to [min_extent_capacity, max_extent_capacity].
     next_extent_capacity: u32,
+
+    /// Growth factor for adaptive capacity scaling on extent-full.
+    /// On extent-full, `next_extent_capacity = min(current * growth_factor, max)`.
+    /// Configurable per stream (default 2). Higher values (e.g. 8) reach
+    /// steady-state faster with fewer extent transitions.
+    growth_factor: u32,
 
     /// When the current active extent was created (for the 5-minute idle-shrink rule).
     active_extent_created_at: Option<Instant>,
@@ -109,6 +115,7 @@ impl Stream {
             min_extent_capacity: 0,
             max_extent_capacity: 0,
             next_extent_capacity: 0,
+            growth_factor: 0,
             active_extent_created_at: None,
             max_extents: 0,
             in_flight: AtomicU64::new(0),
@@ -139,11 +146,13 @@ impl Stream {
         epoch: Epoch,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
+        growth_factor: u32,
     ) {
         self.epoch = epoch;
         self.extent_capacity = extent_capacity;
         self.min_extent_capacity = min_extent_capacity;
         self.max_extent_capacity = max_extent_capacity;
+        self.growth_factor = growth_factor;
         self.next_extent_capacity = extent_capacity;
         self.next_extent_id = ExtentId(id.0 + 1);
         self.active_extent_created_at = Some(Instant::now());
@@ -184,6 +193,7 @@ impl Stream {
             epoch,
             extent_capacity,
             extent_capacity,
+            2, // default growth factor for tests
         );
     }
 
@@ -523,9 +533,10 @@ impl Stream {
         // Compute next extent capacity based on seal reason.
         match reason {
             SealReason::ExtentFull => {
-                // Scale up: double capacity (capped at max).
-                self.next_extent_capacity =
-                    (self.next_extent_capacity.saturating_mul(2)).min(self.max_extent_capacity);
+                // Scale up: multiply capacity by growth_factor (capped at max).
+                self.next_extent_capacity = (self.next_extent_capacity
+                    .saturating_mul(self.growth_factor))
+                .min(self.max_extent_capacity);
             }
             SealReason::IdleShrink => {
                 if active_bytes_written == 0 {
@@ -608,6 +619,7 @@ impl std::fmt::Debug for Stream {
             .field("min_extent_capacity", &self.min_extent_capacity)
             .field("max_extent_capacity", &self.max_extent_capacity)
             .field("next_extent_capacity", &self.next_extent_capacity)
+            .field("growth_factor", &self.growth_factor)
             .field("max_extents", &self.max_extents)
             .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
             .finish()
@@ -907,7 +919,7 @@ mod tests {
         let max_cap: u32 = 2048;
         let mut stream = Stream::new(StreamId(1));
         stream.set_max_extents(4);
-        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap);
+        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap, 2);
 
         // Fill extent to trigger extent-full on next append.
         // Each record = 4 bytes header + payload. With 256 bytes, we can fit ~25 records of 6 bytes.
@@ -921,7 +933,7 @@ mod tests {
         }
         assert!(offset > 0);
 
-        // Seal with ExtentFull reason — should double capacity.
+        // Seal with ExtentFull reason — should scale up by growth_factor (2x).
         let notif = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
         assert_eq!(notif.new_extent_capacity, min_cap * 2);
 
@@ -943,7 +955,7 @@ mod tests {
         let max_cap: u32 = 512;
         let mut stream = Stream::new(StreamId(1));
         stream.set_max_extents(4);
-        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap);
+        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap, 2);
 
         // Fill and seal with ExtentFull — doubles to 512.
         loop {
@@ -975,7 +987,7 @@ mod tests {
         let mut stream = Stream::new(StreamId(1));
         stream.set_max_extents(4);
         // Start at 1024 (mid-range).
-        stream.register_extent(ExtentId(0), Offset(0), 1024, Epoch(0), min_cap, max_cap);
+        stream.register_extent(ExtentId(0), Offset(0), 1024, Epoch(0), min_cap, max_cap, 2);
 
         // Write a small amount (less than half).
         stream
@@ -993,7 +1005,7 @@ mod tests {
         let max_cap: u32 = 2048;
         let mut stream = Stream::new(StreamId(1));
         stream.set_max_extents(4);
-        stream.register_extent(ExtentId(0), Offset(0), 1024, Epoch(0), min_cap, max_cap);
+        stream.register_extent(ExtentId(0), Offset(0), 1024, Epoch(0), min_cap, max_cap, 2);
         // Don't write anything — extent is completely empty.
 
         let notif = stream.seal_and_create_next(SealReason::IdleShrink).unwrap();
@@ -1006,7 +1018,7 @@ mod tests {
         let max_cap: u32 = 2048;
         let mut stream = Stream::new(StreamId(1));
         stream.set_max_extents(4);
-        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap);
+        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap, 2);
         // Artificially set active_extent_created_at to the past.
         stream.active_extent_created_at =
             Some(Instant::now() - std::time::Duration::from_secs(600));
@@ -1021,7 +1033,7 @@ mod tests {
         let max_cap: u32 = 2048;
         let mut stream = Stream::new(StreamId(1));
         stream.set_max_extents(4);
-        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap);
+        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap, 2);
 
         // Write a small amount.
         stream
@@ -1039,7 +1051,7 @@ mod tests {
         let max_cap: u32 = 2048;
         let mut stream = Stream::new(StreamId(1));
         stream.set_max_extents(3);
-        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap);
+        stream.register_extent(ExtentId(0), Offset(0), min_cap, Epoch(0), min_cap, max_cap, 2);
 
         // Fill and seal — creates extent at 512, evicts extent 0 into pool (capacity 256).
         loop {

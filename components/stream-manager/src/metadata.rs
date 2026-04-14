@@ -24,6 +24,7 @@ pub struct StreamRow {
     pub min_extent_capacity: u32,
     pub max_extent_capacity: u32,
     pub cache_extents: u32,
+    pub extent_growth_factor: u32,
 }
 
 /// A row from the `extent` table.
@@ -139,9 +140,10 @@ impl MetadataStore {
         min_extent_capacity: u32,
         max_extent_capacity: u32,
         cache_extents: u32,
+        extent_growth_factor: u32,
     ) -> Result<StreamId, StorageError> {
         let result = sqlx::query(
-            "INSERT INTO stream (stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO stream (stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name)
         .bind(stream_type)
@@ -150,6 +152,7 @@ impl MetadataStore {
         .bind(min_extent_capacity as i32)
         .bind(max_extent_capacity as i32)
         .bind(cache_extents as i32)
+        .bind(extent_growth_factor as i32)
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("create_stream: {e}")))?;
@@ -169,7 +172,7 @@ impl MetadataStore {
     /// Get a stream by ID.
     pub async fn get_stream(&self, id: StreamId) -> Result<Option<StreamRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents FROM stream WHERE stream_id = ?",
+            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor FROM stream WHERE stream_id = ?",
         )
         .bind(id.0 as i64)
         .fetch_optional(&self.pool)
@@ -185,13 +188,14 @@ impl MetadataStore {
             min_extent_capacity: r.get::<i32, _>("min_extent_capacity") as u32,
             max_extent_capacity: r.get::<i32, _>("max_extent_capacity") as u32,
             cache_extents: r.get::<i32, _>("cache_extents") as u32,
+            extent_growth_factor: r.get::<i32, _>("extent_growth_factor") as u32,
         }))
     }
 
     /// Get a stream by name.
     pub async fn get_stream_by_name(&self, name: &str) -> Result<Option<StreamRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents FROM stream WHERE stream_name = ?",
+            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor FROM stream WHERE stream_name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -207,6 +211,7 @@ impl MetadataStore {
             min_extent_capacity: r.get::<i32, _>("min_extent_capacity") as u32,
             max_extent_capacity: r.get::<i32, _>("max_extent_capacity") as u32,
             cache_extents: r.get::<i32, _>("cache_extents") as u32,
+            extent_growth_factor: r.get::<i32, _>("extent_growth_factor") as u32,
         }))
     }
 
@@ -293,6 +298,21 @@ impl MetadataStore {
         let min = row.get::<i32, _>("min_extent_capacity") as u32;
         let max = row.get::<i32, _>("max_extent_capacity") as u32;
         Ok((min, max))
+    }
+
+    /// Get the extent growth factor for a stream.
+    pub async fn get_stream_growth_factor(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<u32, StorageError> {
+        let row =
+            sqlx::query("SELECT extent_growth_factor FROM stream WHERE stream_id = ?")
+                .bind(stream_id.0 as i64)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|e| StorageError::Internal(format!("get_stream_growth_factor: {e}")))?;
+
+        Ok(row.get::<i32, _>("extent_growth_factor") as u32)
     }
 
     /// Get the minimum extent capacity for a stream.
