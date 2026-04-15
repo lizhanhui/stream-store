@@ -1,28 +1,21 @@
 CREATE TABLE extent (
     stream_id     BIGINT NOT NULL,
+    epoch         INT NOT NULL DEFAULT 0,    
     extent_id     INT NOT NULL,
     start_offset  BIGINT NOT NULL,
     end_offset    BIGINT NOT NULL DEFAULT 0,
     state         TINYINT NOT NULL DEFAULT 1,
-    epoch         INT NOT NULL DEFAULT 0,
     s3_key        VARCHAR(1024),
-    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    sealed_at     TIMESTAMP NULL,
-    flushed_at    TIMESTAMP NULL,
+    created_at    DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    sealed_at     DATETIME(3) NULL,
+    flushed_at    DATETIME(3) NULL,
     PRIMARY KEY (stream_id, extent_id),
     INDEX idx_stream_state (stream_id, state)
 );
 
-CREATE TABLE stream_replica (
-    stream_id     BIGINT NOT NULL,
-    epoch         INT NOT NULL,
-    node_addr     VARCHAR(256) NOT NULL,
-    role          TINYINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (stream_id, epoch, node_addr),
-    INDEX idx_node (node_addr)
-);
-
 CREATE TABLE stream_sequence (
     stream_id       BIGINT PRIMARY KEY,
-    next_extent_id  INT NOT NULL DEFAULT 0
+    next_extent_id  INT NOT NULL DEFAULT 0,
+    created_at      DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at      DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 );
