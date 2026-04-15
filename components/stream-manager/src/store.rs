@@ -1485,11 +1485,83 @@ impl StreamManagerStore {
         {
             Ok(offset) => offset,
             Err(e) => {
-                // Primary unreachable — fall back to extent-based seal with quorum.
-                // Bump epoch first, then seal+allocate at the new epoch.
+                // Primary unreachable — fall back to quorum seal.
                 warn!(
                     "Epoch seal: primary unreachable at {primary_addr}, falling back to quorum seal: {e}"
                 );
+
+                // Step 1: Query surviving replicas for all extents they know about.
+                // The primary may have autonomously sealed + created extents that SM
+                // never learned about (fire-and-forget UpdateExtentSealed was lost).
+                let replicas_for_report = replicas.clone();
+                let original_epoch = active.epoch;
+                for replica in &replicas_for_report {
+                    if replica.node_addr == primary_addr {
+                        continue; // skip dead primary
+                    }
+                    match report_extents_from_node_static(
+                        &replica.node_addr,
+                        stream_id,
+                        original_epoch,
+                    )
+                    .await
+                    {
+                        Ok(en_extents) => {
+                            if !en_extents.is_empty() {
+                                info!(
+                                    "Epoch seal: reconciling {} extents from {} for stream {} epoch {}",
+                                    en_extents.len(), replica.node_addr, stream_id, original_epoch
+                                );
+                                if let Err(e) = self
+                                    .store
+                                    .reconcile_extents(stream_id, original_epoch, &en_extents)
+                                    .await
+                                {
+                                    warn!(
+                                        "Epoch seal: reconcile_extents from {} failed: {e}",
+                                        replica.node_addr
+                                    );
+                                }
+                            }
+                            // One successful reconciliation is enough — all replicas
+                            // within the same epoch have the same extents.
+                            break;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "Epoch seal: report_extents from {} failed: {e}",
+                                replica.node_addr
+                            );
+                        }
+                    }
+                }
+
+                // Step 2: Re-read the active extent — it may have changed after reconciliation.
+                // If the primary autonomously created extent 6 (unknown to SM before), it's
+                // now in the DB and may be the new active extent.
+                let active = match self.store.get_active_extent(stream_id).await {
+                    Ok(Some(ext)) => ext,
+                    Ok(None) => {
+                        return Frame::seal_ack_error(
+                            request_id,
+                            stream_id,
+                            ExtentId(0),
+                            ErrorCode::InternalError,
+                            "no active extent after reconciliation",
+                        );
+                    }
+                    Err(e) => {
+                        return Frame::seal_ack_error(
+                            request_id,
+                            stream_id,
+                            ExtentId(0),
+                            ErrorCode::InternalError,
+                            &format!("get_active_extent after reconciliation: {e}"),
+                        );
+                    }
+                };
+
+                // Step 3: Bump epoch and seal the (possibly new) active extent.
                 let new_epoch = match self.store.bump_epoch(stream_id).await {
                     Ok(e) => e,
                     Err(e) => {
@@ -1502,6 +1574,10 @@ impl StreamManagerStore {
                         );
                     }
                 };
+                info!(
+                    "Epoch seal: reconciled, sealing extent {} at new epoch {} for stream {}",
+                    active.extent_id, new_epoch, stream_id
+                );
                 match self
                     .seal_extent(stream_id, active.extent_id, None, new_epoch)
                     .await
