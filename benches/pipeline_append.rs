@@ -215,10 +215,7 @@ async fn main() {
         .describe_stream(stream_id, 1)
         .await
         .expect("describe_stream for initial epoch");
-    let initial_epoch = extents
-        .first()
-        .map(|e| e.epoch)
-        .unwrap_or(Epoch(0));
+    let initial_epoch = extents.first().map(|e| e.epoch).unwrap_or(Epoch(0));
     info!(
         "[setup] Stream {} opened with primary={}, epoch={}",
         stream_id, initial_primary_addr, initial_epoch
@@ -444,7 +441,9 @@ async fn sender_task(
                         primary_addr = addr;
                         epoch = new_epoch;
                         backoff = Duration::from_millis(100);
-                        info!("sender {sender_id}: rediscovered primary {primary_addr} epoch {epoch}");
+                        info!(
+                            "sender {sender_id}: rediscovered primary {primary_addr} epoch {epoch}"
+                        );
                         counters.record_reconnect();
                         continue 'outer;
                     }
@@ -484,7 +483,11 @@ async fn sender_task(
                     let needs_seal = is_connection_broken(e) || is_primary_lost_stream(e);
                     warn!(
                         "sender {sender_id}: {e} -- draining pipeline and {}",
-                        if needs_seal { "sealing epoch to recover" } else { "refreshing epoch" }
+                        if needs_seal {
+                            "sealing epoch to recover"
+                        } else {
+                            "refreshing epoch"
+                        }
                     );
                     counters.record_error();
 
@@ -515,7 +518,9 @@ async fn sender_task(
                             primary_addr = addr;
                             epoch = new_epoch;
                             backoff = Duration::from_millis(100);
-                            info!("sender {sender_id}: reconnected to {primary_addr} epoch {epoch}");
+                            info!(
+                                "sender {sender_id}: reconnected to {primary_addr} epoch {epoch}"
+                            );
                         }
                         Err(e) => {
                             warn!("sender {sender_id}: reconnect failed: {e}");
@@ -628,8 +633,7 @@ async fn reconnect_with_seal(
     let max_backoff = Duration::from_secs(5);
 
     loop {
-        let result =
-            try_reconnect_with_seal(stream_manager_addr, stream_id, epoch).await;
+        let result = try_reconnect_with_seal(stream_manager_addr, stream_id, epoch).await;
         match result {
             Ok(ok) => return Ok(ok),
             Err(e) => {

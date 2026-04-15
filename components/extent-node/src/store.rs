@@ -1059,6 +1059,11 @@ impl ExtentNodeStore {
                     Err(_) => {
                         // Follower incremented in_flight but hasn't pushed yet.
                         // Release the guard before yielding so writers can proceed.
+                        let delegated = stream_ref.in_flight().load(Ordering::Acquire);
+                        if 0 == delegated {
+                            // handle concurrent system tick
+                            return all_seal_notifications;
+                        }
                         drop(stream_ref);
                         tokio::task::yield_now().await;
                     }
@@ -1159,7 +1164,12 @@ impl ExtentNodeStore {
             if let Some(ref n) = notification {
                 info!(
                     "seal_and_create: stream={}, sealed={}, new={}, capacity={}, reason={:?}, duration={}us",
-                    stream_id, n.sealed_extent_id, n.new_extent_id, n.new_extent_capacity, reason, seal_us,
+                    stream_id,
+                    n.sealed_extent_id,
+                    n.new_extent_id,
+                    n.new_extent_capacity,
+                    reason,
+                    seal_us,
                 );
                 if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
                     ri.extent_id = n.new_extent_id;
