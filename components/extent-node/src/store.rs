@@ -959,7 +959,7 @@ impl ExtentNodeStore {
                             Some(payload_for_forward),
                         );
                         // Inject ForwardInitExtent if this is the first forward for the extent.
-                        if let Some(init) = self.maybe_build_init_forward(&forward_frame) {
+                        if let Some(init) = self.maybe_build_init_forward(stream, &forward_frame) {
                             stream.send_forward(init);
                         }
                         stream.send_forward(forward_frame);
@@ -1225,7 +1225,7 @@ impl ExtentNodeStore {
         );
         // Push inline via per-stream channels.
         if let Some(stream_ref) = self.streams.get(&stream_id) {
-            if let Some(init) = self.maybe_build_init_forward(&frame) {
+            if let Some(init) = self.maybe_build_init_forward(&stream_ref, &frame) {
                 stream_ref.send_forward(init);
             }
             stream_ref.send_forward(frame);
@@ -1498,7 +1498,7 @@ impl ExtentNodeStore {
                                 },
                                 Some(entry.payload_for_forward.clone()),
                             );
-                            if let Some(init) = self.maybe_build_init_forward(&forward_frame) {
+                            if let Some(init) = self.maybe_build_init_forward(&stream_ref, &forward_frame) {
                                 stream_ref.send_forward(init);
                             }
                             stream_ref.send_forward(forward_frame);
@@ -1613,7 +1613,10 @@ impl ExtentNodeStore {
     /// ordering guarantees ForwardInitExtent arrives before the Forward frame
     /// on the wire. The atomic `take_init_forward()` ensures exactly-once
     /// semantics — the init frame is built once and cloned to all secondaries.
-    fn maybe_build_init_forward(&self, frame: &Frame) -> Option<Frame> {
+    ///
+    /// Accepts a `&Stream` reference to avoid re-acquiring the DashMap lock
+    /// (the caller already holds a guard).
+    fn maybe_build_init_forward(&self, stream: &Stream, frame: &Frame) -> Option<Frame> {
         let (stream_id, extent_id, epoch) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
@@ -1629,8 +1632,7 @@ impl ExtentNodeStore {
             _ => return None,
         };
 
-        let stream_ref = self.streams.get(&stream_id)?;
-        let ext = stream_ref.find_extent(extent_id)?;
+        let ext = stream.find_extent(extent_id)?;
 
         if !ext.take_init_forward() {
             return None;
@@ -1643,8 +1645,8 @@ impl ExtentNodeStore {
                 extent_id,
                 epoch,
                 start_offset: ext.start_offset,
-                extent_capacity: stream_ref.extent_capacity(),
-                cache_extents: stream_ref.max_extents() as u32,
+                extent_capacity: stream.extent_capacity(),
+                cache_extents: stream.max_extents() as u32,
             },
             None,
         ))
