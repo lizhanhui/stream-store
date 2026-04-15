@@ -1611,6 +1611,54 @@ impl StreamManagerStore {
             }
         };
 
+        // Primary was reachable and sealed. But the primary may have autonomously
+        // created extents that SM doesn't know about (fire-and-forget UpdateExtentSealed
+        // may not have arrived yet). Reconcile before allocating.
+        let original_epoch = active.epoch;
+        match report_extents_from_node_static(&primary_addr, stream_id, original_epoch).await {
+            Ok(en_extents) => {
+                if !en_extents.is_empty() {
+                    info!(
+                        "Epoch seal: reconciling {} extents from primary {} for stream {} epoch {}",
+                        en_extents.len(), primary_addr, stream_id, original_epoch
+                    );
+                    if let Err(e) = self
+                        .store
+                        .reconcile_extents(stream_id, original_epoch, &en_extents)
+                        .await
+                    {
+                        warn!("Epoch seal: reconcile_extents from primary failed: {e}");
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("Epoch seal: report_extents from primary failed: {e}");
+            }
+        }
+
+        // Re-read the active extent after reconciliation — it may have advanced
+        // (e.g., primary had sealed extent 5 and created extent 6 autonomously).
+        let active = match self.store.get_active_extent(stream_id).await {
+            Ok(Some(ext)) => ext,
+            Ok(None) => {
+                return Frame::seal_ack_error(
+                    request_id,
+                    stream_id,
+                    ExtentId(0),
+                    ErrorCode::InternalError,
+                    "no active extent after reconciliation with primary",
+                );
+            }
+            Err(e) => {
+                return Frame::seal_ack_error(
+                    request_id,
+                    stream_id,
+                    ExtentId(0),
+                    ErrorCode::InternalError,
+                    &format!("get_active_extent after reconciliation: {e}"),
+                );
+            }
+        };
         let sealed_extent_id = active.extent_id;
 
         // Bump epoch BEFORE seal+allocate so the new extent is created at the new epoch.
