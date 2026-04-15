@@ -1147,9 +1147,14 @@ impl ExtentNodeStore {
             {
                 return None;
             }
+            let t0 = std::time::Instant::now();
             let notification = stream_mut.seal_and_create_next(reason);
-            // Update ReplicaInfo to point to new extent_id.
+            let seal_us = t0.elapsed().as_micros();
             if let Some(ref n) = notification {
+                info!(
+                    "seal_and_create: stream={}, sealed={}, new={}, capacity={}, reason={:?}, duration={}us",
+                    stream_id, n.sealed_extent_id, n.new_extent_id, n.new_extent_capacity, reason, seal_us,
+                );
                 if let Some(mut ri) = self.replicas.get_mut(&stream_id) {
                     ri.extent_id = n.new_extent_id;
                 }
