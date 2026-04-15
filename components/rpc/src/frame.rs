@@ -1,10 +1,9 @@
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EPOCH_PRESENT,
-    FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
-    FLAG_FORWARD_INIT_EXTENT, FLAG_NEW_EXTENT_PRESENT, FLAG_OFFSET_PRESENT, FLAG_RESPONSE_ERROR,
-    FLAG_START_OFFSET_PRESENT, FLAG_SYSTEM_TICK, HEADER_LEN, MAGIC, Offset, Opcode,
+    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_PROGRESS,
+    FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT,
+    FLAG_RESPONSE_ERROR, FLAG_SEAL_RESPONSE, FLAG_SYSTEM_TICK, HEADER_LEN, MAGIC, Offset, Opcode,
     PROTOCOL_VERSION, StreamId,
 };
 
@@ -67,30 +66,41 @@ pub enum VariableHeader {
         offset: Offset,
         error_code: ErrorCode,
     },
-    Seal {
+    SealStreamManagerRequest {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
-        offset: Option<Offset>,
-        start_offset: Option<u64>,
-        /// Epoch for epoch-based seal. When present (FLAG_EPOCH_PRESENT),
-        /// the seal targets the active extent at this epoch.
-        epoch: Option<Epoch>,
+        epoch: Epoch,
     },
-    SealAck {
+    SealStreamManagerResp {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         offset: Offset,
-        new_extent_id: Option<ExtentId>,
-        primary_addr: Option<Bytes>,
-        /// New epoch after an epoch bump (FLAG_EPOCH_PRESENT on SealAck).
-        epoch: Option<Epoch>,
+        new_epoch: Epoch,
+        primary_addr: Bytes,
     },
-    SealAckError {
+    SealStreamManagerRespError {
         request_id: u32,
         stream_id: StreamId,
+        error_code: ErrorCode,
+    },
+    SealExtentNodeRequest {
+        request_id: u32,
+        stream_id: StreamId,
+        epoch: Epoch,
+        extent_id_from: ExtentId,
+        start_offset: u64,
+    },
+    SealExtentNodeResp {
+        request_id: u32,
+        stream_id: StreamId,
+        epoch: Epoch,
         extent_id: ExtentId,
+        start_offset: u64,
+        end_offset: u64,
+    },
+    SealExtentNodeRespError {
+        request_id: u32,
+        stream_id: StreamId,
         error_code: ErrorCode,
     },
     CreateStream {
@@ -398,9 +408,12 @@ impl Frame {
             | VariableHeader::Read { request_id, .. }
             | VariableHeader::ReadResp { request_id, .. }
             | VariableHeader::ReadRespError { request_id, .. }
-            | VariableHeader::Seal { request_id, .. }
-            | VariableHeader::SealAck { request_id, .. }
-            | VariableHeader::SealAckError { request_id, .. }
+            | VariableHeader::SealStreamManagerRequest { request_id, .. }
+            | VariableHeader::SealStreamManagerResp { request_id, .. }
+            | VariableHeader::SealStreamManagerRespError { request_id, .. }
+            | VariableHeader::SealExtentNodeRequest { request_id, .. }
+            | VariableHeader::SealExtentNodeResp { request_id, .. }
+            | VariableHeader::SealExtentNodeRespError { request_id, .. }
             | VariableHeader::CreateStream { request_id, .. }
             | VariableHeader::CreateStreamResp { request_id, .. }
             | VariableHeader::CreateStreamRespError { request_id, .. }
@@ -449,9 +462,12 @@ impl Frame {
             | VariableHeader::Read { stream_id, .. }
             | VariableHeader::ReadResp { stream_id, .. }
             | VariableHeader::ReadRespError { stream_id, .. }
-            | VariableHeader::Seal { stream_id, .. }
-            | VariableHeader::SealAck { stream_id, .. }
-            | VariableHeader::SealAckError { stream_id, .. }
+            | VariableHeader::SealStreamManagerRequest { stream_id, .. }
+            | VariableHeader::SealStreamManagerResp { stream_id, .. }
+            | VariableHeader::SealStreamManagerRespError { stream_id, .. }
+            | VariableHeader::SealExtentNodeRequest { stream_id, .. }
+            | VariableHeader::SealExtentNodeResp { stream_id, .. }
+            | VariableHeader::SealExtentNodeRespError { stream_id, .. }
             | VariableHeader::CreateStreamResp { stream_id, .. }
             | VariableHeader::QueryOffset { stream_id, .. }
             | VariableHeader::QueryOffsetResp { stream_id, .. }
@@ -487,7 +503,7 @@ impl Frame {
             VariableHeader::AppendAck { offset, .. }
             | VariableHeader::ReadResp { offset, .. }
             | VariableHeader::ReadRespError { offset, .. }
-            | VariableHeader::SealAck { offset, .. }
+            | VariableHeader::SealStreamManagerResp { offset, .. }
             | VariableHeader::QueryOffsetResp { offset, .. }
             | VariableHeader::Watermark { offset, .. }
             | VariableHeader::Forward { offset, .. }
@@ -495,7 +511,6 @@ impl Frame {
             | VariableHeader::SeekResp { offset, .. }
             | VariableHeader::SeekRespError { offset, .. } => *offset,
             VariableHeader::Read { offset, .. } => *offset,
-            VariableHeader::Seal { offset, .. } => offset.unwrap_or(Offset(0)),
             _ => Offset(0),
         }
     }
@@ -507,9 +522,7 @@ impl Frame {
             | VariableHeader::AppendAckError { extent_id, .. }
             | VariableHeader::Read { extent_id, .. }
             | VariableHeader::ReadRespError { extent_id, .. }
-            | VariableHeader::Seal { extent_id, .. }
-            | VariableHeader::SealAck { extent_id, .. }
-            | VariableHeader::SealAckError { extent_id, .. }
+            | VariableHeader::SealExtentNodeResp { extent_id, .. }
             | VariableHeader::CreateStreamResp { extent_id, .. }
             | VariableHeader::RegisterExtentAck { extent_id, .. }
             | VariableHeader::RegisterExtentAckError { extent_id, .. }
@@ -520,6 +533,9 @@ impl Frame {
             | VariableHeader::Watermark { extent_id, .. }
             | VariableHeader::DescribeExtent { extent_id, .. }
             | VariableHeader::DescribeExtentRespError { extent_id, .. } => *extent_id,
+            VariableHeader::SealExtentNodeRequest {
+                extent_id_from, ..
+            } => *extent_id_from,
             _ => ExtentId(0),
         }
     }
@@ -531,9 +547,10 @@ impl Frame {
             | VariableHeader::AppendAck { epoch, .. }
             | VariableHeader::AppendAckError { epoch, .. }
             | VariableHeader::CreateStreamResp { epoch, .. } => *epoch,
-            VariableHeader::Seal { epoch, .. } | VariableHeader::SealAck { epoch, .. } => {
-                epoch.unwrap_or(Epoch(0))
-            }
+            VariableHeader::SealStreamManagerRequest { epoch, .. }
+            | VariableHeader::SealExtentNodeRequest { epoch, .. }
+            | VariableHeader::SealExtentNodeResp { epoch, .. } => *epoch,
+            VariableHeader::SealStreamManagerResp { new_epoch, .. } => *new_epoch,
             VariableHeader::RegisterExtent { epoch, .. } => *epoch,
             VariableHeader::UpdateExtentSealed { epoch, .. }
             | VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
@@ -561,7 +578,8 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::AppendAckError { error_code, .. }
             | VariableHeader::ReadRespError { error_code, .. }
-            | VariableHeader::SealAckError { error_code, .. }
+            | VariableHeader::SealStreamManagerRespError { error_code, .. }
+            | VariableHeader::SealExtentNodeRespError { error_code, .. }
             | VariableHeader::CreateStreamRespError { error_code, .. }
             | VariableHeader::QueryOffsetRespError { error_code, .. }
             | VariableHeader::ConnectAckError { error_code, .. }
@@ -582,13 +600,14 @@ impl Frame {
 
     /// Get the flags byte for this frame on the wire.
     ///
-    /// For Append, Seal, and SealAck, flags are computed from `Option` fields
-    /// (eliminating stale-flag bugs). For other opcodes, returns `header.flags`.
+    /// For response/error variants, flags are computed from the variant type.
+    /// For other opcodes, returns `header.flags`.
     pub fn flags(&self) -> u8 {
         let computed = match &self.variable_header {
             VariableHeader::AppendAckError { .. }
             | VariableHeader::ReadRespError { .. }
-            | VariableHeader::SealAckError { .. }
+            | VariableHeader::SealStreamManagerRespError { .. }
+            | VariableHeader::SealExtentNodeRespError { .. }
             | VariableHeader::CreateStreamRespError { .. }
             | VariableHeader::QueryOffsetRespError { .. }
             | VariableHeader::ConnectAckError { .. }
@@ -599,38 +618,8 @@ impl Frame {
             | VariableHeader::DescribeStreamRespError { .. }
             | VariableHeader::DescribeExtentRespError { .. }
             | VariableHeader::SeekRespError { .. } => FLAG_RESPONSE_ERROR,
-            VariableHeader::Seal {
-                offset,
-                start_offset,
-                epoch,
-                ..
-            } => {
-                let mut f = 0u8;
-                if offset.is_some() {
-                    f |= FLAG_OFFSET_PRESENT;
-                }
-                if start_offset.is_some() {
-                    f |= FLAG_START_OFFSET_PRESENT;
-                }
-                if epoch.is_some() {
-                    f |= FLAG_EPOCH_PRESENT;
-                }
-                f
-            }
-            VariableHeader::SealAck {
-                new_extent_id,
-                epoch,
-                ..
-            } => {
-                let mut f = 0u8;
-                if new_extent_id.is_some() {
-                    f |= FLAG_NEW_EXTENT_PRESENT;
-                }
-                if epoch.is_some() {
-                    f |= FLAG_EPOCH_PRESENT;
-                }
-                f
-            }
+            VariableHeader::SealStreamManagerResp { .. }
+            | VariableHeader::SealExtentNodeResp { .. } => FLAG_SEAL_RESPONSE,
             VariableHeader::UpdateExtentSealed { .. } => FLAG_EXTENT_SEALED,
             VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
@@ -688,18 +677,32 @@ impl Frame {
         )
     }
 
-    pub fn seal_ack_error(
+    pub fn seal_stream_manager_resp_error(
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         error_code: ErrorCode,
         message: &str,
     ) -> Frame {
         Frame::new(
-            VariableHeader::SealAckError {
+            VariableHeader::SealStreamManagerRespError {
                 request_id,
                 stream_id,
-                extent_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
+    pub fn seal_extent_node_resp_error(
+        request_id: u32,
+        stream_id: StreamId,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::SealExtentNodeRespError {
+                request_id,
+                stream_id,
                 error_code,
             },
             Some(Bytes::copy_from_slice(message.as_bytes())),
@@ -896,19 +899,23 @@ impl Frame {
                 error_code,
                 message,
             ),
-            VariableHeader::Seal {
+            VariableHeader::SealStreamManagerRequest {
                 request_id,
                 stream_id,
-                extent_id,
                 ..
-            } => Self::seal_ack_error(
+            } => Self::seal_stream_manager_resp_error(
                 *request_id,
                 *stream_id,
-                if effective_extent_id != ExtentId(0) {
-                    effective_extent_id
-                } else {
-                    *extent_id
-                },
+                error_code,
+                message,
+            ),
+            VariableHeader::SealExtentNodeRequest {
+                request_id,
+                stream_id,
+                ..
+            } => Self::seal_extent_node_resp_error(
+                *request_id,
+                *stream_id,
                 error_code,
                 message,
             ),
@@ -1013,38 +1020,20 @@ impl Frame {
             VariableHeader::ReadResp { .. } => 4 + 8 + 8 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) + offset(8) + error_code(2)
             VariableHeader::ReadRespError { .. } => 4 + 8 + 4 + 8 + 2,
-            // request_id(4) + stream_id(8) + extent_id(4) [+ offset(8) if present]
-            VariableHeader::Seal {
-                offset,
-                start_offset,
-                epoch,
-                ..
-            } => {
-                let base = 4 + 8 + 4;
-                let so = if start_offset.is_some() { 8 } else { 0 };
-                let off = if offset.is_some() { 8 } else { 0 };
-                let ep = if epoch.is_some() { 4 } else { 0 };
-                base + so + off + ep
+            // request_id(4) + stream_id(8) + epoch(4)
+            VariableHeader::SealStreamManagerRequest { .. } => 4 + 8 + 4,
+            // request_id(4) + stream_id(8) + offset(8) + new_epoch(4) + addr_len(2) + addr(N)
+            VariableHeader::SealStreamManagerResp { primary_addr, .. } => {
+                4 + 8 + 8 + 4 + 2 + primary_addr.len()
             }
-            // request_id(4) + stream_id(8) + extent_id(4) + offset(8)
-            // [+ new_extent_id(4) + addr_len(2) + addr_bytes if FLAG_NEW_EXTENT_PRESENT]
-            VariableHeader::SealAck {
-                new_extent_id,
-                primary_addr,
-                epoch,
-                ..
-            } => {
-                let base = 4 + 8 + 4 + 8;
-                let ne = if new_extent_id.is_some() {
-                    4 + 2 + primary_addr.as_ref().map_or(0, |a| a.len())
-                } else {
-                    0
-                };
-                let ep = if epoch.is_some() { 4 } else { 0 };
-                base + ne + ep
-            }
-            // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
-            VariableHeader::SealAckError { .. } => 4 + 8 + 4 + 2,
+            // request_id(4) + stream_id(8) + error_code(2)
+            VariableHeader::SealStreamManagerRespError { .. } => 4 + 8 + 2,
+            // request_id(4) + stream_id(8) + epoch(4) + extent_id_from(4) + start_offset(8)
+            VariableHeader::SealExtentNodeRequest { .. } => 4 + 8 + 4 + 4 + 8,
+            // request_id(4) + stream_id(8) + epoch(4) + extent_id(4) + start_offset(8) + end_offset(8)
+            VariableHeader::SealExtentNodeResp { .. } => 4 + 8 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(8) + error_code(2)
+            VariableHeader::SealExtentNodeRespError { .. } => 4 + 8 + 2,
             // request_id(4) + name_len(2) + name(N) + replication_factor(2) + min_extent_capacity(4) + max_extent_capacity(4) + cache_extents(4) + extent_growth_factor(4)
             VariableHeader::CreateStream { stream_name, .. } => {
                 4 + 2 + stream_name.len() + 2 + 4 + 4 + 4 + 4
@@ -1141,7 +1130,9 @@ impl Frame {
             | VariableHeader::SeekResp { .. }
             | VariableHeader::SeekRespError { .. }
             | VariableHeader::AppendAckError { .. }
-            | VariableHeader::SealAckError { .. }
+            | VariableHeader::SealStreamManagerRespError { .. }
+            | VariableHeader::SealExtentNodeResp { .. }
+            | VariableHeader::SealExtentNodeRespError { .. }
             | VariableHeader::CreateStreamRespError { .. }
             | VariableHeader::QueryOffsetRespError { .. }
             | VariableHeader::ConnectAckError { .. }
@@ -1248,59 +1239,73 @@ impl Frame {
                 dst.put_u64(offset.0);
                 dst.put_u16(*error_code as u16);
             }
-            VariableHeader::Seal {
+            VariableHeader::SealStreamManagerRequest {
                 request_id,
                 stream_id,
-                extent_id,
-                offset,
-                start_offset,
                 epoch,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
-                dst.put_u32(extent_id.0);
-                if let Some(so) = start_offset {
-                    dst.put_u64(*so);
-                }
-                if let Some(off) = offset {
-                    dst.put_u64(off.0);
-                }
-                if let Some(ep) = epoch {
-                    dst.put_u32(ep.0);
-                }
+                dst.put_u32(epoch.0);
             }
-            VariableHeader::SealAck {
+            VariableHeader::SealStreamManagerResp {
                 request_id,
                 stream_id,
-                extent_id,
                 offset,
-                new_extent_id,
+                new_epoch,
                 primary_addr,
-                epoch,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
-                if let Some(neid) = new_extent_id {
-                    dst.put_u32(neid.0);
-                    let addr_bytes = primary_addr.as_ref().map_or(&[][..], |a| &a[..]);
-                    dst.put_u16(addr_bytes.len() as u16);
-                    dst.extend_from_slice(addr_bytes);
-                }
-                if let Some(ep) = epoch {
-                    dst.put_u32(ep.0);
-                }
+                dst.put_u32(new_epoch.0);
+                dst.put_u16(primary_addr.len() as u16);
+                dst.extend_from_slice(primary_addr);
             }
-            VariableHeader::SealAckError {
+            VariableHeader::SealStreamManagerRespError {
                 request_id,
                 stream_id,
-                extent_id,
                 error_code,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u64(stream_id.0);
+                dst.put_u16(*error_code as u16);
+            }
+            VariableHeader::SealExtentNodeRequest {
+                request_id,
+                stream_id,
+                epoch,
+                extent_id_from,
+                start_offset,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u32(epoch.0);
+                dst.put_u32(extent_id_from.0);
+                dst.put_u64(*start_offset);
+            }
+            VariableHeader::SealExtentNodeResp {
+                request_id,
+                stream_id,
+                epoch,
+                extent_id,
+                start_offset,
+                end_offset,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
+                dst.put_u32(epoch.0);
                 dst.put_u32(extent_id.0);
+                dst.put_u64(*start_offset);
+                dst.put_u64(*end_offset);
+            }
+            VariableHeader::SealExtentNodeRespError {
+                request_id,
+                stream_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u64(stream_id.0);
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::CreateStream {
@@ -1790,85 +1795,97 @@ impl Frame {
                     ))
                 }
             }
-            Opcode::Seal => {
+            Opcode::SealStreamManager => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
-                let extent_id = ExtentId(body.get_u32());
-                let start_offset = if flags & FLAG_START_OFFSET_PRESENT != 0 {
-                    Some(body.get_u64())
-                } else {
-                    None
-                };
-                let offset = if flags & FLAG_OFFSET_PRESENT != 0 {
-                    Some(Offset(body.get_u64()))
-                } else {
-                    None
-                };
-                let epoch = if flags & FLAG_EPOCH_PRESENT != 0 {
-                    Some(Epoch(body.get_u32()))
-                } else {
-                    None
-                };
-                Ok((
-                    VariableHeader::Seal {
-                        request_id,
-                        stream_id,
-                        extent_id,
-                        offset,
-                        start_offset,
-                        epoch,
-                    },
-                    None,
-                ))
-            }
-            Opcode::SealAck => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let extent_id = ExtentId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown SealAck error code".into())
+                        StorageError::InvalidFrame(
+                            "unknown SealStreamManager error code".into(),
+                        )
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::SealAckError {
+                        VariableHeader::SealStreamManagerRespError {
                             request_id,
                             stream_id,
-                            extent_id,
                             error_code,
                         },
                         payload,
                     ))
-                } else {
-                    let response_flags = flags & !FLAG_RESPONSE_ERROR;
+                } else if flags & FLAG_SEAL_RESPONSE != 0 {
                     let offset = Offset(body.get_u64());
-                    let (new_extent_id, primary_addr) =
-                        if response_flags & FLAG_NEW_EXTENT_PRESENT != 0 {
-                            let neid = ExtentId(body.get_u32());
-                            let addr_len = body.get_u16() as usize;
-                            let addr = if body.remaining() >= addr_len {
-                                Some(body.split_to(addr_len).freeze())
-                            } else {
-                                None
-                            };
-                            (Some(neid), addr)
-                        } else {
-                            (None, None)
-                        };
-                    let epoch = if response_flags & FLAG_EPOCH_PRESENT != 0 {
-                        Some(Epoch(body.get_u32()))
-                    } else {
-                        None
-                    };
+                    let new_epoch = Epoch(body.get_u32());
+                    let addr_len = body.get_u16() as usize;
+                    let primary_addr = body.split_to(addr_len).freeze();
                     Ok((
-                        VariableHeader::SealAck {
+                        VariableHeader::SealStreamManagerResp {
                             request_id,
                             stream_id,
-                            extent_id,
                             offset,
-                            new_extent_id,
+                            new_epoch,
                             primary_addr,
+                        },
+                        None,
+                    ))
+                } else {
+                    let epoch = Epoch(body.get_u32());
+                    Ok((
+                        VariableHeader::SealStreamManagerRequest {
+                            request_id,
+                            stream_id,
                             epoch,
+                        },
+                        None,
+                    ))
+                }
+            }
+            Opcode::SealExtentNode => {
+                let request_id = body.get_u32();
+                let stream_id = StreamId(body.get_u64());
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame(
+                            "unknown SealExtentNode error code".into(),
+                        )
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::SealExtentNodeRespError {
+                            request_id,
+                            stream_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else if flags & FLAG_SEAL_RESPONSE != 0 {
+                    let epoch = Epoch(body.get_u32());
+                    let extent_id = ExtentId(body.get_u32());
+                    let start_offset = body.get_u64();
+                    let end_offset = body.get_u64();
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::SealExtentNodeResp {
+                            request_id,
+                            stream_id,
+                            epoch,
+                            extent_id,
+                            start_offset,
+                            end_offset,
+                        },
+                        payload,
+                    ))
+                } else {
+                    let epoch = Epoch(body.get_u32());
+                    let extent_id_from = ExtentId(body.get_u32());
+                    let start_offset = body.get_u64();
+                    Ok((
+                        VariableHeader::SealExtentNodeRequest {
+                            request_id,
+                            stream_id,
+                            epoch,
+                            extent_id_from,
+                            start_offset,
                         },
                         None,
                     ))
@@ -2407,8 +2424,12 @@ impl VariableHeader {
             VariableHeader::ReadResp { .. } | VariableHeader::ReadRespError { .. } => {
                 Opcode::ReadResp
             }
-            VariableHeader::Seal { .. } => Opcode::Seal,
-            VariableHeader::SealAck { .. } | VariableHeader::SealAckError { .. } => Opcode::SealAck,
+            VariableHeader::SealStreamManagerRequest { .. }
+            | VariableHeader::SealStreamManagerResp { .. }
+            | VariableHeader::SealStreamManagerRespError { .. } => Opcode::SealStreamManager,
+            VariableHeader::SealExtentNodeRequest { .. }
+            | VariableHeader::SealExtentNodeResp { .. }
+            | VariableHeader::SealExtentNodeRespError { .. } => Opcode::SealExtentNode,
             VariableHeader::CreateStream { .. } => Opcode::CreateStream,
             VariableHeader::CreateStreamResp { .. }
             | VariableHeader::CreateStreamRespError { .. } => Opcode::CreateStreamResp,
@@ -2655,127 +2676,196 @@ mod tests {
     }
 
     #[test]
-    fn seal_without_offset() {
+    fn seal_stream_manager_request_round_trip() {
         let frame = Frame::new(
-            VariableHeader::Seal {
+            VariableHeader::SealStreamManagerRequest {
                 request_id: 1,
                 stream_id: StreamId(10),
-                extent_id: ExtentId(5),
-                offset: None,
-                start_offset: None,
-                epoch: None,
+                epoch: Epoch(5),
             },
             None,
         );
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);
-        // 8 + 4 + 8 + 4 = 24
+        // 8 (fixed) + 4 + 8 + 4 = 24
         assert_eq!(buf.len(), 24);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.extent_id(), ExtentId(5));
-        assert_eq!(decoded.offset(), Offset(0));
+        assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
+        assert_eq!(decoded.flags(), 0);
+        assert_eq!(decoded.request_id(), 1);
+        assert_eq!(decoded.stream_id(), StreamId(10));
+        assert_eq!(decoded.epoch(), Epoch(5));
+        assert!(!decoded.is_error_response());
+        assert!(buf.is_empty());
     }
 
     #[test]
-    fn seal_with_offset() {
+    fn seal_stream_manager_resp_round_trip() {
+        let addr = Bytes::from_static(b"127.0.0.1:9001");
         let frame = Frame::new(
-            VariableHeader::Seal {
-                request_id: 1,
+            VariableHeader::SealStreamManagerResp {
+                request_id: 2,
                 stream_id: StreamId(10),
-                extent_id: ExtentId(5),
-                offset: Some(Offset(42)),
-                start_offset: None,
-                epoch: None,
+                offset: Offset(42),
+                new_epoch: Epoch(6),
+                primary_addr: addr.clone(),
             },
             None,
         );
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);
-        // 8 + 4 + 8 + 4 + 8 = 32
-        assert_eq!(buf.len(), 32);
+        // 8 (fixed) + 4 + 8 + 8 + 4 + 2 + 14 = 48
+        assert_eq!(buf.len(), 48);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.flags(), FLAG_OFFSET_PRESENT);
-        assert_eq!(decoded.extent_id(), ExtentId(5));
+        assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
+        assert_eq!(decoded.flags(), FLAG_SEAL_RESPONSE);
+        assert_eq!(decoded.request_id(), 2);
+        assert_eq!(decoded.stream_id(), StreamId(10));
         assert_eq!(decoded.offset(), Offset(42));
+        assert_eq!(decoded.epoch(), Epoch(6));
+        assert!(!decoded.is_error_response());
+        match &decoded.variable_header {
+            VariableHeader::SealStreamManagerResp {
+                primary_addr,
+                new_epoch,
+                ..
+            } => {
+                assert_eq!(primary_addr, &addr);
+                assert_eq!(*new_epoch, Epoch(6));
+            }
+            _ => panic!("expected SealStreamManagerResp"),
+        }
+        assert!(buf.is_empty());
     }
 
     #[test]
-    fn seal_with_start_offset_only() {
+    fn seal_stream_manager_resp_error_round_trip() {
+        let frame = Frame::seal_stream_manager_resp_error(
+            3,
+            StreamId(10),
+            ErrorCode::ExtentSealed,
+            "stream sealed",
+        );
+
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf);
+
+        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
+        assert!(decoded.is_error_response());
+        assert_eq!(decoded.request_id(), 3);
+        assert_eq!(decoded.stream_id(), StreamId(10));
+        assert_eq!(decoded.error_code(), ErrorCode::ExtentSealed as u16);
+        assert_eq!(decoded.payload, Some(Bytes::from_static(b"stream sealed")));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn seal_extent_node_request_round_trip() {
         let frame = Frame::new(
-            VariableHeader::Seal {
-                request_id: 1,
-                stream_id: StreamId(10),
-                extent_id: ExtentId(5),
-                offset: None,
-                start_offset: Some(100),
-                epoch: None,
+            VariableHeader::SealExtentNodeRequest {
+                request_id: 4,
+                stream_id: StreamId(20),
+                epoch: Epoch(3),
+                extent_id_from: ExtentId(7),
+                start_offset: 100,
             },
             None,
         );
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);
-        // 8 + 4 + 8 + 4 + 8(start_offset) = 32
-        assert_eq!(buf.len(), 32);
+        // 8 (fixed) + 4 + 8 + 4 + 4 + 8 = 36
+        assert_eq!(buf.len(), 36);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.flags(), FLAG_START_OFFSET_PRESENT);
-        assert_eq!(decoded.extent_id(), ExtentId(5));
-        assert_eq!(decoded.offset(), Offset(0)); // no offset present
-        if let VariableHeader::Seal {
-            start_offset,
-            offset,
-            ..
-        } = &decoded.variable_header
-        {
-            assert_eq!(*start_offset, Some(100));
-            assert_eq!(*offset, None);
-        } else {
-            panic!("expected Seal variant");
+        assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
+        assert_eq!(decoded.flags(), 0);
+        assert_eq!(decoded.request_id(), 4);
+        assert_eq!(decoded.stream_id(), StreamId(20));
+        assert_eq!(decoded.epoch(), Epoch(3));
+        assert_eq!(decoded.extent_id(), ExtentId(7));
+        assert!(!decoded.is_error_response());
+        match &decoded.variable_header {
+            VariableHeader::SealExtentNodeRequest {
+                extent_id_from,
+                start_offset,
+                ..
+            } => {
+                assert_eq!(*extent_id_from, ExtentId(7));
+                assert_eq!(*start_offset, 100);
+            }
+            _ => panic!("expected SealExtentNodeRequest"),
         }
+        assert!(buf.is_empty());
     }
 
     #[test]
-    fn seal_with_both_offsets() {
+    fn seal_extent_node_resp_round_trip() {
         let frame = Frame::new(
-            VariableHeader::Seal {
-                request_id: 1,
-                stream_id: StreamId(10),
-                extent_id: ExtentId(5),
-                offset: Some(Offset(42)),
-                start_offset: Some(100),
-                epoch: None,
+            VariableHeader::SealExtentNodeResp {
+                request_id: 5,
+                stream_id: StreamId(20),
+                epoch: Epoch(4),
+                extent_id: ExtentId(8),
+                start_offset: 100,
+                end_offset: 500,
             },
-            None,
+            Some(Bytes::from_static(b"extra-data")),
         );
 
         let mut buf = BytesMut::new();
         frame.encode(&mut buf);
-        // 8 + 4 + 8 + 4 + 8(start_offset) + 8(offset) = 40
-        assert_eq!(buf.len(), 40);
+        // 8 (fixed) + 4 + 8 + 4 + 4 + 8 + 8 = 44 (vh) + 4 + 10 = 58
+        assert_eq!(buf.len(), 58);
 
         let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(
-            decoded.flags(),
-            FLAG_OFFSET_PRESENT | FLAG_START_OFFSET_PRESENT
-        );
-        assert_eq!(decoded.extent_id(), ExtentId(5));
-        assert_eq!(decoded.offset(), Offset(42));
-        if let VariableHeader::Seal {
-            start_offset,
-            offset,
-            ..
-        } = &decoded.variable_header
-        {
-            assert_eq!(*start_offset, Some(100));
-            assert_eq!(*offset, Some(Offset(42)));
-        } else {
-            panic!("expected Seal variant");
+        assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
+        assert_eq!(decoded.flags(), FLAG_SEAL_RESPONSE);
+        assert_eq!(decoded.request_id(), 5);
+        assert_eq!(decoded.stream_id(), StreamId(20));
+        assert_eq!(decoded.epoch(), Epoch(4));
+        assert_eq!(decoded.extent_id(), ExtentId(8));
+        assert!(!decoded.is_error_response());
+        match &decoded.variable_header {
+            VariableHeader::SealExtentNodeResp {
+                start_offset,
+                end_offset,
+                ..
+            } => {
+                assert_eq!(*start_offset, 100);
+                assert_eq!(*end_offset, 500);
+            }
+            _ => panic!("expected SealExtentNodeResp"),
         }
+        assert_eq!(decoded.payload, Some(Bytes::from_static(b"extra-data")));
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn seal_extent_node_resp_error_round_trip() {
+        let frame = Frame::seal_extent_node_resp_error(
+            6,
+            StreamId(20),
+            ErrorCode::ExtentSealed,
+            "node error",
+        );
+
+        let mut buf = BytesMut::new();
+        frame.encode(&mut buf);
+
+        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+        assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
+        assert!(decoded.is_error_response());
+        assert_eq!(decoded.request_id(), 6);
+        assert_eq!(decoded.stream_id(), StreamId(20));
+        assert_eq!(decoded.error_code(), ErrorCode::ExtentSealed as u16);
+        assert_eq!(decoded.payload, Some(Bytes::from_static(b"node error")));
+        assert!(buf.is_empty());
     }
 
     #[test]
@@ -2945,90 +3035,6 @@ mod tests {
                 );
             }
             _ => panic!("expected DescribeStream"),
-        }
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn seal_ack_without_new_extent() {
-        let frame = Frame::new(
-            VariableHeader::SealAck {
-                request_id: 1,
-                stream_id: StreamId(10),
-                extent_id: ExtentId(5),
-                offset: Offset(42),
-                new_extent_id: None,
-                primary_addr: None,
-                epoch: None,
-            },
-            None,
-        );
-
-        let mut buf = BytesMut::new();
-        frame.encode(&mut buf);
-        // 8 (fixed) + 4 (req) + 8 (stream) + 4 (extent) + 8 (offset) = 32 bytes
-        assert_eq!(buf.len(), 32);
-
-        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.opcode(), Opcode::SealAck);
-        assert_eq!(decoded.flags(), 0);
-        assert_eq!(decoded.request_id(), 1);
-        assert_eq!(decoded.stream_id(), StreamId(10));
-        assert_eq!(decoded.extent_id(), ExtentId(5));
-        assert_eq!(decoded.offset(), Offset(42));
-        // No new_extent_id or primary_addr
-        match &decoded.variable_header {
-            VariableHeader::SealAck {
-                new_extent_id,
-                primary_addr,
-                ..
-            } => {
-                assert!(new_extent_id.is_none());
-                assert!(primary_addr.is_none());
-            }
-            _ => panic!("expected SealAck"),
-        }
-        assert!(buf.is_empty());
-    }
-
-    #[test]
-    fn seal_ack_with_new_extent() {
-        let addr = b"127.0.0.1:9001";
-        let frame = Frame::new(
-            VariableHeader::SealAck {
-                request_id: 2,
-                stream_id: StreamId(10),
-                extent_id: ExtentId(5),
-                offset: Offset(42),
-                new_extent_id: Some(ExtentId(6)),
-                primary_addr: Some(Bytes::from_static(addr)),
-                epoch: None,
-            },
-            None,
-        );
-
-        let mut buf = BytesMut::new();
-        frame.encode(&mut buf);
-        // 8 (fixed) + 24 (base) + 4 (new_extent_id) + 2 (addr_len) + 14 (addr) = 52 bytes
-        assert_eq!(buf.len(), 52);
-
-        let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-        assert_eq!(decoded.opcode(), Opcode::SealAck);
-        assert_eq!(decoded.flags(), FLAG_NEW_EXTENT_PRESENT);
-        assert_eq!(decoded.request_id(), 2);
-        assert_eq!(decoded.stream_id(), StreamId(10));
-        assert_eq!(decoded.extent_id(), ExtentId(5));
-        assert_eq!(decoded.offset(), Offset(42));
-        match &decoded.variable_header {
-            VariableHeader::SealAck {
-                new_extent_id,
-                primary_addr,
-                ..
-            } => {
-                assert_eq!(*new_extent_id, Some(ExtentId(6)));
-                assert_eq!(primary_addr.as_ref().unwrap(), &Bytes::from_static(addr));
-            }
-            _ => panic!("expected SealAck"),
         }
         assert!(buf.is_empty());
     }

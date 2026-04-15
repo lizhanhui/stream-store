@@ -210,8 +210,8 @@ async fn client_recovers_after_primary_killed() {
     // Client-driven recovery: client observed append error, now seals by epoch on SM.
     // SM seals secondaries (primary is dead), allocates new extent with degraded RF.
     let sm_client2 = StreamClient::connect(&sm_addr).await.unwrap();
-    let seal_result = sm_client2.seal_by_epoch(stream_id, Epoch(0)).await;
-    info!("[test] seal_by_epoch result: {:?}", seal_result);
+    let seal_result = sm_client2.seal(stream_id, Epoch(0)).await;
+    info!("[test] seal result: {:?}", seal_result);
 
     // Discover the new primary via describe_stream.
     let extents = sm_client2.describe_stream(stream_id, 0).await.unwrap();
@@ -249,9 +249,8 @@ async fn client_recovers_after_primary_killed() {
     );
 
     // Resume appending on the new primary.
-    // Note: the first few appends may fail if stale Forward frames from the old
-    // extent are still being processed by secondaries (causes subtract overflow).
-    // Retry until we get a success.
+    // Wait briefly for RegisterExtent to propagate to the new primary.
+    sleep(Duration::from_millis(200)).await;
     let new_client = StreamClient::connect(&new_primary.node_addr).await.unwrap();
     let mut appended_after = 0;
     for i in 100..120 {

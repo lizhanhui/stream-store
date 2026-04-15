@@ -162,19 +162,25 @@ async fn main() {
     }
     info!("    (verified: all messages match)");
 
-    // ── 9. Seal extent via StreamManager (client seal — StreamManager queries ExtentNodes for offset) ──
-    let (new_extent_id_raw, new_primary_addr) = stream_manager_client
-        .seal(stream_id, extent_id, None)
+    // ── 9. Seal extent via StreamManager (epoch-based seal) ──
+    let (new_epoch, new_primary_addr) = stream_manager_client
+        .seal(stream_id, Epoch(0))
         .await
         .expect("seal failed");
-    let new_extent_id = ExtentId(new_extent_id_raw);
     let sealed_count = messages.len() as u32;
+
+    // Discover the new extent_id from describe_stream.
+    let post_seal_extents = stream_manager_client
+        .describe_stream(stream_id, 1)
+        .await
+        .expect("describe_stream after seal");
+    let new_extent_id = ExtentId(post_seal_extents[0].extent_id);
 
     info!(
         "[8] Sealed extent {:?} (messages={sealed_count})",
         extent_id
     );
-    info!("    New extent_id={new_extent_id_raw}, primary={new_primary_addr}");
+    info!("    New epoch={new_epoch}, extent_id={new_extent_id:?}, primary={new_primary_addr}");
 
     // ── 10. Append more records to the new extent ──
     let extent_node_client_2 = StreamClient::connect(&new_primary_addr)
@@ -227,8 +233,8 @@ async fn main() {
     info!("    (verified: all messages match)");
 
     // ── 12. Seal the second extent ──
-    let (final_extent_id, final_addr) = stream_manager_client
-        .seal(stream_id, new_extent_id, None)
+    let (final_epoch, final_addr) = stream_manager_client
+        .seal(stream_id, new_epoch)
         .await
         .expect("second seal failed");
 
@@ -239,7 +245,7 @@ async fn main() {
         .expect("query_offset on StreamManager failed");
 
     info!(
-        "[11] Sealed extent {} -> new extent_id={final_extent_id}, primary={final_addr}",
+        "[11] Sealed extent {:?} -> new epoch={final_epoch}, primary={final_addr}",
         new_extent_id
     );
     info!(

@@ -18,30 +18,29 @@ use rpc::payload::{
 use server::handler::RequestHandler;
 use tracing::{error, info, warn};
 
-/// Seal an ExtentNode's extent and return the committed end_offset.
+/// Seal an ExtentNode's extent and return the sealed extent info.
 ///
-/// This is a free function (not a method) so that it can be called from async tasks
-/// spawned for concurrent sealing without borrowing `self`.
+/// Sends SealExtentNodeRequest to the EN and parses SealExtentNodeResp.
+/// Returns (sealed_extent_id, start_offset, end_offset, optional payload with predecessor extents).
 async fn seal_extent_node_static(
     addr: &str,
     stream_id: StreamId,
-    extent_id: ExtentId,
-    committed_offset: Option<u64>,
-    start_offset: Option<u64>,
-) -> Result<u64, StorageError> {
+    epoch: Epoch,
+    extent_id_from: ExtentId,
+    start_offset: u64,
+) -> Result<(ExtentId, u64, u64, Option<Bytes>), StorageError> {
     let client = client::StreamClient::connect(addr).await.map_err(|e| {
         StorageError::Internal(format!("connect to ExtentNode {addr} for Seal: {e}"))
     })?;
 
     let resp = client
         .send_frame(Frame::new(
-            VariableHeader::Seal {
+            VariableHeader::SealExtentNodeRequest {
                 request_id: 0,
                 stream_id,
-                extent_id,
-                offset: committed_offset.map(Offset),
+                epoch,
+                extent_id_from,
                 start_offset,
-                epoch: None,
             },
             None,
         ))
@@ -55,8 +54,19 @@ async fn seal_extent_node_static(
         )));
     }
 
-    // SealAck carries committed end_offset in the offset field.
-    Ok(resp.offset().0)
+    // Parse SealExtentNodeResp.
+    match &resp.variable_header {
+        VariableHeader::SealExtentNodeResp {
+            extent_id,
+            start_offset: so,
+            end_offset,
+            ..
+        } => Ok((*extent_id, *so, *end_offset, resp.payload.clone())),
+        _ => Err(StorageError::Internal(format!(
+            "ExtentNode {addr} returned unexpected response: {:?}",
+            resp.opcode()
+        ))),
+    }
 }
 
 /// Query an ExtentNode for all extents it holds for a stream (used during recovery/reconciliation).
@@ -293,7 +303,7 @@ impl StreamManagerStore {
     /// Register the new extent on the Primary ExtentNode and wait for its ACK.
     ///
     /// This guarantees the Primary is ready to accept appends before any client
-    /// learns about the new extent (via SealAck or DescribeStream).
+    /// learns about the new extent (via SealStreamManagerResp or DescribeStream).
     ///
     /// Uses a 1-second timeout covering both TCP connect and the RegisterExtent
     /// round-trip. On a healthy LAN this completes in sub-millisecond; a timeout
@@ -554,7 +564,7 @@ impl RequestHandler for StreamManagerStore {
                     Opcode::Heartbeat => self.handle_heartbeat(frame).await,
                     Opcode::Disconnect => self.handle_disconnect(frame).await,
                     Opcode::CreateStream => self.handle_create_stream(frame).await,
-                    Opcode::Seal => self.handle_seal(frame).await,
+                    Opcode::SealStreamManager => self.handle_seal_stream_manager(frame).await,
                     Opcode::QueryOffset => self.handle_query_offset(frame).await,
                     Opcode::DescribeStream => self.handle_describe_stream(frame).await,
                     Opcode::DescribeExtent => self.handle_describe_extent(frame).await,
@@ -570,7 +580,7 @@ impl RequestHandler for StreamManagerStore {
                     | Opcode::CreateStreamResp
                     | Opcode::QueryOffsetResp
                     | Opcode::ReadResp
-                    | Opcode::SealAck
+                    | Opcode::SealExtentNode
                     | Opcode::DescribeStreamResp
                     | Opcode::DescribeExtentResp
                     | Opcode::SeekResp
@@ -821,75 +831,41 @@ impl StreamManagerStore {
 
     /// Seal an extent for a stream and allocate a new replica set.
     ///
-    /// Dispatches based on whether the caller provides a committed offset:
-    /// - Seal variant's `offset` is `None`: SM queries all EN replicas for offset via quorum.
-    /// - Seal variant's `offset` is `Some`: SM trusts offset from the caller.
-    ///
-    /// Both paths seal in MySQL (transaction) + allocate new extent and notify ExtentNodes.
-    async fn handle_seal(&self, frame: Frame) -> Frame {
-        let stream_id = frame.stream_id();
-        let extent_id = frame.extent_id();
-        let (committed_offset, epoch) = match &frame.variable_header {
-            VariableHeader::Seal { offset, epoch, .. } => (offset.map(|o| o.0), *epoch),
-            _ => (None, None),
+    /// Receives SealStreamManagerRequest(stream_id, epoch) from the client.
+    /// SM forwards seal to the Primary of that epoch and allocates a new extent.
+    async fn handle_seal_stream_manager(&self, frame: Frame) -> Frame {
+        let (request_id, stream_id, epoch) = match &frame.variable_header {
+            VariableHeader::SealStreamManagerRequest {
+                request_id,
+                stream_id,
+                epoch,
+            } => (*request_id, *stream_id, *epoch),
+            _ => {
+                return Frame::seal_stream_manager_resp_error(
+                    frame.request_id(),
+                    frame.stream_id(),
+                    ErrorCode::InternalError,
+                    "invalid SealStreamManagerRequest frame",
+                );
+            }
         };
 
-        // Epoch-based seal: client sends Seal(stream_id, epoch) when it doesn't know
-        // the current extent_id. SM forwards to the Primary of that epoch.
-        if let Some(seal_epoch) = epoch {
-            return self
-                .handle_epoch_seal(frame.request_id(), stream_id, seal_epoch)
-                .await;
-        }
-
-        let result = async {
-            // Fetch current stream epoch for extent-based seal (no epoch bump).
-            let current_epoch = self.store.get_stream_epoch(stream_id).await?;
-            self.seal_extent(stream_id, extent_id, committed_offset, current_epoch)
-                .await
-        }
-        .await;
-
-        match result {
-            Ok((new_extent_id, primary_addr)) => Frame::new(
-                VariableHeader::SealAck {
-                    request_id: frame.request_id(),
-                    stream_id,
-                    extent_id,
-                    offset: Offset(0),
-                    new_extent_id: Some(new_extent_id),
-                    primary_addr: Some(Bytes::copy_from_slice(primary_addr.as_bytes())),
-                    epoch: None,
-                },
-                None,
-            ),
-            Err(e) => {
-                error!("seal failed: {e}");
-                Frame::error_from_request(
-                    &frame,
-                    ErrorCode::InternalError,
-                    &e.to_string(),
-                    ExtentId(0),
-                )
-            }
-        }
+        self.handle_epoch_seal(request_id, stream_id, epoch).await
     }
 
     /// Seal an extent and allocate a new one.
     ///
-    /// Both seal paths follow the same two-phase protocol:
+    /// The new seal protocol sends SealExtentNodeRequest to ENs, which seal the
+    /// last mutable extent and return SealExtentNodeResp with extent info.
     ///
     /// **Phase 1 — Seal primary, obtain committed offset.**
     /// - EN-initiated (extent-full): Primary already sealed locally and provides
     ///   `committed_offset=Some(offset)`. Phase 1 is done.
     /// - Client-initiated: `committed_offset=None`. `resolve_committed_offset`
-    ///   seals only the primary with a short timeout (100ms). Secondaries are
-    ///   left unsealed so they continue accepting in-flight forwarded appends.
+    ///   seals only the primary with a short timeout (100ms).
     ///
-    /// **Phase 2 — Seal all replicas with the committed offset (fire-and-forget).**
-    /// After `seal_allocate_register`, all replicas are sealed with the final
-    /// committed offset. Secondaries update their `limit` so no further appends
-    /// are accepted. This is idempotent — already-sealed nodes return SealAck.
+    /// **Phase 2 — Seal all replicas (fire-and-forget).**
+    /// After `seal_allocate_register`, all replicas are sealed. This is idempotent.
     async fn seal_extent(
         &self,
         stream_id: StreamId,
@@ -931,11 +907,7 @@ impl StreamManagerStore {
             .seal_allocate_register(stream_id, extent_id, end_offset, epoch)
             .await?;
 
-        // Fire-and-forget seal to all replicas with the committed offset.
-        //
-        // EN-initiated path: primary already sealed locally, secondaries need sealing.
-        //
-        // Fire-and-forget seal to all replicas (safety net for client-initiated seal).
+        // Fire-and-forget seal to all replicas (safety net).
         // Look up replicas using the extent's epoch (not the new bumped epoch).
         {
             let replicas = self
@@ -948,15 +920,13 @@ impl StreamManagerStore {
             if !addrs.is_empty() {
                 let sid = stream_id;
                 let eid = extent_id;
-                let seal_offset = end_offset;
+                let ep = extent_row.epoch;
                 let so = extent_start_offset;
                 tokio::spawn(async move {
                     for addr in addrs {
-                        match seal_extent_node_static(&addr, sid, eid, Some(seal_offset), Some(so))
-                            .await
-                        {
-                            Ok(offset) => {
-                                info!("fire-and-forget seal to {addr}: offset={offset}");
+                        match seal_extent_node_static(&addr, sid, ep, eid, so).await {
+                            Ok((_sealed_eid, _start, end, _payload)) => {
+                                info!("fire-and-forget seal to {addr}: end_offset={end}");
                             }
                             Err(e) => {
                                 warn!("fire-and-forget seal to {addr} failed: {e}");
@@ -973,14 +943,10 @@ impl StreamManagerStore {
     /// Resolve the committed offset for a client-initiated seal.
     ///
     /// **Phase 1** — Seal primary with a short timeout (100ms). If the primary is
-    /// alive (common case), it returns its committed offset immediately. This is
-    /// authoritative. Secondaries are NOT sealed here — they continue accepting
-    /// in-flight forwarded appends. The caller (`seal_extent`) will fire-and-forget
-    /// seal all replicas with the final committed offset afterwards.
+    /// alive (common case), it returns its committed offset immediately.
     ///
     /// **Fallback** — If the primary is unreachable (timeout/error), seal ALL
-    /// replicas concurrently (secondaries with `offset=None`) and compute the
-    /// committed offset from secondary quorum.
+    /// replicas concurrently and compute the committed offset from secondary quorum.
     pub async fn resolve_committed_offset(
         &self,
         stream_id: StreamId,
@@ -1008,25 +974,24 @@ impl StreamManagerStore {
         }
 
         // Phase 1: Seal primary with short timeout (100ms).
-        // Covers TCP connect + seal RPC round-trip on a healthy node.
         if let Some(ref addr) = primary_addr {
             let addr = addr.clone();
             let sid = stream_id;
+            let ep = epoch;
+            let eid = extent_id;
+            let so = start_offset;
             match tokio::time::timeout(
                 Duration::from_millis(100),
-                seal_extent_node_static(&addr, sid, extent_id, None, None),
+                seal_extent_node_static(&addr, sid, ep, eid, so),
             )
             .await
             {
-                Ok(Ok(offset)) => {
+                Ok(Ok((_sealed_eid, _start, end_offset, _payload))) => {
                     info!(
-                        "Primary {addr} reports committed offset {offset} for stream {} (fast path)",
+                        "Primary {addr} reports committed offset {end_offset} for stream {} (fast path)",
                         stream_id
                     );
-                    // Primary is authoritative. Secondaries are left unsealed so they
-                    // continue accepting in-flight forwarded appends. The caller will
-                    // fire-and-forget seal all replicas with this offset.
-                    return Ok(offset);
+                    return Ok(end_offset);
                 }
                 Ok(Err(e)) => {
                     warn!("Primary {addr} seal failed for stream {}: {e}", stream_id);
@@ -1054,10 +1019,11 @@ impl StreamManagerStore {
             let addr = replica.node_addr.clone();
             let role = replica.role;
             let sid = stream_id;
+            let ep = epoch;
             let eid = extent_id;
             let so = start_offset;
             seal_futures.push(async move {
-                let result = seal_extent_node_static(&addr, sid, eid, None, Some(so)).await;
+                let result = seal_extent_node_static(&addr, sid, ep, eid, so).await;
                 (addr, role, result)
             });
         }
@@ -1069,19 +1035,19 @@ impl StreamManagerStore {
 
         for (addr, role, result) in &seal_results {
             match result {
-                Ok(offset) => {
+                Ok((_sealed_eid, _start, end_offset, _payload)) => {
                     if *role == 0 {
                         info!(
-                            "Primary {addr} reports committed offset {offset} for stream {:?} (fallback)",
+                            "Primary {addr} reports committed offset {end_offset} for stream {:?} (fallback)",
                             stream_id
                         );
-                        primary_offset = Some(*offset);
+                        primary_offset = Some(*end_offset);
                     } else {
                         info!(
-                            "Secondary {addr} reports offset {offset} for stream {:?}",
+                            "Secondary {addr} reports offset {end_offset} for stream {:?}",
                             stream_id
                         );
-                        secondary_offsets.push(*offset);
+                        secondary_offsets.push(*end_offset);
                     }
                 }
                 Err(e) => {
@@ -1414,10 +1380,10 @@ impl StreamManagerStore {
     ///
     /// Flow:
     /// 1. Look up the Primary EN for the active extent at this epoch.
-    /// 2. Forward Seal to the Primary — it knows the ground truth.
-    /// 3. Primary seals its active extent and responds with (extent_id, end_offset).
+    /// 2. Forward SealExtentNodeRequest to the Primary — it knows the ground truth.
+    /// 3. Primary seals its active extent and responds with SealExtentNodeResp.
     /// 4. SM reconciles metadata, bumps epoch, allocates new extent on new replica set.
-    /// 5. SM responds to client with new epoch/extent info.
+    /// 5. SM responds to client with SealStreamManagerResp (new epoch/extent info).
     async fn handle_epoch_seal(&self, request_id: u32, stream_id: StreamId, epoch: Epoch) -> Frame {
         info!("Epoch-based seal: stream={}, epoch={}", stream_id, epoch);
 
@@ -1425,19 +1391,17 @@ impl StreamManagerStore {
         let active = match self.store.get_active_extent(stream_id).await {
             Ok(Some(ext)) => ext,
             Ok(None) => {
-                return Frame::seal_ack_error(
+                return Frame::seal_stream_manager_resp_error(
                     request_id,
                     stream_id,
-                    ExtentId(0),
                     ErrorCode::InternalError,
                     "no active extent for epoch seal",
                 );
             }
             Err(e) => {
-                return Frame::seal_ack_error(
+                return Frame::seal_stream_manager_resp_error(
                     request_id,
                     stream_id,
-                    ExtentId(0),
                     ErrorCode::InternalError,
                     &format!("get_active_extent: {e}"),
                 );
@@ -1447,10 +1411,9 @@ impl StreamManagerStore {
         let replicas = match self.store.get_replicas(stream_id, active.epoch).await {
             Ok(r) => r,
             Err(e) => {
-                return Frame::seal_ack_error(
+                return Frame::seal_stream_manager_resp_error(
                     request_id,
                     stream_id,
-                    active.extent_id,
                     ErrorCode::InternalError,
                     &format!("get_replicas: {e}"),
                 );
@@ -1464,10 +1427,9 @@ impl StreamManagerStore {
             .unwrap_or_default();
 
         if primary_addr.is_empty() {
-            return Frame::seal_ack_error(
+            return Frame::seal_stream_manager_resp_error(
                 request_id,
                 stream_id,
-                active.extent_id,
                 ErrorCode::InternalError,
                 "no primary replica found for epoch seal",
             );
@@ -1477,13 +1439,13 @@ impl StreamManagerStore {
         let end_offset = match seal_extent_node_static(
             &primary_addr,
             stream_id,
+            active.epoch,
             active.extent_id,
-            None,
-            None,
+            active.start_offset,
         )
         .await
         {
-            Ok(offset) => offset,
+            Ok((_sealed_eid, _start, end, _payload)) => end,
             Err(e) => {
                 // Primary unreachable — fall back to quorum seal.
                 warn!(
@@ -1491,8 +1453,6 @@ impl StreamManagerStore {
                 );
 
                 // Step 1: Query surviving replicas for all extents they know about.
-                // The primary may have autonomously sealed + created extents that SM
-                // never learned about (fire-and-forget UpdateExtentSealed was lost).
                 let replicas_for_report = replicas.clone();
                 let original_epoch = active.epoch;
                 for replica in &replicas_for_report {
@@ -1523,8 +1483,6 @@ impl StreamManagerStore {
                                     );
                                 }
                             }
-                            // One successful reconciliation is enough — all replicas
-                            // within the same epoch have the same extents.
                             break;
                         }
                         Err(e) => {
@@ -1537,24 +1495,20 @@ impl StreamManagerStore {
                 }
 
                 // Step 2: Re-read the active extent — it may have changed after reconciliation.
-                // If the primary autonomously created extent 6 (unknown to SM before), it's
-                // now in the DB and may be the new active extent.
                 let active = match self.store.get_active_extent(stream_id).await {
                     Ok(Some(ext)) => ext,
                     Ok(None) => {
-                        return Frame::seal_ack_error(
+                        return Frame::seal_stream_manager_resp_error(
                             request_id,
                             stream_id,
-                            ExtentId(0),
                             ErrorCode::InternalError,
                             "no active extent after reconciliation",
                         );
                     }
                     Err(e) => {
-                        return Frame::seal_ack_error(
+                        return Frame::seal_stream_manager_resp_error(
                             request_id,
                             stream_id,
-                            ExtentId(0),
                             ErrorCode::InternalError,
                             &format!("get_active_extent after reconciliation: {e}"),
                         );
@@ -1565,10 +1519,9 @@ impl StreamManagerStore {
                 let new_epoch = match self.store.bump_epoch(stream_id).await {
                     Ok(e) => e,
                     Err(e) => {
-                        return Frame::seal_ack_error(
+                        return Frame::seal_stream_manager_resp_error(
                             request_id,
                             stream_id,
-                            active.extent_id,
                             ErrorCode::InternalError,
                             &format!("epoch seal fallback: bump_epoch failed: {e}"),
                         );
@@ -1582,27 +1535,24 @@ impl StreamManagerStore {
                     .seal_extent(stream_id, active.extent_id, None, new_epoch)
                     .await
                 {
-                    Ok((new_extent_id, new_primary_addr)) => {
+                    Ok((_new_extent_id, new_primary_addr)) => {
                         return Frame::new(
-                            VariableHeader::SealAck {
+                            VariableHeader::SealStreamManagerResp {
                                 request_id,
                                 stream_id,
-                                extent_id: active.extent_id,
                                 offset: Offset(0),
-                                new_extent_id: Some(new_extent_id),
-                                primary_addr: Some(Bytes::copy_from_slice(
+                                new_epoch,
+                                primary_addr: Bytes::copy_from_slice(
                                     new_primary_addr.as_bytes(),
-                                )),
-                                epoch: Some(new_epoch),
+                                ),
                             },
                             None,
                         );
                     }
                     Err(e2) => {
-                        return Frame::seal_ack_error(
+                        return Frame::seal_stream_manager_resp_error(
                             request_id,
                             stream_id,
-                            active.extent_id,
                             ErrorCode::InternalError,
                             &format!("epoch seal fallback failed: {e2}"),
                         );
@@ -1611,9 +1561,7 @@ impl StreamManagerStore {
             }
         };
 
-        // Primary was reachable and sealed. But the primary may have autonomously
-        // created extents that SM doesn't know about (fire-and-forget UpdateExtentSealed
-        // may not have arrived yet). Reconcile before allocating.
+        // Primary was reachable and sealed. Reconcile before allocating.
         let original_epoch = active.epoch;
         match report_extents_from_node_static(&primary_addr, stream_id, original_epoch).await {
             Ok(en_extents) => {
@@ -1636,69 +1584,64 @@ impl StreamManagerStore {
             }
         }
 
-        // Re-read the active extent after reconciliation — it may have advanced
-        // (e.g., primary had sealed extent 5 and created extent 6 autonomously).
-        let active = match self.store.get_active_extent(stream_id).await {
-            Ok(Some(ext)) => ext,
+        // Re-read the active extent after reconciliation — it may have advanced.
+        // If no active extent remains (primary already sealed the last one),
+        // use the sealed extent from the SealExtentNodeResp.
+        let sealed_extent_id = match self.store.get_active_extent(stream_id).await {
+            Ok(Some(ext)) => ext.extent_id,
             Ok(None) => {
-                return Frame::seal_ack_error(
-                    request_id,
-                    stream_id,
-                    ExtentId(0),
-                    ErrorCode::InternalError,
-                    "no active extent after reconciliation with primary",
-                );
+                // Primary already sealed the last extent. Ensure it's sealed in DB too.
+                let _ = self
+                    .store
+                    .seal_extent(stream_id, active.extent_id, end_offset)
+                    .await;
+                active.extent_id
             }
             Err(e) => {
-                return Frame::seal_ack_error(
+                return Frame::seal_stream_manager_resp_error(
                     request_id,
                     stream_id,
-                    ExtentId(0),
                     ErrorCode::InternalError,
                     &format!("get_active_extent after reconciliation: {e}"),
                 );
             }
         };
-        let sealed_extent_id = active.extent_id;
 
         // Bump epoch BEFORE seal+allocate so the new extent is created at the new epoch.
         let new_epoch = match self.store.bump_epoch(stream_id).await {
             Ok(e) => e,
             Err(e) => {
                 error!("epoch seal: bump_epoch failed: {e}");
-                return Frame::seal_ack_error(
+                return Frame::seal_stream_manager_resp_error(
                     request_id,
                     stream_id,
-                    sealed_extent_id,
                     ErrorCode::InternalError,
                     &format!("epoch seal: bump_epoch: {e}"),
                 );
             }
         };
 
-        // Seal in SM metadata and allocate new extent at the new epoch.
+        // Allocate new extent. The sealed extent is already sealed on the EN (and in DB
+        // after reconciliation). We just need to allocate the successor.
         match self
-            .seal_extent(stream_id, sealed_extent_id, Some(end_offset), new_epoch)
+            .seal_allocate_register(stream_id, sealed_extent_id, end_offset, new_epoch)
             .await
         {
-            Ok((new_extent_id, new_primary_addr)) => Frame::new(
-                VariableHeader::SealAck {
+            Ok((_new_extent_id, new_primary_addr)) => Frame::new(
+                VariableHeader::SealStreamManagerResp {
                     request_id,
                     stream_id,
-                    extent_id: sealed_extent_id,
                     offset: Offset(end_offset),
-                    new_extent_id: Some(new_extent_id),
-                    primary_addr: Some(Bytes::copy_from_slice(new_primary_addr.as_bytes())),
-                    epoch: Some(new_epoch),
+                    new_epoch,
+                    primary_addr: Bytes::copy_from_slice(new_primary_addr.as_bytes()),
                 },
                 None,
             ),
             Err(e) => {
                 error!("epoch seal metadata update failed: {e}");
-                Frame::seal_ack_error(
+                Frame::seal_stream_manager_resp_error(
                     request_id,
                     stream_id,
-                    sealed_extent_id,
                     ErrorCode::InternalError,
                     &format!("epoch seal: {e}"),
                 )
