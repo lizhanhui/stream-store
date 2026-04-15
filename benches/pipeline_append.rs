@@ -14,9 +14,11 @@
 //! error such as `ExtentSealed` or `EpochStale`, it drains the in-flight pipeline, reconnects
 //! to the current primary via the Stream Manager, and resumes appending.
 //!
-//! Connection drops and timeouts are handled the same way: drain, reconnect with exponential
-//! backoff, and resume. The benchmark is designed to run for the full duration without getting
-//! stuck.
+//! Connection drops and timeouts are handled with epoch-based seal recovery: the sender
+//! seals the stream by epoch on the Stream Manager, which bumps the epoch and allocates a
+//! new replica set on healthy nodes. Other senders that observe `EpochStale` from the bump
+//! simply refresh their epoch via `describe_stream` without issuing another seal.
+//! The benchmark is designed to run for the full duration without getting stuck.
 //!
 //! **Prerequisites**: MySQL running at the default StreamManagerConfig URL.
 //!
@@ -204,9 +206,18 @@ async fn main() {
         .cached_primary(stream_id)
         .await
         .expect("primary address cached after open");
+    // Discover the current epoch from the active extent so senders can track it.
+    let extents = stream_manager_client
+        .describe_stream(stream_id, 1)
+        .await
+        .expect("describe_stream for initial epoch");
+    let initial_epoch = extents
+        .first()
+        .map(|e| e.epoch)
+        .unwrap_or(Epoch(0));
     info!(
-        "[setup] Stream {} opened with primary={}",
-        stream_id, initial_primary_addr
+        "[setup] Stream {} opened with primary={}, epoch={}",
+        stream_id, initial_primary_addr, initial_epoch
     );
 
     // -- 6. Shared counters ---------------------------------------------------
@@ -224,6 +235,7 @@ async fn main() {
             sender_task(
                 sender_id,
                 stream_id,
+                initial_epoch,
                 primary_addr,
                 stream_manager_addr,
                 BENCH_DURATION,
@@ -395,6 +407,7 @@ fn past_deadline(deadline: Instant) -> bool {
 async fn sender_task(
     sender_id: usize,
     stream_id: StreamId,
+    initial_epoch: Epoch,
     initial_primary_addr: String,
     stream_manager_addr: String,
     duration: Duration,
@@ -404,6 +417,7 @@ async fn sender_task(
     let deadline = Instant::now() + duration;
 
     let mut primary_addr = initial_primary_addr;
+    let mut epoch = initial_epoch;
     let mut backoff = Duration::from_millis(100);
     let max_backoff = Duration::from_secs(5);
 
@@ -413,7 +427,7 @@ async fn sender_task(
             break;
         }
 
-        // Connect to primary. On failure, rediscover via SM.
+        // Connect to primary. On failure, rediscover via SM (describe only, no seal).
         let extent_node_client = match StreamClient::connect(&primary_addr).await {
             Ok(c) => Arc::new(c),
             Err(e) => {
@@ -422,10 +436,11 @@ async fn sender_task(
                 sleep(backoff).await;
                 backoff = (backoff * 2).min(max_backoff);
                 match reconnect_to_primary(&stream_manager_addr, stream_id, deadline).await {
-                    Ok((_client, addr)) => {
+                    Ok((_client, addr, new_epoch)) => {
                         primary_addr = addr;
+                        epoch = new_epoch;
                         backoff = Duration::from_millis(100);
-                        info!("sender {sender_id}: rediscovered primary {primary_addr}");
+                        info!("sender {sender_id}: rediscovered primary {primary_addr} epoch {epoch}");
                         counters.record_reconnect();
                         continue 'outer;
                     }
@@ -443,9 +458,10 @@ async fn sender_task(
             while in_flight.len() < PIPELINE_DEPTH && !past_deadline(deadline) {
                 let client = Arc::clone(&extent_node_client);
                 let data = payload.clone();
+                let append_epoch = epoch;
                 in_flight.push(async move {
                     let started_at = Instant::now();
-                    let result = client.append(stream_id, Epoch(0), data).await;
+                    let result = client.append(stream_id, append_epoch, data).await;
                     (started_at, result)
                 });
             }
@@ -461,7 +477,11 @@ async fn sender_task(
                     counters.record_success(started_at.elapsed());
                 }
                 Err(ref e) if needs_reconnect(e) => {
-                    warn!("sender {sender_id}: {e} -- draining pipeline and reconnecting");
+                    let is_broken = is_connection_broken(e);
+                    warn!(
+                        "sender {sender_id}: {e} -- draining pipeline and {}",
+                        if is_broken { "sealing epoch to recover" } else { "refreshing epoch" }
+                    );
                     counters.record_error();
 
                     let mut drained = 0u64;
@@ -476,12 +496,22 @@ async fn sender_task(
                     }
                     counters.record_reconnect();
 
+                    // Connection-broken (RPC timeout, connection closed, send failed):
+                    //   Seal by epoch to force SM to bump epoch and allocate new replica set.
+                    // Routing error (EpochStale, ExtentSealed):
+                    //   Another sender or SM already bumped the epoch. Just describe to refresh.
                     sleep(backoff).await;
-                    match reconnect_to_primary(&stream_manager_addr, stream_id, deadline).await {
-                        Ok((_, addr)) => {
+                    let reconnect_result = if is_broken {
+                        reconnect_with_seal(&stream_manager_addr, stream_id, epoch, deadline).await
+                    } else {
+                        reconnect_to_primary(&stream_manager_addr, stream_id, deadline).await
+                    };
+                    match reconnect_result {
+                        Ok((_, addr, new_epoch)) => {
                             primary_addr = addr;
+                            epoch = new_epoch;
                             backoff = Duration::from_millis(100);
-                            info!("sender {sender_id}: reconnected to {primary_addr}");
+                            info!("sender {sender_id}: reconnected to {primary_addr} epoch {epoch}");
                         }
                         Err(e) => {
                             warn!("sender {sender_id}: reconnect failed: {e}");
@@ -510,7 +540,7 @@ async fn reconnect_to_primary(
     stream_manager_addr: &str,
     stream_id: StreamId,
     deadline: Instant,
-) -> Result<(Arc<StreamClient>, String), StorageError> {
+) -> Result<(Arc<StreamClient>, String, Epoch), StorageError> {
     let mut backoff = Duration::from_millis(100);
     let max_backoff = Duration::from_secs(5);
 
@@ -533,17 +563,81 @@ async fn reconnect_to_primary(
 async fn try_reconnect(
     stream_manager_addr: &str,
     stream_id: StreamId,
-) -> Result<(Arc<StreamClient>, String), StorageError> {
+) -> Result<(Arc<StreamClient>, String, Epoch), StorageError> {
     let sm_client = StreamClient::connect(stream_manager_addr).await?;
-    sm_client.describe_stream(stream_id, 1).await?;
+    let extents = sm_client.describe_stream(stream_id, 1).await?;
     let primary_addr = sm_client.cached_primary(stream_id).await.ok_or_else(|| {
         StorageError::Internal(format!(
             "stream {} missing primary after describe_stream",
             stream_id
         ))
     })?;
+    let epoch = extents
+        .first()
+        .map(|e| Epoch(e.epoch.0))
+        .unwrap_or(Epoch(0));
     let en_client = Arc::new(StreamClient::connect(&primary_addr).await?);
-    Ok((en_client, primary_addr))
+    Ok((en_client, primary_addr, epoch))
+}
+
+/// Reconnect by sealing the current epoch, forcing SM to bump epoch and allocate
+/// a new replica set. Falls back to describe_stream if the seal fails (e.g.,
+/// another sender or SM failover already bumped the epoch).
+async fn try_reconnect_with_seal(
+    stream_manager_addr: &str,
+    stream_id: StreamId,
+    epoch: Epoch,
+) -> Result<(Arc<StreamClient>, String, Epoch), StorageError> {
+    let sm_client = StreamClient::connect(stream_manager_addr).await?;
+    match sm_client.seal_by_epoch(stream_id, epoch).await {
+        Ok((_new_extent_id, primary_addr, new_epoch)) => {
+            let new_epoch = new_epoch.unwrap_or(Epoch(epoch.0 + 1));
+            info!(
+                "sealed stream {} epoch {} -> new epoch {}, new primary {}",
+                stream_id, epoch, new_epoch, primary_addr
+            );
+            let en_client = Arc::new(StreamClient::connect(&primary_addr).await?);
+            Ok((en_client, primary_addr, new_epoch))
+        }
+        Err(e) => {
+            warn!(
+                "seal_by_epoch failed for stream {} epoch {}: {e}, falling back to describe",
+                stream_id, epoch
+            );
+            // Seal failed (epoch already bumped, or other error).
+            // Fall back to describe_stream to discover current state.
+            drop(sm_client);
+            try_reconnect(stream_manager_addr, stream_id).await
+        }
+    }
+}
+
+/// Reconnect by sealing the current epoch with exponential backoff.
+/// Retries until success or deadline is reached.
+async fn reconnect_with_seal(
+    stream_manager_addr: &str,
+    stream_id: StreamId,
+    epoch: Epoch,
+    deadline: Instant,
+) -> Result<(Arc<StreamClient>, String, Epoch), StorageError> {
+    let mut backoff = Duration::from_millis(100);
+    let max_backoff = Duration::from_secs(5);
+
+    loop {
+        let result =
+            try_reconnect_with_seal(stream_manager_addr, stream_id, epoch).await;
+        match result {
+            Ok(ok) => return Ok(ok),
+            Err(e) => {
+                if past_deadline(deadline) {
+                    return Err(e);
+                }
+                warn!("reconnect-with-seal failed ({e}), retrying in {backoff:?}");
+                sleep(backoff).await;
+                backoff = (backoff * 2).min(max_backoff);
+            }
+        }
+    }
 }
 
 // -- Helpers ------------------------------------------------------------------
