@@ -1,5 +1,7 @@
 use std::time::Duration;
 
+use bytes::Buf;
+
 use crate::allocator::Allocator;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
@@ -72,6 +74,32 @@ async fn seal_extent_node_static(
 /// Query an ExtentNode for all extents it holds for a stream (used during recovery/reconciliation).
 ///
 /// Sends a ReportExtents RPC and parses the ReportExtentsResp payload.
+/// Parse the predecessor extent payload from SealExtentNodeResp.
+/// Same format as ReportExtentsResp: [num:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+fn parse_seal_predecessor_payload(
+    payload: &Bytes,
+) -> Option<Vec<(ExtentId, u64, u64, common::types::ExtentState)>> {
+    let mut buf = &payload[..];
+    if buf.len() < 4 {
+        return None;
+    }
+    let num = buf.get_u32() as usize;
+    let mut result = Vec::with_capacity(num);
+    for _ in 0..num {
+        if buf.remaining() < 4 + 8 + 8 + 1 {
+            return None;
+        }
+        let eid = ExtentId(buf.get_u32());
+        let start = buf.get_u64();
+        let end = buf.get_u64();
+        let state_val = buf.get_u8();
+        let state = common::types::ExtentState::from_u8(state_val)
+            .unwrap_or(common::types::ExtentState::Unspecified);
+        result.push((eid, start, end, state));
+    }
+    Some(result)
+}
+
 /// Response format: [num_extents:u32] then for each extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
 ///
 /// Returns Vec of (ExtentId, start_offset, end_offset, ExtentState) tuples.
@@ -1035,7 +1063,7 @@ impl StreamManagerStore {
 
         for (addr, role, result) in &seal_results {
             match result {
-                Ok((_sealed_eid, _start, end_offset, _payload)) => {
+                Ok((_sealed_eid, _start, end_offset, payload)) => {
                     if *role == 0 {
                         info!(
                             "Primary {addr} reports committed offset {end_offset} for stream {:?} (fallback)",
@@ -1048,6 +1076,18 @@ impl StreamManagerStore {
                             stream_id
                         );
                         secondary_offsets.push(*end_offset);
+                    }
+                    // Reconcile predecessor extents from the SealExtentNodeResp payload.
+                    if let Some(payload) = payload {
+                        if let Some(extents) = parse_seal_predecessor_payload(payload) {
+                            if !extents.is_empty() {
+                                info!(
+                                    "Reconciling {} predecessor extents from {addr} for stream {stream_id}",
+                                    extents.len()
+                                );
+                                let _ = self.store.reconcile_extents(stream_id, epoch, &extents).await;
+                            }
+                        }
                     }
                 }
                 Err(e) => {
@@ -1445,56 +1485,34 @@ impl StreamManagerStore {
         )
         .await
         {
-            Ok((_sealed_eid, _start, end, _payload)) => end,
+            Ok((_sealed_eid, _start, end, payload)) => {
+                // Reconcile predecessor extents from the primary's SealExtentNodeResp.
+                if let Some(ref payload) = payload {
+                    if let Some(extents) = parse_seal_predecessor_payload(payload) {
+                        if !extents.is_empty() {
+                            info!(
+                                "Epoch seal: reconciling {} predecessor extents from primary for stream {}",
+                                extents.len(), stream_id
+                            );
+                            let _ = self
+                                .store
+                                .reconcile_extents(stream_id, active.epoch, &extents)
+                                .await;
+                        }
+                    }
+                }
+                end
+            }
             Err(e) => {
                 // Primary unreachable — fall back to quorum seal.
+                // resolve_committed_offset sends SealExtentNode to all replicas;
+                // their SealExtentNodeResp payloads carry predecessor extents which
+                // are reconciled inline — no separate report_extents needed.
                 warn!(
                     "Epoch seal: primary unreachable at {primary_addr}, falling back to quorum seal: {e}"
                 );
 
-                // Step 1: Query surviving replicas for all extents they know about.
-                let replicas_for_report = replicas.clone();
-                let original_epoch = active.epoch;
-                for replica in &replicas_for_report {
-                    if replica.node_addr == primary_addr {
-                        continue; // skip dead primary
-                    }
-                    match report_extents_from_node_static(
-                        &replica.node_addr,
-                        stream_id,
-                        original_epoch,
-                    )
-                    .await
-                    {
-                        Ok(en_extents) => {
-                            if !en_extents.is_empty() {
-                                info!(
-                                    "Epoch seal: reconciling {} extents from {} for stream {} epoch {}",
-                                    en_extents.len(), replica.node_addr, stream_id, original_epoch
-                                );
-                                if let Err(e) = self
-                                    .store
-                                    .reconcile_extents(stream_id, original_epoch, &en_extents)
-                                    .await
-                                {
-                                    warn!(
-                                        "Epoch seal: reconcile_extents from {} failed: {e}",
-                                        replica.node_addr
-                                    );
-                                }
-                            }
-                            break;
-                        }
-                        Err(e) => {
-                            warn!(
-                                "Epoch seal: report_extents from {} failed: {e}",
-                                replica.node_addr
-                            );
-                        }
-                    }
-                }
-
-                // Step 2: Re-read the active extent — it may have changed after reconciliation.
+                // Re-read the active extent — it may have changed after reconciliation.
                 let active = match self.store.get_active_extent(stream_id).await {
                     Ok(Some(ext)) => ext,
                     Ok(None) => {
@@ -1561,30 +1579,8 @@ impl StreamManagerStore {
             }
         };
 
-        // Primary was reachable and sealed. Reconcile before allocating.
-        let original_epoch = active.epoch;
-        match report_extents_from_node_static(&primary_addr, stream_id, original_epoch).await {
-            Ok(en_extents) => {
-                if !en_extents.is_empty() {
-                    info!(
-                        "Epoch seal: reconciling {} extents from primary {} for stream {} epoch {}",
-                        en_extents.len(), primary_addr, stream_id, original_epoch
-                    );
-                    if let Err(e) = self
-                        .store
-                        .reconcile_extents(stream_id, original_epoch, &en_extents)
-                        .await
-                    {
-                        warn!("Epoch seal: reconcile_extents from primary failed: {e}");
-                    }
-                }
-            }
-            Err(e) => {
-                warn!("Epoch seal: report_extents from primary failed: {e}");
-            }
-        }
-
-        // Re-read the active extent after reconciliation — it may have advanced.
+        // Reconciliation already happened from the SealExtentNodeResp payload above.
+        // Re-read the active extent — it may have advanced after reconciliation.
         // If no active extent remains (primary already sealed the last one),
         // use the sealed extent from the SealExtentNodeResp.
         let sealed_extent_id = match self.store.get_active_extent(stream_id).await {
