@@ -13,12 +13,12 @@ CREATE TABLE extent (
     INDEX idx_stream_state (stream_id, state)
 );
 
-CREATE TABLE extent_replica (
+CREATE TABLE stream_replica (
     stream_id     BIGINT NOT NULL,
-    extent_id     INT NOT NULL,
+    epoch         INT NOT NULL,
     node_addr     VARCHAR(256) NOT NULL,
     role          TINYINT NOT NULL DEFAULT 0,
-    PRIMARY KEY (stream_id, extent_id, node_addr),
+    PRIMARY KEY (stream_id, epoch, node_addr),
     INDEX idx_node (node_addr)
 );
 

@@ -22,7 +22,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::{ExtentNodeConfig, StreamManagerConfig};
+use common::config::{
+    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
+    DEFAULT_MIN_EXTENT_CAPACITY, ExtentNodeConfig, StreamManagerConfig,
+};
 use common::types::Epoch;
 use extent_node::ExtentNode;
 use sqlx::mysql::MySqlPoolOptions;
@@ -143,7 +146,7 @@ async fn clean_database(mysql_url: &str) {
         .await
         .expect("failed to connect to MySQL for cleanup");
     for table in &[
-        "extent_replica",
+        "stream_replica",
         "extent",
         "stream_sequence",
         "stream",
@@ -193,9 +196,10 @@ async fn client_task(
         .create_stream(
             &format!("bench-stream-{client_id}"),
             REPLICATION_FACTOR,
-            0,
-            0,
-            0,
+            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_MAX_EXTENT_CAPACITY,
+            DEFAULT_CACHE_EXTENTS,
+            DEFAULT_EXTENT_GROWTH_FACTOR,
         )
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: create_stream failed: {e}"));

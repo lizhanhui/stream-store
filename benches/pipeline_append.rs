@@ -556,7 +556,7 @@ async fn clean_database(mysql_url: &str) {
         .await
         .expect("failed to connect to MySQL for cleanup");
     for table in &[
-        "extent_replica",
+        "stream_replica",
         "extent",
         "stream_sequence",
         "stream",

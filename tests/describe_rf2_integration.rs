@@ -46,7 +46,7 @@ async fn start_stream_manager_rf2() -> String {
         .await
         .expect("failed to connect for cleanup");
     for table in &[
-        "extent_replica",
+        "stream_replica",
         "extent",
         "stream_sequence",
         "stream",

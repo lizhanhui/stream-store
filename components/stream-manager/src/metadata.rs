@@ -38,11 +38,11 @@ pub struct ExtentRow {
     pub epoch: Epoch,
 }
 
-/// A row from the `extent_replica` table.
+/// A row from the `stream_replica` table (keyed by stream_id + epoch).
 #[derive(Debug, Clone)]
-pub struct ExtentReplicaRow {
+pub struct StreamReplicaRow {
     pub stream_id: StreamId,
-    pub extent_id: ExtentId,
+    pub epoch: Epoch,
     pub node_addr: String,
     pub role: u8,
 }
@@ -342,7 +342,7 @@ impl MetadataStore {
     /// 1. Locks the stream_sequence row with SELECT ... FOR UPDATE.
     /// 2. Increments next_extent_id and reads the new value atomically.
     /// 3. Inserts the extent row.
-    /// 4. Inserts extent_replica rows for each node.
+    /// 4. Inserts stream_replica rows for the (stream, epoch) if not already present.
     pub async fn allocate_extent(
         &self,
         stream_id: StreamId,
@@ -404,18 +404,19 @@ impl MetadataStore {
         .await
         .map_err(|e| StorageError::Internal(format!("insert extent: {e}")))?;
 
-        // Step 3: Insert extent_replica rows.
+        // Step 3: Insert stream_replica rows keyed by (stream_id, epoch).
+        // INSERT IGNORE — within an epoch the replica set is written once.
         for (addr, role) in nodes {
             sqlx::query(
-                "INSERT INTO extent_replica (stream_id, extent_id, node_addr, role) VALUES (?, ?, ?, ?)",
+                "INSERT IGNORE INTO stream_replica (stream_id, epoch, node_addr, role) VALUES (?, ?, ?, ?)",
             )
             .bind(stream_id.0 as i64)
-            .bind(extent_id.0 as i64)
+            .bind(epoch.0 as i32)
             .bind(addr)
             .bind(*role)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("insert extent_replica: {e}")))?;
+            .map_err(|e| StorageError::Internal(format!("insert stream_replica: {e}")))?;
         }
 
         tx.commit()
@@ -513,13 +514,13 @@ impl MetadataStore {
             let new_extent_id = ExtentId(successor.get::<i64, _>("extent_id") as u32);
             let new_start_offset = successor.get::<i64, _>("start_offset") as u64;
 
-            // Get primary replica address for the successor extent.
+            // Get primary replica address from the stream-level replica set.
             let replica = sqlx::query(
-                "SELECT node_addr FROM extent_replica \
-                 WHERE stream_id = ? AND extent_id = ? AND role = 0",
+                "SELECT node_addr FROM stream_replica \
+                 WHERE stream_id = ? AND epoch = ? AND role = 0",
             )
             .bind(stream_id.0 as i64)
-            .bind(new_extent_id.0 as i64)
+            .bind(epoch.0 as i32)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("find successor primary: {e}")))?;
@@ -585,18 +586,19 @@ impl MetadataStore {
         .await
         .map_err(|e| StorageError::Internal(format!("insert extent: {e}")))?;
 
-        // Step 5: Insert extent_replica rows for the new extent.
+        // Step 5: Insert stream_replica rows for this (stream, epoch).
+        // INSERT IGNORE — within an epoch the replica set is written once.
         for (addr, role) in nodes {
             sqlx::query(
-                "INSERT INTO extent_replica (stream_id, extent_id, node_addr, role) VALUES (?, ?, ?, ?)",
+                "INSERT IGNORE INTO stream_replica (stream_id, epoch, node_addr, role) VALUES (?, ?, ?, ?)",
             )
             .bind(stream_id.0 as i64)
-            .bind(new_extent_id.0 as i64)
+            .bind(epoch.0 as i32)
             .bind(addr)
             .bind(*role)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("insert extent_replica: {e}")))?;
+            .map_err(|e| StorageError::Internal(format!("insert stream_replica: {e}")))?;
         }
 
         tx.commit()
@@ -646,7 +648,7 @@ impl MetadataStore {
         let rows = sqlx::query(
             "SELECT e.extent_id, e.stream_id, e.start_offset, e.end_offset, e.state, e.epoch \
              FROM extent e \
-             INNER JOIN extent_replica r ON e.stream_id = r.stream_id AND e.extent_id = r.extent_id \
+             INNER JOIN stream_replica r ON e.stream_id = r.stream_id AND e.epoch = r.epoch \
              WHERE r.node_addr = ? AND e.state = ?",
         )
         .bind(node_addr)
@@ -658,28 +660,28 @@ impl MetadataStore {
         Ok(rows.into_iter().map(Self::map_extent_row).collect())
     }
 
-    /// Get all replicas for an extent, ordered by role.
+    /// Get all replicas for a (stream, epoch) pair, ordered by role.
     pub async fn get_replicas(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
-    ) -> Result<Vec<ExtentReplicaRow>, StorageError> {
+        epoch: Epoch,
+    ) -> Result<Vec<StreamReplicaRow>, StorageError> {
         let rows = sqlx::query(
-            "SELECT stream_id, extent_id, node_addr, role \
-             FROM extent_replica \
-             WHERE stream_id = ? AND extent_id = ? ORDER BY role",
+            "SELECT stream_id, epoch, node_addr, role \
+             FROM stream_replica \
+             WHERE stream_id = ? AND epoch = ? ORDER BY role",
         )
         .bind(stream_id.0 as i64)
-        .bind(extent_id.0 as i64)
+        .bind(epoch.0 as i32)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("get_replicas: {e}")))?;
 
         Ok(rows
             .into_iter()
-            .map(|r| ExtentReplicaRow {
+            .map(|r| StreamReplicaRow {
                 stream_id: StreamId(r.get::<i64, _>("stream_id") as u64),
-                extent_id: ExtentId(r.get::<i64, _>("extent_id") as u32),
+                epoch: Epoch(r.get::<i32, _>("epoch") as u32),
                 node_addr: r.get("node_addr"),
                 role: r.get::<i8, _>("role") as u8,
             })
@@ -701,21 +703,21 @@ impl MetadataStore {
 
     // ── Management API queries ──
 
-    /// Get replicas for an extent with node liveness info, ordered by role (Primary first).
+    /// Get replicas for a (stream, epoch) with node liveness info, ordered by role (Primary first).
     async fn get_replicas_with_liveness(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
+        epoch: Epoch,
     ) -> Result<Vec<ReplicaDetail>, StorageError> {
         let rows = sqlx::query(
             "SELECT r.node_addr, r.role, COALESCE(n.state, 0) AS node_state \
-             FROM extent_replica r \
+             FROM stream_replica r \
              LEFT JOIN node n ON r.node_addr = n.addr \
-             WHERE r.stream_id = ? AND r.extent_id = ? \
+             WHERE r.stream_id = ? AND r.epoch = ? \
              ORDER BY r.role",
         )
         .bind(stream_id.0 as i64)
-        .bind(extent_id.0 as i64)
+        .bind(epoch.0 as i32)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("get_replicas_with_liveness: {e}")))?;
@@ -768,7 +770,7 @@ impl MetadataStore {
         for row in extent_rows {
             let ext = Self::map_extent_row(row);
             let replicas = self
-                .get_replicas_with_liveness(stream_id, ext.extent_id)
+                .get_replicas_with_liveness(stream_id, ext.epoch)
                 .await?;
             result.push(ExtentInfo {
                 extent_id: ext.extent_id.0,
@@ -805,7 +807,7 @@ impl MetadataStore {
             Some(r) => {
                 let ext = Self::map_extent_row(r);
                 let replicas = self
-                    .get_replicas_with_liveness(stream_id, extent_id)
+                    .get_replicas_with_liveness(stream_id, ext.epoch)
                     .await?;
                 Ok(Some(ExtentInfo {
                     extent_id: ext.extent_id.0,
@@ -853,7 +855,7 @@ impl MetadataStore {
         if let Some(r) = row {
             let ext = Self::map_extent_row(r);
             let replicas = self
-                .get_replicas_with_liveness(stream_id, ext.extent_id)
+                .get_replicas_with_liveness(stream_id, ext.epoch)
                 .await?;
             return Ok(Some(ExtentInfo {
                 extent_id: ext.extent_id.0,
@@ -884,7 +886,7 @@ impl MetadataStore {
             Some(r) => {
                 let ext = Self::map_extent_row(r);
                 let replicas = self
-                    .get_replicas_with_liveness(stream_id, ext.extent_id)
+                    .get_replicas_with_liveness(stream_id, ext.epoch)
                     .await?;
                 Ok(Some(ExtentInfo {
                     extent_id: ext.extent_id.0,
@@ -1201,7 +1203,21 @@ impl MetadataStore {
             )));
         }
 
-        // Seal the old extent (idempotent — only updates if currently Active).
+        // Insert sealed extent if not yet known (handles out-of-order arrival).
+        sqlx::query(
+            "INSERT IGNORE INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) \
+             VALUES (?, ?, 0, ?, ?, ?)",
+        )
+        .bind(stream_id.0 as i64)
+        .bind(sealed_extent_id.0 as i64)
+        .bind(end_offset as i64)
+        .bind(ExtentState::Sealed.as_u8())
+        .bind(epoch.0 as i32)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Internal(format!("insert sealed extent: {e}")))?;
+
+        // Seal it (idempotent — only updates if currently Active).
         sqlx::query(
             "UPDATE extent SET state = ?, end_offset = ?, sealed_at = NOW() \
              WHERE stream_id = ? AND extent_id = ? AND state = ?",
@@ -1215,34 +1231,23 @@ impl MetadataStore {
         .await
         .map_err(|e| StorageError::Internal(format!("seal extent: {e}")))?;
 
-        // Insert new extent (idempotent — ignore duplicate).
+        // Insert new active extent (idempotent — ignore duplicate).
         sqlx::query(
             "INSERT IGNORE INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) \
              VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(stream_id.0 as i64)
         .bind(new_extent_id.0 as i64)
-        .bind(end_offset as i64)  // new extent starts where old one ended
-        .bind(end_offset as i64)  // end_offset = start_offset for active
+        .bind(end_offset as i64)
+        .bind(end_offset as i64)
         .bind(ExtentState::Active.as_u8())
         .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("insert new extent: {e}")))?;
 
-        // Copy replica rows from sealed extent to new extent (same replica set within epoch).
-        sqlx::query(
-            "INSERT IGNORE INTO extent_replica (stream_id, extent_id, node_addr, role) \
-             SELECT stream_id, ?, node_addr, role \
-             FROM extent_replica \
-             WHERE stream_id = ? AND extent_id = ?",
-        )
-        .bind(new_extent_id.0 as i64)
-        .bind(stream_id.0 as i64)
-        .bind(sealed_extent_id.0 as i64)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| StorageError::Internal(format!("copy replicas: {e}")))?;
+        // No replica manipulation — replicas are stored at (stream_id, epoch)
+        // level and all extents within an epoch inherit the same replica set.
 
         // Update stream_sequence to be at least new_extent_id + 1.
         sqlx::query(
@@ -1398,29 +1403,4 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Copy replica rows from one extent to another (same stream, same replica set).
-    /// Used during reconciliation: extents created autonomously within an epoch
-    /// share the same replica set as the original extent.
-    /// Idempotent: uses INSERT IGNORE to skip already-existing replicas.
-    pub async fn copy_replicas(
-        &self,
-        stream_id: StreamId,
-        from_extent_id: ExtentId,
-        to_extent_id: ExtentId,
-    ) -> Result<(), StorageError> {
-        sqlx::query(
-            "INSERT IGNORE INTO extent_replica (stream_id, extent_id, node_addr, role) \
-             SELECT stream_id, ?, node_addr, role \
-             FROM extent_replica \
-             WHERE stream_id = ? AND extent_id = ?",
-        )
-        .bind(to_extent_id.0 as i64)
-        .bind(stream_id.0 as i64)
-        .bind(from_extent_id.0 as i64)
-        .execute(&self.pool)
-        .await
-        .map_err(|e| StorageError::Internal(format!("copy_replicas: {e}")))?;
-
-        Ok(())
-    }
 }
