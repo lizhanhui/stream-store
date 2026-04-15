@@ -17,7 +17,7 @@ use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::downstream::DownstreamPool;
 use crate::stream::{SealNotification, SealReason, Stream};
@@ -1188,7 +1188,7 @@ impl ExtentNodeStore {
             },
             None => return,
         };
-        info!(
+        debug!(
             "ForwardChecksum sent: stream={}, extent={}, crc32={:#x}, bytes={}",
             stream_id, sealed_extent_id, checksum, committed_bytes,
         );
