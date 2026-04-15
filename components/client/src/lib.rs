@@ -444,106 +444,48 @@ impl StreamClient {
     ///   already sealed the extent locally (e.g. extent full).
     ///
     /// Returns (new_extent_id, new_primary_addr).
+    /// Seal a stream by epoch on the StreamManager.
+    ///
+    /// The SM looks up the active extent at this epoch, seals it via EN quorum,
+    /// bumps epoch, and allocates a new extent on the surviving (or new) replica set.
+    ///
+    /// Returns `(new_epoch, new_primary_addr)`.
     pub async fn seal(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
-        committed_offset: Option<u64>,
-    ) -> Result<(u32, String), StorageError> {
-        let req = Frame::new(
-            VariableHeader::Seal {
-                request_id: self.alloc_request_id(),
-                stream_id,
-                extent_id,
-                offset: committed_offset.map(Offset),
-                start_offset: None,
-                epoch: None,
-            },
-            None,
-        );
-        let resp = self.send_request(req).await?;
-        Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::SealAck {
-            return Err(StorageError::Internal(format!(
-                "expected SealAck, got {:?}",
-                resp.opcode()
-            )));
-        }
-
-        // SealAck: new_extent_id and primary_addr from variable header
-        if let VariableHeader::SealAck {
-            new_extent_id,
-            primary_addr,
-            ..
-        } = &resp.variable_header
-        {
-            let new_eid = new_extent_id.map(|e| e.0).unwrap_or(0);
-            let addr = primary_addr
-                .as_ref()
-                .map(|b| String::from_utf8_lossy(b).to_string())
-                .unwrap_or_default();
-            if !addr.is_empty() {
-                self.cache_primary(stream_id, &addr).await;
-            }
-            Ok((new_eid, addr))
-        } else {
-            Err(StorageError::Internal(
-                "unexpected variable header in SealAck".into(),
-            ))
-        }
-    }
-
-    /// Seal a stream by epoch on the StreamManager and allocate a new one.
-    ///
-    /// The client identifies the stream by `(stream_id, epoch)` — the SM looks up
-    /// the active extent at that epoch, seals it, bumps epoch, and allocates a new
-    /// extent on a (potentially different) replica set.
-    ///
-    /// Returns (new_extent_id, new_primary_addr, new_epoch).
-    pub async fn seal_by_epoch(
-        &self,
-        stream_id: StreamId,
         epoch: Epoch,
-    ) -> Result<(u32, String, Option<Epoch>), StorageError> {
+    ) -> Result<(Epoch, String), StorageError> {
         let req = Frame::new(
-            VariableHeader::Seal {
+            VariableHeader::SealStreamManagerRequest {
                 request_id: self.alloc_request_id(),
                 stream_id,
-                extent_id: ExtentId(0), // not used for epoch-based seal
-                offset: None,
-                start_offset: None,
-                epoch: Some(epoch),
+                epoch,
             },
             None,
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::SealAck {
+        if resp.opcode() != Opcode::SealStreamManager {
             return Err(StorageError::Internal(format!(
-                "expected SealAck, got {:?}",
+                "expected SealStreamManagerResp, got {:?}",
                 resp.opcode()
             )));
         }
 
-        if let VariableHeader::SealAck {
-            new_extent_id,
+        if let VariableHeader::SealStreamManagerResp {
+            new_epoch,
             primary_addr,
-            epoch: new_epoch,
             ..
         } = &resp.variable_header
         {
-            let new_eid = new_extent_id.map(|e| e.0).unwrap_or(0);
-            let addr = primary_addr
-                .as_ref()
-                .map(|b| String::from_utf8_lossy(b).to_string())
-                .unwrap_or_default();
+            let addr = String::from_utf8_lossy(primary_addr).to_string();
             if !addr.is_empty() {
                 self.cache_primary(stream_id, &addr).await;
             }
-            Ok((new_eid, addr, *new_epoch))
+            Ok((*new_epoch, addr))
         } else {
             Err(StorageError::Internal(
-                "unexpected variable header in SealAck".into(),
+                "unexpected variable header in SealStreamManagerResp".into(),
             ))
         }
     }

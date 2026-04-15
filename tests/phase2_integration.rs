@@ -174,13 +174,19 @@ async fn stream_manager_integration() {
         let offset = stream_manager_client.query_offset(stream_id).await.unwrap();
         assert_eq!(offset, Offset(0)); // active extent has 0 in metadata
 
-        // Seal via StreamManager with explicit extent_id.
-        let (new_extent_id, new_addr) = stream_manager_client
-            .seal(stream_id, extent_id, None)
+        // Seal via StreamManager (epoch-based).
+        let (new_epoch, new_addr) = stream_manager_client
+            .seal(stream_id, Epoch(0))
             .await
             .unwrap();
-        assert!(new_extent_id > 0);
         assert_eq!(new_addr, extent_node_addr); // only one ExtentNode, seal-and-new goes to same node
+
+        // Discover the new extent_id from describe_stream.
+        let post_seal_extents = stream_manager_client
+            .describe_stream(stream_id, 1)
+            .await
+            .unwrap();
+        let new_extent_id = post_seal_extents[0].extent_id;
 
         // QueryOffset after seal.
         let offset = stream_manager_client.query_offset(stream_id).await.unwrap();
@@ -202,11 +208,17 @@ async fn stream_manager_integration() {
                 .unwrap();
         }
 
-        let new_eid = ExtentId(new_extent_id);
-        let (third_extent_id, _) = stream_manager_client
-            .seal(stream_id, new_eid, None)
+        let (_new_epoch2, _) = stream_manager_client
+            .seal(stream_id, new_epoch)
             .await
             .unwrap();
+
+        // Discover the third extent_id from describe_stream.
+        let post_seal2_extents = stream_manager_client
+            .describe_stream(stream_id, 1)
+            .await
+            .unwrap();
+        let third_extent_id = post_seal2_extents[0].extent_id;
         let offset = stream_manager_client.query_offset(stream_id).await.unwrap();
         assert_eq!(offset, Offset(15)); // 5 + 10 = 15
 
@@ -224,12 +236,12 @@ async fn stream_manager_integration() {
             .unwrap();
         assert_eq!(all_extents.len(), 3);
         // Ordered by extent_id descending: 3, 2, 1.
-        assert_eq!(all_extents[0].extent_id, (third_extent_id));
+        assert_eq!(all_extents[0].extent_id, third_extent_id);
         assert_eq!(all_extents[0].state, ExtentState::Active);
         assert_eq!(all_extents[0].start_offset, 15);
         assert_eq!(all_extents[0].end_offset, 15);
 
-        assert_eq!(all_extents[1].extent_id, (new_extent_id));
+        assert_eq!(all_extents[1].extent_id, new_extent_id);
         assert_eq!(all_extents[1].state, ExtentState::Sealed);
         assert_eq!(all_extents[1].start_offset, 5);
         assert_eq!(all_extents[1].end_offset, 15);
@@ -257,7 +269,7 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].extent_id, (third_extent_id));
+        assert_eq!(latest[0].extent_id, third_extent_id);
         assert_eq!(latest[0].state, ExtentState::Active);
 
         // 3d. describe_stream(count=2) — latest 2 extents.
@@ -266,8 +278,8 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(top2.len(), 2);
-        assert_eq!(top2[0].extent_id, (third_extent_id));
-        assert_eq!(top2[1].extent_id, (new_extent_id));
+        assert_eq!(top2[0].extent_id, third_extent_id);
+        assert_eq!(top2[1].extent_id, new_extent_id);
 
         // 3e. describe_extent — inspect a specific sealed extent.
         let ext1 = stream_manager_client
@@ -347,7 +359,7 @@ async fn stream_manager_integration() {
             .seek(stream_id, Offset(5))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, (second_eid));
+        assert_eq!(s.extent_id, second_eid);
         assert_eq!(s.state, ExtentState::Sealed);
         assert_eq!(s.start_offset, 5);
         assert_eq!(s.end_offset, 15);
@@ -357,21 +369,21 @@ async fn stream_manager_integration() {
             .seek(stream_id, Offset(12))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, (second_eid));
+        assert_eq!(s.extent_id, second_eid);
 
         // 4f. Seek offset=14 -> second sealed extent (last message).
         let s = stream_manager_client
             .seek(stream_id, Offset(14))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, (second_eid));
+        assert_eq!(s.extent_id, second_eid);
 
         // 4g. Seek offset=15 -> active (mutable) extent (boundary = start of active).
         let s = stream_manager_client
             .seek(stream_id, Offset(15))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, (third_eid as u32));
+        assert_eq!(s.extent_id, third_eid);
         assert_eq!(s.state, ExtentState::Active);
         assert_eq!(s.start_offset, 15);
 
@@ -380,7 +392,7 @@ async fn stream_manager_integration() {
             .seek(stream_id, Offset(999))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, (third_eid as u32));
+        assert_eq!(s.extent_id, third_eid);
         assert_eq!(s.state, ExtentState::Active);
     }
 }

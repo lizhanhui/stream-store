@@ -10,25 +10,10 @@ pub const PROTOCOL_VERSION: u8 = 2;
 /// + RemainingLength 4 = 8).
 pub const HEADER_LEN: usize = 8;
 
-/// Flag bit on SEAL indicating the caller provides the resolved end offset.
-/// When clear (client seal): Stream Manager queries all EN replicas for offset.
-/// When set (extent-node seal): offset field is present and trusted by SM.
-pub const FLAG_OFFSET_PRESENT: u8 = 0x01;
-
-/// Flag bit on SEAL indicating the frame carries the extent's start_offset.
-/// When set, secondaries that have no extent can respond with SealAck(start_offset)
-/// to indicate zero committed records, enabling Stream Manager quorum resolution.
-pub const FLAG_START_OFFSET_PRESENT: u8 = 0x02;
-
-/// Flag bit on SEAL_ACK indicating the response carries new extent info.
-/// When clear (EN→SM): only base variable header (no new extent info).
-/// When set (SM→Client): variable header includes new_extent_id + primary_addr.
-pub const FLAG_NEW_EXTENT_PRESENT: u8 = 0x01;
-
-/// Flag bit on SEAL / SEAL_ACK indicating the frame carries an epoch field.
-/// Used for epoch-based seal (client seals by epoch rather than extent_id)
-/// and for SM responses that include the new epoch after an epoch bump.
-pub const FLAG_EPOCH_PRESENT: u8 = 0x04;
+/// Flag on SealStreamManager / SealExtentNode: response (success).
+/// When clear (0x00): request frame. When set (0x01): response frame.
+/// Error responses use FLAG_RESPONSE_ERROR (0x80) instead.
+pub const FLAG_SEAL_RESPONSE: u8 = 0x01;
 
 /// Flag on UPDATE_EXTENT: extent was sealed, new extent created.
 pub const FLAG_EXTENT_SEALED: u8 = 0x00;
@@ -119,8 +104,12 @@ pub enum Opcode {
     /// Carries all metadata (including byte_pos) so the secondary writes
     /// each record at the exact same position as the primary.
     Forward = 0x05,
-    Seal = 0x06,
-    SealAck = 0x07,
+    /// Epoch-based seal: Client ↔ StreamManager.
+    /// Flags: 0x00=request, 0x01=response, 0x80=error.
+    SealStreamManager = 0x06,
+    /// Epoch-based seal: StreamManager ↔ ExtentNode.
+    /// Flags: 0x00=request, 0x01=response, 0x80=error.
+    SealExtentNode = 0x07,
     QueryOffset = 0x08,
     QueryOffsetResp = 0x09,
     Read = 0x0A,
@@ -164,8 +153,8 @@ impl Opcode {
             0x03 => Some(Opcode::Append),
             0x04 => Some(Opcode::AppendAck),
             0x05 => Some(Opcode::Forward),
-            0x06 => Some(Opcode::Seal),
-            0x07 => Some(Opcode::SealAck),
+            0x06 => Some(Opcode::SealStreamManager),
+            0x07 => Some(Opcode::SealExtentNode),
             0x08 => Some(Opcode::QueryOffset),
             0x09 => Some(Opcode::QueryOffsetResp),
             0x0A => Some(Opcode::Read),

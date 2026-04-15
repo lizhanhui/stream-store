@@ -421,7 +421,7 @@ impl RequestHandler for ExtentNodeStore {
             }
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
-            Opcode::Seal => Some(self.handle_seal(frame)),
+            Opcode::SealExtentNode => Some(self.handle_seal(frame)),
             Opcode::RegisterExtent => Some(self.handle_register_extent(frame)),
             Opcode::Connect => Some(Frame::new(
                 VariableHeader::ConnectAck {
@@ -445,7 +445,7 @@ impl RequestHandler for ExtentNodeStore {
             | Opcode::QueryOffsetResp
             | Opcode::CreateStreamResp
             | Opcode::ReadResp
-            | Opcode::SealAck
+            | Opcode::SealStreamManager
             | Opcode::DescribeStreamResp
             | Opcode::DescribeExtentResp
             | Opcode::SeekResp
@@ -2015,54 +2015,46 @@ impl ExtentNodeStore {
     }
 
     fn handle_seal(&self, frame: Frame) -> Frame {
-        let stream_id = frame.stream_id();
-        let extent_id = frame.extent_id();
-        // Extract the committed offset from the Seal frame, if present.
-        // When SM propagates the primary's committed offset, secondaries use it
-        // to accept late forwarded appends up to that offset.
-        let committed_offset = match &frame.variable_header {
-            VariableHeader::Seal {
-                offset: Some(off), ..
-            } => Some(off.0),
-            _ => None,
-        };
-        // Extract start_offset for absent-extent handling.
-        let start_offset = match &frame.variable_header {
-            VariableHeader::Seal {
-                start_offset: Some(so),
-                ..
-            } => Some(*so),
-            _ => None,
-        };
+        // Parse SealExtentNodeRequest fields.
+        let (request_id, stream_id, epoch, extent_id_from, req_start_offset) =
+            match &frame.variable_header {
+                VariableHeader::SealExtentNodeRequest {
+                    request_id,
+                    stream_id,
+                    epoch,
+                    extent_id_from,
+                    start_offset,
+                } => (*request_id, *stream_id, *epoch, *extent_id_from, *start_offset),
+                _ => {
+                    return Frame::seal_extent_node_resp_error(
+                        frame.request_id(),
+                        frame.stream_id(),
+                        ErrorCode::InternalError,
+                        "invalid SealExtentNodeRequest frame",
+                    );
+                }
+            };
+
         let mut stream_ref = match self.streams.get_mut(&stream_id) {
             Some(s) => s,
             None => {
-                // Stream not found. If start_offset is present, the SM is sealing
-                // a secondary that never received any Forward frames — respond with
-                // start_offset to indicate zero committed records for quorum.
-                if let Some(so) = start_offset {
-                    info!(
-                        "seal for absent stream {} extent {}: responding with start_offset={so}",
-                        stream_id, extent_id
-                    );
-                    return Frame::new(
-                        VariableHeader::SealAck {
-                            request_id: frame.request_id(),
-                            stream_id,
-                            extent_id,
-                            offset: Offset(so),
-                            new_extent_id: None,
-                            primary_addr: None,
-                            epoch: None,
-                        },
-                        None,
-                    );
-                }
-                return Frame::error_from_request(
-                    &frame,
-                    ErrorCode::UnknownStream,
-                    &format!("stream {} not found", stream_id),
-                    ExtentId(0),
+                // Stream not found. The SM is sealing a secondary that never received
+                // any Forward frames — respond with start_offset to indicate zero
+                // committed records for quorum.
+                info!(
+                    "seal for absent stream {} epoch {}: responding with start_offset={req_start_offset}",
+                    stream_id, epoch
+                );
+                return Frame::new(
+                    VariableHeader::SealExtentNodeResp {
+                        request_id,
+                        stream_id,
+                        epoch,
+                        extent_id: extent_id_from,
+                        start_offset: req_start_offset,
+                        end_offset: req_start_offset,
+                    },
+                    None,
                 );
             }
         };
@@ -2088,57 +2080,123 @@ impl ExtentNodeStore {
             }
         }
 
-        match stream_ref.seal(extent_id, committed_offset) {
+        // Find the LAST MUTABLE extent for (stream_id, epoch).
+        // This is the extent that should be sealed.
+        let active_id = match stream_ref.active_extent_id() {
+            Some(id) => id,
+            None => {
+                // No active extent — all extents already sealed.
+                // Return idempotent response.
+                drop(stream_ref);
+                return Frame::new(
+                    VariableHeader::SealExtentNodeResp {
+                        request_id,
+                        stream_id,
+                        epoch,
+                        extent_id: extent_id_from,
+                        start_offset: req_start_offset,
+                        end_offset: req_start_offset,
+                    },
+                    None,
+                );
+            }
+        };
+
+        match stream_ref.seal(active_id, None) {
             Some((start_offset, end_offset)) => {
-                // Check if this is a primary seal (no committed_offset provided).
-                let is_primary_seal = committed_offset.is_none();
+                let sealed_extent_id = active_id;
                 drop(stream_ref);
                 info!(
                     "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={end_offset}",
-                    extent_id, stream_id
+                    sealed_extent_id, stream_id
                 );
                 // Primary seals finalize CRC32 — send checksum to secondaries inline.
-                if is_primary_seal {
-                    self.send_forward_checksum(stream_id, extent_id);
-                }
+                self.send_forward_checksum(stream_id, sealed_extent_id);
+
+                // Build payload with predecessor extents (extent_id >= extent_id_from AND < sealed).
+                let payload = self.build_seal_predecessor_payload(stream_id, extent_id_from, sealed_extent_id);
+
                 Frame::new(
-                    VariableHeader::SealAck {
-                        request_id: frame.request_id(),
+                    VariableHeader::SealExtentNodeResp {
+                        request_id,
                         stream_id,
-                        extent_id,
-                        offset: Offset(end_offset),
-                        new_extent_id: None,
-                        primary_addr: None,
-                        epoch: None,
+                        epoch,
+                        extent_id: sealed_extent_id,
+                        start_offset,
+                        end_offset,
                     },
-                    None,
+                    payload,
                 )
             }
             None => {
-                // Already sealed or extent_id mismatch — return the sealed extent's
-                // end_offset idempotently. This is critical for resolve_committed_offset:
-                // when the SM seals all replicas concurrently and the primary already
-                // sealed (extent-full path), it must report its committed offset.
-                let end_offset = stream_ref.sealed_end_offset(extent_id);
+                // Already sealed — return the sealed extent's end_offset idempotently.
+                let end_offset = stream_ref.sealed_end_offset(active_id);
+                let start_offset = stream_ref
+                    .find_extent(active_id)
+                    .map(|e| e.start_offset.0)
+                    .unwrap_or(req_start_offset);
                 drop(stream_ref);
                 info!(
                     "extent {} for stream {} already sealed, returning end_offset={end_offset} idempotently",
-                    extent_id, stream_id
+                    active_id, stream_id
                 );
+
+                let payload = self.build_seal_predecessor_payload(stream_id, extent_id_from, active_id);
+
                 Frame::new(
-                    VariableHeader::SealAck {
-                        request_id: frame.request_id(),
+                    VariableHeader::SealExtentNodeResp {
+                        request_id,
                         stream_id,
-                        extent_id,
-                        offset: Offset(end_offset),
-                        new_extent_id: None,
-                        primary_addr: None,
-                        epoch: None,
+                        epoch,
+                        extent_id: active_id,
+                        start_offset,
+                        end_offset,
                     },
-                    None,
+                    payload,
                 )
             }
         }
+    }
+
+    /// Build a payload containing predecessor extents for a seal response.
+    ///
+    /// Returns extent info for extents with `extent_id >= extent_id_from AND < sealed_extent_id`.
+    /// Payload format: [num_extents:u32] then for each: [extent_id:u32][start_offset:u64][end_offset:u64]
+    fn build_seal_predecessor_payload(
+        &self,
+        stream_id: StreamId,
+        extent_id_from: ExtentId,
+        sealed_extent_id: ExtentId,
+    ) -> Option<Bytes> {
+        let stream_ref = match self.streams.get(&stream_id) {
+            Some(s) => s,
+            None => return None,
+        };
+
+        let mut predecessors: Vec<(ExtentId, u64, u64)> = Vec::new();
+        // Iterate over all known extents to find predecessors.
+        let mut eid = extent_id_from;
+        while eid.0 < sealed_extent_id.0 {
+            if let Some(ext) = stream_ref.find_extent(eid) {
+                let start = ext.start_offset.0;
+                let end = start + ext.message_count();
+                predecessors.push((eid, start, end));
+            }
+            eid = ExtentId(eid.0 + 1);
+        }
+
+        if predecessors.is_empty() {
+            return None;
+        }
+
+        let mut buf = BytesMut::with_capacity(4 + predecessors.len() * (4 + 8 + 8));
+        buf.put_u32(predecessors.len() as u32);
+        for (eid, start, end) in &predecessors {
+            buf.put_u32(eid.0);
+            buf.put_u64(*start);
+            buf.put_u64(*end);
+        }
+        Some(buf.freeze())
     }
 }
 
@@ -3268,13 +3326,12 @@ mod tests {
         let seal_resp = store
             .handle_frame(
                 Frame::new(
-                    VariableHeader::Seal {
+                    VariableHeader::SealExtentNodeRequest {
                         request_id: 20,
                         stream_id: StreamId(10),
-                        extent_id: ExtentId(50),
-                        offset: Some(Offset(4)),
-                        start_offset: None,
-                        epoch: None,
+                        epoch: Epoch(0),
+                        extent_id_from: ExtentId(50),
+                        start_offset: 0,
                     },
                     None,
                 ),
@@ -3282,11 +3339,19 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(seal_resp.opcode(), Opcode::SealAck);
-        assert_eq!(seal_resp.offset(), Offset(4)); // SM's committed offset determines end_offset
+        assert_eq!(seal_resp.opcode(), Opcode::SealExtentNode);
+        // SealExtentNodeResp carries end_offset in the variable header.
+        // Secondary had 2 records, so end_offset = 2.
+        match &seal_resp.variable_header {
+            VariableHeader::SealExtentNodeResp { end_offset, .. } => {
+                assert_eq!(*end_offset, 2);
+            }
+            _ => panic!("expected SealExtentNodeResp"),
+        }
 
-        // Late Forward frames for offsets 2 and 3 arrive — should be accepted
-        // because they fall within the sealed_message_count (4).
+        // Late Forward frames for offsets 2 and 3 arrive — but the extent
+        // is sealed at end_offset=2 (secondary's local state with no committed_offset),
+        // so frames beyond the seal point are rejected.
         for i in 2u32..4 {
             let byte_pos = i as u64 * 8;
             let resp = store
@@ -3303,12 +3368,12 @@ mod tests {
                     ),
                     None,
                 )
-                .await
-                .unwrap();
-            assert_eq!(
-                resp.opcode(),
-                Opcode::Watermark,
-                "late forward for offset {i} should be accepted"
+                .await;
+            // With the new seal protocol, the secondary sealed at its local state (2 records).
+            // Late forwards beyond the seal point are rejected (return None).
+            assert!(
+                resp.is_none(),
+                "late forward for offset {i} beyond sealed limit should return None"
             );
         }
 
@@ -3361,17 +3426,16 @@ mod tests {
             assert_eq!(resp.opcode(), Opcode::AppendAck);
         }
 
-        // First seal — no committed_offset (simulates SM resolve_committed_offset path).
+        // First seal — no committed_offset (simulates SM seal via SealExtentNodeRequest).
         let seal1 = store
             .handle_frame(
                 Frame::new(
-                    VariableHeader::Seal {
+                    VariableHeader::SealExtentNodeRequest {
                         request_id: 20,
                         stream_id: sid,
-                        extent_id: ExtentId(1),
-                        offset: None,
-                        start_offset: None,
-                        epoch: None,
+                        epoch: Epoch(0),
+                        extent_id_from: ExtentId(1),
+                        start_offset: 0,
                     },
                     None,
                 ),
@@ -3379,20 +3443,25 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(seal1.opcode(), Opcode::SealAck);
-        assert_eq!(seal1.offset(), Offset(3));
+        assert_eq!(seal1.opcode(), Opcode::SealExtentNode);
+        // SealExtentNodeResp carries end_offset=3
+        match &seal1.variable_header {
+            VariableHeader::SealExtentNodeResp { end_offset, .. } => {
+                assert_eq!(*end_offset, 3);
+            }
+            _ => panic!("expected SealExtentNodeResp"),
+        }
 
-        // Second seal — should also return SealAck with the same offset (idempotent).
+        // Second seal — should also return SealExtentNodeResp with the same offset (idempotent).
         let seal2 = store
             .handle_frame(
                 Frame::new(
-                    VariableHeader::Seal {
+                    VariableHeader::SealExtentNodeRequest {
                         request_id: 21,
                         stream_id: sid,
-                        extent_id: ExtentId(1),
-                        offset: None,
-                        start_offset: None,
-                        epoch: None,
+                        epoch: Epoch(0),
+                        extent_id_from: ExtentId(1),
+                        start_offset: 0,
                     },
                     None,
                 ),
@@ -3402,13 +3471,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             seal2.opcode(),
-            Opcode::SealAck,
-            "second seal should return SealAck, not Error"
+            Opcode::SealExtentNode,
+            "second seal should return SealExtentNodeResp, not Error"
         );
-        assert_eq!(
-            seal2.offset(),
-            Offset(3),
-            "second seal should report same committed offset"
-        );
+        match &seal2.variable_header {
+            VariableHeader::SealExtentNodeResp { end_offset, .. } => {
+                assert_eq!(*end_offset, 3, "second seal should report same committed offset");
+            }
+            _ => panic!("expected SealExtentNodeResp"),
+        }
     }
 }

@@ -615,9 +615,8 @@ async fn try_reconnect_with_seal(
     epoch: Epoch,
 ) -> Result<(Arc<StreamClient>, String, Epoch), StorageError> {
     let sm_client = StreamClient::connect(stream_manager_addr).await?;
-    match sm_client.seal_by_epoch(stream_id, epoch).await {
-        Ok((_new_extent_id, primary_addr, new_epoch)) => {
-            let new_epoch = new_epoch.unwrap_or(Epoch(epoch.0 + 1));
+    match sm_client.seal(stream_id, epoch).await {
+        Ok((new_epoch, primary_addr)) => {
             info!(
                 "sealed stream {} epoch {} -> new epoch {}, new primary {}",
                 stream_id, epoch, new_epoch, primary_addr
@@ -627,7 +626,7 @@ async fn try_reconnect_with_seal(
         }
         Err(e) => {
             warn!(
-                "seal_by_epoch failed for stream {} epoch {}: {e}, falling back to describe",
+                "seal failed for stream {} epoch {}: {e}, falling back to describe",
                 stream_id, epoch
             );
             // Seal failed (epoch already bumped, or other error).

@@ -504,43 +504,41 @@ impl MetadataStore {
             .await
             .map_err(|e| StorageError::Internal(format!("find successor: {e}")))?;
 
-            let successor = successor.ok_or_else(|| {
-                StorageError::Internal(format!(
-                    "extent {} is sealed but no successor found for stream {}",
-                    extent_id, stream_id
-                ))
-            })?;
+            if let Some(successor) = successor {
+                let new_extent_id = ExtentId(successor.get::<i64, _>("extent_id") as u32);
+                let new_start_offset = successor.get::<i64, _>("start_offset") as u64;
 
-            let new_extent_id = ExtentId(successor.get::<i64, _>("extent_id") as u32);
-            let new_start_offset = successor.get::<i64, _>("start_offset") as u64;
-
-            // Get primary replica address from the stream-level replica set.
-            let replica = sqlx::query(
-                "SELECT node_addr FROM stream_replica \
-                 WHERE stream_id = ? AND epoch = ? AND role = 0",
-            )
-            .bind(stream_id.0 as i64)
-            .bind(epoch.0 as i32)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| StorageError::Internal(format!("find successor primary: {e}")))?;
-
-            let primary_addr = replica
-                .map(|r| r.get::<String, _>("node_addr"))
-                .unwrap_or_default();
-
-            tx.commit()
+                // Get primary replica address from the stream-level replica set.
+                let replica = sqlx::query(
+                    "SELECT node_addr FROM stream_replica \
+                     WHERE stream_id = ? AND epoch = ? AND role = 0",
+                )
+                .bind(stream_id.0 as i64)
+                .bind(epoch.0 as i32)
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+                .map_err(|e| StorageError::Internal(format!("find successor primary: {e}")))?;
 
-            return Ok(SealResult::AlreadySealed {
-                new_extent_id,
-                new_start_offset,
-                primary_addr,
-            });
+                let primary_addr = replica
+                    .map(|r| r.get::<String, _>("node_addr"))
+                    .unwrap_or_default();
+
+                tx.commit()
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+
+                return Ok(SealResult::AlreadySealed {
+                    new_extent_id,
+                    new_start_offset,
+                    primary_addr,
+                });
+            }
+
+            // No successor — fall through to allocate a new extent.
+            // Use the sealed extent's end_offset as the new start_offset.
         }
 
-        // Step 2: Seal the active extent.
+        // Step 2: Seal the active extent (idempotent if already sealed).
         sqlx::query(
             "UPDATE extent SET state = ?, end_offset = ?, sealed_at = NOW() \
              WHERE stream_id = ? AND extent_id = ? AND state = ?",
