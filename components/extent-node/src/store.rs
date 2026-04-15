@@ -2081,8 +2081,8 @@ impl ExtentNodeStore {
         }
 
         // Find the LAST MUTABLE extent for (stream_id, epoch).
-        // This is the extent that should be sealed.
-        let active_id = match stream_ref.active_extent_id() {
+        // Only seal extents at the requested epoch — newer epochs are untouched.
+        let active_id = match stream_ref.active_extent_at_epoch(epoch) {
             Some(id) => id,
             None => {
                 // No active extent — all extents already sealed.

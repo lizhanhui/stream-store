@@ -11,7 +11,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{ExtentState, Offset};
+use common::types::{Epoch, ExtentState, Offset};
 use extent_node::ExtentNode;
 use stream_manager::StreamManager;
 use stream_manager::metadata::MetadataStore;
@@ -223,14 +223,16 @@ async fn multi_sm_leadership_failover() {
 
     // Wait for SM-2 to detect dead node and run failover.
     // EN heartbeat=2000ms, expiry threshold=3s (1.5×), SM check=1000ms.
-    // Allow generous time for the full seal+allocate cycle.
+    // Wait for SM to mark the dead EN, then trigger client-driven seal.
     sleep(Duration::from_secs(6)).await;
 
-    // Reconnect to SM-2 and describe the stream — we should see a sealed extent
-    // and a new active extent allocated by SM-2's failover.
+    // Client-driven seal: seal the stream at epoch 0.
     let sm2_client = StreamClient::connect(&sm2_addr)
         .await
         .expect("connect to SM-2");
+    let seal_result = sm2_client.seal(stream_id, Epoch(0)).await;
+    info!("Phase 6: seal result: {:?}", seal_result);
+
     let extents = sm2_client
         .describe_stream(stream_id, 100)
         .await
