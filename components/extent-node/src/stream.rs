@@ -297,6 +297,16 @@ impl Stream {
         self.extents.last().map(|e| e.id)
     }
 
+    /// The extent ID of the last mutable extent at the given epoch.
+    /// Returns None if no unsealed extent exists at that epoch.
+    pub fn active_extent_at_epoch(&self, epoch: Epoch) -> Option<ExtentId> {
+        self.extents
+            .iter()
+            .rev()
+            .find(|e| e.epoch == epoch && e.state() == ExtentState::Active)
+            .map(|e| e.id)
+    }
+
     /// The maximum offset (exclusive): the next offset that would be assigned.
     /// Returns `Offset(0)` if the stream has no extents.
     pub fn max_offset(&self) -> Offset {
