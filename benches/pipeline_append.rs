@@ -141,8 +141,12 @@ fn is_routing_error(err: &StorageError) -> bool {
     )
 }
 
+fn is_primary_lost_stream(err: &StorageError) -> bool {
+    matches!(err, StorageError::UnknownStream(_))
+}
+
 fn needs_reconnect(err: &StorageError) -> bool {
-    is_connection_broken(err) || is_routing_error(err)
+    is_connection_broken(err) || is_routing_error(err) || is_primary_lost_stream(err)
 }
 
 // -- Main ---------------------------------------------------------------------
@@ -477,10 +481,10 @@ async fn sender_task(
                     counters.record_success(started_at.elapsed());
                 }
                 Err(ref e) if needs_reconnect(e) => {
-                    let is_broken = is_connection_broken(e);
+                    let needs_seal = is_connection_broken(e) || is_primary_lost_stream(e);
                     warn!(
                         "sender {sender_id}: {e} -- draining pipeline and {}",
-                        if is_broken { "sealing epoch to recover" } else { "refreshing epoch" }
+                        if needs_seal { "sealing epoch to recover" } else { "refreshing epoch" }
                     );
                     counters.record_error();
 
@@ -501,7 +505,7 @@ async fn sender_task(
                     // Routing error (EpochStale, ExtentSealed):
                     //   Another sender or SM already bumped the epoch. Just describe to refresh.
                     sleep(backoff).await;
-                    let reconnect_result = if is_broken {
+                    let reconnect_result = if needs_seal {
                         reconnect_with_seal(&stream_manager_addr, stream_id, epoch, deadline).await
                     } else {
                         reconnect_to_primary(&stream_manager_addr, stream_id, deadline).await
