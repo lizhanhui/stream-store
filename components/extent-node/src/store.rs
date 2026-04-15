@@ -1097,7 +1097,7 @@ impl ExtentNodeStore {
                 }
             }
 
-            if let Some(ef_idx) = extent_full_idx {
+            if let Some(index) = extent_full_idx {
                 // Drop the read guard BEFORE acquiring write guard for seal+create.
                 drop(stream_ref);
 
@@ -1107,23 +1107,23 @@ impl ExtentNodeStore {
                 }
 
                 // Re-acquire read guard to retry the failed job and remaining jobs on the new extent.
-                if let Some(stream_ref2) = self.streams.get(&stream_id) {
-                    let epoch2 = stream_ref2.epoch();
-                    for job in &batch[ef_idx..] {
+                if let Some(stream_ref) = self.streams.get(&stream_id) {
+                    epoch = stream_ref.epoch();
+                    for job in &batch[index..] {
                         let (_, _) = self.do_append_and_respond(
-                            &stream_ref2,
+                            &stream_ref,
                             job.request_id,
                             job.stream_id,
-                            epoch2,
+                            epoch,
                             job.payload.clone(),
                             job.response_tx.clone(),
                         );
                     }
                     // Decrement in_flight by the full batch size.
-                    let remaining = stream_ref2
+                    let remaining = stream_ref
                         .in_flight()
                         .fetch_sub(batch_len as u64, Ordering::Release);
-                    drop(stream_ref2);
+                    drop(stream_ref);
                     if remaining <= batch_len as u64 {
                         break;
                     }
