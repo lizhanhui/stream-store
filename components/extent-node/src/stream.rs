@@ -95,10 +95,10 @@ pub struct Stream {
     job_tx: Sender<AppendJob>,
     job_rx: Receiver<AppendJob>,
 
-    /// Cached per-secondary UnboundedSender clones (Primary only).
+    /// Cached per-secondary Sender clones (Primary only).
     /// Populated at RegisterExtent time from DownstreamPool.
     /// Vec since RF is small (1-3); iteration is the hot path.
-    downstream_txs: Vec<mpsc::UnboundedSender<Frame>>,
+    downstream_txs: Vec<mpsc::Sender<Frame>>,
 
     /// Pool of recycled extents ready for reuse. Avoids ~5ms allocation
     /// on extent-full transitions. Pre-populated at register_extent time;
@@ -476,7 +476,7 @@ impl Stream {
     }
 
     /// Set cached downstream senders (Primary only, called at RegisterExtent time).
-    pub(crate) fn set_downstream_txs(&mut self, txs: Vec<mpsc::UnboundedSender<Frame>>) {
+    pub(crate) fn set_downstream_txs(&mut self, txs: Vec<mpsc::Sender<Frame>>) {
         self.downstream_txs = txs;
     }
 
@@ -497,9 +497,20 @@ impl Stream {
         }
         // Send clones to all but the last, move the original to the last.
         for tx in &self.downstream_txs[..n - 1] {
-            let _ = tx.send(frame.clone());
+            if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(frame.clone()) {
+                tracing::warn!(
+                    "downstream channel full for stream {}, dropping forward frame",
+                    self.id,
+                );
+            }
         }
-        let _ = self.downstream_txs[n - 1].send(frame);
+        if let Err(mpsc::error::TrySendError::Full(_)) = self.downstream_txs[n - 1].try_send(frame)
+        {
+            tracing::warn!(
+                "downstream channel full for stream {}, dropping forward frame",
+                self.id,
+            );
+        }
     }
 
     /// Append to the active extent (single-writer, called by stream-level leader).

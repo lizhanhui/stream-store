@@ -628,7 +628,7 @@ impl ExtentNodeStore {
                 AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout)
             });
 
-            // Cache per-secondary UnboundedSender handles in the Stream so the
+            // Cache per-secondary Sender handles in the Stream so the
             // hot append path can push Forward frames with zero lookup overhead.
             if !ri.replica_addrs.is_empty() {
                 if let Some(pool) = self.downstream.get() {

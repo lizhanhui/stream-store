@@ -2,14 +2,14 @@
 //!
 //! Each secondary address gets a dedicated writer task that owns the TCP
 //! `FramedWrite` exclusively — no per-writer Mutex. The leader pushes frames
-//! into per-address unbounded mpsc channels and returns immediately (fire-and-
-//! forget), completely decoupling append latency from network I/O.
+//! into per-address bounded mpsc channels via `try_send` (non-blocking,
+//! fire-and-forget), completely decoupling append latency from network I/O.
 //!
 //! Channels are created once per address and outlive individual TCP connections.
 //! On TCP failure, the writer task reconnects in a loop — frames buffered in
 //! the channel survive outages and are drained on reconnect.
 //!
-//! Streams cache cloned `UnboundedSender` handles at RegisterExtent time so
+//! Streams cache cloned `Sender` handles at RegisterExtent time so
 //! the hot append path pushes directly into channels with zero lookup overhead.
 //!
 //! Each connection also spawns a reader task that processes Watermark ACKs
@@ -36,8 +36,8 @@ use crate::store::ExtentNodeStore;
 
 /// Handle to a dedicated per-address writer task.
 struct WriterHandle {
-    /// Unbounded sender — leader pushes frames here, never blocks.
-    tx: mpsc::UnboundedSender<Frame>,
+    /// Bounded sender — leader pushes frames via try_send (never blocks).
+    tx: mpsc::Sender<Frame>,
 }
 
 /// Channel-based TCP connection pool for broadcast replication.
@@ -61,6 +61,10 @@ pub struct DownstreamPool {
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+/// Default capacity for the per-secondary bounded channel.
+/// Shared across all streams replicating to the same secondary.
+const DEFAULT_DOWNSTREAM_CHANNEL_CAPACITY: usize = 1_048_576;
+
 impl DownstreamPool {
     /// Create a new pool with a back-reference to the store.
     pub fn new(store: Arc<ExtentNodeStore>) -> Self {
@@ -79,7 +83,7 @@ impl DownstreamPool {
         map.clear(); // Drops senders, causing writer tasks to exit on next recv().
     }
 
-    /// Get or create an `UnboundedSender` for the given secondary address.
+    /// Get or create a `Sender` for the given secondary address.
     ///
     /// Called at `handle_register_extent` time (cold path). Returns a clone
     /// of the sender that can be cached in the Stream struct for zero-lookup
@@ -89,7 +93,7 @@ impl DownstreamPool {
     /// existing sender (multiple streams sharing the same secondary reuse
     /// the same channel). Otherwise creates the channel and spawns the
     /// writer task (which connects to TCP internally in its reconnect loop).
-    pub fn get_or_create_sender(&self, addr: &str) -> mpsc::UnboundedSender<Frame> {
+    pub fn get_or_create_sender(&self, addr: &str) -> mpsc::Sender<Frame> {
         let mut map = self.writers.lock().unwrap();
 
         // Return existing sender if alive.
@@ -100,8 +104,8 @@ impl DownstreamPool {
             // Channel closed (shouldn't happen unless shutdown) — recreate.
         }
 
-        // Create channel + spawn writer task.
-        let (tx, rx) = mpsc::unbounded_channel::<Frame>();
+        // Create bounded channel + spawn writer task.
+        let (tx, rx) = mpsc::channel::<Frame>(DEFAULT_DOWNSTREAM_CHANNEL_CAPACITY);
 
         let addr_owned = addr.to_string();
         let shutdown_rx = self.shutdown_tx.subscribe();
@@ -140,7 +144,7 @@ async fn connect_tcp(addr: &str) -> Result<TcpStream, std::io::Error> {
 
 /// Dedicated writer task for a single secondary address.
 ///
-/// Reconnects forever on TCP failure — the unbounded channel outlives any
+/// Reconnects forever on TCP failure — the bounded channel outlives any
 /// individual TCP connection. Frames buffered during outages are drained
 /// on reconnect. Only exits when the channel is closed (all senders dropped)
 /// or the shutdown signal is received.
@@ -150,7 +154,7 @@ async fn connect_tcp(addr: &str) -> Result<TcpStream, std::io::Error> {
 /// before a single `flush()`.
 async fn downstream_writer_task(
     addr: String,
-    mut rx: mpsc::UnboundedReceiver<Frame>,
+    mut rx: mpsc::Receiver<Frame>,
     mut shutdown_rx: broadcast::Receiver<()>,
     store: Arc<ExtentNodeStore>,
 ) {
