@@ -447,14 +447,14 @@ impl Stream {
             return;
         }
         while self.extents.len() > self.max_extents && self.extents.len() > 1 {
-            let mut evicted = self.extents.remove(0);
-            // Cap the pool at 2 spares to bound memory. Beyond that, just drop.
-            if evicted.can_recycle() && self.extent_pool.len() < 2 {
-                // Pre-resize to next_extent_capacity so create_next_extent
-                // never resizes on the hot append path.
-                if evicted.capacity() != self.next_extent_capacity {
-                    evicted.resize(self.next_extent_capacity);
-                }
+            let evicted = self.extents.remove(0);
+            // Only pool extents that already match the target capacity.
+            // Mismatched extents (from growth transitions) are dropped to avoid
+            // blocking resize on the hot append path.
+            if evicted.can_recycle()
+                && self.extent_pool.len() < 2
+                && evicted.capacity() == self.next_extent_capacity
+            {
                 self.extent_pool.push_back(evicted);
             }
         }
