@@ -5,7 +5,7 @@ CREATE TABLE node_metrics (
   appends_per_sec        INT UNSIGNED NOT NULL DEFAULT 0,
   active_extent_count    INT UNSIGNED NOT NULL DEFAULT 0,
   bytes_written_per_sec  BIGINT UNSIGNED NOT NULL DEFAULT 0,
-  updated_at             TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  updated_at             DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 );
 
 CREATE TABLE stream_manager_leadership (

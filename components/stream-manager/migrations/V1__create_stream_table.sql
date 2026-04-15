@@ -8,6 +8,18 @@ CREATE TABLE stream (
     max_extent_capacity INT NOT NULL DEFAULT 268435456,
     extent_growth_factor INT NOT NULL DEFAULT 2,
     cache_extents       INT NOT NULL DEFAULT 4,
-    epoch               INT NOT NULL DEFAULT 0,
-    created_at          TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    epoch               INT NOT NULL DEFAULT 0,    
+    created_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
+);
+
+CREATE TABLE stream_replica (
+    stream_id     BIGINT NOT NULL,
+    epoch         INT NOT NULL,
+    node_addr     VARCHAR(256) NOT NULL,
+    role          TINYINT NOT NULL DEFAULT 0,
+    created_at    DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at    DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (stream_id, epoch, node_addr),
+    INDEX idx_node (node_addr)
 );
