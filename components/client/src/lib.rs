@@ -692,7 +692,13 @@ impl StreamClient {
         extent_growth_factor: u32,
     ) -> Result<StreamId, StorageError> {
         match self.describe_stream_by_name(stream_name, 1).await {
-            Ok((stream_id, _)) => Ok(stream_id),
+            Ok((stream_id, extents)) => {
+                // If the latest extent had no replicas, retry with all extents.
+                if self.cached_primary(stream_id).await.is_none() && !extents.is_empty() {
+                    self.describe_stream(stream_id, 0).await?;
+                }
+                Ok(stream_id)
+            }
             Err(StorageError::UnknownStream(_)) => {
                 let (stream_id, _, _, _) = self
                     .create_stream(
@@ -724,9 +730,15 @@ impl StreamClient {
     }
 
     /// Extract and cache the primary address from extent info.
+    ///
+    /// Prefers the active extent's primary; falls back to any extent's primary
+    /// since all extents within an epoch share the same replica set.
     async fn cache_primary_from_extents(&self, stream_id: StreamId, extents: &[ExtentInfo]) {
-        // Find the active extent's primary replica.
-        if let Some(ext) = extents.iter().find(|e| e.state == ExtentState::Active) {
+        let target = extents
+            .iter()
+            .find(|e| e.state == ExtentState::Active)
+            .or_else(|| extents.first());
+        if let Some(ext) = target {
             if let Some(primary) = ext.replicas.iter().find(|r| r.role == 0) {
                 self.cache_primary(stream_id, &primary.node_addr).await;
             }

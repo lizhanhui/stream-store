@@ -212,7 +212,7 @@ impl StreamManagerStore {
                 }
             };
 
-            let replicas = match self.store.get_replicas(*stream_id, active.extent_id).await {
+            let replicas = match self.store.get_replicas(*stream_id, active.epoch).await {
                 Ok(r) => r,
                 Err(e) => {
                     warn!(
@@ -280,24 +280,7 @@ impl StreamManagerStore {
                 continue;
             }
 
-            // Copy replica rows for any newly discovered extents.
-            // Extents within the same epoch share the same replica set as the known active extent.
-            let known_extent_id = active.extent_id;
-            for (extent_id, _, _, _) in &en_extents {
-                if *extent_id != known_extent_id {
-                    // Best-effort: copy replicas from known extent to new extent.
-                    if let Err(e) = self
-                        .store
-                        .copy_replicas(*stream_id, known_extent_id, *extent_id)
-                        .await
-                    {
-                        warn!(
-                            "startup reconciliation: copy_replicas for extent {:?}: {e}",
-                            extent_id
-                        );
-                    }
-                }
-            }
+            // No per-extent replica copy needed — replicas are at (stream, epoch) level.
 
             reconciled += 1;
         }
@@ -491,7 +474,7 @@ impl StreamManagerStore {
     /// Returns (ExtentId, primary node address).
     ///
     /// `replication_factor` specifies how many replicas to create for this extent.
-    /// The extent_replica table stores node *addresses* (not node IDs) so that the StreamManager
+    /// The stream_replica table stores node *addresses* (not node IDs) so that the StreamManager
     /// can connect to ExtentNodes for seal and RegisterExtent operations.
     async fn allocate_and_notify_replica_set(
         &self,
@@ -938,7 +921,7 @@ impl StreamManagerStore {
             }
             None => {
                 // Query all EN replicas to determine committed offset via quorum.
-                self.resolve_committed_offset(stream_id, extent_id, extent_start_offset)
+                self.resolve_committed_offset(stream_id, extent_id, extent_start_offset, epoch)
                     .await?
             }
         };
@@ -958,7 +941,7 @@ impl StreamManagerStore {
         {
             let replicas = self
                 .store
-                .get_replicas(stream_id, extent_id)
+                .get_replicas(stream_id, epoch)
                 .await
                 .unwrap_or_default();
             let addrs: Vec<String> = replicas.into_iter().map(|r| r.node_addr).collect();
@@ -1004,8 +987,9 @@ impl StreamManagerStore {
         stream_id: StreamId,
         extent_id: ExtentId,
         start_offset: u64,
+        epoch: Epoch,
     ) -> Result<u64, StorageError> {
-        let replicas = self.store.get_replicas(stream_id, extent_id).await?;
+        let replicas = self.store.get_replicas(stream_id, epoch).await?;
         if replicas.is_empty() {
             return Err(StorageError::Internal(format!(
                 "no replicas found for stream {} extent {}",
@@ -1458,7 +1442,7 @@ impl StreamManagerStore {
             }
         };
 
-        let replicas = match self.store.get_replicas(stream_id, active.extent_id).await {
+        let replicas = match self.store.get_replicas(stream_id, active.epoch).await {
             Ok(r) => r,
             Err(e) => {
                 return Frame::seal_ack_error(
