@@ -1057,13 +1057,14 @@ impl ExtentNodeStore {
                         break;
                     }
                     Err(_) => {
-                        // Follower incremented in_flight but hasn't pushed yet.
-                        // Release the guard before yielding so writers can proceed.
+                        // handle concurrent system tick
                         let delegated = stream_ref.in_flight().load(Ordering::Acquire);
                         if 0 == delegated {
-                            // handle concurrent system tick
                             return all_seal_notifications;
                         }
+
+                        // Follower incremented in_flight but hasn't pushed yet.
+                        // Release the guard before yielding so writers can proceed.
                         drop(stream_ref);
                         tokio::task::yield_now().await;
                     }
