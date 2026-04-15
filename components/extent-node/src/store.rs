@@ -1025,48 +1025,54 @@ impl ExtentNodeStore {
         let mut all_seal_notifications = Vec::new();
 
         loop {
-            // Acquire a fresh read guard each outer iteration.
-            let stream_ref = match self.streams.get(&stream_id) {
-                Some(s) => s,
-                None => break,
-            };
-            let epoch = stream_ref.epoch();
-
+            // ── Phase 1: Drain jobs from the channel ──
+            // Hold the DashMap guard only for try_recv. If the channel is empty
+            // (follower incremented in_flight but hasn't pushed yet), drop the
+            // guard before yielding to avoid blocking writers on the same shard.
             let mut batch: Vec<AppendJob> = Vec::new();
-
-            // Drain all available jobs from the channel.
-            // Yield the tokio task (not the OS thread) if a follower has incremented
-            // in_flight but hasn't pushed its job yet. This prevents starving other
-            // async tasks (e.g., the downstream watermark reader) on the same thread.
-            {
-                let mut spin_count = 0u32;
-                loop {
-                    match stream_ref.job_rx().try_recv() {
-                        Ok(job) => {
-                            batch.push(job);
-                            spin_count = 0;
-                        }
-                        Err(_) => {
-                            if batch.is_empty() {
-                                if spin_count < 8 {
-                                    std::hint::spin_loop();
-                                    spin_count += 1;
-                                } else {
-                                    // Yield the tokio task so other tasks on this
-                                    // worker thread can make progress.
-                                    tokio::task::yield_now().await;
-                                    spin_count = 0;
-                                }
-                                continue;
+            let mut epoch = Epoch(0);
+            loop {
+                let stream_ref = match self.streams.get(&stream_id) {
+                    Some(s) => s,
+                    None => return all_seal_notifications,
+                };
+                if batch.is_empty() {
+                    epoch = stream_ref.epoch();
+                }
+                match stream_ref.job_rx().try_recv() {
+                    Ok(job) => {
+                        batch.push(job);
+                        // Keep draining without releasing the guard.
+                        loop {
+                            match stream_ref.job_rx().try_recv() {
+                                Ok(job) => batch.push(job),
+                                Err(_) => break,
                             }
-                            break;
                         }
+                        drop(stream_ref);
+                        break;
+                    }
+                    Err(_) if !batch.is_empty() => {
+                        drop(stream_ref);
+                        break;
+                    }
+                    Err(_) => {
+                        // Follower incremented in_flight but hasn't pushed yet.
+                        // Release the guard before yielding so writers can proceed.
+                        drop(stream_ref);
+                        tokio::task::yield_now().await;
                     }
                 }
             }
 
+            // ── Phase 2: Process the batch ──
             let batch_len = batch.len();
             let mut extent_full_idx: Option<usize> = None;
+
+            let stream_ref = match self.streams.get(&stream_id) {
+                Some(s) => s,
+                None => break,
+            };
 
             // Process each job. Stop at the first ExtentFull.
             // Forward frames are pushed inline by do_append_and_respond.
