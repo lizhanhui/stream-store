@@ -477,6 +477,13 @@ impl Extent {
         byte_pos: u64,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
+        // Reject stale Forward frames from a previous extent (offset < start_offset).
+        if offset.0 < self.start_offset.0 {
+            return Err(StorageError::Internal(format!(
+                "stale forward: offset {} < extent start_offset {}",
+                offset.0, self.start_offset.0
+            )));
+        }
         let seq = offset.0 - self.start_offset.0;
         // Check seal limit (limit is count-based).
         let limit = self.limit.load(Ordering::Acquire);
