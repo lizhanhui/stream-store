@@ -107,86 +107,15 @@ async fn check_expired_nodes(
     for node in expired {
         info!("node {} expired, marking DEAD", node.node_id);
 
-        // Mark node as dead.
+        // Mark node as dead so the allocator excludes it from future placements.
+        // Do NOT proactively seal extents — let clients trigger seal when they
+        // observe append errors (timeout, connection reset, UnknownStream).
+        // Client-driven seal is simpler and avoids races with SM-driven seal.
         store.mark_node_dead(&node.node_id).await?;
+    }
 
-        // Get all active extents on this dead node and seal them.
-        let active_extents = store.get_active_extents_on_node(&node.addr).await?;
-
-        for extent in &active_extents {
-            info!(
-                "failover: sealing extent {} on dead node {} (stream {})",
-                extent.extent_id, node.node_id, extent.stream_id
-            );
-
-            // Resolve the true committed offset from surviving replicas.
-            // This contacts the Primary (if alive) or uses secondary quorum.
-            let committed_offset = match sm_store
-                .resolve_committed_offset(
-                    extent.stream_id,
-                    extent.extent_id,
-                    extent.start_offset,
-                    extent.epoch,
-                )
-                .await
-            {
-                Ok(offset) => {
-                    info!(
-                        "failover: resolved committed offset={offset} for extent {} stream {}",
-                        extent.extent_id, extent.stream_id
-                    );
-                    offset
-                }
-                Err(e) => {
-                    // All replicas unreachable — fall back to metadata end_offset.
-                    // This may lose data but is the best we can do.
-                    warn!(
-                        "failover: resolve_committed_offset failed for extent {} stream {}: {e}; \
-                         falling back to metadata end_offset={}",
-                        extent.extent_id, extent.stream_id, extent.end_offset
-                    );
-                    extent.end_offset
-                }
-            };
-
-            // Bump epoch since the replica set is changing due to node failure.
-            // CAS guard prevents double-bump if another SM raced us.
-            let new_epoch = match store.bump_epoch(extent.stream_id).await {
-                Ok(epoch) => epoch,
-                Err(e) => {
-                    warn!(
-                        "failover: bump_epoch failed for stream {} (concurrent failover?): {e}",
-                        extent.stream_id
-                    );
-                    continue;
-                }
-            };
-
-            // Seal-and-allocate with proper RF, RegisterExtent to new Primary,
-            // and fire-and-forget notify to secondaries.
-            match sm_store
-                .seal_allocate_register(
-                    extent.stream_id,
-                    extent.extent_id,
-                    committed_offset,
-                    new_epoch,
-                )
-                .await
-            {
-                Ok((new_extent_id, primary_addr)) => {
-                    info!(
-                        "failover: replacement extent {} allocated on {primary_addr} for stream {} (epoch={})",
-                        new_extent_id, extent.stream_id, new_epoch
-                    );
-                }
-                Err(e) => {
-                    warn!(
-                        "failover: seal_allocate_register failed for stream {}: {e}",
-                        extent.stream_id
-                    );
-                }
-            }
-        }
+    if dead_count > 0 {
+        info!("heartbeat checker: marked {dead_count} dead node(s)");
     }
 
     Ok(dead_count)

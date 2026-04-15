@@ -920,7 +920,8 @@ impl StreamManagerStore {
             }
             None => {
                 // Query all EN replicas to determine committed offset via quorum.
-                self.resolve_committed_offset(stream_id, extent_id, extent_start_offset, epoch)
+                // Use the extent's original epoch for replica lookup (not the bumped epoch).
+                self.resolve_committed_offset(stream_id, extent_id, extent_start_offset, extent_row.epoch)
                     .await?
             }
         };
@@ -934,13 +935,12 @@ impl StreamManagerStore {
         //
         // EN-initiated path: primary already sealed locally, secondaries need sealing.
         //
-        // Client-initiated path: resolve_committed_offset already sealed secondaries
-        // with the primary's committed offset (two-phase approach). This re-seal is
-        // still useful as a safety net — idempotent, no harm if limit is already set.
+        // Fire-and-forget seal to all replicas (safety net for client-initiated seal).
+        // Look up replicas using the extent's epoch (not the new bumped epoch).
         {
             let replicas = self
                 .store
-                .get_replicas(stream_id, epoch)
+                .get_replicas(stream_id, extent_row.epoch)
                 .await
                 .unwrap_or_default();
             let addrs: Vec<String> = replicas.into_iter().map(|r| r.node_addr).collect();
