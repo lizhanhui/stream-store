@@ -1427,6 +1427,54 @@ impl StreamManagerStore {
     async fn handle_epoch_seal(&self, request_id: u32, stream_id: StreamId, epoch: Epoch) -> Frame {
         info!("Epoch-based seal: stream={}, epoch={}", stream_id, epoch);
 
+        // Check if the client's epoch is stale. If the stream has already advanced
+        // past the requested epoch, return the current epoch's primary info directly
+        // — no seal needed.
+        let current_epoch = match self.store.get_stream_epoch(stream_id).await {
+            Ok(e) => e,
+            Err(e) => {
+                return Frame::seal_stream_manager_resp_error(
+                    request_id,
+                    stream_id,
+                    ErrorCode::InternalError,
+                    &format!("get_stream_epoch: {e}"),
+                );
+            }
+        };
+        if epoch.0 < current_epoch.0 {
+            info!(
+                "Epoch seal: client epoch {} is stale (current={}), returning current state",
+                epoch, current_epoch
+            );
+            // Return the current epoch's primary and let the client reconnect.
+            let replicas = match self.store.get_replicas(stream_id, current_epoch).await {
+                Ok(r) => r,
+                Err(e) => {
+                    return Frame::seal_stream_manager_resp_error(
+                        request_id,
+                        stream_id,
+                        ErrorCode::InternalError,
+                        &format!("get_replicas for current epoch: {e}"),
+                    );
+                }
+            };
+            let primary_addr = replicas
+                .iter()
+                .find(|r| r.role == 0)
+                .map(|r| r.node_addr.clone())
+                .unwrap_or_default();
+            return Frame::new(
+                VariableHeader::SealStreamManagerResp {
+                    request_id,
+                    stream_id,
+                    offset: Offset(0),
+                    new_epoch: current_epoch,
+                    primary_addr: Bytes::copy_from_slice(primary_addr.as_bytes()),
+                },
+                None,
+            );
+        }
+
         // Get the active extent to find the Primary's address.
         let active = match self.store.get_active_extent(stream_id).await {
             Ok(Some(ext)) => ext,
