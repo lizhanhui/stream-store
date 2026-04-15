@@ -355,9 +355,11 @@ impl Stream {
         self.next_extent_id = ExtentId(new_id.0 + 1);
         let target_capacity = self.next_extent_capacity;
 
-        // Recycle from pool (O(1) reset, resize if needed) or allocate fresh (~5ms).
+        // Recycle from pool (O(1) reset, pre-sized at eviction time) or allocate fresh.
         if let Some(mut recycled) = self.extent_pool.pop_front() {
             if recycled.capacity() != target_capacity {
+                // Should rarely happen — evict_oldest_extents pre-resizes.
+                // Safety net for capacity changes between eviction and use.
                 recycled.resize(target_capacity);
             }
             recycled.reset(new_id, end_offset, self.epoch);
@@ -445,26 +447,15 @@ impl Stream {
             return;
         }
         while self.extents.len() > self.max_extents && self.extents.len() > 1 {
-            let evicted = self.extents.remove(0);
+            let mut evicted = self.extents.remove(0);
             // Cap the pool at 2 spares to bound memory. Beyond that, just drop.
             if evicted.can_recycle() && self.extent_pool.len() < 2 {
-                tracing::info!(
-                    "recycled extent {} (sealed={}) from stream {} (retained: {}, pool: {})",
-                    evicted.id,
-                    evicted.is_sealed(),
-                    self.id,
-                    self.extents.len(),
-                    self.extent_pool.len() + 1,
-                );
+                // Pre-resize to next_extent_capacity so create_next_extent
+                // never resizes on the hot append path.
+                if evicted.capacity() != self.next_extent_capacity {
+                    evicted.resize(self.next_extent_capacity);
+                }
                 self.extent_pool.push_back(evicted);
-            } else {
-                tracing::info!(
-                    "dropping extent {} from stream {} (retained: {}, pool: {})",
-                    evicted.id,
-                    self.id,
-                    self.extents.len(),
-                    self.extent_pool.len(),
-                );
             }
         }
     }
