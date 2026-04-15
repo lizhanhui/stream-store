@@ -1154,14 +1154,16 @@ impl MetadataStore {
 
     /// Record an extent sealed notification from a Primary EN (autonomous extent creation).
     ///
-    /// This is the lightweight metadata update for NOTIFY_SEALED_EXTENT:
-    /// 1. Seal the old extent (set end_offset, state=Sealed).
-    /// 2. Insert the new extent row (state=Active, same epoch).
-    /// 3. Update stream_sequence to reflect the new extent ID.
-    /// 4. Copy replica rows from the sealed extent to the new extent (same replica set within epoch).
+    /// Handles out-of-order notifications gracefully:
+    /// 1. Insert the sealed extent if it doesn't exist yet (out-of-order case).
+    /// 2. Seal it (idempotent — only updates Active extents).
+    /// 3. Insert the new active extent (idempotent — INSERT IGNORE).
+    /// 4. Fix start_offset of the new extent if it was inserted out-of-order
+    ///    with a placeholder (start_offset=0 from a later notification).
+    /// 5. Update stream_sequence.
     ///
-    /// Idempotent: if the sealed extent is already sealed or the new extent already exists,
-    /// the operation succeeds without error.
+    /// No replica manipulation needed — replicas are stored at (stream_id, epoch)
+    /// level and all extents within an epoch inherit the same replica set.
     pub async fn record_extent_sealed(
         &self,
         stream_id: StreamId,
@@ -1245,6 +1247,21 @@ impl MetadataStore {
         .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("insert new extent: {e}")))?;
+
+        // Fix start_offset on the sealed extent if it was inserted out-of-order
+        // with a placeholder (start_offset=0). Also fix start_offset on the new
+        // extent if a later notification already inserted it with start_offset=0.
+        sqlx::query(
+            "UPDATE extent SET start_offset = ? \
+             WHERE stream_id = ? AND extent_id = ? AND start_offset = 0 AND ? > 0",
+        )
+        .bind(end_offset as i64)
+        .bind(stream_id.0 as i64)
+        .bind(new_extent_id.0 as i64)
+        .bind(end_offset as i64)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Internal(format!("fix new extent start_offset: {e}")))?;
 
         // No replica manipulation — replicas are stored at (stream_id, epoch)
         // level and all extents within an epoch inherit the same replica set.
