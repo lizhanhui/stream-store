@@ -29,7 +29,7 @@ When a trigger fires (size threshold, time interval, node failure, or **extent f
 
 For **extent full**: handled autonomously by the Primary Extent Node within the current epoch — see "ExtentFull handling" below. Stream Manager is not involved.
 
-For **client timeout or failure recovery**: the `SEAL` opcode (0x06) is used. `Flags` distinguish the seal variant:
+For **client timeout or failure recovery**: the `SEAL_STREAM_MANAGER` opcode (0x06) is used. The client sends `seal(stream_id, epoch)` to the Stream Manager, which:
 
 **Client Seal (`FLAG_EPOCH_PRESENT = 1`)**:
 1. Client sends `Seal(stream_id, epoch)` to Stream Manager (client seals by epoch, not extent_id).
@@ -231,7 +231,7 @@ A DB-based leadership lease (`stream_manager_leadership` table) ensures that onl
 
 **Rust Representation**: The `Frame` type uses a `FixedHeader` + `VariableHeader` enum + `Option<Bytes>` payload design. Each opcode is a distinct `VariableHeader` variant containing only the fields valid for that opcode — invalid field combinations are rejected at compile time. Flag-dependent fields (e.g., `Seal.offset`, `SealAck.new_extent_id`, response error headers) use distinct variants or `Option<T>` fields so the flags byte is derived from the variable-header shape during encode.
 
-**Flagged response errors**: The protocol no longer uses a standalone `ERROR` opcode. Instead, a failed RPC returns the normal response opcode with `FLAG_RESPONSE_ERROR = 0x80` set. The opcode still identifies the response family (`APPEND_ACK`, `SEAL_ACK`, `DESCRIBE_STREAM_RESP`, etc.), while the error flag switches the variable header to that response family's dedicated `*Error` layout. The payload then carries a human-readable error message.
+**Flagged response errors**: The protocol no longer uses a standalone `ERROR` opcode. Instead, a failed RPC returns the normal response opcode with `FLAG_RESPONSE_ERROR = 0x80` set. The opcode still identifies the response family (`APPEND_ACK`, `SEAL_STREAM_MANAGER`, `SEAL_EXTENT_NODE`, `DESCRIBE_STREAM_RESP`, etc.), while the error flag switches the variable header to that response family's dedicated `*Error` layout. The payload then carries a human-readable error message.
 
 #### Opcodes
 
@@ -359,100 +359,101 @@ Variable Header (24B):
 No Payload.
 ```
 
-##### 0x06 SEAL (Client -> Stream Manager; Extent Node -> Stream Manager; Stream Manager -> Extent Node)
+##### 0x06 SEAL_STREAM_MANAGER (Client <-> Stream Manager)
 
-Seal an extent. A single opcode covers all trigger sources; `Flags` distinguish the seal variant:
+Epoch-based seal. Flags distinguish request (0x00), response (0x01), and error (0x80).
 
-Flags:
-- `FLAG_OFFSET_PRESENT = 0x01`: caller provides committed end offset
-- `FLAG_START_OFFSET_PRESENT = 0x02`: start_offset field is present (for absent-extent handling)
-- `FLAG_EPOCH_PRESENT = 0x04`: epoch field present (epoch-based seal)
+**Request (flag=0x00): Client -> SM**
 
-- **Client seal** (`FLAG_OFFSET_PRESENT = 0`, `FLAG_EPOCH_PRESENT = 0`): Client doesn't know the committed offset. Stream Manager concurrently seals all Extent Node replicas and determines the committed offset via quorum (Primary's offset if available, otherwise k-th largest Secondary offset where `k = RF/2`).
-- **Extent-node seal** (`FLAG_OFFSET_PRESENT = 1`): Primary ExtentNode proactively seals (e.g. ExtentFull) and reports its committed end_offset. Stream Manager trusts the offset, skips sealing the Primary (already sealed locally), and fire-and-forgets Seal RPCs to secondary ExtentNodes only.
-- **Client epoch-based seal** (`FLAG_EPOCH_PRESENT = 1`): Client seals by epoch rather than extent_id. Stream Manager resolves the active extent for that epoch.
-- **Stream Manager -> Extent Node**: Stream Manager sends Seal to individual Extent Nodes during client-seal quorum collection. Variable header carries `stream_id` only; Extent Node seals locally and responds with SEAL_ACK.
-
-Both client-initiated and EN-initiated paths end with Stream Manager allocating a new extent and responding with SEAL_ACK.
+Client requests SM to seal the active extent at the given epoch, bump epoch, and allocate a new extent.
 
 ```
-FLAG_OFFSET_PRESENT = 0 (client seal, or SM -> EN):
-  Fixed Header (8B)
-    Flags: 0x00
-  Variable Header:
-    [request_id   : u32]    -- correlates request/response
-    [stream_id    : u64]    -- stream to seal
-    [extent_id    : u32]    -- extent to seal
-  No Payload.
-
-FLAG_OFFSET_PRESENT = 1 (extent-node seal):
-  Fixed Header (8B)
-    Flags: 0x01
-  Variable Header:
-    [request_id   : u32]    -- correlates request/response
-    [stream_id    : u64]    -- stream to seal
-    [extent_id    : u32]    -- extent to seal
-    [offset       : u64]    -- committed end_offset, trusted by SM
-  No Payload.
-
-FLAG_EPOCH_PRESENT = 4 (client epoch-based seal):
-  Fixed Header (8B)
-    Flags: 0x04
-  Variable Header:
-    [request_id   : u32]    -- correlates request/response
-    [stream_id    : u64]    -- stream to seal
-    [extent_id    : u32]    -- ignored (SM resolves via epoch)
-    [epoch        : u32]    -- seal active extent at this epoch
-  No Payload.
-```
-
-##### 0x07 SEAL_ACK (Extent Node -> Stream Manager; Stream Manager -> Client)
-
-**Extent Node -> Stream Manager**: Seal confirmation from an individual EN. Carries the committed offset so Stream Manager can compute quorum.
-
-```
-Fixed Header (8B)
-  Flags: 0x00
 Variable Header:
-  [request_id   : u32]    -- request id
-  [stream_id    : u64]    -- stream that was sealed
-  [extent_id    : u32]    -- extent that was sealed
-  [offset       : u64]    -- committed end_offset
+  [request_id : u32]
+  [stream_id  : u64]
+  [epoch      : u32]    -- seal active extent at this epoch
 No Payload.
 ```
 
-**Stream Manager -> Client**: Returns new extent info after seal-and-new allocation. Uses `FLAG_NEW_EXTENT_PRESENT` (0x01) to carry the new extent info in the variable header. On failure, it still returns opcode `SEAL_ACK`, but sets `FLAG_RESPONSE_ERROR = 0x80` and uses the error header layout below.
+**Response (flag=0x01): SM -> Client**
+
+Returns the new epoch and primary address for the replacement extent.
 
 ```
-Fixed Header (8B)
-  Flags: 0x01 (FLAG_NEW_EXTENT_PRESENT)
 Variable Header:
-  [request_id   : u32]    -- request id
-  [stream_id    : u64]    -- stream that was sealed
-  [extent_id    : u32]    -- extent that was sealed
-  [offset       : u64]    -- committed end_offset
-  [new_extent_id: u32]    -- newly allocated extent (in count field)
-  [primary_addr_len : u16]
+  [request_id   : u32]
+  [stream_id    : u64]
+  [offset       : u64]    -- committed end offset of sealed extent
+  [new_epoch    : u32]    -- epoch of the newly allocated extent
+  [addr_len     : u16]
   [primary_addr : bytes]  -- address of the new extent's Primary node
 No Payload.
 ```
 
-When `FLAG_EPOCH_PRESENT` (0x04) is also set on SealAck (epoch-based seal response), an additional field follows:
+**Error (flag=0x80): SM -> Client**
+
 ```
-  [epoch        : u32]    -- new epoch after epoch bump
+Variable Header:
+  [request_id : u32]
+  [stream_id  : u64]
+  [error_code : u16]
+Payload:
+  [payload_len : u32]
+  [payload     : bytes]  -- human-readable error message
 ```
 
-Error form (Flags = 0x80 / FLAG_RESPONSE_ERROR):
+##### 0x07 SEAL_EXTENT_NODE (Stream Manager <-> Extent Node)
+
+SM seals the last mutable extent at the given epoch on an EN. The EN returns the sealed extent info in the header and any predecessor extents (unknown to SM) in the payload, enabling one-RPC reconciliation.
+
+**Request (flag=0x00): SM -> EN**
+
+`extent_id_from` is SM's last known extent — the EN returns all extents with `extent_id >= extent_id_from` in the response payload.
+
 ```
-Fixed Header (8B)
+Variable Header:
+  [request_id     : u32]
+  [stream_id      : u64]
+  [epoch          : u32]    -- seal last mutable extent at this epoch
+  [extent_id_from : u32]    -- SM's last known extent
+  [start_offset   : u64]    -- hint for absent-extent handling
+No Payload.
+```
+
+**Response (flag=0x01): EN -> SM**
+
+Header carries the just-sealed extent. Payload carries predecessor extents that SM may not know about (from autonomous seal-and-new before SM was notified).
+
+```
 Variable Header:
   [request_id   : u32]
   [stream_id    : u64]
-  [extent_id    : u32]
-  [error_code   : u16]
+  [epoch        : u32]
+  [extent_id    : u32]    -- the just-sealed (last mutable) extent
+  [start_offset : u64]
+  [end_offset   : u64]    -- committed end offset
+Payload (optional):
+  [num_extents  : u32]
+  per extent:
+    [extent_id    : u32]
+    [start_offset : u64]
+    [end_offset   : u64]
+    [state        : u8]
+  -- predecessor extents: extent_id >= extent_id_from AND < sealed extent_id
+  -- does NOT include the just-sealed extent (already in header)
+  -- empty if SM's view was up-to-date
+```
+
+**Error (flag=0x80): EN -> SM**
+
+```
+Variable Header:
+  [request_id : u32]
+  [stream_id  : u64]
+  [error_code : u16]
 Payload:
-  [payload_len  : u32]
-  [payload      : bytes]  -- human-readable error message
+  [payload_len : u32]
+  [payload     : bytes]  -- human-readable error message
 ```
 
 ##### 0x08 QUERY_OFFSET (Client -> Extent Node / Stream Manager)
