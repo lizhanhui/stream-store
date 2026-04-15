@@ -487,9 +487,8 @@ impl StreamManagerStore {
         cache_extents: u32,
         extent_growth_factor: u32,
     ) -> Result<(ExtentId, String), StorageError> {
-        let nodes = self.allocator.pick_nodes(replication_factor).await?;
-
-        // Build (addr, role) pairs for the replica set.
+        // Initial allocation: require full RF.
+        let nodes = self.allocator.pick_nodes(replication_factor, replication_factor).await?;
         let replicas: Vec<(String, u8)> = nodes
             .iter()
             .enumerate()
@@ -1146,7 +1145,10 @@ impl StreamManagerStore {
         let (min_extent_capacity, max_extent_capacity) =
             self.store.get_stream_capacity_bounds(stream_id).await?;
         let extent_growth_factor = self.store.get_stream_growth_factor(stream_id).await?;
-        let nodes = self.allocator.pick_nodes(replication_factor).await?;
+        // Failover allocation: degrade RF if necessary, as long as quorum is preserved.
+        // Quorum = floor(RF/2) + 1. E.g., RF=3 → quorum=2, so degraded RF=2 is acceptable.
+        let quorum = replication_factor / 2 + 1;
+        let nodes = self.allocator.pick_nodes(replication_factor, quorum).await?;
 
         let new_replicas: Vec<(String, u8)> = nodes
             .iter()

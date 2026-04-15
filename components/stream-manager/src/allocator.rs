@@ -56,22 +56,32 @@ impl Allocator {
             + 0.15 * append_load.min(1.0)
     }
 
-    /// Pick `count` distinct least-loaded alive nodes for replica set placement.
+    /// Pick up to `desired` distinct least-loaded alive nodes for replica set placement.
     /// Returns nodes sorted by load (least loaded first): [Primary, Secondary_1, ...].
-    /// Errors if fewer than `count` alive nodes are available.
-    pub async fn pick_nodes(&self, count: usize) -> Result<Vec<NodeRow>, StorageError> {
-        if count == 0 {
+    ///
+    /// If fewer than `desired` nodes are alive but at least `min_count` are,
+    /// returns the available nodes (degraded RF). This allows writes to continue
+    /// after a node failure as long as quorum is still possible.
+    ///
+    /// Errors if fewer than `min_count` alive nodes are available.
+    pub async fn pick_nodes(
+        &self,
+        desired: usize,
+        min_count: usize,
+    ) -> Result<Vec<NodeRow>, StorageError> {
+        if desired == 0 || min_count == 0 {
             return Err(StorageError::Internal(
                 "replication_factor must be >= 1".into(),
             ));
         }
         let alive = self.store.get_alive_nodes().await?;
-        if alive.len() < count {
+        if alive.len() < min_count {
             return Err(StorageError::Internal(format!(
-                "need {count} alive ExtentNode nodes for replica set, but only {} available",
+                "need at least {min_count} alive ExtentNode nodes (desired {desired}), but only {} available",
                 alive.len()
             )));
         }
+        let count = desired.min(alive.len());
 
         // Load all node metrics in a single query.
         let all_metrics = self.store.get_all_node_metrics().await?;
