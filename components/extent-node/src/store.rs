@@ -12,8 +12,9 @@ use common::config::{
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, Opcode, StreamId};
 use dashmap::DashMap;
-use rpc::frame::{Frame, VariableHeader};
+use rpc::frame::Frame;
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
+use rpc::frame::variable_header::VariableHeader;
 use server::handler::RequestHandler;
 use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
