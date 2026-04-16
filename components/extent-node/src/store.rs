@@ -14,6 +14,7 @@ use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, Opcode
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
+use smallvec::SmallVec;
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::sync::mpsc::Sender;
@@ -1053,8 +1054,8 @@ impl ExtentNodeStore {
     /// On ExtentFull, this method calls `seal_and_create` (which manages its own
     /// pin guard) and retries the remaining jobs on the new extent.
     /// Pin guards are scoped in blocks so they're dropped before `yield_now().await`.
-    async fn drain_follower_jobs(&self, stream_id: StreamId) -> Vec<SealNotification> {
-        let mut all_seal_notifications = Vec::new();
+    async fn drain_follower_jobs(&self, stream_id: StreamId) -> SmallVec<[SealNotification; 1]> {
+        let mut notifications = SmallVec::with_capacity(1);
 
         loop {
             // ── Phase 1: Drain jobs from the channel ──
@@ -1066,7 +1067,7 @@ impl ExtentNodeStore {
                     let guard = self.streams.pin();
                     let stream = match guard.get(&stream_id) {
                         Some(s) => s,
-                        None => return all_seal_notifications,
+                        None => return notifications,
                     };
                     if batch.is_empty() {
                         epoch = stream.epoch();
@@ -1125,7 +1126,7 @@ impl ExtentNodeStore {
             if let Some(index) = extent_full_idx {
                 let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
                 if let Some(ref notification) = seal_notification {
-                    all_seal_notifications.push(notification.clone());
+                    notifications.push(notification.clone());
                 }
 
                 // Retry the failed job and remaining jobs on the new extent.
@@ -1174,7 +1175,7 @@ impl ExtentNodeStore {
             // More followers arrived during processing — loop again.
         }
 
-        all_seal_notifications
+        notifications
     }
 
     /// Seal the active extent and create a new one.
