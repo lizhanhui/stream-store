@@ -8,6 +8,8 @@
 
 use std::time::Duration;
 
+use serial_test::serial;
+
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
@@ -114,6 +116,7 @@ async fn poll_leader_is(store: &MetadataStore, expected: &str, timeout: Duration
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn multi_sm_leadership_failover() {
     init_tracing();
 

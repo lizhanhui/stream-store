@@ -1261,9 +1261,20 @@ impl ExtentNodeStore {
             }
         };
 
-        // No early extent_id validation. In the epoch-based model, the client's extent_id
-        // may be stale. try_append_active() routes to the current active extent.
+        // Epoch validation: reject if the client's epoch doesn't match the stream's.
         let epoch = stream_ref.epoch();
+        let client_epoch = frames[0].epoch();
+        if client_epoch != Epoch(0) && client_epoch != epoch {
+            for frame in frames {
+                responses.push(Frame::error_from_request(
+                    frame,
+                    ErrorCode::EpochStale,
+                    &format!("epoch stale: client={}, current={}", client_epoch, epoch),
+                    ExtentId(0),
+                ));
+            }
+            return responses;
+        }
 
         let batch_len = frames.len() as u64;
 
@@ -1498,7 +1509,9 @@ impl ExtentNodeStore {
                                 },
                                 Some(entry.payload_for_forward.clone()),
                             );
-                            if let Some(init) = self.maybe_build_init_forward(&stream_ref, &forward_frame) {
+                            if let Some(init) =
+                                self.maybe_build_init_forward(&stream_ref, &forward_frame)
+                            {
                                 stream_ref.send_forward(init);
                             }
                             stream_ref.send_forward(forward_frame);
@@ -2024,7 +2037,13 @@ impl ExtentNodeStore {
                     epoch,
                     extent_id_from,
                     start_offset,
-                } => (*request_id, *stream_id, *epoch, *extent_id_from, *start_offset),
+                } => (
+                    *request_id,
+                    *stream_id,
+                    *epoch,
+                    *extent_id_from,
+                    *start_offset,
+                ),
                 _ => {
                     return Frame::seal_extent_node_resp_error(
                         frame.request_id(),
@@ -2086,18 +2105,23 @@ impl ExtentNodeStore {
             Some(id) => id,
             None => {
                 // No active extent — all extents already sealed.
-                // Return idempotent response.
+                // Return idempotent response with the actual sealed extent's offsets.
+                let (extent_id, start_offset, end_offset) = stream_ref
+                    .last_sealed_extent_at_epoch(epoch)
+                    .unwrap_or((extent_id_from, req_start_offset, req_start_offset));
                 drop(stream_ref);
+                let payload =
+                    self.build_seal_predecessor_payload(stream_id, extent_id_from, extent_id);
                 return Frame::new(
                     VariableHeader::SealExtentNodeResp {
                         request_id,
                         stream_id,
                         epoch,
-                        extent_id: extent_id_from,
-                        start_offset: req_start_offset,
-                        end_offset: req_start_offset,
+                        extent_id,
+                        start_offset,
+                        end_offset,
                     },
-                    None,
+                    payload,
                 );
             }
         };
@@ -2114,7 +2138,11 @@ impl ExtentNodeStore {
                 self.send_forward_checksum(stream_id, sealed_extent_id);
 
                 // Build payload with predecessor extents (extent_id >= extent_id_from AND < sealed).
-                let payload = self.build_seal_predecessor_payload(stream_id, extent_id_from, sealed_extent_id);
+                let payload = self.build_seal_predecessor_payload(
+                    stream_id,
+                    extent_id_from,
+                    sealed_extent_id,
+                );
 
                 Frame::new(
                     VariableHeader::SealExtentNodeResp {
@@ -2141,7 +2169,8 @@ impl ExtentNodeStore {
                     active_id, stream_id
                 );
 
-                let payload = self.build_seal_predecessor_payload(stream_id, extent_id_from, active_id);
+                let payload =
+                    self.build_seal_predecessor_payload(stream_id, extent_id_from, active_id);
 
                 Frame::new(
                     VariableHeader::SealExtentNodeResp {
@@ -3476,9 +3505,103 @@ mod tests {
         );
         match &seal2.variable_header {
             VariableHeader::SealExtentNodeResp { end_offset, .. } => {
-                assert_eq!(*end_offset, 3, "second seal should report same committed offset");
+                assert_eq!(
+                    *end_offset, 3,
+                    "second seal should report same committed offset"
+                );
             }
             _ => panic!("expected SealExtentNodeResp"),
         }
+    }
+
+    #[tokio::test]
+    async fn append_with_stale_epoch_returns_epoch_stale() {
+        let store = ExtentNodeStore::new();
+        let sid = register_stream(&store, 1, 1).await;
+
+        // Bump the stream's epoch to 5 (simulates SM epoch bump after failover).
+        {
+            let mut stream = store.streams.get_mut(&sid).unwrap();
+            stream.set_epoch(Epoch(5));
+        }
+
+        // Append with stale epoch (client thinks epoch=1, but stream is at epoch=5).
+        let resp = store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::Append {
+                        request_id: 10,
+                        stream_id: sid,
+                        epoch: Epoch(1),
+                    },
+                    Some(Bytes::from_static(b"stale")),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert!(resp.is_error_response());
+        assert_eq!(resp.error_code(), ErrorCode::EpochStale as u16);
+    }
+
+    #[tokio::test]
+    async fn append_with_epoch_zero_bypasses_epoch_check() {
+        let store = ExtentNodeStore::new();
+        let sid = register_stream(&store, 1, 1).await;
+
+        // Bump the stream's epoch to 5.
+        {
+            let mut stream = store.streams.get_mut(&sid).unwrap();
+            stream.set_epoch(Epoch(5));
+        }
+
+        // Append with epoch=0 (wildcard) should succeed regardless of stream epoch.
+        let resp = store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::Append {
+                        request_id: 10,
+                        stream_id: sid,
+                        epoch: Epoch(0),
+                    },
+                    Some(Bytes::from_static(b"wildcard")),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert!(!resp.is_error_response());
+    }
+
+    #[tokio::test]
+    async fn append_with_matching_epoch_succeeds() {
+        let store = ExtentNodeStore::new();
+        let sid = register_stream(&store, 1, 1).await;
+
+        // Bump the stream's epoch to 3.
+        {
+            let mut stream = store.streams.get_mut(&sid).unwrap();
+            stream.set_epoch(Epoch(3));
+        }
+
+        // Append with matching epoch=3 should succeed.
+        let resp = store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::Append {
+                        request_id: 10,
+                        stream_id: sid,
+                        epoch: Epoch(3),
+                    },
+                    Some(Bytes::from_static(b"correct")),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert!(!resp.is_error_response());
     }
 }

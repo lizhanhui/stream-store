@@ -526,7 +526,10 @@ impl StreamManagerStore {
         extent_growth_factor: u32,
     ) -> Result<(ExtentId, String), StorageError> {
         // Initial allocation: require full RF.
-        let nodes = self.allocator.pick_nodes(replication_factor, replication_factor).await?;
+        let nodes = self
+            .allocator
+            .pick_nodes(replication_factor, replication_factor)
+            .await?;
         let replicas: Vec<(String, u8)> = nodes
             .iter()
             .enumerate()
@@ -925,8 +928,13 @@ impl StreamManagerStore {
             None => {
                 // Query all EN replicas to determine committed offset via quorum.
                 // Use the extent's original epoch for replica lookup (not the bumped epoch).
-                self.resolve_committed_offset(stream_id, extent_id, extent_start_offset, extent_row.epoch)
-                    .await?
+                self.resolve_committed_offset(
+                    stream_id,
+                    extent_id,
+                    extent_start_offset,
+                    extent_row.epoch,
+                )
+                .await?
             }
         };
 
@@ -1085,7 +1093,10 @@ impl StreamManagerStore {
                                     "Reconciling {} predecessor extents from {addr} for stream {stream_id}",
                                     extents.len()
                                 );
-                                let _ = self.store.reconcile_extents(stream_id, epoch, &extents).await;
+                                let _ = self
+                                    .store
+                                    .reconcile_extents(stream_id, epoch, &extents)
+                                    .await;
                             }
                         }
                     }
@@ -1154,7 +1165,10 @@ impl StreamManagerStore {
         // Failover allocation: degrade RF if necessary, as long as quorum is preserved.
         // Quorum = floor(RF/2) + 1. E.g., RF=3 → quorum=2, so degraded RF=2 is acceptable.
         let quorum = replication_factor / 2 + 1;
-        let nodes = self.allocator.pick_nodes(replication_factor, quorum).await?;
+        let nodes = self
+            .allocator
+            .pick_nodes(replication_factor, quorum)
+            .await?;
 
         let new_replicas: Vec<(String, u8)> = nodes
             .iter()
@@ -1540,7 +1554,8 @@ impl StreamManagerStore {
                         if !extents.is_empty() {
                             info!(
                                 "Epoch seal: reconciling {} predecessor extents from primary for stream {}",
-                                extents.len(), stream_id
+                                extents.len(),
+                                stream_id
                             );
                             let _ = self
                                 .store
@@ -1608,9 +1623,7 @@ impl StreamManagerStore {
                                 stream_id,
                                 offset: Offset(0),
                                 new_epoch,
-                                primary_addr: Bytes::copy_from_slice(
-                                    new_primary_addr.as_bytes(),
-                                ),
+                                primary_addr: Bytes::copy_from_slice(new_primary_addr.as_bytes()),
                             },
                             None,
                         );

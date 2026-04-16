@@ -12,6 +12,7 @@ use common::config::{
     DEFAULT_MIN_EXTENT_CAPACITY, StreamManagerConfig,
 };
 use common::types::{Epoch, ExtentState, NodeMetrics};
+use serial_test::serial;
 
 /// Initialize tracing for tests.
 fn init_tracing() {
@@ -98,6 +99,7 @@ async fn start_extent_node_server() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn stream_client_open_integration() {
     init_tracing();
 

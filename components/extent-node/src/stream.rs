@@ -307,6 +307,16 @@ impl Stream {
             .map(|e| e.id)
     }
 
+    /// The last sealed extent at the given epoch.
+    /// Returns `(extent_id, start_offset, end_offset)` or None if no sealed extent exists at that epoch.
+    pub fn last_sealed_extent_at_epoch(&self, epoch: Epoch) -> Option<(ExtentId, u64, u64)> {
+        self.extents
+            .iter()
+            .rev()
+            .find(|e| e.epoch == epoch && e.is_sealed())
+            .map(|e| (e.id, e.start_offset.0, e.start_offset.0 + e.message_count()))
+    }
+
     /// The maximum offset (exclusive): the next offset that would be assigned.
     /// Returns `Offset(0)` if the stream has no extents.
     pub fn max_offset(&self) -> Offset {
