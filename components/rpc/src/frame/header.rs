@@ -347,8 +347,9 @@ impl VariableHeader {
             VariableHeader::Disconnect { .. }
             | VariableHeader::DisconnectAck { .. }
             | VariableHeader::DisconnectAckError { .. } => Opcode::Disconnect,
-            VariableHeader::Heartbeat { .. }
-            | VariableHeader::HeartbeatError { .. } => Opcode::Heartbeat,
+            VariableHeader::Heartbeat { .. } | VariableHeader::HeartbeatError { .. } => {
+                Opcode::Heartbeat
+            }
             VariableHeader::RegisterExtent { .. }
             | VariableHeader::RegisterExtentAck { .. }
             | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterExtent,

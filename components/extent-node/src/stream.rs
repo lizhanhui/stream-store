@@ -108,11 +108,7 @@ impl StreamInner {
     /// Extent ID is incremented locally — no SM round-trip needed.
     ///
     /// Returns `(new_extent_id, start_offset)` of the created extent.
-    fn create_next_extent(
-        &mut self,
-        stream_id: StreamId,
-        epoch: Epoch,
-    ) -> (ExtentId, Offset) {
+    fn create_next_extent(&mut self, stream_id: StreamId, epoch: Epoch) -> (ExtentId, Offset) {
         let end_offset = self
             .extents
             .last()
@@ -503,8 +499,7 @@ impl Stream {
                 );
             }
         }
-        if let Err(mpsc::error::TrySendError::Full(_)) =
-            inner.downstream_txs[n - 1].try_send(frame)
+        if let Err(mpsc::error::TrySendError::Full(_)) = inner.downstream_txs[n - 1].try_send(frame)
         {
             tracing::warn!(
                 "downstream channel full for stream {}, dropping forward frame",
@@ -646,11 +641,7 @@ impl Stream {
     ///
     /// After seal, the stream has no active extent until SM sends a new `RegisterExtent`
     /// or the Primary autonomously creates one via `create_next_extent()`.
-    pub fn seal(
-        &self,
-        extent_id: ExtentId,
-        committed_offset: Option<u64>,
-    ) -> Option<(u64, u64)> {
+    pub fn seal(&self, extent_id: ExtentId, committed_offset: Option<u64>) -> Option<(u64, u64)> {
         let inner = self.inner.write();
         inner.seal_extent(extent_id, committed_offset)
     }
@@ -681,9 +672,10 @@ impl Stream {
         match reason {
             SealReason::ExtentFull => {
                 // Scale up: multiply capacity by growth_factor (capped at max).
-                inner.next_extent_capacity =
-                    (inner.next_extent_capacity.saturating_mul(inner.growth_factor))
-                        .min(inner.max_extent_capacity);
+                inner.next_extent_capacity = (inner
+                    .next_extent_capacity
+                    .saturating_mul(inner.growth_factor))
+                .min(inner.max_extent_capacity);
             }
             SealReason::IdleShrink => {
                 if active_bytes_written == 0 {
@@ -1172,9 +1164,9 @@ mod tests {
             2,
         );
         // Artificially set active_extent_created_at to the past.
-        stream.set_active_extent_created_at(
-            Some(Instant::now() - std::time::Duration::from_secs(600)),
-        );
+        stream.set_active_extent_created_at(Some(
+            Instant::now() - std::time::Duration::from_secs(600),
+        ));
 
         // Already at min + empty -> should_idle_shrink returns false.
         assert!(!stream.should_idle_shrink(std::time::Duration::from_secs(300)));
