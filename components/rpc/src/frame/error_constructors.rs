@@ -1,8 +1,7 @@
 use bytes::Bytes;
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, StreamId};
 
-use super::Frame;
-use super::header::VariableHeader;
+use super::{Frame, VariableHeader};
 
 impl Frame {
     pub fn append_ack_error(
