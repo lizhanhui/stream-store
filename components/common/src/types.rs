@@ -10,10 +10,11 @@ pub const PROTOCOL_VERSION: u8 = 2;
 /// + RemainingLength 4 = 8).
 pub const HEADER_LEN: usize = 8;
 
-/// Flag on SealStreamManager / SealExtentNode: response (success).
-/// When clear (0x00): request frame. When set (0x01): response frame.
+/// Flag on all request-response opcodes: success response.
+/// When clear (0x00) and FLAG_RESPONSE_ERROR also clear: request frame.
+/// When set (0x01): success response frame.
 /// Error responses use FLAG_RESPONSE_ERROR (0x80) instead.
-pub const FLAG_SEAL_RESPONSE: u8 = 0x01;
+pub const FLAG_RESPONSE: u8 = 0x01;
 
 /// Flag on UPDATE_EXTENT: extent was sealed, new extent created.
 pub const FLAG_EXTENT_SEALED: u8 = 0x00;
@@ -29,7 +30,8 @@ pub const FLAG_FORWARD_CHECKSUM: u8 = 0x02;
 
 /// Flag on DESCRIBE_STREAM: lookup by stream name instead of stream_id.
 /// When set, variable header carries [name_len:u16][name_bytes] after count.
-pub const FLAG_DESCRIBE_STREAM_BY_NAME: u8 = 0x01;
+/// Uses 0x02 (not 0x01) to avoid conflict with FLAG_RESPONSE.
+pub const FLAG_DESCRIBE_STREAM_BY_NAME: u8 = 0x02;
 
 /// Shared flag on response opcodes indicating the response carries an
 /// opcode-specific error header instead of the success header layout.
@@ -37,7 +39,8 @@ pub const FLAG_RESPONSE_ERROR: u8 = 0x80;
 
 /// Flag on APPEND: system-generated tick for capacity scaling.
 /// When set, the append is synthetic (no payload), flagged for special handling.
-pub const FLAG_SYSTEM_TICK: u8 = 0x01;
+/// Uses 0x02 (not 0x01) to avoid conflict with FLAG_RESPONSE.
+pub const FLAG_SYSTEM_TICK: u8 = 0x02;
 
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -92,14 +95,18 @@ impl Display for NodeId {
 }
 
 /// Wire protocol operation codes, grouped by category with gaps for future growth.
+///
+/// All request-response opcodes use a single opcode with flags to distinguish
+/// direction: flag=0x00 request, flag=0x01 (FLAG_RESPONSE) success response,
+/// flag=0x80 (FLAG_RESPONSE_ERROR) error response.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Opcode {
     // -- Data path (0x01-0x0F): Client <-> ExtentNode --
+    /// Create a new stream. Flags: 0x00=request, 0x01=response, 0x80=error.
     CreateStream = 0x01,
-    CreateStreamResp = 0x02,
+    /// Append a message. Flags: 0x00=request, 0x01=ack, 0x80=error.
     Append = 0x03,
-    AppendAck = 0x04,
     /// Dedicated forward opcode for Primary→Secondary replication.
     /// Carries all metadata (including byte_pos) so the secondary writes
     /// each record at the exact same position as the primary.
@@ -110,38 +117,38 @@ pub enum Opcode {
     /// Epoch-based seal: StreamManager ↔ ExtentNode.
     /// Flags: 0x00=request, 0x01=response, 0x80=error.
     SealExtentNode = 0x07,
+    /// Query max offset. Flags: 0x00=request, 0x01=response, 0x80=error.
     QueryOffset = 0x08,
-    QueryOffsetResp = 0x09,
+    /// Read messages. Flags: 0x00=request, 0x01=response, 0x80=error.
     Read = 0x0A,
-    ReadResp = 0x0B,
 
     // -- Lifecycle (0x10-0x1F): ExtentNode <-> StreamManager --
+    /// ExtentNode Connect. Flags: 0x00=request, 0x01=ack, 0x80=error.
     Connect = 0x10,
-    ConnectAck = 0x11,
+    /// ExtentNode Disconnect. Flags: 0x00=request, 0x01=ack, 0x80=error.
     Disconnect = 0x12,
-    DisconnectAck = 0x13,
     Heartbeat = 0x14,
+    /// Register extent replica. Flags: 0x00=request, 0x01=ack, 0x80=error.
     RegisterExtent = 0x15,
-    RegisterExtentAck = 0x16,
     Watermark = 0x17,
     /// Async extent update from Primary EN to SM. Fire-and-forget.
     /// Flags distinguish variants: sealed (0x00) or progress (0x01).
     UpdateExtent = 0x18,
     /// SM queries an EN for all extents it holds for a stream (recovery path).
+    /// Flags: 0x00=request, 0x01=response, 0x80=error.
     ReportExtents = 0x19,
-    /// EN response to ReportExtents with extent state for reconciliation.
-    ReportExtentsResp = 0x1A,
 
     // -- Cluster management (0x20-0x2F): StreamManager -> ExtentNode/Client --
     StreamManagerMembershipChange = 0x20,
 
     // -- Management (0x30-0x3F): Client <-> StreamManager --
+    /// Describe stream extents. Flags: 0x00=request, 0x01=response, 0x80=error.
+    /// Request flag 0x02=by-name lookup (FLAG_DESCRIBE_STREAM_BY_NAME).
     DescribeStream = 0x30,
-    DescribeStreamResp = 0x31,
+    /// Describe a single extent. Flags: 0x00=request, 0x01=response, 0x80=error.
     DescribeExtent = 0x32,
-    DescribeExtentResp = 0x33,
+    /// Seek: resolve offset to extent. Flags: 0x00=request, 0x01=response, 0x80=error.
     Seek = 0x34,
-    SeekResp = 0x35,
 }
 
 impl Opcode {
@@ -149,37 +156,26 @@ impl Opcode {
         match value {
             // Data path
             0x01 => Some(Opcode::CreateStream),
-            0x02 => Some(Opcode::CreateStreamResp),
             0x03 => Some(Opcode::Append),
-            0x04 => Some(Opcode::AppendAck),
             0x05 => Some(Opcode::Forward),
             0x06 => Some(Opcode::SealStreamManager),
             0x07 => Some(Opcode::SealExtentNode),
             0x08 => Some(Opcode::QueryOffset),
-            0x09 => Some(Opcode::QueryOffsetResp),
             0x0A => Some(Opcode::Read),
-            0x0B => Some(Opcode::ReadResp),
             // Lifecycle
             0x10 => Some(Opcode::Connect),
-            0x11 => Some(Opcode::ConnectAck),
             0x12 => Some(Opcode::Disconnect),
-            0x13 => Some(Opcode::DisconnectAck),
             0x14 => Some(Opcode::Heartbeat),
             0x15 => Some(Opcode::RegisterExtent),
-            0x16 => Some(Opcode::RegisterExtentAck),
             0x17 => Some(Opcode::Watermark),
             0x18 => Some(Opcode::UpdateExtent),
             0x19 => Some(Opcode::ReportExtents),
-            0x1A => Some(Opcode::ReportExtentsResp),
             // Cluster management
             0x20 => Some(Opcode::StreamManagerMembershipChange),
             // Management
             0x30 => Some(Opcode::DescribeStream),
-            0x31 => Some(Opcode::DescribeStreamResp),
             0x32 => Some(Opcode::DescribeExtent),
-            0x33 => Some(Opcode::DescribeExtentResp),
             0x34 => Some(Opcode::Seek),
-            0x35 => Some(Opcode::SeekResp),
             _ => None,
         }
     }

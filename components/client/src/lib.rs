@@ -262,9 +262,9 @@ impl StreamClient {
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::CreateStreamResp {
+        if resp.opcode() != Opcode::CreateStream {
             return Err(StorageError::Internal(format!(
-                "expected CreateStreamResp, got {:?}",
+                "expected CreateStream response, got {:?}",
                 resp.opcode()
             )));
         }
@@ -388,9 +388,9 @@ impl StreamClient {
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::ConnectAck {
+        if resp.opcode() != Opcode::Connect {
             return Err(StorageError::Internal(format!(
-                "expected ConnectAck, got {:?}",
+                "expected Connect response, got {:?}",
                 resp.opcode()
             )));
         }
@@ -424,9 +424,9 @@ impl StreamClient {
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::DisconnectAck {
+        if resp.opcode() != Opcode::Disconnect {
             return Err(StorageError::Internal(format!(
-                "expected DisconnectAck, got {:?}",
+                "expected Disconnect response, got {:?}",
                 resp.opcode()
             )));
         }
@@ -513,14 +513,14 @@ impl StreamClient {
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::DescribeStreamResp {
+        if resp.opcode() != Opcode::DescribeStream {
             return Err(StorageError::Internal(format!(
-                "expected DescribeStreamResp, got {:?}",
+                "expected DescribeStream response, got {:?}",
                 resp.opcode()
             )));
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid DescribeStreamResp payload".into()))?;
+            .ok_or_else(|| StorageError::Internal("invalid DescribeStream response payload".into()))?;
         self.cache_primary_from_extents(stream_id, &extents).await;
         Ok(extents)
     }
@@ -541,16 +541,16 @@ impl StreamClient {
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::DescribeExtentResp {
+        if resp.opcode() != Opcode::DescribeExtent {
             return Err(StorageError::Internal(format!(
-                "expected DescribeExtentResp, got {:?}",
+                "expected DescribeExtent response, got {:?}",
                 resp.opcode()
             )));
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid DescribeExtentResp payload".into()))?;
+            .ok_or_else(|| StorageError::Internal("invalid DescribeExtent response payload".into()))?;
         extents.into_iter().next().ok_or_else(|| {
-            StorageError::Internal("DescribeExtentResp returned empty result".into())
+            StorageError::Internal("DescribeExtent response returned empty result".into())
         })
     }
 
@@ -573,18 +573,18 @@ impl StreamClient {
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::SeekResp {
+        if resp.opcode() != Opcode::Seek {
             return Err(StorageError::Internal(format!(
-                "expected SeekResp, got {:?}",
+                "expected Seek response, got {:?}",
                 resp.opcode()
             )));
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid SeekResp payload".into()))?;
+            .ok_or_else(|| StorageError::Internal("invalid Seek response payload".into()))?;
         extents
             .into_iter()
             .next()
-            .ok_or_else(|| StorageError::Internal("SeekResp returned empty result".into()))
+            .ok_or_else(|| StorageError::Internal("Seek response returned empty result".into()))
     }
 
     // ── High-level operations ──
@@ -606,15 +606,15 @@ impl StreamClient {
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::DescribeStreamResp {
+        if resp.opcode() != Opcode::DescribeStream {
             return Err(StorageError::Internal(format!(
-                "expected DescribeStreamResp, got {:?}",
+                "expected DescribeStream response, got {:?}",
                 resp.opcode()
             )));
         }
         let stream_id = resp.stream_id();
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid DescribeStreamResp payload".into()))?;
+            .ok_or_else(|| StorageError::Internal("invalid DescribeStream response payload".into()))?;
         self.cache_primary_from_extents(stream_id, &extents).await;
         Ok((stream_id, extents))
     }

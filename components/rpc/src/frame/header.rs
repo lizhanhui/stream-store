@@ -318,62 +318,59 @@ pub enum VariableHeader {
 
 impl VariableHeader {
     /// Return the opcode that corresponds to this variant.
+    ///
+    /// All variants in a request/response/error family return the same base opcode.
+    /// The direction (request vs response vs error) is indicated by flags, not opcode.
     pub fn opcode(&self) -> Opcode {
         match self {
-            VariableHeader::Append { .. } => Opcode::Append,
-            VariableHeader::AppendAck { .. } | VariableHeader::AppendAckError { .. } => {
-                Opcode::AppendAck
-            }
-            VariableHeader::Read { .. } => Opcode::Read,
-            VariableHeader::ReadResp { .. } | VariableHeader::ReadRespError { .. } => {
-                Opcode::ReadResp
-            }
+            VariableHeader::Append { .. }
+            | VariableHeader::AppendAck { .. }
+            | VariableHeader::AppendAckError { .. } => Opcode::Append,
+            VariableHeader::Read { .. }
+            | VariableHeader::ReadResp { .. }
+            | VariableHeader::ReadRespError { .. } => Opcode::Read,
             VariableHeader::SealStreamManagerRequest { .. }
             | VariableHeader::SealStreamManagerResp { .. }
             | VariableHeader::SealStreamManagerRespError { .. } => Opcode::SealStreamManager,
             VariableHeader::SealExtentNodeRequest { .. }
             | VariableHeader::SealExtentNodeResp { .. }
             | VariableHeader::SealExtentNodeRespError { .. } => Opcode::SealExtentNode,
-            VariableHeader::CreateStream { .. } => Opcode::CreateStream,
-            VariableHeader::CreateStreamResp { .. }
-            | VariableHeader::CreateStreamRespError { .. } => Opcode::CreateStreamResp,
-            VariableHeader::QueryOffset { .. } => Opcode::QueryOffset,
-            VariableHeader::QueryOffsetResp { .. }
-            | VariableHeader::QueryOffsetRespError { .. } => Opcode::QueryOffsetResp,
-            VariableHeader::Connect { .. } => Opcode::Connect,
-            VariableHeader::ConnectAck { .. } | VariableHeader::ConnectAckError { .. } => {
-                Opcode::ConnectAck
-            }
-            VariableHeader::Disconnect { .. } => Opcode::Disconnect,
-            VariableHeader::DisconnectAck { .. } | VariableHeader::DisconnectAckError { .. } => {
-                Opcode::DisconnectAck
-            }
-            VariableHeader::Heartbeat { .. } | VariableHeader::HeartbeatError { .. } => {
-                Opcode::Heartbeat
-            }
-            VariableHeader::RegisterExtent { .. } => Opcode::RegisterExtent,
-            VariableHeader::RegisterExtentAck { .. }
-            | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterExtentAck,
+            VariableHeader::CreateStream { .. }
+            | VariableHeader::CreateStreamResp { .. }
+            | VariableHeader::CreateStreamRespError { .. } => Opcode::CreateStream,
+            VariableHeader::QueryOffset { .. }
+            | VariableHeader::QueryOffsetResp { .. }
+            | VariableHeader::QueryOffsetRespError { .. } => Opcode::QueryOffset,
+            VariableHeader::Connect { .. }
+            | VariableHeader::ConnectAck { .. }
+            | VariableHeader::ConnectAckError { .. } => Opcode::Connect,
+            VariableHeader::Disconnect { .. }
+            | VariableHeader::DisconnectAck { .. }
+            | VariableHeader::DisconnectAckError { .. } => Opcode::Disconnect,
+            VariableHeader::Heartbeat { .. }
+            | VariableHeader::HeartbeatError { .. } => Opcode::Heartbeat,
+            VariableHeader::RegisterExtent { .. }
+            | VariableHeader::RegisterExtentAck { .. }
+            | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterExtent,
             VariableHeader::Watermark { .. } => Opcode::Watermark,
             VariableHeader::UpdateExtentSealed { .. }
             | VariableHeader::UpdateExtentProgress { .. } => Opcode::UpdateExtent,
-            VariableHeader::ReportExtents { .. } => Opcode::ReportExtents,
-            VariableHeader::ReportExtentsResp { .. }
-            | VariableHeader::ReportExtentsRespError { .. } => Opcode::ReportExtentsResp,
+            VariableHeader::ReportExtents { .. }
+            | VariableHeader::ReportExtentsResp { .. }
+            | VariableHeader::ReportExtentsRespError { .. } => Opcode::ReportExtents,
             VariableHeader::Forward { .. }
             | VariableHeader::ForwardInitExtent { .. }
             | VariableHeader::ForwardChecksum { .. } => Opcode::Forward,
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
-            VariableHeader::DescribeStream { .. } => Opcode::DescribeStream,
-            VariableHeader::DescribeStreamResp { .. }
-            | VariableHeader::DescribeStreamRespError { .. } => Opcode::DescribeStreamResp,
-            VariableHeader::DescribeExtent { .. } => Opcode::DescribeExtent,
-            VariableHeader::DescribeExtentResp { .. }
-            | VariableHeader::DescribeExtentRespError { .. } => Opcode::DescribeExtentResp,
-            VariableHeader::Seek { .. } => Opcode::Seek,
-            VariableHeader::SeekResp { .. } | VariableHeader::SeekRespError { .. } => {
-                Opcode::SeekResp
-            }
+            VariableHeader::DescribeStream { .. }
+            | VariableHeader::DescribeStreamResp { .. }
+            | VariableHeader::DescribeStreamRespError { .. } => Opcode::DescribeStream,
+            VariableHeader::DescribeExtent { .. }
+            | VariableHeader::DescribeExtentResp { .. }
+            | VariableHeader::DescribeExtentRespError { .. } => Opcode::DescribeExtent,
+            VariableHeader::Seek { .. }
+            | VariableHeader::SeekResp { .. }
+            | VariableHeader::SeekRespError { .. } => Opcode::Seek,
         }
     }
 }

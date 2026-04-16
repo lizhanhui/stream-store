@@ -601,20 +601,10 @@ impl RequestHandler for StreamManagerStore {
                     Opcode::DescribeExtent => self.handle_describe_extent(frame).await,
                     Opcode::Seek => self.handle_seek(frame).await,
                     Opcode::ReportExtents => self.handle_report_extents(frame).await,
-                    Opcode::ConnectAck
-                    | Opcode::DisconnectAck
-                    | Opcode::RegisterExtent
-                    | Opcode::RegisterExtentAck
+                    Opcode::RegisterExtent
                     | Opcode::Watermark
                     | Opcode::UpdateExtent
-                    | Opcode::ReportExtentsResp
-                    | Opcode::CreateStreamResp
-                    | Opcode::QueryOffsetResp
-                    | Opcode::ReadResp
                     | Opcode::SealExtentNode
-                    | Opcode::DescribeStreamResp
-                    | Opcode::DescribeExtentResp
-                    | Opcode::SeekResp
                     | Opcode::StreamManagerMembershipChange => {
                         warn!(opcode = ?frame.opcode(), "SM received unexpected response/fire-and-forget opcode");
                         return None;

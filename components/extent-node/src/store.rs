@@ -436,19 +436,9 @@ impl RequestHandler for ExtentNodeStore {
                 None,
             )),
             Opcode::ReportExtents => Some(self.handle_report_extents(frame)),
-            Opcode::ReportExtentsResp
-            | Opcode::UpdateExtent
-            | Opcode::ConnectAck
-            | Opcode::DisconnectAck
-            | Opcode::RegisterExtentAck
+            Opcode::UpdateExtent
             | Opcode::Watermark
-            | Opcode::QueryOffsetResp
-            | Opcode::CreateStreamResp
-            | Opcode::ReadResp
             | Opcode::SealStreamManager
-            | Opcode::DescribeStreamResp
-            | Opcode::DescribeExtentResp
-            | Opcode::SeekResp
             | Opcode::StreamManagerMembershipChange => {
                 warn!(
                     opcode = ?frame.opcode(),
@@ -465,7 +455,7 @@ impl RequestHandler for ExtentNodeStore {
         }
     }
 
-    /// Optimized batch append for consecutive same-extent frames.
+    /// Optimized batch append for consecutive same-epoch frames.
     ///
     /// All frames in the batch share the same stream_id/extent_id, so we:
     /// - Do a single DashMap.get(streams) instead of N
@@ -1232,7 +1222,7 @@ impl ExtentNodeStore {
         }
     }
 
-    /// Optimized batch append: all frames share the same stream_id/extent_id.
+    /// Optimized batch append: all frames share the same stream_id/epoch.
     ///
     /// Amortizes DashMap lookups (3N → 3), leader elections (N → 1),
     /// ReplicaInfo access (N clones → 0, borrow within guard), and
@@ -2264,7 +2254,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::RegisterExtentAck);
+        assert_eq!(resp.opcode(), Opcode::RegisterExtent);
         sid
     }
 
@@ -2288,7 +2278,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert_eq!(resp.opcode(), Opcode::Append);
         assert_eq!(resp.offset(), Offset(0));
     }
 
@@ -2309,7 +2299,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert_eq!(resp.opcode(), Opcode::Append);
         assert!(resp.is_error_response());
     }
 
@@ -2338,7 +2328,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert_eq!(resp.opcode(), Opcode::Append);
         assert!(resp.is_error_response());
         assert_eq!(resp.error_code(), ErrorCode::ExtentSealed as u16);
         assert_eq!(resp.extent_id(), ExtentId(1));
@@ -2364,7 +2354,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.opcode(), Opcode::AppendAck);
+            assert_eq!(resp.opcode(), Opcode::Append);
             assert_eq!(resp.offset(), Offset(i as u64));
         }
 
@@ -2381,7 +2371,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::QueryOffsetResp);
+        assert_eq!(resp.opcode(), Opcode::QueryOffset);
         assert_eq!(resp.offset(), Offset(3));
 
         // Read all 3 from offset 0.
@@ -2401,7 +2391,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::ReadResp);
+        assert_eq!(resp.opcode(), Opcode::Read);
         assert_eq!(resp.count(), 3);
 
         let resp_payload = resp.payload.as_ref().unwrap();
@@ -2432,7 +2422,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::ReadResp);
+        assert_eq!(resp.opcode(), Opcode::Read);
         assert_eq!(resp.count(), 1);
         let resp_payload = resp.payload.as_ref().unwrap();
         let len = u32::from_be_bytes([
@@ -2475,7 +2465,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.opcode(), Opcode::RegisterExtentAck);
+        assert_eq!(resp.opcode(), Opcode::RegisterExtent);
         assert_eq!(resp.stream_id(), StreamId(42));
 
         assert!(store.streams.contains_key(&StreamId(42)));
@@ -2523,7 +2513,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.opcode(), Opcode::RegisterExtentAck);
+        assert_eq!(resp.opcode(), Opcode::RegisterExtent);
 
         let ri = store.get_replica_info(StreamId(42)).unwrap();
         assert!(!ri.is_primary());
@@ -2582,7 +2572,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert_eq!(resp.opcode(), Opcode::Append);
         assert_eq!(resp.offset(), Offset(0));
     }
 
@@ -2680,7 +2670,7 @@ mod tests {
 
         // The client response channel should now have the AppendAck.
         let ack = resp_rx.try_recv().unwrap();
-        assert_eq!(ack.opcode(), Opcode::AppendAck);
+        assert_eq!(ack.opcode(), Opcode::Append);
         assert_eq!(ack.offset(), Offset(0));
         assert_eq!(ack.request_id(), 2);
     }
@@ -2826,7 +2816,7 @@ mod tests {
 
         // First PendingAck should have been expired with an error.
         let err_frame = resp_rx.try_recv().unwrap();
-        assert_eq!(err_frame.opcode(), Opcode::AppendAck);
+        assert_eq!(err_frame.opcode(), Opcode::Append);
         assert!(err_frame.is_error_response());
         assert_eq!(err_frame.request_id(), 42);
 
@@ -2892,7 +2882,7 @@ mod tests {
 
                     assert_eq!(
                         resp.opcode(),
-                        Opcode::AppendAck,
+                        Opcode::Append,
                         "task {task_idx} seq {seq}: expected AppendAck"
                     );
                     offsets.push(resp.offset().0);
@@ -2981,7 +2971,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.opcode(), Opcode::ReadResp);
+            assert_eq!(resp.opcode(), Opcode::Read);
             let count = resp.count() as usize;
             assert!(count > 0, "task {task_idx}: expected at least 1 message");
 
@@ -3100,7 +3090,7 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                    assert_eq!(resp.opcode(), Opcode::AppendAck);
+                    assert_eq!(resp.opcode(), Opcode::Append);
                 }
                 "writer_done"
             }));
@@ -3127,7 +3117,7 @@ mod tests {
                         )
                         .await
                         .unwrap();
-                    assert_eq!(resp.opcode(), Opcode::ReadResp);
+                    assert_eq!(resp.opcode(), Opcode::Read);
                     assert!(resp.count() > 0, "reader should get at least 1 message");
                 }
                 "reader_done"
@@ -3236,7 +3226,7 @@ mod tests {
                         resp_rx.recv().await.unwrap()
                     };
 
-                    assert_eq!(resp.opcode(), Opcode::AppendAck);
+                    assert_eq!(resp.opcode(), Opcode::Append);
                     offsets.push(resp.offset().0);
                 }
                 offsets
@@ -3452,7 +3442,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(resp.opcode(), Opcode::AppendAck);
+            assert_eq!(resp.opcode(), Opcode::Append);
         }
 
         // First seal — no committed_offset (simulates SM seal via SealExtentNodeRequest).
@@ -3540,7 +3530,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert_eq!(resp.opcode(), Opcode::Append);
         assert!(resp.is_error_response());
         assert_eq!(resp.error_code(), ErrorCode::EpochStale as u16);
     }
@@ -3571,7 +3561,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert_eq!(resp.opcode(), Opcode::Append);
         assert!(!resp.is_error_response());
     }
 
@@ -3601,7 +3591,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(resp.opcode(), Opcode::AppendAck);
+        assert_eq!(resp.opcode(), Opcode::Append);
         assert!(!resp.is_error_response());
     }
 }

@@ -92,7 +92,7 @@ async fn register_extent(
         .unwrap();
 
     let resp = framed.next().await.unwrap().unwrap();
-    assert_eq!(resp.opcode(), Opcode::RegisterExtentAck);
+    assert_eq!(resp.opcode(), Opcode::RegisterExtent);
 }
 
 /// Test RF=2: Primary broadcasts to 1 Secondary.
