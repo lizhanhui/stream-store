@@ -292,7 +292,9 @@ async fn downstream_reader_inline(
                     let acked_offset = frame.offset().0;
 
                     // Inline watermark processing — no channel hop.
-                    if let Some(mut ack_queue) = store.ack_queues.get_mut(&stream_id) {
+                    let aq_guard = store.ack_queues.pin();
+                    if let Some(aq_mutex) = aq_guard.get(&stream_id) {
+                        let mut ack_queue = aq_mutex.lock().unwrap();
                         ack_queue.ack_from_secondary(&addr, acked_offset);
                         ack_queue.drain_quorum();
                     } else {

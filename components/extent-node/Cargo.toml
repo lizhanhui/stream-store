@@ -14,7 +14,8 @@ tokio-util = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
 sysinfo = "0.33"
-dashmap = "6"
+papaya = { workspace = true }
+parking_lot = { workspace = true }
 socket2 = "0.5"
 common = { path = "../common" }
 rpc = { path = "../rpc" }

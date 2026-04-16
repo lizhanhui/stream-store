@@ -29,6 +29,8 @@ crc32fast = "1.5"
 smallvec = "1.15"
 tikv-jemallocator = "0.6"
 core_affinity = "0.8"
+papaya = "0.2"
+parking_lot = "0.12"
 
 [package]
 name = "stream-store"
@@ -54,7 +56,7 @@ tikv-jemallocator = { workspace = true }
 futures-util = { workspace = true }
 tokio-util = { workspace = true }
 sqlx = { workspace = true }
-dashmap = "6"
+papaya = { workspace = true }
 fastant = { workspace = true }
 hdrhistogram = "7.5"
 serial_test = "3"
