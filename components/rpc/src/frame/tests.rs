@@ -2,8 +2,8 @@ use super::*;
 use bytes::{BufMut, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_SEAL_RESPONSE, HEADER_LEN,
-    MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE, HEADER_LEN, MAGIC,
+    Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 fn sample_append_frame() -> Frame {
@@ -57,7 +57,7 @@ fn invalid_magic_returns_error() {
     let mut buf = BytesMut::new();
     buf.put_u8(0xDE); // bad magic
     buf.put_u8(PROTOCOL_VERSION);
-    buf.put_u8(Opcode::ConnectAck as u8);
+    buf.put_u8(Opcode::Connect as u8);
     buf.put_u8(0);
     buf.put_u32(4); // remaining_length = 4 (request_id)
     buf.put_u32(0); // request_id
@@ -131,7 +131,7 @@ fn connect_ack_minimal() {
     assert_eq!(buf.len(), 12);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::ConnectAck);
+    assert_eq!(decoded.opcode(), Opcode::Connect);
     assert_eq!(decoded.request_id(), 1);
 }
 
@@ -250,7 +250,7 @@ fn seal_stream_manager_resp_round_trip() {
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
-    assert_eq!(decoded.flags(), FLAG_SEAL_RESPONSE);
+    assert_eq!(decoded.flags(), FLAG_RESPONSE);
     assert_eq!(decoded.request_id(), 2);
     assert_eq!(decoded.stream_id(), StreamId(10));
     assert_eq!(decoded.offset(), Offset(42));
@@ -353,7 +353,7 @@ fn seal_extent_node_resp_round_trip() {
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
-    assert_eq!(decoded.flags(), FLAG_SEAL_RESPONSE);
+    assert_eq!(decoded.flags(), FLAG_RESPONSE);
     assert_eq!(decoded.request_id(), 5);
     assert_eq!(decoded.stream_id(), StreamId(20));
     assert_eq!(decoded.epoch(), Epoch(4));
@@ -407,7 +407,7 @@ fn append_ack_error_frame() {
     frame.encode(&mut buf);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::AppendAck);
+    assert_eq!(decoded.opcode(), Opcode::Append);
     assert!(decoded.is_error_response());
     assert_eq!(decoded.request_id(), 42);
     assert_eq!(decoded.stream_id(), StreamId(9));
@@ -518,7 +518,7 @@ fn create_stream_resp_round_trip() {
     frame.encode(&mut buf);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::CreateStreamResp);
+    assert_eq!(decoded.opcode(), Opcode::CreateStream);
     assert_eq!(decoded.request_id(), 5);
     assert_eq!(decoded.stream_id(), StreamId(42));
     assert_eq!(decoded.extent_id(), ExtentId(1));

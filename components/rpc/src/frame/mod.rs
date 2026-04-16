@@ -10,8 +10,8 @@ mod tests;
 use bytes::Bytes;
 use common::types::{
     Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
-    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE_ERROR,
-    FLAG_SEAL_RESPONSE, FLAG_SYSTEM_TICK, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE,
+    FLAG_RESPONSE_ERROR, FLAG_SYSTEM_TICK, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 pub use header::{FixedHeader, VariableHeader};
@@ -42,7 +42,7 @@ impl Default for Frame {
     fn default() -> Self {
         Frame {
             header: FixedHeader {
-                opcode: Opcode::ConnectAck,
+                opcode: Opcode::Connect,
                 version: PROTOCOL_VERSION,
                 flags: 0,
             },
@@ -296,6 +296,7 @@ impl Frame {
     /// For other opcodes, returns `header.flags`.
     pub fn flags(&self) -> u8 {
         let computed = match &self.variable_header {
+            // ── Error responses: FLAG_RESPONSE_ERROR (0x80) ──
             VariableHeader::AppendAckError { .. }
             | VariableHeader::ReadRespError { .. }
             | VariableHeader::SealStreamManagerRespError { .. }
@@ -310,8 +311,21 @@ impl Frame {
             | VariableHeader::DescribeStreamRespError { .. }
             | VariableHeader::DescribeExtentRespError { .. }
             | VariableHeader::SeekRespError { .. } => FLAG_RESPONSE_ERROR,
-            VariableHeader::SealStreamManagerResp { .. }
-            | VariableHeader::SealExtentNodeResp { .. } => FLAG_SEAL_RESPONSE,
+            // ── Success responses: FLAG_RESPONSE (0x01) ──
+            VariableHeader::AppendAck { .. }
+            | VariableHeader::ReadResp { .. }
+            | VariableHeader::SealStreamManagerResp { .. }
+            | VariableHeader::SealExtentNodeResp { .. }
+            | VariableHeader::CreateStreamResp { .. }
+            | VariableHeader::QueryOffsetResp { .. }
+            | VariableHeader::ConnectAck { .. }
+            | VariableHeader::DisconnectAck { .. }
+            | VariableHeader::RegisterExtentAck { .. }
+            | VariableHeader::ReportExtentsResp { .. }
+            | VariableHeader::DescribeStreamResp { .. }
+            | VariableHeader::DescribeExtentResp { .. }
+            | VariableHeader::SeekResp { .. } => FLAG_RESPONSE,
+            // ── Per-opcode request-side flags ──
             VariableHeader::UpdateExtentSealed { .. } => FLAG_EXTENT_SEALED,
             VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
@@ -324,6 +338,7 @@ impl Frame {
                     0
                 }
             }
+            // ── Requests and fire-and-forget: 0x00 ──
             _ => 0,
         };
         self.header.flags | computed

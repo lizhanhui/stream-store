@@ -3,7 +3,7 @@ use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_PROGRESS,
     FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT,
-    FLAG_RESPONSE_ERROR, FLAG_SEAL_RESPONSE, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
+    FLAG_RESPONSE, FLAG_RESPONSE_ERROR, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
     StreamId,
 };
 
@@ -72,28 +72,15 @@ impl Frame {
         body: &mut BytesMut,
     ) -> Result<(VariableHeader, Option<Bytes>), StorageError> {
         match opcode {
+            // ── Append: request (0x00), ack (0x01), error (0x80) ──
             Opcode::Append => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let epoch = Epoch(body.get_u32());
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::Append {
-                        request_id,
-                        stream_id,
-                        epoch,
-                    },
-                    payload,
-                ))
-            }
-            Opcode::AppendAck => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let epoch = Epoch(body.get_u32());
-                let extent_id = ExtentId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let extent_id = ExtentId(body.get_u32());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown AppendAck error code".into())
+                        StorageError::InvalidFrame("unknown Append error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -106,7 +93,8 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
+                    let extent_id = ExtentId(body.get_u32());
                     let offset = Offset(body.get_u64());
                     Ok((
                         VariableHeader::AppendAck {
@@ -118,33 +106,27 @@ impl Frame {
                         },
                         None,
                     ))
+                } else {
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::Append {
+                            request_id,
+                            stream_id,
+                            epoch,
+                        },
+                        payload,
+                    ))
                 }
             }
+            // ── Read: request (0x00), response (0x01), error (0x80) ──
             Opcode::Read => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let extent_id = ExtentId(body.get_u32());
-                let offset = Offset(body.get_u64());
-                let count = body.get_u32();
-                Ok((
-                    VariableHeader::Read {
-                        request_id,
-                        stream_id,
-                        extent_id,
-                        offset,
-                        count,
-                    },
-                    None,
-                ))
-            }
-            Opcode::ReadResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let extent_id = ExtentId(body.get_u32());
                     let offset = Offset(body.get_u64());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown ReadResp error code".into())
+                        StorageError::InvalidFrame("unknown Read error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -157,7 +139,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let offset = Offset(body.get_u64());
                     let count = body.get_u32();
                     let payload = Self::read_payload(body);
@@ -170,8 +152,23 @@ impl Frame {
                         },
                         payload,
                     ))
+                } else {
+                    let extent_id = ExtentId(body.get_u32());
+                    let offset = Offset(body.get_u64());
+                    let count = body.get_u32();
+                    Ok((
+                        VariableHeader::Read {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            offset,
+                            count,
+                        },
+                        None,
+                    ))
                 }
             }
+            // ── SealStreamManager: request (0x00), response (0x01), error (0x80) ──
             Opcode::SealStreamManager => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
@@ -188,7 +185,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else if flags & FLAG_SEAL_RESPONSE != 0 {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let offset = Offset(body.get_u64());
                     let new_epoch = Epoch(body.get_u32());
                     let addr_len = body.get_u16() as usize;
@@ -215,6 +212,7 @@ impl Frame {
                     ))
                 }
             }
+            // ── SealExtentNode: request (0x00), response (0x01), error (0x80) ──
             Opcode::SealExtentNode => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
@@ -231,7 +229,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else if flags & FLAG_SEAL_RESPONSE != 0 {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let epoch = Epoch(body.get_u32());
                     let extent_id = ExtentId(body.get_u32());
                     let start_offset = body.get_u64();
@@ -264,33 +262,12 @@ impl Frame {
                     ))
                 }
             }
+            // ── CreateStream: request (0x00), response (0x01), error (0x80) ──
             Opcode::CreateStream => {
-                let request_id = body.get_u32();
-                let name_len = body.get_u16() as usize;
-                let stream_name = body.split_to(name_len).freeze();
-                let replication_factor = body.get_u16();
-                let min_extent_capacity = body.get_u32();
-                let max_extent_capacity = body.get_u32();
-                let cache_extents = body.get_u32();
-                let extent_growth_factor = body.get_u32();
-                Ok((
-                    VariableHeader::CreateStream {
-                        request_id,
-                        stream_name,
-                        replication_factor,
-                        min_extent_capacity,
-                        max_extent_capacity,
-                        cache_extents,
-                        extent_growth_factor,
-                    },
-                    None,
-                ))
-            }
-            Opcode::CreateStreamResp => {
                 let request_id = body.get_u32();
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown CreateStreamResp error code".into())
+                        StorageError::InvalidFrame("unknown CreateStream error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -300,7 +277,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let stream_id = StreamId(body.get_u64());
                     let extent_id = ExtentId(body.get_u32());
                     let epoch = Epoch(body.get_u32());
@@ -316,25 +293,35 @@ impl Frame {
                         },
                         None,
                     ))
+                } else {
+                    let name_len = body.get_u16() as usize;
+                    let stream_name = body.split_to(name_len).freeze();
+                    let replication_factor = body.get_u16();
+                    let min_extent_capacity = body.get_u32();
+                    let max_extent_capacity = body.get_u32();
+                    let cache_extents = body.get_u32();
+                    let extent_growth_factor = body.get_u32();
+                    Ok((
+                        VariableHeader::CreateStream {
+                            request_id,
+                            stream_name,
+                            replication_factor,
+                            min_extent_capacity,
+                            max_extent_capacity,
+                            cache_extents,
+                            extent_growth_factor,
+                        },
+                        None,
+                    ))
                 }
             }
+            // ── QueryOffset: request (0x00), response (0x01), error (0x80) ──
             Opcode::QueryOffset => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                Ok((
-                    VariableHeader::QueryOffset {
-                        request_id,
-                        stream_id,
-                    },
-                    None,
-                ))
-            }
-            Opcode::QueryOffsetResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown QueryOffsetResp error code".into())
+                        StorageError::InvalidFrame("unknown QueryOffset error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -345,7 +332,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let offset = Offset(body.get_u64());
                     Ok((
                         VariableHeader::QueryOffsetResp {
@@ -355,18 +342,61 @@ impl Frame {
                         },
                         None,
                     ))
+                } else {
+                    Ok((
+                        VariableHeader::QueryOffset {
+                            request_id,
+                            stream_id,
+                        },
+                        None,
+                    ))
                 }
             }
+            // ── Connect: request (0x00), ack (0x01), error (0x80) ──
             Opcode::Connect => {
                 let request_id = body.get_u32();
-                let payload = Self::read_payload(body);
-                Ok((VariableHeader::Connect { request_id }, payload))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown Connect error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::ConnectAckError {
+                            request_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else if flags & FLAG_RESPONSE != 0 {
+                    Ok((VariableHeader::ConnectAck { request_id }, None))
+                } else {
+                    let payload = Self::read_payload(body);
+                    Ok((VariableHeader::Connect { request_id }, payload))
+                }
             }
+            // ── Disconnect: request (0x00), ack (0x01), error (0x80) ──
             Opcode::Disconnect => {
                 let request_id = body.get_u32();
-                let payload = Self::read_payload(body);
-                Ok((VariableHeader::Disconnect { request_id }, payload))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        StorageError::InvalidFrame("unknown Disconnect error code".into())
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::DisconnectAckError {
+                            request_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else if flags & FLAG_RESPONSE != 0 {
+                    Ok((VariableHeader::DisconnectAck { request_id }, None))
+                } else {
+                    let payload = Self::read_payload(body);
+                    Ok((VariableHeader::Disconnect { request_id }, payload))
+                }
             }
+            // ── Heartbeat: request/echo (0x00), error (0x80) ──
             Opcode::Heartbeat => {
                 let request_id = body.get_u32();
                 if flags & FLAG_RESPONSE_ERROR != 0 {
@@ -386,79 +416,14 @@ impl Frame {
                     Ok((VariableHeader::Heartbeat { request_id }, payload))
                 }
             }
+            // ── RegisterExtent: request (0x00), ack (0x01), error (0x80) ──
             Opcode::RegisterExtent => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
-                let role = body.get_u8();
-                let replication_factor = body.get_u16();
-                let epoch = Epoch(body.get_u32());
-                let extent_capacity = body.get_u32();
-                let cache_extents = body.get_u32();
-                let min_extent_capacity = body.get_u32();
-                let max_extent_capacity = body.get_u32();
-                let extent_growth_factor = body.get_u32();
-                let payload = Self::read_payload(body);
-                Ok((
-                    VariableHeader::RegisterExtent {
-                        request_id,
-                        stream_id,
-                        extent_id,
-                        role,
-                        replication_factor,
-                        epoch,
-                        extent_capacity,
-                        cache_extents,
-                        min_extent_capacity,
-                        max_extent_capacity,
-                        extent_growth_factor,
-                    },
-                    payload,
-                ))
-            }
-            Opcode::ConnectAck => {
-                let request_id = body.get_u32();
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown ConnectAck error code".into())
-                    })?;
-                    let payload = Self::read_payload(body);
-                    Ok((
-                        VariableHeader::ConnectAckError {
-                            request_id,
-                            error_code,
-                        },
-                        payload,
-                    ))
-                } else {
-                    Ok((VariableHeader::ConnectAck { request_id }, None))
-                }
-            }
-            Opcode::DisconnectAck => {
-                let request_id = body.get_u32();
-                if flags & FLAG_RESPONSE_ERROR != 0 {
-                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown DisconnectAck error code".into())
-                    })?;
-                    let payload = Self::read_payload(body);
-                    Ok((
-                        VariableHeader::DisconnectAckError {
-                            request_id,
-                            error_code,
-                        },
-                        payload,
-                    ))
-                } else {
-                    Ok((VariableHeader::DisconnectAck { request_id }, None))
-                }
-            }
-            Opcode::RegisterExtentAck => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let extent_id = ExtentId(body.get_u32());
-                if flags & FLAG_RESPONSE_ERROR != 0 {
-                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown RegisterExtentAck error code".into())
+                        StorageError::InvalidFrame("unknown RegisterExtent error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -470,7 +435,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
                     Ok((
                         VariableHeader::RegisterExtentAck {
                             request_id,
@@ -479,8 +444,35 @@ impl Frame {
                         },
                         None,
                     ))
+                } else {
+                    let role = body.get_u8();
+                    let replication_factor = body.get_u16();
+                    let epoch = Epoch(body.get_u32());
+                    let extent_capacity = body.get_u32();
+                    let cache_extents = body.get_u32();
+                    let min_extent_capacity = body.get_u32();
+                    let max_extent_capacity = body.get_u32();
+                    let extent_growth_factor = body.get_u32();
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::RegisterExtent {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            role,
+                            replication_factor,
+                            epoch,
+                            extent_capacity,
+                            cache_extents,
+                            min_extent_capacity,
+                            max_extent_capacity,
+                            extent_growth_factor,
+                        },
+                        payload,
+                    ))
                 }
             }
+            // ── Watermark: fire-and-forget ──
             Opcode::Watermark => {
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
@@ -494,6 +486,7 @@ impl Frame {
                     None,
                 ))
             }
+            // ── Forward: flag-based variants (append/init/checksum) ──
             Opcode::Forward => {
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
@@ -552,36 +545,18 @@ impl Frame {
                     }
                 }
             }
+            // ── StreamManagerMembershipChange: fire-and-forget ──
             Opcode::StreamManagerMembershipChange => {
                 let payload = Self::read_payload(body);
                 Ok((VariableHeader::StreamManagerMembershipChange, payload))
             }
+            // ── DescribeStream: request (0x00 or 0x02 for by-name), response (0x01), error (0x80) ──
             Opcode::DescribeStream => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let count = body.get_u32();
-                let stream_name = if flags & FLAG_DESCRIBE_STREAM_BY_NAME != 0 {
-                    let name_len = body.get_u16() as usize;
-                    Some(body.split_to(name_len).freeze())
-                } else {
-                    None
-                };
-                Ok((
-                    VariableHeader::DescribeStream {
-                        request_id,
-                        stream_id,
-                        count,
-                        stream_name,
-                    },
-                    None,
-                ))
-            }
-            Opcode::DescribeStreamResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown DescribeStreamResp error code".into())
+                        StorageError::InvalidFrame("unknown DescribeStream error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -592,7 +567,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::DescribeStreamResp {
@@ -601,28 +576,33 @@ impl Frame {
                         },
                         payload,
                     ))
+                } else {
+                    let count = body.get_u32();
+                    let stream_name = if flags & FLAG_DESCRIBE_STREAM_BY_NAME != 0 {
+                        let name_len = body.get_u16() as usize;
+                        Some(body.split_to(name_len).freeze())
+                    } else {
+                        None
+                    };
+                    Ok((
+                        VariableHeader::DescribeStream {
+                            request_id,
+                            stream_id,
+                            count,
+                            stream_name,
+                        },
+                        None,
+                    ))
                 }
             }
+            // ── DescribeExtent: request (0x00), response (0x01), error (0x80) ──
             Opcode::DescribeExtent => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let extent_id = ExtentId(body.get_u32());
-                Ok((
-                    VariableHeader::DescribeExtent {
-                        request_id,
-                        stream_id,
-                        extent_id,
-                    },
-                    None,
-                ))
-            }
-            Opcode::DescribeExtentResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let extent_id = ExtentId(body.get_u32());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown DescribeExtentResp error code".into())
+                        StorageError::InvalidFrame("unknown DescribeExtent error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -634,7 +614,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::DescribeExtentResp {
@@ -643,28 +623,26 @@ impl Frame {
                         },
                         payload,
                     ))
+                } else {
+                    let extent_id = ExtentId(body.get_u32());
+                    Ok((
+                        VariableHeader::DescribeExtent {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                        },
+                        None,
+                    ))
                 }
             }
+            // ── Seek: request (0x00), response (0x01), error (0x80) ──
             Opcode::Seek => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let offset = Offset(body.get_u64());
-                Ok((
-                    VariableHeader::Seek {
-                        request_id,
-                        stream_id,
-                        offset,
-                    },
-                    None,
-                ))
-            }
-            Opcode::SeekResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let offset = Offset(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown SeekResp error code".into())
+                        StorageError::InvalidFrame("unknown Seek error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -676,7 +654,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::SeekResp {
@@ -686,8 +664,18 @@ impl Frame {
                         },
                         payload,
                     ))
+                } else {
+                    Ok((
+                        VariableHeader::Seek {
+                            request_id,
+                            stream_id,
+                            offset,
+                        },
+                        None,
+                    ))
                 }
             }
+            // ── UpdateExtent: fire-and-forget, flag-based variants ──
             Opcode::UpdateExtent => {
                 let stream_id = StreamId(body.get_u64());
                 let epoch = Epoch(body.get_u32());
@@ -727,26 +715,14 @@ impl Frame {
                     ))),
                 }
             }
+            // ── ReportExtents: request (0x00), response (0x01), error (0x80) ──
             Opcode::ReportExtents => {
-                let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
-                let epoch = Epoch(body.get_u32());
-                Ok((
-                    VariableHeader::ReportExtents {
-                        request_id,
-                        stream_id,
-                        epoch,
-                    },
-                    None,
-                ))
-            }
-            Opcode::ReportExtentsResp => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u64());
                 let epoch = Epoch(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown ReportExtentsResp error code".into())
+                        StorageError::InvalidFrame("unknown ReportExtents error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -758,7 +734,7 @@ impl Frame {
                         },
                         payload,
                     ))
-                } else {
+                } else if flags & FLAG_RESPONSE != 0 {
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::ReportExtentsResp {
@@ -767,6 +743,15 @@ impl Frame {
                             epoch,
                         },
                         payload,
+                    ))
+                } else {
+                    Ok((
+                        VariableHeader::ReportExtents {
+                            request_id,
+                            stream_id,
+                            epoch,
+                        },
+                        None,
                     ))
                 }
             }

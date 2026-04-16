@@ -226,7 +226,7 @@ impl StreamManagerClient {
                         return Ok(true);
                     }
                     match tokio::time::timeout(Duration::from_millis(500), framed.next()).await {
-                        Ok(Some(Ok(resp))) if resp.opcode() == Opcode::DisconnectAck => {
+                        Ok(Some(Ok(resp))) if resp.opcode() == Opcode::Disconnect => {
                             info!("received DisconnectAck from StreamManager");
                         }
                         Ok(Some(Ok(resp))) => {
@@ -447,7 +447,7 @@ impl StreamManagerClient {
             .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))??;
 
         match tokio::time::timeout(rpc_request_timeout, framed.next()).await {
-            Ok(Some(Ok(resp))) if resp.opcode() == Opcode::ConnectAck => {
+            Ok(Some(Ok(resp))) if resp.opcode() == Opcode::Connect => {
                 info!("registered with StreamManager at {stream_manager_addr}");
             }
             Ok(Some(Ok(resp))) => {
