@@ -376,12 +376,8 @@ fn seal_extent_node_resp_round_trip() {
 
 #[test]
 fn seal_extent_node_resp_error_round_trip() {
-    let frame = Frame::seal_extent_node_resp_error(
-        6,
-        StreamId(20),
-        ErrorCode::ExtentSealed,
-        "node error",
-    );
+    let frame =
+        Frame::seal_extent_node_resp_error(6, StreamId(20), ErrorCode::ExtentSealed, "node error");
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);

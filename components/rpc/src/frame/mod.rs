@@ -1,5 +1,4 @@
-pub mod fixed_header;
-pub mod variable_header;
+pub mod header;
 
 mod decode;
 mod encode;
@@ -10,14 +9,12 @@ mod tests;
 
 use bytes::Bytes;
 use common::types::{
-    Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_PROGRESS,
-    FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT,
-    FLAG_RESPONSE_ERROR, FLAG_SEAL_RESPONSE, FLAG_SYSTEM_TICK, Offset, Opcode, PROTOCOL_VERSION,
-    StreamId,
+    Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
+    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE_ERROR,
+    FLAG_SEAL_RESPONSE, FLAG_SYSTEM_TICK, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
-use fixed_header::FixedHeader;
-use variable_header::VariableHeader;
+pub use header::{FixedHeader, VariableHeader};
 
 /// A wire protocol frame.
 ///

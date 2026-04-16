@@ -7,9 +7,7 @@ use common::types::{
     StreamId,
 };
 
-use super::Frame;
-use super::fixed_header::FixedHeader;
-use super::variable_header::VariableHeader;
+use super::{FixedHeader, Frame, VariableHeader};
 
 impl Frame {
     /// Try to decode a frame from the source buffer.
