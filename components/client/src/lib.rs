@@ -11,11 +11,10 @@ use common::types::{
 };
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
-use rpc::frame::Frame;
+use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{
     build_connect_payload, build_heartbeat_payload, build_string_payload, parse_extent_info_vec,
 };
-use rpc::frame::variable_header::VariableHeader;
 use tokio::net::TcpStream;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;

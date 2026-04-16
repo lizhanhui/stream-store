@@ -1,8 +1,7 @@
 use bytes::{BufMut, BytesMut};
 use common::types::{HEADER_LEN, MAGIC, PROTOCOL_VERSION};
 
-use super::Frame;
-use super::variable_header::VariableHeader;
+use super::{FixedHeader, Frame, VariableHeader};
 
 impl Frame {
     /// Compute the remaining length (variable header + payload) for this frame.

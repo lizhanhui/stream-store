@@ -2,7 +2,7 @@ use bytes::Bytes;
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, StreamId};
 
 use super::Frame;
-use super::variable_header::VariableHeader;
+use super::header::VariableHeader;
 
 impl Frame {
     pub fn append_ack_error(

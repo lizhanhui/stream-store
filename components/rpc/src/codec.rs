@@ -29,7 +29,7 @@ impl Encoder<Frame> for FrameCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::variable_header::VariableHeader;
+    use crate::frame::VariableHeader;
     use bytes::Bytes;
     use common::types::{Epoch, ExtentId, StreamId};
 
