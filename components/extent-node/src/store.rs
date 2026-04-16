@@ -11,15 +11,16 @@ use common::config::{
 };
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, Opcode, StreamId};
-use std::sync::Mutex;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 
 use crate::downstream::DownstreamPool;
+use crate::extent::AppendResult;
 use crate::stream::{SealNotification, SealReason, Stream};
 
 // ── Broadcast replication types ──────────────────────────────────────────────
@@ -331,7 +332,10 @@ impl ExtentNodeStore {
 
     /// Get the replication info for a stream, if registered via RegisterExtent.
     pub fn get_replica_info(&self, stream_id: StreamId) -> Option<ReplicaInfo> {
-        self.replicas.pin().get(&stream_id).map(|m| m.lock().unwrap().clone())
+        self.replicas
+            .pin()
+            .get(&stream_id)
+            .map(|m| m.lock().unwrap().clone())
     }
 
     /// Expire stale PendingAcks across all streams by running the timeout sweep.
@@ -388,10 +392,7 @@ impl ExtentNodeStore {
     /// Pure read-only scan — no write guards, no idle-shrink checks.
     pub fn stream_epochs(&self) -> Vec<(StreamId, Epoch)> {
         let guard = self.streams.pin();
-        guard
-            .iter()
-            .map(|(k, v)| (*k, v.epoch()))
-            .collect()
+        guard.iter().map(|(k, v)| (*k, v.epoch())).collect()
     }
 }
 
@@ -551,14 +552,14 @@ impl ExtentNodeStore {
         // lazily created by a forwarded append that arrived before this RegisterExtent).
         let _start_offset = {
             let guard = self.streams.pin();
-            if let Some(stream_ref) = guard.get(&stream_id) {
+            if let Some(stream) = guard.get(&stream_id) {
                 // RegisterExtent is the authoritative source for cache policy.
                 // Always apply — the stream may have been lazily created by
                 // ForwardInitExtent before this arrives with max_extents=0.
-                stream_ref.set_max_extents(cache_extents as usize);
-                if stream_ref.with_extent(extent_id, |_| ()).is_none() {
-                    let so = stream_ref.max_offset();
-                    stream_ref.register_extent(
+                stream.set_max_extents(cache_extents as usize);
+                if stream.with_extent(extent_id, |_| ()).is_none() {
+                    let so = stream.max_offset();
+                    stream.register_extent(
                         extent_id,
                         so,
                         extent_capacity,
@@ -571,8 +572,8 @@ impl ExtentNodeStore {
                 } else {
                     // Extent already exists (lazy creation from Forward), but update epoch
                     // from authoritative source (RegisterExtent carries the real epoch).
-                    stream_ref.set_epoch(epoch);
-                    stream_ref.max_offset()
+                    stream.set_epoch(epoch);
+                    stream.max_offset()
                 }
             } else {
                 let stream = Stream::new(stream_id);
@@ -624,7 +625,10 @@ impl ExtentNodeStore {
             {
                 let aq_guard = self.ack_queues.pin();
                 aq_guard.get_or_insert_with(stream_id, || {
-                    Mutex::new(AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout))
+                    Mutex::new(AckQueue::with_timeout(
+                        ri.required_secondary_acks(),
+                        self.replication_timeout,
+                    ))
                 });
             }
 
@@ -638,8 +642,8 @@ impl ExtentNodeStore {
                         .map(|addr| pool.get_or_create_sender(addr))
                         .collect();
                     let stream_guard = self.streams.pin();
-                    if let Some(stream_ref) = stream_guard.get(&stream_id) {
-                        stream_ref.set_downstream_txs(txs);
+                    if let Some(stream) = stream_guard.get(&stream_id) {
+                        stream.set_downstream_txs(txs);
                     }
                 }
             }
@@ -681,9 +685,18 @@ impl ExtentNodeStore {
         let client_epoch = frame.epoch();
 
         // ── Validation + leader election + own append (scoped pin guard) ──
-        let (epoch, own_result, extent_full, remaining, is_tick, should_shrink, payload, request_id) = {
+        let (
+            epoch,
+            own_result,
+            extent_full,
+            remaining,
+            is_tick,
+            should_shrink,
+            payload,
+            request_id,
+        ) = {
             let guard = self.streams.pin();
-            let stream_ref = match guard.get(&stream_id) {
+            let stream = match guard.get(&stream_id) {
                 Some(s) => s,
                 None => {
                     return Some(Frame::error_from_request(
@@ -695,7 +708,7 @@ impl ExtentNodeStore {
                 }
             };
 
-            let epoch = stream_ref.epoch();
+            let epoch = stream.epoch();
             if client_epoch != Epoch(0) && client_epoch != epoch {
                 return Some(Frame::error_from_request(
                     &frame,
@@ -706,11 +719,11 @@ impl ExtentNodeStore {
             }
 
             let is_tick = frame.flags() & FLAG_SYSTEM_TICK != 0;
-            let prev = stream_ref.in_flight().fetch_add(1, Ordering::Acquire);
+            let prev = stream.in_flight().fetch_add(1, Ordering::Acquire);
 
             if prev > 0 {
                 if is_tick {
-                    stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+                    stream.in_flight().fetch_sub(1, Ordering::Release);
                     return None;
                 }
                 let job = AppendJob {
@@ -719,30 +732,48 @@ impl ExtentNodeStore {
                     payload: frame.payload.clone().unwrap_or_default(),
                     response_tx: response_tx.cloned(),
                 };
-                let _ = stream_ref.job_tx().send(job);
+                let _ = stream.job_tx().send(job);
                 return None;
             }
 
             // FAST PATH: I'm the active writer (prev == 0).
 
             if is_tick {
-                let should_shrink = stream_ref
+                let should_shrink = stream
                     .should_idle_shrink(Duration::from_secs(DEFAULT_IDLE_SHRINK_THRESHOLD_SECS));
-                let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
-                (epoch, None, false, remaining, true, should_shrink, Bytes::new(), 0)
+                let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
+                (
+                    epoch,
+                    None,
+                    false,
+                    remaining,
+                    true,
+                    should_shrink,
+                    Bytes::new(),
+                    0,
+                )
             } else {
                 let payload = frame.payload.clone().unwrap_or_default();
                 let request_id = frame.request_id();
                 let (own_result, extent_full) = self.do_append_and_respond(
-                    stream_ref, request_id, stream_id, epoch, payload.clone(), response_tx.cloned(),
+                    stream,
+                    request_id,
+                    stream_id,
+                    epoch,
+                    payload.clone(),
+                    response_tx.cloned(),
                 );
                 if extent_full {
                     // Don't decrement in_flight — we're still the leader.
                     // Will decrement after seal+create+retry below.
-                    (epoch, own_result, true, 0, false, false, payload, request_id)
+                    (
+                        epoch, own_result, true, 0, false, false, payload, request_id,
+                    )
                 } else {
-                    let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
-                    (epoch, own_result, false, remaining, false, false, payload, request_id)
+                    let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
+                    (
+                        epoch, own_result, false, remaining, false, false, payload, request_id,
+                    )
                 }
             }
         };
@@ -765,8 +796,10 @@ impl ExtentNodeStore {
                     self.send_forward_checksum(stream_id, notification.sealed_extent_id);
                     info!(
                         "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
-                        stream_id, notification.sealed_extent_id,
-                        notification.new_extent_id, notification.new_extent_capacity,
+                        stream_id,
+                        notification.sealed_extent_id,
+                        notification.new_extent_id,
+                        notification.new_extent_capacity,
                     );
                 }
             }
@@ -781,11 +814,16 @@ impl ExtentNodeStore {
             let (retry_result, remaining) = {
                 let guard = self.streams.pin();
                 match guard.get(&stream_id) {
-                    Some(stream_ref) => {
+                    Some(stream) => {
                         let (retry_result, _) = self.do_append_and_respond(
-                            stream_ref, request_id, stream_id, epoch, payload, response_tx.cloned(),
+                            stream,
+                            request_id,
+                            stream_id,
+                            epoch,
+                            payload,
+                            response_tx.cloned(),
                         );
-                        let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+                        let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
                         (retry_result, remaining)
                     }
                     None => return None,
@@ -893,7 +931,11 @@ impl ExtentNodeStore {
             .fetch_add(payload_len as u64, Ordering::Relaxed);
 
         // Check replica info for this stream.
-        let replica = self.replicas.pin().get(&stream_id).map(|m| m.lock().unwrap().clone());
+        let replica = self
+            .replicas
+            .pin()
+            .get(&stream_id)
+            .map(|m| m.lock().unwrap().clone());
 
         match replica {
             None => {
@@ -1022,17 +1064,17 @@ impl ExtentNodeStore {
                 // Scope pin guard — must be dropped before yield_now().await.
                 let need_yield = {
                     let guard = self.streams.pin();
-                    let stream_ref = match guard.get(&stream_id) {
+                    let stream = match guard.get(&stream_id) {
                         Some(s) => s,
                         None => return all_seal_notifications,
                     };
                     if batch.is_empty() {
-                        epoch = stream_ref.epoch();
+                        epoch = stream.epoch();
                     }
-                    match stream_ref.job_rx().try_recv() {
+                    match stream.job_rx().try_recv() {
                         Ok(job) => {
                             batch.push(job);
-                            while let Ok(job) = stream_ref.job_rx().try_recv() {
+                            while let Ok(job) = stream.job_rx().try_recv() {
                                 batch.push(job);
                             }
                             false
@@ -1040,7 +1082,7 @@ impl ExtentNodeStore {
                         Err(_) if !batch.is_empty() => false,
                         Err(_) => {
                             // Follower incremented in_flight but hasn't pushed yet.
-                            let delegated = stream_ref.in_flight().load(Ordering::Acquire);
+                            let delegated = stream.in_flight().load(Ordering::Acquire);
                             delegated > 0
                         }
                     }
@@ -1059,13 +1101,13 @@ impl ExtentNodeStore {
             // Process each job (scoped pin guard).
             {
                 let guard = self.streams.pin();
-                let stream_ref = match guard.get(&stream_id) {
+                let stream = match guard.get(&stream_id) {
                     Some(s) => s,
                     None => break,
                 };
                 for (i, job) in batch.iter().enumerate() {
                     let (_, extent_full) = self.do_append_and_respond(
-                        stream_ref,
+                        stream,
                         job.request_id,
                         job.stream_id,
                         epoch,
@@ -1089,11 +1131,11 @@ impl ExtentNodeStore {
                 // Retry the failed job and remaining jobs on the new extent.
                 let done = {
                     let guard = self.streams.pin();
-                    if let Some(stream_ref) = guard.get(&stream_id) {
-                        epoch = stream_ref.epoch();
+                    if let Some(stream) = guard.get(&stream_id) {
+                        epoch = stream.epoch();
                         for job in &batch[index..] {
                             let (_, _) = self.do_append_and_respond(
-                                stream_ref,
+                                stream,
                                 job.request_id,
                                 job.stream_id,
                                 epoch,
@@ -1101,7 +1143,7 @@ impl ExtentNodeStore {
                                 job.response_tx.clone(),
                             );
                         }
-                        let remaining = stream_ref
+                        let remaining = stream
                             .in_flight()
                             .fetch_sub(batch_len as u64, Ordering::Release);
                         remaining <= batch_len as u64
@@ -1116,8 +1158,8 @@ impl ExtentNodeStore {
                 // All jobs processed without ExtentFull.
                 let done = {
                     let guard = self.streams.pin();
-                    if let Some(stream_ref) = guard.get(&stream_id) {
-                        let remaining = stream_ref
+                    if let Some(stream) = guard.get(&stream_id) {
+                        let remaining = stream
                             .in_flight()
                             .fetch_sub(batch_len as u64, Ordering::Release);
                         remaining <= batch_len as u64
@@ -1140,16 +1182,16 @@ impl ExtentNodeStore {
     /// Acquires write lock on the stream's inner RwLock. Returns the seal notification
     /// if a seal+create occurred, or None if already sealed / stream not found.
     fn seal_and_create(&self, stream_id: StreamId, reason: SealReason) -> Option<SealNotification> {
-        if let Some(stream_ref) = self.streams.pin().get(&stream_id) {
+        if let Some(stream) = self.streams.pin().get(&stream_id) {
             // For IdleShrink, re-check eligibility under write guard.
             if matches!(reason, SealReason::IdleShrink)
-                && !stream_ref
+                && !stream
                     .should_idle_shrink(Duration::from_secs(DEFAULT_IDLE_SHRINK_THRESHOLD_SECS))
             {
                 return None;
             }
             let t0 = std::time::Instant::now();
-            let notification = stream_ref.seal_and_create_next(reason);
+            let notification = stream.seal_and_create_next(reason);
             let seal_us = t0.elapsed().as_micros();
             if let Some(ref n) = notification {
                 info!(
@@ -1192,7 +1234,7 @@ impl ExtentNodeStore {
         let (checksum, committed_bytes) = {
             let guard = self.streams.pin();
             match guard.get(&stream_id) {
-                Some(stream_ref) => match stream_ref.with_extent(sealed_extent_id, |ext| {
+                Some(stream) => match stream.with_extent(sealed_extent_id, |ext| {
                     (
                         ext.finalized_crc32().unwrap_or(0),
                         ext.committed_data().len() as u64,
@@ -1219,11 +1261,11 @@ impl ExtentNodeStore {
         );
         // Push inline via per-stream channels.
         let guard2 = self.streams.pin();
-        if let Some(stream_ref) = guard2.get(&stream_id) {
-            if let Some(init) = self.maybe_build_init_forward(stream_ref, &frame) {
-                stream_ref.send_forward(init);
+        if let Some(stream) = guard2.get(&stream_id) {
+            if let Some(init) = self.maybe_build_init_forward(stream, &frame) {
+                stream.send_forward(init);
             }
-            stream_ref.send_forward(frame);
+            stream.send_forward(frame);
         }
     }
 
@@ -1263,7 +1305,7 @@ impl ExtentNodeStore {
         // ── Validation + leader election + batch appends (scoped pin guard) ──
         let (epoch, batch_len) = {
             let guard = self.streams.pin();
-            let stream_ref = match guard.get(&stream_id) {
+            let stream = match guard.get(&stream_id) {
                 Some(s) => s,
                 None => {
                     for frame in frames {
@@ -1278,7 +1320,7 @@ impl ExtentNodeStore {
                 }
             };
 
-            let epoch = stream_ref.epoch();
+            let epoch = stream.epoch();
             let client_epoch = frames[0].epoch();
             if client_epoch != Epoch(0) && client_epoch != epoch {
                 for frame in frames {
@@ -1293,7 +1335,7 @@ impl ExtentNodeStore {
             }
 
             let batch_len = frames.len() as u64;
-            let prev = stream_ref.in_flight().fetch_add(batch_len, Ordering::Acquire);
+            let prev = stream.in_flight().fetch_add(batch_len, Ordering::Acquire);
 
             if prev > 0 {
                 // SLOW PATH: active writer exists. Push all as AppendJobs.
@@ -1304,7 +1346,7 @@ impl ExtentNodeStore {
                         payload: frame.payload.clone().unwrap_or_default(),
                         response_tx: response_tx.cloned(),
                     };
-                    let _ = stream_ref.job_tx().send(job);
+                    let _ = stream.job_tx().send(job);
                 }
                 return responses; // All deferred — empty responses.
             }
@@ -1317,79 +1359,160 @@ impl ExtentNodeStore {
                 let payload_for_forward = payload.clone();
 
                 if extent_full {
-                    failed_frames.push(FailedFrame { request_id, payload });
+                    failed_frames.push(FailedFrame {
+                        request_id,
+                        payload,
+                    });
                     continue;
                 }
 
-                match stream_ref.try_append_active(payload.clone()) {
+                match stream.try_append_active(payload.clone()) {
                     Ok((result, eid)) => {
                         entries.push(BatchEntry {
-                            request_id, payload_for_forward, offset: result.offset,
-                            byte_pos: result.byte_pos, payload_len, extent_id: eid,
+                            request_id,
+                            payload_for_forward,
+                            offset: result.offset,
+                            byte_pos: result.byte_pos,
+                            payload_len,
+                            extent_id: eid,
                         });
                     }
                     Err(StorageError::ExtentSealed(extent_id)) => {
-                        let err = Frame::append_ack_error(request_id, stream_id, epoch, extent_id, ErrorCode::ExtentSealed, "extent is sealed");
-                        if let Some(tx) = response_tx { let _ = tx.try_send(err); } else { responses.push(err); }
+                        let err = Frame::append_ack_error(
+                            request_id,
+                            stream_id,
+                            epoch,
+                            extent_id,
+                            ErrorCode::ExtentSealed,
+                            "extent is sealed",
+                        );
+                        if let Some(tx) = response_tx {
+                            let _ = tx.try_send(err);
+                        } else {
+                            responses.push(err);
+                        }
                     }
                     Err(StorageError::ExtentFull(_)) => {
                         extent_full = true;
-                        failed_frames.push(FailedFrame { request_id, payload });
+                        failed_frames.push(FailedFrame {
+                            request_id,
+                            payload,
+                        });
                     }
                     Err(e) => {
-                        let err = Frame::append_ack_error(request_id, stream_id, epoch, ExtentId(0), ErrorCode::InternalError, &e.to_string());
-                        if let Some(tx) = response_tx { let _ = tx.try_send(err); } else { responses.push(err); }
+                        let err = Frame::append_ack_error(
+                            request_id,
+                            stream_id,
+                            epoch,
+                            ExtentId(0),
+                            ErrorCode::InternalError,
+                            &e.to_string(),
+                        );
+                        if let Some(tx) = response_tx {
+                            let _ = tx.try_send(err);
+                        } else {
+                            responses.push(err);
+                        }
                     }
                 }
             }
 
             // Process successful entries: metrics, replica info, forwards, ACKs.
             if !entries.is_empty() {
-                let _extent_start_offset = stream_ref
+                let _extent_start_offset = stream
                     .with_extent(entries[0].extent_id, |e| e.start_offset.0)
                     .unwrap_or(0);
 
                 let total_bytes: u64 = entries.iter().map(|e| e.payload_len as u64).sum();
-                self.append_count.fetch_add(entries.len() as u64, Ordering::Relaxed);
+                self.append_count
+                    .fetch_add(entries.len() as u64, Ordering::Relaxed);
                 self.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
 
-                let replica = self.replicas.pin().get(&stream_id).map(|m| m.lock().unwrap().clone());
+                let replica = self
+                    .replicas
+                    .pin()
+                    .get(&stream_id)
+                    .map(|m| m.lock().unwrap().clone());
 
                 match replica.as_ref() {
                     None => {
                         for entry in &entries {
-                            let ack = Frame::new(VariableHeader::AppendAck { request_id: entry.request_id, stream_id, epoch, extent_id: entry.extent_id, offset: entry.offset }, None);
-                            if let Some(tx) = response_tx { let _ = tx.try_send(ack); } else { responses.push(ack); }
+                            let ack = Frame::new(
+                                VariableHeader::AppendAck {
+                                    request_id: entry.request_id,
+                                    stream_id,
+                                    epoch,
+                                    extent_id: entry.extent_id,
+                                    offset: entry.offset,
+                                },
+                                None,
+                            );
+                            if let Some(tx) = response_tx {
+                                let _ = tx.try_send(ack);
+                            } else {
+                                responses.push(ack);
+                            }
                         }
                     }
                     Some(ri) if ri.is_primary() => {
                         if ri.is_standalone() {
                             for entry in &entries {
-                                let ack = Frame::new(VariableHeader::AppendAck { request_id: entry.request_id, stream_id, epoch, extent_id: entry.extent_id, offset: entry.offset }, None);
-                                if let Some(tx) = response_tx { let _ = tx.try_send(ack); } else { responses.push(ack); }
+                                let ack = Frame::new(
+                                    VariableHeader::AppendAck {
+                                        request_id: entry.request_id,
+                                        stream_id,
+                                        epoch,
+                                        extent_id: entry.extent_id,
+                                        offset: entry.offset,
+                                    },
+                                    None,
+                                );
+                                if let Some(tx) = response_tx {
+                                    let _ = tx.try_send(ack);
+                                } else {
+                                    responses.push(ack);
+                                }
                             }
                         } else {
-                            if stream_ref.has_secondaries() {
+                            if stream.has_secondaries() {
                                 for entry in &entries {
-                                    let forward_frame = Frame::new(VariableHeader::Forward { stream_id, extent_id: entry.extent_id, epoch, offset: entry.offset, byte_pos: entry.byte_pos }, Some(entry.payload_for_forward.clone()));
-                                    if let Some(init) = self.maybe_build_init_forward(stream_ref, &forward_frame) {
-                                        stream_ref.send_forward(init);
+                                    let forward_frame = Frame::new(
+                                        VariableHeader::Forward {
+                                            stream_id,
+                                            extent_id: entry.extent_id,
+                                            epoch,
+                                            offset: entry.offset,
+                                            byte_pos: entry.byte_pos,
+                                        },
+                                        Some(entry.payload_for_forward.clone()),
+                                    );
+                                    if let Some(init) =
+                                        self.maybe_build_init_forward(stream, &forward_frame)
+                                    {
+                                        stream.send_forward(init);
                                     }
-                                    stream_ref.send_forward(forward_frame);
+                                    stream.send_forward(forward_frame);
                                 }
                             }
                             if let Some(resp_tx) = response_tx {
                                 let aq_guard = self.ack_queues.pin();
                                 let aq_mutex = aq_guard.get_or_insert_with(stream_id, || {
-                                    Mutex::new(AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout))
+                                    Mutex::new(AckQueue::with_timeout(
+                                        ri.required_secondary_acks(),
+                                        self.replication_timeout,
+                                    ))
                                 });
                                 let mut ack_queue = aq_mutex.lock().unwrap();
                                 let now = Instant::now();
                                 for entry in &entries {
                                     ack_queue.pending.push_back(PendingAck {
-                                        request_id: entry.request_id, stream_id,
-                                        response_tx: resp_tx.clone(), assigned_offset: entry.offset.0,
-                                        extent_id: entry.extent_id, epoch, created_at: now,
+                                        request_id: entry.request_id,
+                                        stream_id,
+                                        response_tx: resp_tx.clone(),
+                                        assigned_offset: entry.offset.0,
+                                        extent_id: entry.extent_id,
+                                        epoch,
+                                        created_at: now,
                                     });
                                 }
                             }
@@ -1397,8 +1520,21 @@ impl ExtentNodeStore {
                     }
                     Some(_) => {
                         for entry in &entries {
-                            let ack = Frame::new(VariableHeader::AppendAck { request_id: entry.request_id, stream_id, epoch, extent_id: entry.extent_id, offset: entry.offset }, None);
-                            if let Some(tx) = response_tx { let _ = tx.try_send(ack); } else { responses.push(ack); }
+                            let ack = Frame::new(
+                                VariableHeader::AppendAck {
+                                    request_id: entry.request_id,
+                                    stream_id,
+                                    epoch,
+                                    extent_id: entry.extent_id,
+                                    offset: entry.offset,
+                                },
+                                None,
+                            );
+                            if let Some(tx) = response_tx {
+                                let _ = tx.try_send(ack);
+                            } else {
+                                responses.push(ack);
+                            }
                         }
                     }
                 }
@@ -1415,14 +1551,18 @@ impl ExtentNodeStore {
             // Retry failed frames on the new extent (scoped pin guard).
             let remaining = {
                 let guard = self.streams.pin();
-                if let Some(stream_ref) = guard.get(&stream_id) {
+                if let Some(stream) = guard.get(&stream_id) {
                     for ff in &failed_frames {
                         let (_, _) = self.do_append_and_respond(
-                            stream_ref, ff.request_id, stream_id, epoch,
-                            ff.payload.clone(), response_tx.cloned(),
+                            stream,
+                            ff.request_id,
+                            stream_id,
+                            epoch,
+                            ff.payload.clone(),
+                            response_tx.cloned(),
                         );
                     }
-                    stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release)
+                    stream.in_flight().fetch_sub(batch_len, Ordering::Release)
                 } else {
                     0
                 }
@@ -1445,8 +1585,8 @@ impl ExtentNodeStore {
         // ── Normal path: decrement in_flight and drain followers if any ──
         let remaining = {
             let guard = self.streams.pin();
-            if let Some(stream_ref) = guard.get(&stream_id) {
-                stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release)
+            if let Some(stream) = guard.get(&stream_id) {
+                stream.in_flight().fetch_sub(batch_len, Ordering::Release)
             } else {
                 0
             }
@@ -1599,7 +1739,7 @@ impl ExtentNodeStore {
 
         // Look up the stream — must exist (created by ForwardInitExtent or RegisterExtent).
         let streams = self.streams.pin();
-        let stream_ref = match streams.get(&stream_id) {
+        let stream = match streams.get(&stream_id) {
             Some(s) => s,
             None => {
                 warn!(
@@ -1610,23 +1750,23 @@ impl ExtentNodeStore {
             }
         };
 
-        let replicate_result = stream_ref.replicate(
+        let replicate_result = stream.replicate(
             extent_id,
             offset,
             byte_pos,
             frame.payload.clone().unwrap_or_default(),
         );
 
-        self.finish_forward(stream_ref, stream_id, extent_id, replicate_result, &frame)
+        self.finish_forward(stream, stream_id, extent_id, replicate_result, &frame)
     }
 
     /// Shared tail of handle_forward: process replicate result, update metrics, return watermark.
     fn finish_forward(
         &self,
-        stream_ref: &Stream,
+        stream: &Stream,
         stream_id: StreamId,
         extent_id: ExtentId,
-        replicate_result: Result<crate::extent::AppendResult, StorageError>,
+        replicate_result: Result<AppendResult, StorageError>,
         frame: &Frame,
     ) -> Option<Frame> {
         match replicate_result {
@@ -1649,7 +1789,7 @@ impl ExtentNodeStore {
 
         // Check if deferred CRC32 verification can now complete.
         // Also read the contiguous watermark for the response.
-        let watermark = stream_ref.with_extent(extent_id, |extent| {
+        let watermark = stream.with_extent(extent_id, |extent| {
             match extent.try_verify_checksum() {
                 Some(true) => {
                     info!(
@@ -1698,8 +1838,8 @@ impl ExtentNodeStore {
                 _ => return,
             };
 
-        let streams = self.streams.pin();
-        let stream_ref = match streams.get(&stream_id) {
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => {
                 warn!(
@@ -1710,7 +1850,7 @@ impl ExtentNodeStore {
             }
         };
 
-        let found = stream_ref.with_extent(extent_id, |extent| {
+        let found = stream.with_extent(extent_id, |extent| {
             // Store primary's checksum for deferred comparison.
             extent.store_primary_checksum(primary_crc32);
 
@@ -1753,8 +1893,8 @@ impl ExtentNodeStore {
     fn handle_read(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
         let extent_id = frame.extent_id();
-        let streams = self.streams.pin();
-        let stream_ref = match streams.get(&stream_id) {
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => {
                 return Frame::error_from_request(
@@ -1768,7 +1908,7 @@ impl ExtentNodeStore {
 
         let count = frame.count();
 
-        match stream_ref.read(extent_id, frame.offset(), count) {
+        match stream.read(extent_id, frame.offset(), count) {
             Ok(messages) => {
                 let total_size: usize = messages.iter().map(|m| 4 + m.len()).sum();
                 let mut payload = BytesMut::with_capacity(total_size);
@@ -1797,8 +1937,8 @@ impl ExtentNodeStore {
 
     fn handle_query_offset(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
-        let streams = self.streams.pin();
-        let stream_ref = match streams.get(&stream_id) {
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => {
                 return Frame::error_from_request(
@@ -1814,7 +1954,7 @@ impl ExtentNodeStore {
             VariableHeader::QueryOffsetResp {
                 request_id: frame.request_id(),
                 stream_id,
-                offset: stream_ref.max_offset(),
+                offset: stream.max_offset(),
             },
             None,
         )
@@ -1837,8 +1977,8 @@ impl ExtentNodeStore {
             }
         };
 
-        let streams = self.streams.pin();
-        let stream_ref = match streams.get(&stream_id) {
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => {
                 // Stream not found — return empty response.
@@ -1853,7 +1993,7 @@ impl ExtentNodeStore {
             }
         };
 
-        let report = stream_ref.report_extents(epoch);
+        let report = stream.report_extents(epoch);
         // Encode payload: [num_extents:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
         let mut buf = BytesMut::with_capacity(4 + report.len() * (4 + 8 + 8 + 1));
         buf.put_u32(report.len() as u32);
@@ -1868,7 +2008,7 @@ impl ExtentNodeStore {
             VariableHeader::ReportExtentsResp {
                 request_id: frame.request_id(),
                 stream_id,
-                epoch: stream_ref.epoch(),
+                epoch: stream.epoch(),
             },
             Some(buf.freeze()),
         )
@@ -1901,8 +2041,8 @@ impl ExtentNodeStore {
                 }
             };
 
-        let streams = self.streams.pin();
-        let stream_ref = match streams.get(&stream_id) {
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => {
                 // Stream not found. The SM is sealing a secondary that never received
@@ -1932,7 +2072,7 @@ impl ExtentNodeStore {
         {
             let mut spin_count = 0u32;
             loop {
-                let inflight = stream_ref.in_flight().load(Ordering::Acquire);
+                let inflight = stream.in_flight().load(Ordering::Acquire);
                 if inflight == 0 {
                     break;
                 }
@@ -1949,15 +2089,15 @@ impl ExtentNodeStore {
 
         // Find the LAST MUTABLE extent for (stream_id, epoch).
         // Only seal extents at the requested epoch — newer epochs are untouched.
-        let active_id = match stream_ref.active_extent_at_epoch(epoch) {
+        let active_id = match stream.active_extent_at_epoch(epoch) {
             Some(id) => id,
             None => {
                 // No active extent — all extents already sealed.
                 // Return idempotent response with the actual sealed extent's offsets.
-                let (extent_id, start_offset, end_offset) = stream_ref
+                let (extent_id, start_offset, end_offset) = stream
                     .last_sealed_extent_at_epoch(epoch)
                     .unwrap_or((extent_id_from, req_start_offset, req_start_offset));
-                let _ = stream_ref;
+                let _ = stream;
                 let payload =
                     self.build_seal_predecessor_payload(stream_id, extent_id_from, extent_id);
                 return Frame::new(
@@ -1974,10 +2114,10 @@ impl ExtentNodeStore {
             }
         };
 
-        match stream_ref.seal(active_id, None) {
+        match stream.seal(active_id, None) {
             Some((start_offset, end_offset)) => {
                 let sealed_extent_id = active_id;
-                let _ = stream_ref;
+                let _ = stream;
                 info!(
                     "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={end_offset}",
                     sealed_extent_id, stream_id
@@ -2006,11 +2146,11 @@ impl ExtentNodeStore {
             }
             None => {
                 // Already sealed — return the sealed extent's end_offset idempotently.
-                let end_offset = stream_ref.sealed_end_offset(active_id);
-                let start_offset = stream_ref
+                let end_offset = stream.sealed_end_offset(active_id);
+                let start_offset = stream
                     .with_extent(active_id, |e| e.start_offset.0)
                     .unwrap_or(req_start_offset);
-                let _ = stream_ref;
+                let _ = stream;
                 info!(
                     "extent {} for stream {} already sealed, returning end_offset={end_offset} idempotently",
                     active_id, stream_id
@@ -2044,8 +2184,8 @@ impl ExtentNodeStore {
         extent_id_from: ExtentId,
         sealed_extent_id: ExtentId,
     ) -> Option<Bytes> {
-        let streams = self.streams.pin();
-        let stream_ref = match streams.get(&stream_id) {
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => return None,
         };
@@ -2054,7 +2194,7 @@ impl ExtentNodeStore {
         // Iterate over all known extents to find predecessors.
         let mut eid = extent_id_from;
         while eid.0 < sealed_extent_id.0 {
-            if let Some((start, end)) = stream_ref.with_extent(eid, |ext| {
+            if let Some((start, end)) = stream.with_extent(eid, |ext| {
                 let start = ext.start_offset.0;
                 let end = start + ext.message_count();
                 (start, end)

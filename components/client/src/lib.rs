@@ -520,7 +520,9 @@ impl StreamClient {
             )));
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid DescribeStream response payload".into()))?;
+            .ok_or_else(|| {
+                StorageError::Internal("invalid DescribeStream response payload".into())
+            })?;
         self.cache_primary_from_extents(stream_id, &extents).await;
         Ok(extents)
     }
@@ -548,7 +550,9 @@ impl StreamClient {
             )));
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid DescribeExtent response payload".into()))?;
+            .ok_or_else(|| {
+                StorageError::Internal("invalid DescribeExtent response payload".into())
+            })?;
         extents.into_iter().next().ok_or_else(|| {
             StorageError::Internal("DescribeExtent response returned empty result".into())
         })
@@ -614,7 +618,9 @@ impl StreamClient {
         }
         let stream_id = resp.stream_id();
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid DescribeStream response payload".into()))?;
+            .ok_or_else(|| {
+                StorageError::Internal("invalid DescribeStream response payload".into())
+            })?;
         self.cache_primary_from_extents(stream_id, &extents).await;
         Ok((stream_id, extents))
     }
