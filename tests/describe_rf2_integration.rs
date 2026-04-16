@@ -8,6 +8,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use serial_test::serial;
+
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::StreamManagerConfig;
@@ -113,6 +115,7 @@ async fn start_broadcast_extent_node() -> String {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn describe_stream_rf2_integration() {
     init_tracing();
     // ── Start servers ──
@@ -208,10 +211,7 @@ async fn describe_stream_rf2_integration() {
     assert_eq!(secondary_replica.node_addr, *expected_secondary);
 
     // ── Part 3: Seal and create new extent, then describe all ──
-    let (_new_epoch, new_primary_addr) = stream_manager
-        .seal(stream_id, Epoch(0))
-        .await
-        .unwrap();
+    let (_new_epoch, new_primary_addr) = stream_manager.seal(stream_id, Epoch(0)).await.unwrap();
 
     // Discover the new extent_id from describe_stream.
     let post_seal = stream_manager.describe_stream(stream_id, 1).await.unwrap();

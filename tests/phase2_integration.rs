@@ -9,6 +9,8 @@ use bytes::Bytes;
 use common::config::StreamManagerConfig;
 use common::types::{Epoch, ExtentId, ExtentState, NodeMetrics, Offset};
 
+use serial_test::serial;
+
 /// Initialize tracing for tests. Uses try_init() so it's safe when multiple tests
 /// run in the same process. Override log level via RUST_LOG env var.
 fn init_tracing() {
@@ -100,6 +102,7 @@ async fn start_extent_node_server() -> String {
 /// Single test function that exercises all StreamManager operations against a shared
 /// StreamManager server to avoid parallel table-drop / migration races.
 #[tokio::test(flavor = "multi_thread")]
+#[serial]
 async fn stream_manager_integration() {
     init_tracing();
     // ── Start servers ──

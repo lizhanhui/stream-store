@@ -16,6 +16,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use serial_test::serial;
+
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
@@ -158,6 +160,7 @@ async fn append_messages(
 }
 
 #[tokio::test]
+#[serial]
 async fn client_recovers_after_primary_killed() {
     init_tracing();
     let (sm, sm_addr, mut en_map, _store) = setup_cluster().await;
@@ -174,7 +177,10 @@ async fn client_recovers_after_primary_killed() {
     // Append some messages before the outage.
     let client = StreamClient::connect(&primary_addr).await.unwrap();
     let appended_before = append_messages(&client, stream_id, Epoch(0), 0, 10).await;
-    assert_eq!(appended_before, 10, "should append 10 messages before outage");
+    assert_eq!(
+        appended_before, 10,
+        "should append 10 messages before outage"
+    );
     info!("[test] Appended {appended_before} messages before outage");
 
     // Kill the primary EN (abrupt crash — no Disconnect sent).
@@ -218,7 +224,10 @@ async fn client_recovers_after_primary_killed() {
     info!(
         "[test] describe_stream: {} extents, states: {:?}",
         extents.len(),
-        extents.iter().map(|e| (e.extent_id, e.state)).collect::<Vec<_>>()
+        extents
+            .iter()
+            .map(|e| (e.extent_id, e.state))
+            .collect::<Vec<_>>()
     );
     let active = extents
         .iter()
@@ -231,7 +240,9 @@ async fn client_recovers_after_primary_killed() {
         .expect("active extent should have a live primary");
     info!(
         "[test] New primary={} for active extent {}, replicas={}",
-        new_primary.node_addr, active.extent_id, active.replicas.len()
+        new_primary.node_addr,
+        active.extent_id,
+        active.replicas.len()
     );
     assert_ne!(
         new_primary.node_addr, primary_addr,
@@ -284,7 +295,9 @@ async fn client_recovers_after_primary_killed() {
         .find(|r| r.is_alive)
         .expect("should have a live replica for sealed extent");
 
-    let reader = StreamClient::connect(&live_replica.node_addr).await.unwrap();
+    let reader = StreamClient::connect(&live_replica.node_addr)
+        .await
+        .unwrap();
     let messages = reader
         .read(
             stream_id,
@@ -315,6 +328,7 @@ async fn client_recovers_after_primary_killed() {
 }
 
 #[tokio::test]
+#[serial]
 async fn client_recovers_after_secondary_killed() {
     init_tracing();
     let (sm, sm_addr, mut en_map, _store) = setup_cluster().await;
@@ -331,7 +345,10 @@ async fn client_recovers_after_secondary_killed() {
     // Append some messages before the outage.
     let client = StreamClient::connect(&primary_addr).await.unwrap();
     let appended_before = append_messages(&client, stream_id, Epoch(0), 0, 10).await;
-    assert_eq!(appended_before, 10, "should append 10 messages before outage");
+    assert_eq!(
+        appended_before, 10,
+        "should append 10 messages before outage"
+    );
     info!("[test] Appended {appended_before} messages before outage");
 
     // Kill one secondary EN.
@@ -374,14 +391,19 @@ async fn client_recovers_after_secondary_killed() {
     let sm_client2 = StreamClient::connect(&sm_addr).await.unwrap();
     let extents = sm_client2.describe_stream(stream_id, 0).await.unwrap();
 
-    assert_eq!(extents.len(), 1, "should still have exactly 1 extent (no seal)");
+    assert_eq!(
+        extents.len(),
+        1,
+        "should still have exactly 1 extent (no seal)"
+    );
     let active = extents
         .iter()
         .find(|e| e.state == ExtentState::Active)
         .expect("extent should still be active");
     info!(
         "[test] After secondary outage: extent {} still active, replicas={}",
-        active.extent_id, active.replicas.len()
+        active.extent_id,
+        active.replicas.len()
     );
 
     // Appending should continue on the same primary without reconnection.

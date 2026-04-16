@@ -57,6 +57,7 @@ sqlx = { workspace = true }
 dashmap = "6"
 fastant = { workspace = true }
 hdrhistogram = "7.5"
+serial_test = "3"
 
 [[bench]]
 name = "concurrent_multi_stream"

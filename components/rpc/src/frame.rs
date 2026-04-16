@@ -533,9 +533,7 @@ impl Frame {
             | VariableHeader::Watermark { extent_id, .. }
             | VariableHeader::DescribeExtent { extent_id, .. }
             | VariableHeader::DescribeExtentRespError { extent_id, .. } => *extent_id,
-            VariableHeader::SealExtentNodeRequest {
-                extent_id_from, ..
-            } => *extent_id_from,
+            VariableHeader::SealExtentNodeRequest { extent_id_from, .. } => *extent_id_from,
             _ => ExtentId(0),
         }
     }
@@ -903,22 +901,12 @@ impl Frame {
                 request_id,
                 stream_id,
                 ..
-            } => Self::seal_stream_manager_resp_error(
-                *request_id,
-                *stream_id,
-                error_code,
-                message,
-            ),
+            } => Self::seal_stream_manager_resp_error(*request_id, *stream_id, error_code, message),
             VariableHeader::SealExtentNodeRequest {
                 request_id,
                 stream_id,
                 ..
-            } => Self::seal_extent_node_resp_error(
-                *request_id,
-                *stream_id,
-                error_code,
-                message,
-            ),
+            } => Self::seal_extent_node_resp_error(*request_id, *stream_id, error_code, message),
             VariableHeader::CreateStream { request_id, .. } => {
                 Self::create_stream_resp_error(*request_id, error_code, message)
             }
@@ -1800,9 +1788,7 @@ impl Frame {
                 let stream_id = StreamId(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame(
-                            "unknown SealStreamManager error code".into(),
-                        )
+                        StorageError::InvalidFrame("unknown SealStreamManager error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -1845,9 +1831,7 @@ impl Frame {
                 let stream_id = StreamId(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame(
-                            "unknown SealExtentNode error code".into(),
-                        )
+                        StorageError::InvalidFrame("unknown SealExtentNode error code".into())
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
