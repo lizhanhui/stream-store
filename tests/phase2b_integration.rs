@@ -8,8 +8,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::types::{Epoch, ExtentId, Offset, Opcode, StreamId};
-use rpc::frame::{Frame, VariableHeader};
+use rpc::frame::Frame;
 use rpc::payload::build_register_extent_payload;
+use rpc::frame::variable_header::VariableHeader;
 
 use extent_node::downstream::DownstreamPool;
 use extent_node::store::ExtentNodeStore;
