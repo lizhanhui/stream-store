@@ -667,8 +667,11 @@ impl ExtentNodeStore {
     ///
     /// The active writer handles replication (Forward + PendingAck for RF≥2)
     /// or sends immediate AppendAck (RF=1/standalone) for each job.
-    /// On ExtentFull, the leader drops the read ref, acquires write ref to seal+create,
-    /// then re-acquires read ref and retries — all transparently.
+    /// On ExtentFull, the leader seals the active extent, creates a new one,
+    /// and retries — all transparently within the same leader tenure.
+    ///
+    /// Pin guards are scoped in blocks so they're dropped before `.await` points
+    /// (papaya pin guards are non-Send).
     async fn handle_append(
         &self,
         frame: Frame,
@@ -677,14 +680,8 @@ impl ExtentNodeStore {
         let stream_id = frame.stream_id();
         let client_epoch = frame.epoch();
 
-        // All pin guards are scoped in blocks to avoid holding non-Send types across .await.
-        // Phase 1: synchronous validation + leader election + append.
-        enum SyncOutcome {
-            Tick { remaining: u64, should_shrink: bool },
-            Normal { own_result: Option<Frame>, extent_full: bool, remaining: u64, epoch: Epoch, payload: Bytes, request_id: u32 },
-        }
-
-        let outcome = {
+        // ── Validation + leader election + own append (scoped pin guard) ──
+        let (epoch, own_result, extent_full, remaining, is_tick, should_shrink, payload, request_id) = {
             let guard = self.streams.pin();
             let stream_ref = match guard.get(&stream_id) {
                 Some(s) => s,
@@ -726,88 +723,98 @@ impl ExtentNodeStore {
                 return None;
             }
 
+            // FAST PATH: I'm the active writer (prev == 0).
+
             if is_tick {
                 let should_shrink = stream_ref
                     .should_idle_shrink(Duration::from_secs(DEFAULT_IDLE_SHRINK_THRESHOLD_SECS));
                 let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
-                SyncOutcome::Tick { remaining, should_shrink }
+                (epoch, None, false, remaining, true, should_shrink, Bytes::new(), 0)
             } else {
                 let payload = frame.payload.clone().unwrap_or_default();
                 let request_id = frame.request_id();
                 let (own_result, extent_full) = self.do_append_and_respond(
                     stream_ref, request_id, stream_id, epoch, payload.clone(), response_tx.cloned(),
                 );
-                let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
-                SyncOutcome::Normal { own_result, extent_full, remaining, epoch, payload, request_id }
+                if extent_full {
+                    // Don't decrement in_flight — we're still the leader.
+                    // Will decrement after seal+create+retry below.
+                    (epoch, own_result, true, 0, false, false, payload, request_id)
+                } else {
+                    let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+                    (epoch, own_result, false, remaining, false, false, payload, request_id)
+                }
             }
         };
-        // guard is out of scope — safe to .await.
+        // Pin guard dropped — safe to .await.
 
-        match outcome {
-            SyncOutcome::Tick { remaining, should_shrink } => {
-                if remaining > 1 {
-                    let batch_seals = self.drain_follower_jobs(stream_id).await;
-                    for notification in &batch_seals {
-                        self.send_extent_update(stream_id, notification);
-                        self.send_forward_checksum(stream_id, notification.sealed_extent_id);
-                    }
-                }
-                if should_shrink {
-                    if let Some(ref notification) =
-                        self.seal_and_create(stream_id, SealReason::IdleShrink)
-                    {
-                        self.send_extent_update(stream_id, notification);
-                        self.send_forward_checksum(stream_id, notification.sealed_extent_id);
-                        info!(
-                            "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
-                            stream_id, notification.sealed_extent_id,
-                            notification.new_extent_id, notification.new_extent_capacity,
-                        );
-                    }
-                }
-                None
-            }
-            SyncOutcome::Normal { own_result: _, extent_full: true, remaining: _, epoch, payload, request_id } => {
-                // Extent-full: seal+create, retry, then drain.
-                let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
-
-                let (retry_result, remaining) = {
-                    let guard = self.streams.pin();
-                    match guard.get(&stream_id) {
-                        Some(stream_ref) => {
-                            let (retry_result, _) = self.do_append_and_respond(
-                                stream_ref, request_id, stream_id, epoch, payload, response_tx.cloned(),
-                            );
-                            let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
-                            (retry_result, remaining)
-                        }
-                        None => return None,
-                    }
-                };
-
-                if remaining > 1 {
-                    let batch_seals = self.drain_follower_jobs(stream_id).await;
-                    for notification in &batch_seals {
-                        self.send_extent_update(stream_id, notification);
-                        self.send_forward_checksum(stream_id, notification.sealed_extent_id);
-                    }
-                }
-                if let Some(ref notification) = seal_notification {
+        // ── System tick path ──
+        if is_tick {
+            if remaining > 1 {
+                let batch_seals = self.drain_follower_jobs(stream_id).await;
+                for notification in &batch_seals {
                     self.send_extent_update(stream_id, notification);
                     self.send_forward_checksum(stream_id, notification.sealed_extent_id);
                 }
-                retry_result
             }
-            SyncOutcome::Normal { own_result, extent_full: false, remaining, .. } => {
-                if remaining > 1 {
-                    let batch_seals = self.drain_follower_jobs(stream_id).await;
-                    for notification in &batch_seals {
-                        self.send_extent_update(stream_id, notification);
-                    }
+            if should_shrink {
+                if let Some(ref notification) =
+                    self.seal_and_create(stream_id, SealReason::IdleShrink)
+                {
+                    self.send_extent_update(stream_id, notification);
+                    self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                    info!(
+                        "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
+                        stream_id, notification.sealed_extent_id,
+                        notification.new_extent_id, notification.new_extent_capacity,
+                    );
                 }
-                own_result
+            }
+            return None;
+        }
+
+        // ── Extent-full path: seal+create, retry, then drain ──
+        if extent_full {
+            let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
+
+            // Re-acquire pin guard for retry on the new extent.
+            let (retry_result, remaining) = {
+                let guard = self.streams.pin();
+                match guard.get(&stream_id) {
+                    Some(stream_ref) => {
+                        let (retry_result, _) = self.do_append_and_respond(
+                            stream_ref, request_id, stream_id, epoch, payload, response_tx.cloned(),
+                        );
+                        let remaining = stream_ref.in_flight().fetch_sub(1, Ordering::Release);
+                        (retry_result, remaining)
+                    }
+                    None => return None,
+                }
+            };
+
+            if remaining > 1 {
+                let batch_seals = self.drain_follower_jobs(stream_id).await;
+                for notification in &batch_seals {
+                    self.send_extent_update(stream_id, notification);
+                    self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                }
+            }
+            if let Some(ref notification) = seal_notification {
+                self.send_extent_update(stream_id, notification);
+                self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+            }
+            return retry_result;
+        }
+
+        // ── Normal path: drain followers if any arrived ──
+        if remaining > 1 {
+            let batch_seals = self.drain_follower_jobs(stream_id).await;
+            for notification in &batch_seals {
+                self.send_extent_update(stream_id, notification);
             }
         }
+
+        own_result
     }
 
     /// Perform a single append via the stream's active extent and handle replication / ACK.
@@ -1001,10 +1008,9 @@ impl ExtentNodeStore {
     /// Forward frames are pushed inline by `do_append_and_respond` — this method
     /// only returns seal notifications for the caller to send SM updates.
     ///
-    /// Unlike the old `drain_append_batch`, this method manages its own map
-    /// guard lifecycle: on ExtentFull it drops the read guard, acquires a write
-    /// guard for seal+create, then re-acquires a read guard and continues.
-    /// This avoids holding pin guards across await points.
+    /// On ExtentFull, this method calls `seal_and_create` (which manages its own
+    /// pin guard) and retries the remaining jobs on the new extent.
+    /// Pin guards are scoped in blocks so they're dropped before `yield_now().await`.
     async fn drain_follower_jobs(&self, stream_id: StreamId) -> Vec<SealNotification> {
         let mut all_seal_notifications = Vec::new();
 
@@ -1013,17 +1019,12 @@ impl ExtentNodeStore {
             let mut batch: Vec<AppendJob> = Vec::new();
             let mut epoch = Epoch(0);
             loop {
-                // Scope the pin guard so it's dropped before any .await.
-                enum DrainResult {
-                    GotBatch,
-                    NeedYield,
-                    HaveBatch,
-                }
-                let result = {
+                // Scope pin guard — must be dropped before yield_now().await.
+                let need_yield = {
                     let guard = self.streams.pin();
                     let stream_ref = match guard.get(&stream_id) {
                         Some(s) => s,
-                        None => { return all_seal_notifications; }
+                        None => return all_seal_notifications,
                     };
                     if batch.is_empty() {
                         epoch = stream_ref.epoch();
@@ -1031,45 +1032,37 @@ impl ExtentNodeStore {
                     match stream_ref.job_rx().try_recv() {
                         Ok(job) => {
                             batch.push(job);
-                            loop {
-                                match stream_ref.job_rx().try_recv() {
-                                    Ok(job) => batch.push(job),
-                                    Err(_) => break,
-                                }
+                            while let Ok(job) = stream_ref.job_rx().try_recv() {
+                                batch.push(job);
                             }
-                            DrainResult::GotBatch
+                            false
                         }
-                        Err(_) if !batch.is_empty() => {
-                            DrainResult::HaveBatch
-                        }
+                        Err(_) if !batch.is_empty() => false,
                         Err(_) => {
+                            // Follower incremented in_flight but hasn't pushed yet.
                             let delegated = stream_ref.in_flight().load(Ordering::Acquire);
-                            if 0 == delegated {
-                                return all_seal_notifications;
-                            }
-                            DrainResult::NeedYield
+                            delegated > 0
                         }
                     }
                 };
-                // guard is now out of scope.
-                match result {
-                    DrainResult::GotBatch | DrainResult::HaveBatch => break,
-                    DrainResult::NeedYield => {
-                        tokio::task::yield_now().await;
-                    }
+                if need_yield {
+                    tokio::task::yield_now().await;
+                } else {
+                    break;
                 }
             }
 
-            // ── Phase 2: Process the batch (all synchronous, scoped guard) ──
+            // ── Phase 2: Process the batch ──
             let batch_len = batch.len();
-            let phase2_result = {
+            let mut extent_full_idx: Option<usize> = None;
+
+            // Process each job (scoped pin guard).
+            {
                 let guard = self.streams.pin();
                 let stream_ref = match guard.get(&stream_id) {
                     Some(s) => s,
                     None => break,
                 };
-
-                let mut extent_full_idx: Option<usize> = None;
                 for (i, job) in batch.iter().enumerate() {
                     let (_, extent_full) = self.do_append_and_respond(
                         stream_ref,
@@ -1084,19 +1077,19 @@ impl ExtentNodeStore {
                         break;
                     }
                 }
+            }
+            // Pin guard dropped.
 
-                if let Some(index) = extent_full_idx {
-                    let _ = stream_ref;
-                    drop(guard);
+            if let Some(index) = extent_full_idx {
+                let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
+                if let Some(ref notification) = seal_notification {
+                    all_seal_notifications.push(notification.clone());
+                }
 
-                    let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
-                    if let Some(ref notification) = seal_notification {
-                        all_seal_notifications.push(notification.clone());
-                    }
-
-                    // Re-acquire to retry failed jobs on the new extent.
-                    let guard2 = self.streams.pin();
-                    if let Some(stream_ref) = guard2.get(&stream_id) {
+                // Retry the failed job and remaining jobs on the new extent.
+                let done = {
+                    let guard = self.streams.pin();
+                    if let Some(stream_ref) = guard.get(&stream_id) {
                         epoch = stream_ref.epoch();
                         for job in &batch[index..] {
                             let (_, _) = self.do_append_and_respond(
@@ -1111,21 +1104,32 @@ impl ExtentNodeStore {
                         let remaining = stream_ref
                             .in_flight()
                             .fetch_sub(batch_len as u64, Ordering::Release);
-                        if remaining <= batch_len as u64 { true } else { false }
+                        remaining <= batch_len as u64
                     } else {
-                        true // break
+                        true
                     }
-                } else {
-                    let remaining = stream_ref
-                        .in_flight()
-                        .fetch_sub(batch_len as u64, Ordering::Release);
-                    if remaining <= batch_len as u64 { true } else { false }
+                };
+                if done {
+                    break;
                 }
-            };
-            // guard is out of scope — safe to loop (with potential .await in Phase 1).
-            if phase2_result {
-                break;
+            } else {
+                // All jobs processed without ExtentFull.
+                let done = {
+                    let guard = self.streams.pin();
+                    if let Some(stream_ref) = guard.get(&stream_id) {
+                        let remaining = stream_ref
+                            .in_flight()
+                            .fetch_sub(batch_len as u64, Ordering::Release);
+                        remaining <= batch_len as u64
+                    } else {
+                        true
+                    }
+                };
+                if done {
+                    break;
+                }
             }
+            // More followers arrived during processing — loop again.
         }
 
         all_seal_notifications
@@ -1228,6 +1232,9 @@ impl ExtentNodeStore {
     /// Amortizes map lookups (3N → 3), leader elections (N → 1),
     /// ReplicaInfo access (N clones → 0, borrow within guard), and
     /// atomic operations (2N → 2).
+    ///
+    /// Pin guards are scoped in blocks so they're dropped before `.await` points
+    /// (papaya pin guards are non-Send).
     async fn handle_append_batch_inner(
         &self,
         frames: &[Frame],
@@ -1235,8 +1242,6 @@ impl ExtentNodeStore {
     ) -> Vec<Frame> {
         let stream_id = frames[0].stream_id();
 
-        // All synchronous work is done in a block so pin guards go out of scope
-        // before any .await, satisfying the Send requirement.
         struct BatchEntry {
             request_id: u32,
             payload_for_forward: Bytes,
@@ -1250,31 +1255,13 @@ impl ExtentNodeStore {
             payload: Bytes,
         }
 
-        enum BatchOutcome {
-            EmptyExtentFull {
-                responses: Vec<Frame>,
-                remaining: u64,
-                seal_notification: Option<SealNotification>,
-                batch_len: u64,
-            },
-            EmptyNoExtentFull {
-                responses: Vec<Frame>,
-                remaining: u64,
-                batch_len: u64,
-            },
-            ExtentFull {
-                responses: Vec<Frame>,
-                seal_notification: Option<SealNotification>,
-            },
-            Normal {
-                responses: Vec<Frame>,
-                remaining: u64,
-                batch_len: u64,
-            },
-        }
+        let mut responses = Vec::new();
+        let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
+        let mut failed_frames: Vec<FailedFrame> = Vec::new();
+        let mut extent_full = false;
 
-        let outcome = {
-            let mut responses = Vec::new();
+        // ── Validation + leader election + batch appends (scoped pin guard) ──
+        let (epoch, batch_len) = {
             let guard = self.streams.pin();
             let stream_ref = match guard.get(&stream_id) {
                 Some(s) => s,
@@ -1309,6 +1296,7 @@ impl ExtentNodeStore {
             let prev = stream_ref.in_flight().fetch_add(batch_len, Ordering::Acquire);
 
             if prev > 0 {
+                // SLOW PATH: active writer exists. Push all as AppendJobs.
                 for frame in frames {
                     let job = AppendJob {
                         request_id: frame.request_id(),
@@ -1318,14 +1306,10 @@ impl ExtentNodeStore {
                     };
                     let _ = stream_ref.job_tx().send(job);
                 }
-                return responses;
+                return responses; // All deferred — empty responses.
             }
 
-            // FAST PATH: process appends.
-            let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
-            let mut extent_full = false;
-            let mut failed_frames: Vec<FailedFrame> = Vec::new();
-
+            // FAST PATH: I'm the active writer (prev == 0).
             for frame in frames {
                 let request_id = frame.request_id();
                 let payload = frame.payload.clone().unwrap_or_default();
@@ -1359,31 +1343,8 @@ impl ExtentNodeStore {
                 }
             }
 
-            if entries.is_empty() {
-                if extent_full {
-                    let _remaining_val = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
-
-                    let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
-                    // Retry failed frames on new extent (scoped).
-                    let remaining = {
-                        let g2 = self.streams.pin();
-                        if let Some(sr2) = g2.get(&stream_id) {
-                            for ff in &failed_frames {
-                                let (_, _) = self.do_append_and_respond(sr2, ff.request_id, stream_id, epoch, ff.payload.clone(), response_tx.cloned());
-                            }
-                            sr2.in_flight().fetch_sub(batch_len, Ordering::Release)
-                        } else {
-                            0
-                        }
-                    };
-
-                    BatchOutcome::EmptyExtentFull { responses, remaining, seal_notification, batch_len }
-                } else {
-                    let remaining = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
-                    BatchOutcome::EmptyNoExtentFull { responses, remaining, batch_len }
-                }
-            } else {
-                // Process successful entries: metrics, replica info, forwards, ACKs.
+            // Process successful entries: metrics, replica info, forwards, ACKs.
+            if !entries.is_empty() {
                 let _extent_start_offset = stream_ref
                     .with_extent(entries[0].extent_id, |e| e.start_offset.0)
                     .unwrap_or(0);
@@ -1441,79 +1402,65 @@ impl ExtentNodeStore {
                         }
                     }
                 }
-                drop(replica);
+            }
 
-                if extent_full {
-                    let _ = stream_ref;
-                    drop(guard);
+            (epoch, batch_len)
+        };
+        // Pin guard dropped — safe to .await.
 
-                    let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
-                    // Retry failed frames on new extent (scoped).
-                    let _remaining = {
-                        let g2 = self.streams.pin();
-                        if let Some(sr2) = g2.get(&stream_id) {
-                            for ff in &failed_frames {
-                                let (_, _) = self.do_append_and_respond(sr2, ff.request_id, stream_id, epoch, ff.payload.clone(), response_tx.cloned());
-                            }
-                            sr2.in_flight().fetch_sub(batch_len, Ordering::Release)
-                        } else {
-                            0
-                        }
-                    };
+        // ── Extent-full: seal+create, retry failed frames, then drain ──
+        if extent_full {
+            let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
 
-                    BatchOutcome::ExtentFull { responses, seal_notification }
+            // Retry failed frames on the new extent (scoped pin guard).
+            let remaining = {
+                let guard = self.streams.pin();
+                if let Some(stream_ref) = guard.get(&stream_id) {
+                    for ff in &failed_frames {
+                        let (_, _) = self.do_append_and_respond(
+                            stream_ref, ff.request_id, stream_id, epoch,
+                            ff.payload.clone(), response_tx.cloned(),
+                        );
+                    }
+                    stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release)
                 } else {
-                    let remaining = stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release);
-                    BatchOutcome::Normal { responses, remaining, batch_len }
+                    0
                 }
+            };
+
+            if remaining > batch_len {
+                let batch_seals = self.drain_follower_jobs(stream_id).await;
+                for notif in &batch_seals {
+                    self.send_extent_update(stream_id, notif);
+                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                }
+            }
+            if let Some(ref notif) = seal_notification {
+                self.send_extent_update(stream_id, notif);
+                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+            }
+            return responses;
+        }
+
+        // ── Normal path: decrement in_flight and drain followers if any ──
+        let remaining = {
+            let guard = self.streams.pin();
+            if let Some(stream_ref) = guard.get(&stream_id) {
+                stream_ref.in_flight().fetch_sub(batch_len, Ordering::Release)
+            } else {
+                0
             }
         };
-        // All pin guards are now out of scope — safe to .await.
 
-        match outcome {
-            BatchOutcome::EmptyExtentFull { responses, remaining, seal_notification, batch_len } => {
-                if remaining > batch_len {
-                    let batch_seals = self.drain_follower_jobs(stream_id).await;
-                    for notif in batch_seals {
-                        self.send_extent_update(stream_id, &notif);
-                        self.send_forward_checksum(stream_id, notif.sealed_extent_id);
-                    }
-                }
-                if let Some(ref notif) = seal_notification {
-                    self.send_extent_update(stream_id, notif);
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
-                }
-                responses
-            }
-            BatchOutcome::EmptyNoExtentFull { responses, remaining, batch_len } => {
-                if remaining > batch_len {
-                    let batch_seals = self.drain_follower_jobs(stream_id).await;
-                    for notif in batch_seals {
-                        self.send_extent_update(stream_id, &notif);
-                        self.send_forward_checksum(stream_id, notif.sealed_extent_id);
-                    }
-                }
-                responses
-            }
-            BatchOutcome::ExtentFull { responses, seal_notification } => {
-                // remaining was already handled in the scoped block
-                if let Some(ref notif) = seal_notification {
-                    self.send_extent_update(stream_id, notif);
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
-                }
-                responses
-            }
-            BatchOutcome::Normal { responses, remaining, batch_len } => {
-                if remaining > batch_len {
-                    let batch_seals = self.drain_follower_jobs(stream_id).await;
-                    for notif in &batch_seals {
-                        self.send_extent_update(stream_id, notif);
-                        self.send_forward_checksum(stream_id, notif.sealed_extent_id);
-                    }
-                }
-                responses
+        if remaining > batch_len {
+            let batch_seals = self.drain_follower_jobs(stream_id).await;
+            for notif in &batch_seals {
+                self.send_extent_update(stream_id, notif);
+                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
             }
         }
+
+        responses
     }
 
     /// Check if a Forward or ForwardChecksum frame targets an extent that
