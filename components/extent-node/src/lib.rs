@@ -130,7 +130,7 @@ impl ExtentNode {
                 tokio::select! {
                     _ = ticker.tick() => {
                         // Snapshot (StreamId, Epoch) pairs — lightweight read-only scan.
-                        let streams: Vec<_> = tick_store.stream_epochs().collect();
+                        let streams = tick_store.stream_epochs();
                         for (stream_id, epoch) in streams {
                             let tick_frame = Frame::system_tick(stream_id, epoch);
                             tick_store.handle_frame(tick_frame, None).await;

@@ -28,7 +28,7 @@ pub trait RequestHandler: Send + Sync + 'static {
     ///
     /// Default implementation falls back to per-frame `handle_frame()`.
     /// `ExtentNodeStore` overrides this with an optimized path that amortizes
-    /// DashMap lookups, leader elections, and ReplicaInfo access across the batch.
+    /// map lookups, leader elections, and ReplicaInfo access across the batch.
     fn handle_append_batch(
         &self,
         frames: &[Frame],
@@ -229,7 +229,7 @@ async fn serve_connection<H: RequestHandler>(stream: TcpStream, handler: Arc<H>)
 /// The read task uses greedy batching: when it receives an Append frame, it
 /// peeks ahead for more Appends targeting the same stream/extent (via
 /// `now_or_never()`) and dispatches them as a single batch through
-/// `handle_append_batch()`. This amortizes DashMap lookups and leader elections.
+/// `handle_append_batch()`. This amortizes map lookups and leader elections.
 ///
 /// The write task uses feed+flush batching: it feeds all immediately-available
 /// response frames into the codec buffer, then flushes once per batch to reduce
