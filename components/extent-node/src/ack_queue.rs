@@ -1,0 +1,192 @@
+//! Per-stream ACK queue for quorum-based broadcast replication.
+//!
+//! Tracks pending client ACKs and per-secondary highest acked offset.
+//! When enough secondaries have confirmed (quorum), drains pending ACKs
+//! by sending AppendAck frames back to the client connections.
+
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
+
+use common::config::{DEFAULT_REPLICATION_TIMEOUT_MS, MAX_REPLICATION_FACTOR};
+use common::types::{Epoch, ErrorCode, ExtentId, Offset, StreamId};
+use rpc::frame::{Frame, VariableHeader};
+use tokio::sync::mpsc::Sender;
+use tracing::warn;
+
+/// Default replication timeout used when no config is provided (e.g., in tests).
+pub(crate) const DEFAULT_REPLICATION_TIMEOUT: Duration =
+    Duration::from_millis(DEFAULT_REPLICATION_TIMEOUT_MS);
+
+/// Maximum number of secondaries (MAX_REPLICATION_FACTOR - 1, excluding the Primary).
+const MAX_SECONDARIES: usize = MAX_REPLICATION_FACTOR - 1;
+
+/// A pending client ACK waiting for quorum replication.
+#[derive(Debug)]
+pub struct PendingAck {
+    /// The original request_id from the client's Append frame.
+    pub request_id: u32,
+    /// The stream the append was written to.
+    pub stream_id: StreamId,
+    /// Channel back to the client connection's write task.
+    pub response_tx: Sender<Frame>,
+    /// The offset assigned to this append.
+    pub assigned_offset: u64,
+    /// The extent the record landed on (for diagnostics in AppendAck).
+    pub extent_id: ExtentId,
+    pub epoch: Epoch,
+    /// When this PendingAck was created, for timeout expiry.
+    pub created_at: Instant,
+}
+
+/// Per-stream ACK queue on the Primary with cumulative quorum tracking.
+///
+/// Tracks pending client ACKs and per-secondary highest acked offset.
+/// When enough secondaries have confirmed (quorum), drains pending ACKs.
+///
+/// `acked` is a fixed-size array indexed by secondary ordinal
+/// (role - 1). This avoids the per-watermark `String` allocation that a
+/// `HashMap<String, u64>` would require. Entries are initialized to
+/// `u64::MAX` (sentinel = "never reported").
+#[derive(Debug)]
+pub struct AckQueue {
+    /// Pending client ACKs, ordered by offset (front = lowest).
+    pub pending: VecDeque<PendingAck>,
+
+    /// Highest acked offset per secondary, indexed by ordinal (role - 1).
+    /// `u64::MAX` = never reported.
+    acked: [u64; MAX_SECONDARIES],
+
+    /// Number of secondary ACKs needed for quorum.
+    pub required_acks: u32,
+
+    /// Timeout for expiring stale PendingAcks.
+    replication_timeout: Duration,
+}
+
+impl AckQueue {
+    pub fn new(required_secondary_acks: u32) -> Self {
+        Self::with_timeout(required_secondary_acks, DEFAULT_REPLICATION_TIMEOUT)
+    }
+
+    pub fn with_timeout(required_secondary_acks: u32, replication_timeout: Duration) -> Self {
+        Self {
+            pending: VecDeque::new(),
+            acked: [u64::MAX; MAX_SECONDARIES],
+            required_acks: required_secondary_acks,
+            replication_timeout,
+        }
+    }
+
+    /// Compute the quorum offset: the highest offset where at least
+    /// `required_acks` secondaries have confirmed.
+    ///
+    /// Returns None if quorum cannot be met (not enough secondaries have reported).
+    pub fn quorum_offset(&self) -> Option<u64> {
+        if self.required_acks == 0 {
+            return None; // RF=1, no quorum needed
+        }
+        let required = self.required_acks as usize;
+
+        // Collect offsets from secondaries that have reported (not u64::MAX).
+        let mut offsets = [0u64; MAX_SECONDARIES];
+        let mut count = 0;
+        for &v in &self.acked {
+            if v != u64::MAX {
+                offsets[count] = v;
+                count += 1;
+            }
+        }
+        if count < required {
+            return None;
+        }
+
+        // Fast path for RF=2 (required=1): return the max.
+        if required == 1 {
+            return Some(offsets[..count].iter().copied().max().unwrap_or(0));
+        }
+
+        // General case: sort descending, pick the required-th highest.
+        let slice = &mut offsets[..count];
+        slice.sort_unstable_by(|a, b| b.cmp(a));
+        slice.get(required - 1).copied()
+    }
+
+    /// Record a cumulative ACK from a secondary at the given index and offset.
+    ///
+    /// `secondary_index` is the secondary's ordinal (role - 1): secondary-1 → 0,
+    /// secondary-2 → 1, etc. Callers resolve this once per (stream, connection)
+    /// pair and cache it locally.
+    pub fn ack_from_secondary(&mut self, secondary_index: u8, offset: u64) {
+        let idx = secondary_index as usize;
+        debug_assert!(
+            idx < MAX_SECONDARIES,
+            "secondary_index {} exceeds MAX_SECONDARIES {}",
+            idx,
+            MAX_SECONDARIES,
+        );
+        if idx >= MAX_SECONDARIES {
+            return;
+        }
+        let current = self.acked[idx];
+        if current == u64::MAX || offset > current {
+            self.acked[idx] = offset;
+        }
+    }
+
+    /// Drain all pending ACKs that have reached quorum, sending AppendAck
+    /// frames back to the client connections.
+    ///
+    /// After the normal quorum drain, sweeps the front of the queue for expired
+    /// entries (older than the configured replication timeout) and sends error responses.
+    pub fn drain_quorum(&mut self) {
+        let qo = self.quorum_offset();
+        if let Some(qo) = qo {
+            while let Some(front) = self.pending.front() {
+                if front.assigned_offset <= qo {
+                    let ack = self.pending.pop_front().unwrap();
+                    let frame = Frame::new(
+                        VariableHeader::AppendAck {
+                            request_id: ack.request_id,
+                            stream_id: ack.stream_id,
+                            epoch: ack.epoch,
+                            extent_id: ack.extent_id,
+                            offset: Offset(ack.assigned_offset),
+                        },
+                        None,
+                    );
+                    // Best-effort send — if the client disconnected, the channel is closed.
+                    let _ = ack.response_tx.try_send(frame);
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Timeout sweep: expire PendingAcks older than the configured replication timeout.
+        // Queue is ordered by creation time, so stop at the first non-expired entry.
+        let now = Instant::now();
+        while let Some(front) = self.pending.front() {
+            if now.duration_since(front.created_at) > self.replication_timeout {
+                let ack = self.pending.pop_front().unwrap();
+                warn!(
+                    request_id = ack.request_id,
+                    stream_id = %ack.stream_id,
+                    extent_id = %ack.extent_id,
+                    offset = ack.assigned_offset,
+                    "PendingAck expired after replication timeout",
+                );
+                let frame = Frame::append_ack_error(
+                    ack.request_id,
+                    ack.stream_id,
+                    ack.epoch,
+                    ack.extent_id,
+                    ErrorCode::InternalError,
+                    "replication timeout",
+                );
+                let _ = ack.response_tx.try_send(frame);
+            } else {
+                break;
+            }
+        }
+    }
+}
