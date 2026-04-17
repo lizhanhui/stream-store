@@ -1,14 +1,20 @@
 //! Per-stream ACK queue for quorum-based broadcast replication.
 //!
-//! Tracks pending client ACKs and per-secondary highest acked offset.
-//! When enough secondaries have confirmed (quorum), drains pending ACKs
-//! by sending AppendAck frames back to the client connections.
+//! Split into a lock-free producer half ([`AckQueue::enqueue`]) and a
+//! Mutex-protected consumer half ([`AckQueue::drain_quorum`]).
+//!
+//! The append leader pushes `PendingAck` entries via a crossbeam unbounded
+//! channel — **no Mutex, no contention** with the watermark reader.
+//! The watermark reader locks `AckQueue.inner` to drain the channel,
+//! update per-secondary offsets, and send AppendAck frames back to clients.
 
 use std::collections::VecDeque;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use common::config::{DEFAULT_REPLICATION_TIMEOUT_MS, MAX_REPLICATION_FACTOR};
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, StreamId};
+use crossbeam_channel::Receiver;
 use rpc::frame::{Frame, VariableHeader};
 use tokio::sync::mpsc::Sender;
 use tracing::warn;
@@ -40,17 +46,30 @@ pub struct PendingAck {
 
 /// Per-stream ACK queue on the Primary with cumulative quorum tracking.
 ///
-/// Tracks pending client ACKs and per-secondary highest acked offset.
-/// When enough secondaries have confirmed (quorum), drains pending ACKs.
+/// Split into two halves to eliminate lock contention between the append
+/// hot path (producer) and watermark readers (consumer):
 ///
-/// `acked` is a fixed-size array indexed by secondary ordinal
-/// (role - 1). This avoids the per-watermark `String` allocation that a
-/// `HashMap<String, u64>` would require. Entries are initialized to
-/// `u64::MAX` (sentinel = "never reported").
-#[derive(Debug)]
+/// - **Producer** ([`enqueue`]): pushes `PendingAck` via a lock-free
+///   crossbeam channel. The append leader never acquires a Mutex.
+/// - **Consumer** ([`lock_inner`]): watermark readers lock `inner` to
+///   drain the channel, update `acked[]`, and send AppendAck frames.
+///
+/// `acked` is a fixed-size array indexed by secondary ordinal (role - 1).
+/// Entries are `u64::MAX` (sentinel = "never reported").
 pub struct AckQueue {
+    /// Lock-free producer channel. Append leaders push PendingAcks here.
+    tx: crossbeam_channel::Sender<PendingAck>,
+    /// Consumer state, protected by Mutex. Only watermark readers touch this.
+    inner: Mutex<AckQueueInner>,
+}
+
+/// Consumer-side state, protected by the Mutex inside [`AckQueue`].
+pub struct AckQueueInner {
+    /// Receiver end of the lock-free channel.
+    rx: Receiver<PendingAck>,
     /// Pending client ACKs, ordered by offset (front = lowest).
-    pub pending: VecDeque<PendingAck>,
+    /// Populated by [`receive_pending`] which drains `rx`.
+    pub(crate) pending: VecDeque<PendingAck>,
 
     /// Highest acked offset per secondary, indexed by ordinal (role - 1).
     /// `u64::MAX` = never reported.
@@ -69,11 +88,42 @@ impl AckQueue {
     }
 
     pub fn with_timeout(required_secondary_acks: u32, replication_timeout: Duration) -> Self {
+        let (tx, rx) = crossbeam_channel::unbounded();
         Self {
-            pending: VecDeque::new(),
-            acked: [u64::MAX; MAX_SECONDARIES],
-            required_acks: required_secondary_acks,
-            replication_timeout,
+            tx,
+            inner: Mutex::new(AckQueueInner {
+                rx,
+                pending: VecDeque::new(),
+                acked: [u64::MAX; MAX_SECONDARIES],
+                required_acks: required_secondary_acks,
+                replication_timeout,
+            }),
+        }
+    }
+
+    /// Enqueue a PendingAck from the append leader — **lock-free**.
+    ///
+    /// Uses crossbeam's unbounded channel internally, so this never blocks
+    /// and never contends with the watermark reader's Mutex.
+    pub fn enqueue(&self, ack: PendingAck) {
+        let _ = self.tx.send(ack);
+    }
+
+    /// Lock the consumer-side state for watermark processing.
+    ///
+    /// Call [`AckQueueInner::receive_pending`] first to drain the channel,
+    /// then [`AckQueueInner::ack_from_secondary`] and [`AckQueueInner::drain_quorum`].
+    pub fn lock_inner(&self) -> MutexGuard<'_, AckQueueInner> {
+        self.inner.lock().unwrap()
+    }
+}
+
+impl AckQueueInner {
+    /// Drain all available PendingAcks from the lock-free channel into
+    /// the local `pending` VecDeque. Call this before `drain_quorum`.
+    pub fn receive_pending(&mut self) {
+        while let Ok(ack) = self.rx.try_recv() {
+            self.pending.push_back(ack);
         }
     }
 
@@ -136,6 +186,9 @@ impl AckQueue {
     /// Drain all pending ACKs that have reached quorum, sending AppendAck
     /// frames back to the client connections.
     ///
+    /// Call [`receive_pending`] first to transfer PendingAcks from the
+    /// lock-free channel into the local VecDeque.
+    ///
     /// After the normal quorum drain, sweeps the front of the queue for expired
     /// entries (older than the configured replication timeout) and sends error responses.
     pub fn drain_quorum(&mut self) {
@@ -188,5 +241,34 @@ impl AckQueue {
                 break;
             }
         }
+    }
+}
+
+// AckQueue must be Send + Sync for papaya::HashMap storage.
+// crossbeam Sender/Receiver are Send + Sync, Mutex<AckQueueInner> is Send + Sync.
+const _: () = {
+    fn _assert_send<T: Send>() {}
+    fn _assert_sync<T: Sync>() {}
+    fn _assert_all() {
+        _assert_send::<AckQueue>();
+        _assert_sync::<AckQueue>();
+    }
+};
+
+impl std::fmt::Debug for AckQueue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AckQueue")
+            .field("inner", &"<locked>")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for AckQueueInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AckQueueInner")
+            .field("pending_len", &self.pending.len())
+            .field("acked", &self.acked)
+            .field("required_acks", &self.required_acks)
+            .finish()
     }
 }
