@@ -15,7 +15,6 @@ use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use server::handler::RequestHandler;
 use smallvec::SmallVec;
 use std::sync::Arc;
-use std::sync::Mutex;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info, warn};
 
@@ -115,8 +114,8 @@ pub struct ExtentNodeStore {
     /// Monotonic stream ID generator (atomic, no lock needed).
     next_stream_id: AtomicU64,
     /// Replication info per stream_id (registered via RegisterExtent).
-    /// Fine-grained per-stream locking.
-    replicas: papaya::HashMap<StreamId, Mutex<ReplicaInfo>>,
+    /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
+    replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>>,
     /// Direct TCP connection pool for broadcast replication (None for standalone/test mode).
     /// Initialized via `set_downstream()` after construction (OnceLock breaks circular dep).
     downstream: OnceLock<Arc<DownstreamPool>>,
@@ -173,7 +172,7 @@ impl ExtentNodeStore {
         self.replicas
             .pin()
             .get(&stream_id)
-            .map(|m| m.lock().unwrap().clone())
+            .map(|arc| (**arc).clone())
     }
 
     /// Expire stale PendingAcks across all streams by running the timeout sweep.
@@ -201,7 +200,7 @@ impl ExtentNodeStore {
     /// is immutable within an epoch.
     pub fn secondary_index(&self, stream_id: StreamId, addr: &str) -> Option<u8> {
         let guard = self.replicas.pin();
-        let ri = guard.get(&stream_id)?.lock().unwrap();
+        let ri = guard.get(&stream_id)?;
         ri.replica_addrs
             .iter()
             .position(|a| a == addr)
@@ -499,7 +498,7 @@ impl ExtentNodeStore {
             }
         }
 
-        self.replicas.pin().insert(stream_id, Mutex::new(ri));
+        self.replicas.pin().insert(stream_id, Arc::new(ri));
 
         Frame::new(
             VariableHeader::RegisterExtentAck {
@@ -780,12 +779,12 @@ impl ExtentNodeStore {
         self.bytes_written
             .fetch_add(payload_len as u64, Ordering::Relaxed);
 
-        // Check replica info for this stream.
+        // Check replica info for this stream (Arc clone — one atomic, no deep copy).
         let replica = self
             .replicas
             .pin()
             .get(&stream_id)
-            .map(|m| m.lock().unwrap().clone());
+            .map(Arc::clone);
 
         match replica {
             None => {
@@ -1052,9 +1051,6 @@ impl ExtentNodeStore {
                     reason,
                     seal_us,
                 );
-                if let Some(ri) = self.replicas.pin().get(&stream_id) {
-                    ri.lock().unwrap().extent_id = n.new_extent_id;
-                }
             }
             notification
         } else {
@@ -1277,7 +1273,7 @@ impl ExtentNodeStore {
                     .replicas
                     .pin()
                     .get(&stream_id)
-                    .map(|m| m.lock().unwrap().clone());
+                    .map(Arc::clone);
 
                 match replica.as_ref() {
                     None => {
