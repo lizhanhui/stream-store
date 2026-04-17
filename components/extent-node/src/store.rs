@@ -405,46 +405,40 @@ impl ExtentNodeStore {
         // Create the stream locally if it doesn't exist, then register the new extent.
         // Skip extent creation if it already exists (idempotent — extent may have been
         // lazily created by a forwarded append that arrived before this RegisterExtent).
-        let _start_offset = {
-            let guard = self.streams.pin();
-            if let Some(stream) = guard.get(&stream_id) {
-                // RegisterExtent is the authoritative source for cache policy.
-                // Always apply — the stream may have been lazily created by
-                // ForwardInitExtent before this arrives with max_extents=0.
-                stream.set_max_extents(cache_extents as usize);
-                if stream.with_extent(extent_id, |_| ()).is_none() {
-                    let so = stream.max_offset();
-                    stream.register_extent(
-                        extent_id,
-                        so,
-                        extent_capacity,
-                        epoch,
-                        DEFAULT_MIN_EXTENT_CAPACITY,
-                        DEFAULT_MAX_EXTENT_CAPACITY,
-                        extent_growth_factor,
-                    );
-                    so
-                } else {
-                    // Extent already exists (lazy creation from Forward), but update epoch
-                    // from authoritative source (RegisterExtent carries the real epoch).
-                    stream.set_epoch(epoch);
-                    stream.max_offset()
-                }
-            } else {
-                let stream = Stream::new(stream_id);
-                stream.set_max_extents(cache_extents as usize);
+        let streams_guard = self.streams.pin();
+        if let Some(stream) = streams_guard.get(&stream_id) {
+            // RegisterExtent is the authoritative source for cache policy.
+            // Always apply — the stream may have been lazily created by
+            // ForwardInitExtent before this arrives with max_extents=0.
+            stream.set_max_extents(cache_extents as usize);
+            if stream.with_extent(extent_id, |_| ()).is_none() {
                 stream.register_extent(
                     extent_id,
-                    Offset(0),
+                    stream.max_offset(),
                     extent_capacity,
                     epoch,
                     DEFAULT_MIN_EXTENT_CAPACITY,
                     DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor,
                 );
-                guard.insert(stream_id, stream);
-                Offset(0)
+            } else {
+                // Extent already exists (lazy creation from Forward), but update epoch
+                // from authoritative source (RegisterExtent carries the real epoch).
+                stream.set_epoch(epoch);
             }
+        } else {
+            let stream = Stream::new(stream_id);
+            stream.set_max_extents(cache_extents as usize);
+            stream.register_extent(
+                extent_id,
+                Offset(0),
+                extent_capacity,
+                epoch,
+                DEFAULT_MIN_EXTENT_CAPACITY,
+                DEFAULT_MAX_EXTENT_CAPACITY,
+                extent_growth_factor,
+            );
+            streams_guard.insert(stream_id, stream);
         };
 
         // Update next_stream_id to avoid collision with StreamManager-assigned IDs.
@@ -496,8 +490,7 @@ impl ExtentNodeStore {
                         .iter()
                         .map(|addr| pool.get_or_create_sender(addr))
                         .collect();
-                    let stream_guard = self.streams.pin();
-                    if let Some(stream) = stream_guard.get(&stream_id) {
+                    if let Some(stream) = streams_guard.get(&stream_id) {
                         stream.set_downstream_txs(txs);
                     }
                 }
@@ -1086,21 +1079,21 @@ impl ExtentNodeStore {
     ///
     /// Fire-and-forget: the secondary defers verification via `try_verify_checksum()`.
     fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
-        let (checksum, committed_bytes) = {
-            let guard = self.streams.pin();
-            match guard.get(&stream_id) {
-                Some(stream) => match stream.with_extent(sealed_extent_id, |ext| {
-                    (
-                        ext.finalized_crc32().unwrap_or(0),
-                        ext.committed_data().len() as u64,
-                    )
-                }) {
-                    Some(pair) => pair,
-                    None => return,
-                },
-                None => return,
-            }
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
+            Some(s) => s,
+            None => return,
         };
+        let (checksum, committed_bytes) =
+            match stream.with_extent(sealed_extent_id, |ext| {
+                (
+                    ext.finalized_crc32().unwrap_or(0),
+                    ext.committed_data().len() as u64,
+                )
+            }) {
+                Some(pair) => pair,
+                None => return,
+            };
         debug!(
             "ForwardChecksum sent: stream={}, extent={}, crc32={:#x}, bytes={}",
             stream_id, sealed_extent_id, checksum, committed_bytes,
@@ -1114,14 +1107,10 @@ impl ExtentNodeStore {
             },
             None,
         );
-        // Push inline via per-stream channels.
-        let guard2 = self.streams.pin();
-        if let Some(stream) = guard2.get(&stream_id) {
-            if let Some(init) = self.maybe_build_init_forward(stream, &frame) {
-                stream.send_forward(init);
-            }
-            stream.send_forward(frame);
+        if let Some(init) = self.maybe_build_init_forward(stream, &frame) {
+            stream.send_forward(init);
         }
+        stream.send_forward(frame);
     }
 
     /// Optimized batch append: all frames share the same stream_id/epoch.
@@ -1529,7 +1518,8 @@ impl ExtentNodeStore {
                 _ => return,
             };
 
-        if let Some(stream) = self.streams.pin().get(&stream_id) {
+        let guard = self.streams.pin();
+        if let Some(stream) = guard.get(&stream_id) {
             // Apply cache policy if not yet set (RegisterExtent may arrive later).
             if cache_extents > 0 && stream.max_extents() == 0 {
                 stream.set_max_extents(cache_extents as usize);
@@ -1561,7 +1551,7 @@ impl ExtentNodeStore {
                 DEFAULT_MAX_EXTENT_CAPACITY,
                 DEFAULT_EXTENT_GROWTH_FACTOR,
             );
-            self.streams.pin().insert(stream_id, stream);
+            guard.insert(stream_id, stream);
             self.next_stream_id
                 .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
             info!(
