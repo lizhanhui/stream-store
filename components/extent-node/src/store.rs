@@ -124,8 +124,8 @@ pub struct ExtentNodeStore {
     /// The SM connection task receives these and sends UPDATE_EXTENT frames.
     update_tx: Option<Sender<ExtentUpdate>>,
     /// Per-stream ACK queues for the Primary (only used when this node is Primary for a stream).
-    /// Fine-grained per-stream locking.
-    pub ack_queues: papaya::HashMap<StreamId, Mutex<AckQueue>>,
+    /// AckQueue has its own internal Mutex — no outer Mutex needed.
+    pub ack_queues: papaya::HashMap<StreamId, AckQueue>,
     /// Configurable timeout for replication quorum ACK expiry.
     replication_timeout: Duration,
     // -- Metrics counters (reset on each heartbeat snapshot) --
@@ -185,7 +185,9 @@ impl ExtentNodeStore {
     pub fn expire_pending_acks(&self) {
         let guard = self.ack_queues.pin();
         for (_k, v) in guard.iter() {
-            v.lock().unwrap().drain_quorum();
+            let mut inner = v.lock_inner();
+            inner.receive_pending();
+            inner.drain_quorum();
         }
     }
 
@@ -474,10 +476,10 @@ impl ExtentNodeStore {
             {
                 let aq_guard = self.ack_queues.pin();
                 aq_guard.get_or_insert_with(stream_id, || {
-                    Mutex::new(AckQueue::with_timeout(
+                    AckQueue::with_timeout(
                         ri.required_secondary_acks(),
                         self.replication_timeout,
-                    ))
+                    )
                 });
             }
 
@@ -844,17 +846,16 @@ impl ExtentNodeStore {
                         stream.send_forward(forward_frame);
                     }
 
-                    // Queue deferred ACK.
+                    // Queue deferred ACK — lock-free, no contention with watermark readers.
                     if let Some(ref resp_tx) = response_tx {
                         let aq_guard = self.ack_queues.pin();
-                        let aq_mutex = aq_guard.get_or_insert_with(stream_id, || {
-                            Mutex::new(AckQueue::with_timeout(
+                        let aq = aq_guard.get_or_insert_with(stream_id, || {
+                            AckQueue::with_timeout(
                                 ri.required_secondary_acks(),
                                 self.replication_timeout,
-                            ))
+                            )
                         });
-                        let mut ack_queue = aq_mutex.lock().unwrap();
-                        ack_queue.pending.push_back(PendingAck {
+                        aq.enqueue(PendingAck {
                             request_id,
                             stream_id,
                             response_tx: resp_tx.clone(),
@@ -1340,16 +1341,15 @@ impl ExtentNodeStore {
                             }
                             if let Some(resp_tx) = response_tx {
                                 let aq_guard = self.ack_queues.pin();
-                                let aq_mutex = aq_guard.get_or_insert_with(stream_id, || {
-                                    Mutex::new(AckQueue::with_timeout(
+                                let aq = aq_guard.get_or_insert_with(stream_id, || {
+                                    AckQueue::with_timeout(
                                         ri.required_secondary_acks(),
                                         self.replication_timeout,
-                                    ))
+                                    )
                                 });
-                                let mut ack_queue = aq_mutex.lock().unwrap();
                                 let now = Instant::now();
                                 for entry in &entries {
-                                    ack_queue.pending.push_back(PendingAck {
+                                    aq.enqueue(PendingAck {
                                         request_id: entry.request_id,
                                         stream_id,
                                         response_tx: resp_tx.clone(),
@@ -2326,7 +2326,7 @@ mod tests {
         // AckQueue should be initialized for Primary.
         {
             let aq_guard = store.ack_queues.pin();
-            let aq = aq_guard.get(&StreamId(42)).unwrap().lock().unwrap();
+            let aq = aq_guard.get(&StreamId(42)).unwrap().lock_inner();
             assert_eq!(aq.required_acks, 1);
         }
     }
@@ -2508,18 +2508,19 @@ mod tests {
 
         // PendingAck should be in the ack_queue.
         {
-            let ack_queue = ack_queues.get(&StreamId(10)).unwrap().lock().unwrap();
-            assert_eq!(ack_queue.pending.len(), 1);
-            assert_eq!(ack_queue.pending[0].assigned_offset, 0);
+            let mut inner = ack_queues.get(&StreamId(10)).unwrap().lock_inner();
+            inner.receive_pending();
+            assert_eq!(inner.pending.len(), 1);
+            assert_eq!(inner.pending[0].assigned_offset, 0);
             // RF=3 requires 1 secondary ACK.
-            assert_eq!(ack_queue.required_acks, 1);
+            assert_eq!(inner.required_acks, 1);
         }
 
         // Simulate watermark from first secondary (quorum met with 1 ACK for RF=3).
         {
-            let mut ack_queue = ack_queues.get(&StreamId(10)).unwrap().lock().unwrap();
-            ack_queue.ack_from_secondary(0, 0);
-            ack_queue.drain_quorum();
+            let mut inner = ack_queues.get(&StreamId(10)).unwrap().lock_inner();
+            inner.ack_from_secondary(0, 0);
+            inner.drain_quorum();
         }
 
         // The client response channel should now have the AppendAck.
@@ -2588,11 +2589,11 @@ mod tests {
         // Test that a single watermark can drain multiple pending ACKs.
         let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(100);
 
-        let mut ack_queue = AckQueue::new(1); // need 1 secondary ACK
+        let ack_queue = AckQueue::new(1); // need 1 secondary ACK
 
         // Queue 3 pending ACKs at offsets 0, 1, 2.
         for i in 0u64..3 {
-            ack_queue.pending.push_back(PendingAck {
+            ack_queue.enqueue(PendingAck {
                 request_id: i as u32,
                 stream_id: StreamId(10),
                 extent_id: ExtentId(0),
@@ -2604,8 +2605,11 @@ mod tests {
         }
 
         // Single cumulative ACK at offset 2 from one secondary.
-        ack_queue.ack_from_secondary(0, 2);
-        ack_queue.drain_quorum();
+        let mut inner = ack_queue.lock_inner();
+        inner.receive_pending();
+        inner.ack_from_secondary(0, 2);
+        inner.drain_quorum();
+        drop(inner);
 
         // All 3 should be drained.
         let ack0 = resp_rx.try_recv().unwrap();
@@ -2619,21 +2623,22 @@ mod tests {
 
     #[tokio::test]
     async fn quorum_offset_with_multiple_secondaries() {
-        let mut aq = AckQueue::new(2); // RF=4: need 2 secondary ACKs
+        let aq = AckQueue::new(2); // RF=4: need 2 secondary ACKs
+        let mut inner = aq.lock_inner();
 
         // Only 1 secondary has reported — not enough for quorum.
-        aq.ack_from_secondary(0, 5);
-        assert!(aq.quorum_offset().is_none());
+        inner.ack_from_secondary(0, 5);
+        assert!(inner.quorum_offset().is_none());
 
         // Second secondary reports — now we have quorum.
-        aq.ack_from_secondary(1, 3);
+        inner.ack_from_secondary(1, 3);
         // quorum_offset = min of top-2 = 3
-        assert_eq!(aq.quorum_offset(), Some(3));
+        assert_eq!(inner.quorum_offset(), Some(3));
 
         // Third secondary reports higher.
-        aq.ack_from_secondary(2, 10);
+        inner.ack_from_secondary(2, 10);
         // top-2 descending: [10, 5], so quorum_offset = 5
-        assert_eq!(aq.quorum_offset(), Some(5));
+        assert_eq!(inner.quorum_offset(), Some(5));
     }
 
     #[tokio::test]
@@ -2641,10 +2646,10 @@ mod tests {
         // Verify that PendingAcks expire after the configured replication timeout.
         let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(100);
 
-        let mut ack_queue = AckQueue::new(1); // need 1 secondary ACK
+        let ack_queue = AckQueue::new(1); // need 1 secondary ACK
 
         // Queue a PendingAck with a creation time far in the past (simulates timeout).
-        ack_queue.pending.push_back(PendingAck {
+        ack_queue.enqueue(PendingAck {
             request_id: 42,
             stream_id: StreamId(10),
             extent_id: ExtentId(0),
@@ -2655,7 +2660,7 @@ mod tests {
         });
 
         // Queue a second PendingAck that is NOT expired.
-        ack_queue.pending.push_back(PendingAck {
+        ack_queue.enqueue(PendingAck {
             request_id: 43,
             stream_id: StreamId(10),
             extent_id: ExtentId(0),
@@ -2666,7 +2671,9 @@ mod tests {
         });
 
         // No quorum (no secondary has acked), but timeout sweep should fire.
-        ack_queue.drain_quorum();
+        let mut inner = ack_queue.lock_inner();
+        inner.receive_pending();
+        inner.drain_quorum();
 
         // First PendingAck should have been expired with an error.
         let err_frame = resp_rx.try_recv().unwrap();
@@ -2676,8 +2683,8 @@ mod tests {
 
         // Second PendingAck should still be pending (not expired).
         assert!(resp_rx.try_recv().is_err());
-        assert_eq!(ack_queue.pending.len(), 1);
-        assert_eq!(ack_queue.pending[0].request_id, 43);
+        assert_eq!(inner.pending.len(), 1);
+        assert_eq!(inner.pending[0].request_id, 43);
     }
 
     // ── Concurrent multi-stream benchmark ────────────────────────────────────

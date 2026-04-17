@@ -318,10 +318,11 @@ async fn downstream_reader_inline(
 
                     // Inline watermark processing — no channel hop, no string allocation.
                     let aq_guard = store.ack_queues.pin();
-                    if let Some(aq_mutex) = aq_guard.get(&stream_id) {
-                        let mut ack_queue = aq_mutex.lock().unwrap();
-                        ack_queue.ack_from_secondary(secondary_index, acked_offset);
-                        ack_queue.drain_quorum();
+                    if let Some(aq) = aq_guard.get(&stream_id) {
+                        let mut inner = aq.lock_inner();
+                        inner.receive_pending();
+                        inner.ack_from_secondary(secondary_index, acked_offset);
+                        inner.drain_quorum();
                     } else {
                         warn!(
                             "received watermark for stream {:?} but no ack_queue exists",
