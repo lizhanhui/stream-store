@@ -257,19 +257,21 @@ Lower flag bits (0x02, 0x04) are available for per-opcode request-side semantics
 
 ##### 0x01 CREATE_STREAM (Client <-> Stream Manager)
 
-Create a new stream. If `replication_factor = 0`, Stream Manager uses its default. If `extent_capacity = 0`, Stream Manager uses 64 MiB. If `cache_extents = 0`, Stream Manager uses 4.
+Create a new stream. If `replication_factor = 0`, Stream Manager uses its default. If `min/max_extent_capacity = 0`, defaults apply (8 MiB / 256 MiB). If `cache_extents = 0`, Stream Manager uses 4. If `extent_growth_factor = 0`, default 2 is used.
 
 **Request (flag=0x00): Client -> SM**
 
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id         : u32]
-  [name_len           : u16]
-  [stream_name        : bytes]  -- human-readable stream name
-  [replication_factor : u16]
-  [extent_capacity    : u32]    -- per-stream arena size in bytes (0 = default 64 MiB)
-  [cache_extents      : u32]    -- max extents to retain in memory (0 = default 4)
+  [request_id            : u32]
+  [name_len              : u16]
+  [stream_name           : bytes]  -- human-readable stream name
+  [replication_factor    : u16]
+  [min_extent_capacity   : u32]    -- minimum arena size in bytes (0 = default 8 MiB)
+  [max_extent_capacity   : u32]    -- maximum arena size in bytes (0 = default 256 MiB)
+  [cache_extents         : u32]    -- max extents to retain in memory (0 = default 4)
+  [extent_growth_factor  : u32]    -- adaptive growth multiplier (0 = default 2)
 No Payload.
 ```
 
@@ -693,14 +695,17 @@ Register an extent's replica membership on an Extent Node. Primary receives all 
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id          : u32]
-  [stream_id           : u64]    -- stream this extent belongs to
-  [extent_id           : u32]    -- extent being registered
-  [role                : u8]     -- 0 = Primary, 1+ = Secondary
-  [replication_factor  : u16]
-  [epoch               : u32]    -- stream epoch for this extent registration
-  [extent_capacity     : u32]    -- per-stream arena size in bytes
-  [cache_extents       : u32]    -- max extents to retain in memory per stream
+  [request_id              : u32]
+  [stream_id               : u64]    -- stream this extent belongs to
+  [extent_id               : u32]    -- extent being registered
+  [role                    : u8]     -- 0 = Primary, 1+ = Secondary
+  [replication_factor      : u16]
+  [epoch                   : u32]    -- stream epoch for this extent registration
+  [extent_capacity         : u32]    -- arena size in bytes for this extent
+  [cache_extents           : u32]    -- max extents to retain in memory per stream
+  [min_extent_capacity     : u32]    -- floor for adaptive shrink (0 = default)
+  [max_extent_capacity     : u32]    -- ceiling for adaptive growth (0 = default)
+  [extent_growth_factor    : u32]    -- adaptive growth multiplier (0 = default 2)
 Payload:
   [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
   per address:
@@ -1370,41 +1375,51 @@ Stored in MySQL. Uses sqlx (async MySQL client) and Refinery (schema migrations)
 
 ```sql
 CREATE TABLE stream (
-    stream_id    BIGINT PRIMARY KEY AUTO_INCREMENT,
-    stream_name  VARCHAR(512) NOT NULL UNIQUE,  -- human-readable name
-    stream_type  VARCHAR(32) NOT NULL DEFAULT 'DATA',  -- 'DATA' or 'INDEX'
-    replication_factor SMALLINT NOT NULL DEFAULT 2, -- per-stream RF (1-N)
-    extent_capacity  INT NOT NULL DEFAULT 67108864,  -- per-stream arena size (default 64 MiB)
-    cache_extents    INT NOT NULL DEFAULT 4,          -- max extents retained in memory per stream
-    epoch        INT NOT NULL DEFAULT 0,              -- current stream epoch (bumped on replica set change)
-    created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    stream_id            BIGINT PRIMARY KEY AUTO_INCREMENT,
+    stream_name          VARCHAR(512) NOT NULL UNIQUE,
+    stream_type          VARCHAR(32) NOT NULL DEFAULT 'DATA',
+    replication_factor   SMALLINT NOT NULL DEFAULT 2,
+    extent_capacity      INT NOT NULL DEFAULT 67108864,   -- initial arena size (default 64 MiB)
+    min_extent_capacity  INT NOT NULL DEFAULT 8388608,    -- floor for adaptive shrink (8 MiB)
+    max_extent_capacity  INT NOT NULL DEFAULT 268435456,  -- ceiling for adaptive growth (256 MiB)
+    extent_growth_factor INT NOT NULL DEFAULT 2,          -- adaptive growth multiplier
+    cache_extents        INT NOT NULL DEFAULT 4,          -- max extents retained in memory
+    epoch                INT NOT NULL DEFAULT 0,          -- current stream epoch
+    created_at           DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at           DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 );
 
 CREATE TABLE extent (
     stream_id     BIGINT NOT NULL,
-    extent_id     INT NOT NULL,                    -- per-stream monotonic via stream_sequence table (u32: 4.3B IDs)
-    start_offset  BIGINT NOT NULL DEFAULT 0,    -- first logical offset in this extent
-    end_offset    BIGINT NOT NULL DEFAULT 0,   -- exclusive upper bound (updated on seal; equals start_offset while active)
-    state         TINYINT NOT NULL DEFAULT 1,   -- ExtentState: 0=Unspecified, 1=Active, 2=Sealed, 3=Flushed
-    epoch         INT NOT NULL DEFAULT 0,       -- epoch under which this extent was created
-    s3_key        VARCHAR(1024),                -- set after flush
-    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    sealed_at     TIMESTAMP NULL,
-    flushed_at    TIMESTAMP NULL,
-    PRIMARY KEY (stream_id, extent_id)
+    epoch         INT NOT NULL DEFAULT 0,
+    extent_id     INT NOT NULL,
+    start_offset  BIGINT NOT NULL,
+    end_offset    BIGINT NOT NULL DEFAULT 0,
+    state         TINYINT NOT NULL DEFAULT 1,   -- ExtentState: 1=Active, 2=Sealed, 3=Flushed
+    s3_key        VARCHAR(1024),
+    created_at    DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    sealed_at     DATETIME(3) NULL,
+    flushed_at    DATETIME(3) NULL,
+    PRIMARY KEY (stream_id, extent_id),
+    INDEX idx_stream_state (stream_id, state)
 );
 
-CREATE TABLE extent_replica (
-    stream_id  BIGINT NOT NULL,
-    extent_id  INT NOT NULL,
-    node_addr  VARCHAR(256) NOT NULL,
-    role       TINYINT NOT NULL,                -- 0=Primary, 1+=Secondary
-    PRIMARY KEY (stream_id, extent_id, node_addr)
+CREATE TABLE stream_replica (
+    stream_id     BIGINT NOT NULL,
+    epoch         INT NOT NULL,                 -- epoch this replica set belongs to
+    node_addr     VARCHAR(256) NOT NULL,
+    role          TINYINT NOT NULL DEFAULT 0,   -- 0=Primary, 1+=Secondary
+    created_at    DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at    DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (stream_id, epoch, node_addr),
+    INDEX idx_node (node_addr)
 );
 
 CREATE TABLE stream_sequence (
     stream_id      BIGINT PRIMARY KEY,
-    next_extent_id INT NOT NULL DEFAULT 0
+    next_extent_id INT NOT NULL DEFAULT 0,
+    created_at     DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
+    updated_at     DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
 );
 
 CREATE TABLE node (
@@ -1415,13 +1430,14 @@ CREATE TABLE node (
     state                 TINYINT NOT NULL DEFAULT 1  -- NodeState: 0=Unspecified, 1=Alive, 2=Dead
 );
 
-CREATE TABLE stream_offset (
-    subscription_id VARCHAR(512) NOT NULL,
-    stream_id      BIGINT NOT NULL,
-    committed_offset BIGINT NOT NULL DEFAULT 0,
-    updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    PRIMARY KEY (subscription_id, stream_id)
-);
+-- Planned for future: subscription offset tracking (not yet implemented).
+-- CREATE TABLE stream_offset (
+--     subscription_id VARCHAR(512) NOT NULL,
+--     stream_id      BIGINT NOT NULL,
+--     committed_offset BIGINT NOT NULL DEFAULT 0,
+--     updated_at     TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+--     PRIMARY KEY (subscription_id, stream_id)
+-- );
 
 CREATE TABLE node_metrics (
     node_id                VARCHAR(256) PRIMARY KEY,
