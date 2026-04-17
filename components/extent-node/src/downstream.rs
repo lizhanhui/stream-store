@@ -267,6 +267,10 @@ async fn downstream_writer_task(
 /// directly updates the per-stream AckQueue and drains quorum,
 /// eliminating the WatermarkEvent channel hop.
 ///
+/// Each secondary's ordinal index within a stream's replica set is resolved
+/// once (via `ExtentNodeStore::secondary_index`) and cached locally in
+/// `index_cache`. This avoids per-watermark String allocation and HashMap lookup.
+///
 /// Exits gracefully when the shutdown signal is received or the connection closes.
 async fn downstream_reader_inline(
     addr: String,
@@ -275,6 +279,10 @@ async fn downstream_reader_inline(
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     let mut framed_read = FramedRead::new(read_half, FrameCodec);
+
+    // Cache: stream_id → secondary index (role - 1). Resolved once per stream
+    // per TCP session; immutable within an epoch.
+    let mut index_cache: HashMap<common::types::StreamId, u8> = HashMap::new();
 
     loop {
         let result = tokio::select! {
@@ -291,11 +299,28 @@ async fn downstream_reader_inline(
                     let stream_id = frame.stream_id();
                     let acked_offset = frame.offset().0;
 
-                    // Inline watermark processing — no channel hop.
+                    // Resolve secondary index (cached after first lookup).
+                    let secondary_index = match index_cache.get(&stream_id) {
+                        Some(&idx) => idx,
+                        None => match store.secondary_index(stream_id, &addr) {
+                            Some(idx) => {
+                                index_cache.insert(stream_id, idx);
+                                idx
+                            }
+                            None => {
+                                warn!(
+                                    "cannot resolve secondary index for addr={addr} stream={stream_id}",
+                                );
+                                continue;
+                            }
+                        },
+                    };
+
+                    // Inline watermark processing — no channel hop, no string allocation.
                     let aq_guard = store.ack_queues.pin();
                     if let Some(aq_mutex) = aq_guard.get(&stream_id) {
                         let mut ack_queue = aq_mutex.lock().unwrap();
-                        ack_queue.ack_from_secondary(&addr, acked_offset);
+                        ack_queue.ack_from_secondary(secondary_index, acked_offset);
                         ack_queue.drain_quorum();
                     } else {
                         warn!(

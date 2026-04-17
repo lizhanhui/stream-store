@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -7,7 +7,7 @@ use std::time::Instant;
 use bytes::{BufMut, Bytes, BytesMut};
 use common::config::{
     DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_IDLE_SHRINK_THRESHOLD_SECS, DEFAULT_MAX_EXTENT_CAPACITY,
-    DEFAULT_MIN_EXTENT_CAPACITY,
+    DEFAULT_MIN_EXTENT_CAPACITY, DEFAULT_REPLICATION_TIMEOUT_MS, MAX_REPLICATION_FACTOR,
 };
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, Opcode, StreamId};
@@ -27,8 +27,7 @@ use crate::stream::{SealNotification, SealReason, Stream};
 // ── Broadcast replication types ──────────────────────────────────────────────
 
 /// Default replication timeout used when no config is provided (e.g., in tests).
-const DEFAULT_REPLICATION_TIMEOUT: Duration =
-    Duration::from_millis(common::config::DEFAULT_REPLICATION_TIMEOUT_MS);
+const DEFAULT_REPLICATION_TIMEOUT: Duration = Duration::from_millis(DEFAULT_REPLICATION_TIMEOUT_MS);
 
 /// A pending client ACK waiting for quorum replication.
 #[derive(Debug)]
@@ -48,18 +47,30 @@ pub struct PendingAck {
     pub created_at: Instant,
 }
 
+/// Maximum number of secondaries (MAX_REPLICATION_FACTOR - 1, excluding the Primary).
+const MAX_SECONDARIES: usize = MAX_REPLICATION_FACTOR - 1;
+
 /// Per-stream ACK queue on the Primary with cumulative quorum tracking.
 ///
 /// Tracks pending client ACKs and per-secondary highest acked offset.
 /// When enough secondaries have confirmed (quorum), drains pending ACKs.
+///
+/// `acked` is a fixed-size array indexed by secondary ordinal
+/// (role - 1). This avoids the per-watermark `String` allocation that a
+/// `HashMap<String, u64>` would require. Entries are initialized to
+/// `u64::MAX` (sentinel = "never reported").
 #[derive(Debug)]
 pub struct AckQueue {
     /// Pending client ACKs, ordered by offset (front = lowest).
     pub pending: VecDeque<PendingAck>,
-    /// Highest acked offset per secondary address (cumulative).
-    pub secondary_acked: HashMap<String, u64>,
+
+    /// Highest acked offset per secondary, indexed by ordinal (role - 1).
+    /// `u64::MAX` = never reported.
+    acked: [u64; MAX_SECONDARIES],
+
     /// Number of secondary ACKs needed for quorum.
-    pub required_secondary_acks: u32,
+    pub required_acks: u32,
+
     /// Timeout for expiring stale PendingAcks.
     replication_timeout: Duration,
 }
@@ -72,60 +83,65 @@ impl AckQueue {
     pub fn with_timeout(required_secondary_acks: u32, replication_timeout: Duration) -> Self {
         Self {
             pending: VecDeque::new(),
-            secondary_acked: HashMap::new(),
-            required_secondary_acks,
+            acked: [u64::MAX; MAX_SECONDARIES],
+            required_acks: required_secondary_acks,
             replication_timeout,
         }
     }
 
     /// Compute the quorum offset: the highest offset where at least
-    /// `required_secondary_acks` secondaries have confirmed.
+    /// `required_acks` secondaries have confirmed.
     ///
     /// Returns None if quorum cannot be met (not enough secondaries have reported).
-    ///
-    /// Optimized to avoid heap allocation:
-    /// - RF=2 (required=1): just take the max of secondary offsets.
-    /// - General case: use a fixed-size stack array (RF never exceeds ~4).
     pub fn quorum_offset(&self) -> Option<u64> {
-        if self.required_secondary_acks == 0 {
+        if self.required_acks == 0 {
             return None; // RF=1, no quorum needed
         }
-        let required = self.required_secondary_acks as usize;
-        if self.secondary_acked.len() < required {
-            return None; // Not enough secondaries have reported yet
-        }
-        // Fast path for RF=2 (required=1): just return the max offset.
-        if required == 1 {
-            return self.secondary_acked.values().copied().max();
-        }
-        // General case: use a stack-allocated array for secondary offsets.
-        // MAX_REPLICATION_FACTOR includes the Primary, so max secondaries = MAX_RF - 1.
-        // Collect into a fixed buffer, sort descending, pick the required-th.
-        const MAX_SECONDARIES: usize = common::config::MAX_REPLICATION_FACTOR - 1;
-        debug_assert!(
-            self.secondary_acked.len() <= MAX_SECONDARIES,
-            "secondary count {} exceeds MAX_SECONDARIES {}",
-            self.secondary_acked.len(),
-            MAX_SECONDARIES,
-        );
+        let required = self.required_acks as usize;
+
+        // Collect offsets from secondaries that have reported (not u64::MAX).
         let mut offsets = [0u64; MAX_SECONDARIES];
         let mut count = 0;
-        for &offset in self.secondary_acked.values() {
-            if count < offsets.len() {
-                offsets[count] = offset;
+        for &v in &self.acked {
+            if v != u64::MAX {
+                offsets[count] = v;
                 count += 1;
             }
         }
+        if count < required {
+            return None;
+        }
+
+        // Fast path for RF=2 (required=1): return the max.
+        if required == 1 {
+            return Some(offsets[..count].iter().copied().max().unwrap_or(0));
+        }
+
+        // General case: sort descending, pick the required-th highest.
         let slice = &mut offsets[..count];
-        slice.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        slice.sort_unstable_by(|a, b| b.cmp(a));
         slice.get(required - 1).copied()
     }
 
-    /// Record a cumulative ACK from a secondary at a given offset.
-    pub fn ack_from_secondary(&mut self, addr: &str, offset: u64) {
-        let entry = self.secondary_acked.entry(addr.to_string()).or_insert(0);
-        if offset > *entry {
-            *entry = offset;
+    /// Record a cumulative ACK from a secondary at the given index and offset.
+    ///
+    /// `secondary_index` is the secondary's ordinal (role - 1): secondary-1 → 0,
+    /// secondary-2 → 1, etc. Callers resolve this once per (stream, connection)
+    /// pair and cache it locally.
+    pub fn ack_from_secondary(&mut self, secondary_index: u8, offset: u64) {
+        let idx = secondary_index as usize;
+        debug_assert!(
+            idx < MAX_SECONDARIES,
+            "secondary_index {} exceeds MAX_SECONDARIES {}",
+            idx,
+            MAX_SECONDARIES,
+        );
+        if idx >= MAX_SECONDARIES {
+            return;
+        }
+        let current = self.acked[idx];
+        if current == u64::MAX || offset > current {
+            self.acked[idx] = offset;
         }
     }
 
@@ -350,6 +366,23 @@ impl ExtentNodeStore {
         for (_k, v) in guard.iter() {
             v.lock().unwrap().drain_quorum();
         }
+    }
+
+    /// Resolve the secondary index for the given addr within a stream's replica set.
+    ///
+    /// Returns `None` if the stream has no `ReplicaInfo` or the addr is not among
+    /// the registered secondaries. The index is the position in
+    /// `ReplicaInfo.replica_addrs` (0-based: secondary-1 → 0, secondary-2 → 1).
+    ///
+    /// Callers should cache the result per `(stream_id, addr)` pair — the mapping
+    /// is immutable within an epoch.
+    pub fn secondary_index(&self, stream_id: StreamId, addr: &str) -> Option<u8> {
+        let guard = self.replicas.pin();
+        let ri = guard.get(&stream_id)?.lock().unwrap();
+        ri.replica_addrs
+            .iter()
+            .position(|a| a == addr)
+            .map(|i| i as u8)
     }
 
     /// Snapshot current metrics and reset counters.
@@ -2483,7 +2516,7 @@ mod tests {
         {
             let aq_guard = store.ack_queues.pin();
             let aq = aq_guard.get(&StreamId(42)).unwrap().lock().unwrap();
-            assert_eq!(aq.required_secondary_acks, 1);
+            assert_eq!(aq.required_acks, 1);
         }
     }
 
@@ -2668,13 +2701,13 @@ mod tests {
             assert_eq!(ack_queue.pending.len(), 1);
             assert_eq!(ack_queue.pending[0].assigned_offset, 0);
             // RF=3 requires 1 secondary ACK.
-            assert_eq!(ack_queue.required_secondary_acks, 1);
+            assert_eq!(ack_queue.required_acks, 1);
         }
 
         // Simulate watermark from first secondary (quorum met with 1 ACK for RF=3).
         {
             let mut ack_queue = ack_queues.get(&StreamId(10)).unwrap().lock().unwrap();
-            ack_queue.ack_from_secondary(&addr1, 0);
+            ack_queue.ack_from_secondary(0, 0);
             ack_queue.drain_quorum();
         }
 
@@ -2760,7 +2793,7 @@ mod tests {
         }
 
         // Single cumulative ACK at offset 2 from one secondary.
-        ack_queue.ack_from_secondary("sec-1", 2);
+        ack_queue.ack_from_secondary(0, 2);
         ack_queue.drain_quorum();
 
         // All 3 should be drained.
@@ -2778,16 +2811,16 @@ mod tests {
         let mut aq = AckQueue::new(2); // RF=4: need 2 secondary ACKs
 
         // Only 1 secondary has reported — not enough for quorum.
-        aq.ack_from_secondary("sec-1", 5);
+        aq.ack_from_secondary(0, 5);
         assert!(aq.quorum_offset().is_none());
 
         // Second secondary reports — now we have quorum.
-        aq.ack_from_secondary("sec-2", 3);
+        aq.ack_from_secondary(1, 3);
         // quorum_offset = min of top-2 = 3
         assert_eq!(aq.quorum_offset(), Some(3));
 
         // Third secondary reports higher.
-        aq.ack_from_secondary("sec-3", 10);
+        aq.ack_from_secondary(2, 10);
         // top-2 descending: [10, 5], so quorum_offset = 5
         assert_eq!(aq.quorum_offset(), Some(5));
     }
