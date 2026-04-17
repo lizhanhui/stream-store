@@ -1,3 +1,4 @@
+pub mod ack_queue;
 pub mod downstream;
 pub mod extent;
 pub mod store;
