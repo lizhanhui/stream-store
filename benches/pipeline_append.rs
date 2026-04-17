@@ -58,7 +58,7 @@ const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u16 = 2;
 const MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024; // 8 MiB
 const MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024; // 256 MiB
-const PIPELINE_DEPTH: usize = 4; // max in-flight appends per sender
+const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
 const CACHE_EXTENTS: u32 = 4;
 const EXTENT_GROWTH_FACTOR: u32 = 8; // 8x growth: 8→64→256 MiB (2 transitions vs 5 with 2x)
 
