@@ -29,6 +29,12 @@ Configurable replication factor (default RF=2) with quorum-based durability:
 - **Secondaries** return cumulative watermark ACKs.
 - **Quorum ACK**: Primary waits for a quorum (itself + `RF/2` secondaries) before ACKing clients, tolerating minority failures.
 - **Deferred ACK** via per-connection channels for efficient async notification.
+- **Lock-free append hot path** -- the entire append path (stream lookup, epoch check, leader election, arena write, forward to secondaries, ACK queue enqueue) executes without any Mutex. Key techniques:
+  - `papaya::HashMap` (epoch-based reclamation) for lock-free stream/replica lookups
+  - `parking_lot::RwLock` on `Stream` internals -- read lock (~1 uncontended atomic) for append, write lock only for rare lifecycle ops (seal, register)
+  - `Arc<ReplicaInfo>` for zero-copy replica info access (one atomic refcount vs Mutex + deep clone)
+  - `crossbeam_channel` for lock-free PendingAck handoff from append leader to watermark reader
+  - Fixed `[u64; MAX_SECONDARIES]` array with pre-resolved `u8` secondary indices for zero-allocation watermark processing
 
 ### Seal-and-New
 
@@ -87,6 +93,30 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
 
 - **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests.
 - **Stream Manager** -- Stateless metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Fully stateless design (no in-memory caches) allows multiple SM nodes to run against the same database for high availability. Includes load-aware extent placement, heartbeat-based failure detection, and DB-based leadership lease for failover coordination.
+
+## Performance
+
+### Micro-benchmark (single-node, no replication)
+
+Lock-free arena with pipelined group commit:
+
+- **~230M appends/sec** single-threaded (~10ns per append)
+- **~950M index lookups/sec** via compressed `AtomicU32` pointer index
+
+### End-to-end (RF=2, broadcast replication)
+
+Pipeline append benchmark: 4 senders, 16 in-flight per sender, 1 KiB payload, RF=2, 8x extent growth.
+
+| Metric | Value |
+|--------|-------|
+| Throughput | **~200k ops/s (~200 MB/s)** |
+| Avg latency | **~150 us** |
+| p99 latency | **~240 us** |
+| p99.9 latency | **~280 us** |
+
+The append hot path is **Mutex-free**: stream lookup (`papaya` pin), epoch check (`AtomicU32`), leader election (`AtomicU64`), arena write (atomic cursors), forward to secondaries (`tokio::mpsc::try_send`), ACK queue enqueue (`crossbeam_channel`), and in-flight decrement (`AtomicU64`) all execute without any Mutex acquisition. The only synchronization on the critical path is uncontended `parking_lot::RwLock` read locks (~1 atomic each).
+
+At 200k ops/s with RF=2, the system is **pipeline-depth-bound** (Little's Law: 64 in-flight / 150us RTT), not CPU-bound. Profiling shows **52% kernel time** dominated by TCP syscalls (`writev`, `recvfrom`), confirming the application layer is no longer the bottleneck.
 
 ## Project Structure
 
@@ -157,6 +187,7 @@ cargo bench
 | 1 | Single-node with lock-free extent, APPEND/READ/QUERY_OFFSET | Done |
 | 2 | Broadcast replication, quorum ACK, Stream Manager (MySQL), seal-and-new | Done |
 | 2.5 | Stateless multi-active SM with DB-based leader lease, CAS-fenced failover | Done |
+| 2b | Lock-free hot-path: papaya HashMap, AckQueue producer/consumer split, Arc\<ReplicaInfo\> | Done |
 | 3 | S3 flush/read, S3 Reader/Flusher, LRU read cache | Planned |
 | 4 | Multi-Dispatch (data + index streams) | Planned |
 
