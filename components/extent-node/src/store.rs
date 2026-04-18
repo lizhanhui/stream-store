@@ -475,10 +475,7 @@ impl ExtentNodeStore {
             {
                 let aq_guard = self.ack_queues.pin();
                 aq_guard.get_or_insert_with(stream_id, || {
-                    AckQueue::with_timeout(
-                        ri.required_secondary_acks(),
-                        self.replication_timeout,
-                    )
+                    AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout)
                 });
             }
 
@@ -780,11 +777,7 @@ impl ExtentNodeStore {
             .fetch_add(payload_len as u64, Ordering::Relaxed);
 
         // Check replica info for this stream (Arc clone — one atomic, no deep copy).
-        let replica = self
-            .replicas
-            .pin()
-            .get(&stream_id)
-            .map(Arc::clone);
+        let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
 
         match replica {
             None => {
@@ -1081,16 +1074,15 @@ impl ExtentNodeStore {
             Some(s) => s,
             None => return,
         };
-        let (checksum, committed_bytes) =
-            match stream.with_extent(sealed_extent_id, |ext| {
-                (
-                    ext.finalized_crc32().unwrap_or(0),
-                    ext.committed_data().len() as u64,
-                )
-            }) {
-                Some(pair) => pair,
-                None => return,
-            };
+        let (checksum, committed_bytes) = match stream.with_extent(sealed_extent_id, |ext| {
+            (
+                ext.finalized_crc32().unwrap_or(0),
+                ext.committed_data().len() as u64,
+            )
+        }) {
+            Some(pair) => pair,
+            None => return,
+        };
         debug!(
             "ForwardChecksum sent: stream={}, extent={}, crc32={:#x}, bytes={}",
             stream_id, sealed_extent_id, checksum, committed_bytes,
@@ -1269,11 +1261,7 @@ impl ExtentNodeStore {
                     .fetch_add(entries.len() as u64, Ordering::Relaxed);
                 self.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
 
-                let replica = self
-                    .replicas
-                    .pin()
-                    .get(&stream_id)
-                    .map(Arc::clone);
+                let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
 
                 match replica.as_ref() {
                     None => {
