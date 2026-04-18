@@ -20,6 +20,7 @@ use tokio::time::interval;
 use tracing::info;
 
 use crate::downstream::DownstreamPool;
+use crate::s3::S3Client;
 use crate::store::{ExtentNodeStore, ExtentUpdate};
 use crate::stream_manager_client::StreamManagerClient;
 use server::RequestHandler;
@@ -89,6 +90,12 @@ impl ExtentNode {
         let downstream = Arc::new(DownstreamPool::new(Arc::clone(&store)));
         // Wire pool into store.
         store.set_downstream(Arc::clone(&downstream));
+
+        // Initialize S3 client eagerly (async: reads ~/.aws/config and ~/.aws/credentials).
+        // Returns None if s3_bucket is empty (S3 flush disabled).
+        if let Some(s3_client) = S3Client::new(&config).await {
+            store.set_s3_client(Arc::new(s3_client));
+        }
 
         // Resolve advertise_addr: auto-detect IP if bind_ip is 0.0.0.0 and advertise_ip not set.
         // If port was 0 (OS-assigned), use the actual bound port instead.
