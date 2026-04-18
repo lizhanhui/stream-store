@@ -2,6 +2,8 @@ pub mod ack_queue;
 pub mod downstream;
 pub mod extent;
 pub mod s3;
+pub mod s3_codec;
+pub mod s3_flusher;
 pub mod store;
 pub mod stream;
 pub mod stream_manager_client;
@@ -21,6 +23,7 @@ use tracing::info;
 
 use crate::downstream::DownstreamPool;
 use crate::s3::S3Client;
+use crate::s3_flusher::FlushRequest;
 use crate::store::{ExtentNodeStore, ExtentUpdate};
 use crate::stream_manager_client::StreamManagerClient;
 use server::RequestHandler;
@@ -84,6 +87,11 @@ impl ExtentNode {
         let (update_tx, update_rx) = mpsc::channel::<ExtentUpdate>(64);
         store_inner.set_update_tx(update_tx);
 
+        // Wire up the S3 flush channel. The flusher task is spawned below
+        // after the S3 client is initialized.
+        let (flush_tx, flush_rx) = mpsc::channel::<FlushRequest>(64);
+        store_inner.set_flush_tx(flush_tx);
+
         let store = Arc::new(store_inner);
 
         // Create DownstreamPool with back-reference to store (for inline watermark processing).
@@ -94,7 +102,20 @@ impl ExtentNode {
         // Initialize S3 client eagerly (async: reads ~/.aws/config and ~/.aws/credentials).
         // Returns None if s3_bucket is empty (S3 flush disabled).
         if let Some(s3_client) = S3Client::new(&config).await {
-            store.set_s3_client(Arc::new(s3_client));
+            let s3_client = Arc::new(s3_client);
+            store.set_s3_client(Arc::clone(&s3_client));
+
+            // Spawn the background S3 flusher task.
+            let flusher_store = Arc::clone(&store);
+            let mut flusher_shutdown = shutdown_tx.subscribe();
+            task_handles.push(tokio::spawn(async move {
+                tokio::select! {
+                    _ = crate::s3_flusher::run(s3_client, flusher_store, flush_rx) => {}
+                    _ = flusher_shutdown.recv() => {
+                        info!("S3 flusher received shutdown signal");
+                    }
+                }
+            }));
         }
 
         // Resolve advertise_addr: auto-detect IP if bind_ip is 0.0.0.0 and advertise_ip not set.

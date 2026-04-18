@@ -8,8 +8,8 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub use types::{ExtentUpdate, ReplicaInfo};
 pub(crate) use types::AppendJob;
+pub use types::{ExtentUpdate, ReplicaInfo};
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +25,7 @@ use tracing::warn;
 use crate::ack_queue::{AckQueue, DEFAULT_REPLICATION_TIMEOUT};
 use crate::downstream::DownstreamPool;
 use crate::s3::S3Client;
+use crate::s3_flusher::FlushRequest;
 use crate::stream::Stream;
 
 // ── ExtentNodeStore ──────────────────────────────────────────────────────────
@@ -66,6 +67,9 @@ pub struct ExtentNodeStore {
     pub(crate) append_count: AtomicU64,
     /// Total bytes written since last snapshot (atomic, no lock needed).
     pub(crate) bytes_written: AtomicU64,
+    /// Channel to send sealed extent flush requests to the S3 flusher task.
+    /// None when S3 is not configured.
+    pub(crate) flush_tx: Option<Sender<FlushRequest>>,
 }
 
 impl ExtentNodeStore {
@@ -82,6 +86,7 @@ impl ExtentNodeStore {
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
             append_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
+            flush_tx: None,
         }
     }
 
@@ -111,6 +116,11 @@ impl ExtentNodeStore {
     /// Set the seal request channel (called during ExtentNode bootstrap).
     pub fn set_update_tx(&mut self, update_tx: Sender<ExtentUpdate>) {
         self.update_tx = Some(update_tx);
+    }
+
+    /// Set the S3 flush request channel (called during ExtentNode bootstrap).
+    pub fn set_flush_tx(&mut self, flush_tx: Sender<FlushRequest>) {
+        self.flush_tx = Some(flush_tx);
     }
 
     /// Get the replication info for a stream, if registered via RegisterExtent.

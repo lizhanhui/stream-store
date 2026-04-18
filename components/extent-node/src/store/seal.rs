@@ -6,6 +6,7 @@ use rpc::frame::{Frame, VariableHeader};
 use tracing::info;
 
 use super::ExtentNodeStore;
+use crate::s3_flusher::FlushRequest;
 
 impl ExtentNodeStore {
     /// Handle REPORT_EXTENTS: SM queries this EN for all extents it holds for a stream.
@@ -172,6 +173,26 @@ impl ExtentNodeStore {
                 );
                 // Primary seals finalize CRC32 — send checksum to secondaries inline.
                 self.send_forward_checksum(stream_id, sealed_extent_id);
+
+                // Queue sealed extent for S3 flush (Secondary-1 only).
+                // Only the first secondary (role=1) uploads to S3 — the Primary
+                // is on the hot write path and should not perform S3 I/O.
+                if let Some(ref tx) = self.flush_tx {
+                    let is_flush_role = self
+                        .replicas
+                        .pin()
+                        .get(&stream_id)
+                        .map(|ri| ri.role == 1)
+                        .unwrap_or(false);
+                    if is_flush_role {
+                        let _ = tx.try_send(FlushRequest {
+                            stream_id,
+                            extent_id: sealed_extent_id,
+                            start_offset: start_offset as u64,
+                            end_offset: end_offset as u64,
+                        });
+                    }
+                }
 
                 // Build payload with predecessor extents (extent_id >= extent_id_from AND < sealed).
                 let payload = self.build_seal_predecessor_payload(

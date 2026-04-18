@@ -11,6 +11,7 @@ use tracing::info;
 pub struct S3Client {
     client: s3::Client,
     bucket: String,
+    namespace: String,
 }
 
 impl S3Client {
@@ -33,13 +34,14 @@ impl S3Client {
         let client = s3::Client::from_conf(builder.build());
 
         info!(
-            "S3Client initialized: profile={}, bucket={}, path_style={}",
-            config.s3_profile, config.s3_bucket, config.s3_path_style,
+            "S3Client initialized: profile={}, bucket={}, namespace={}, path_style={}",
+            config.s3_profile, config.s3_bucket, config.s3_namespace, config.s3_path_style,
         );
 
         Some(Self {
             client,
             bucket: config.s3_bucket.clone(),
+            namespace: config.s3_namespace.clone(),
         })
     }
 
@@ -94,6 +96,11 @@ impl S3Client {
     /// The configured S3 bucket name.
     pub fn bucket(&self) -> &str {
         &self.bucket
+    }
+
+    /// The configured S3 namespace prefix.
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 }
 
