@@ -105,7 +105,7 @@ pub struct ExtentNodeConfig {
     pub s3_profile: String,
 
     /// S3 bucket name for flushed extent storage. Must be configured for S3 flush.
-    /// Defaults to "stream-storage-1366919849".
+    /// Defaults to empty.
     pub s3_bucket: String,
 
     /// Use path-style S3 addressing (s3.amazonaws.com/bucket/key instead of
@@ -139,7 +139,7 @@ impl Default for ExtentNodeConfig {
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
             worker_cores: Vec::new(),
             s3_profile: "dev".to_string(),
-            s3_bucket: String::from("stream-storage-1366919849"),
+            s3_bucket: String::new(),
             s3_path_style: false,
             s3_namespace: "default".to_string(),
             s3_compression: "none".to_string(),

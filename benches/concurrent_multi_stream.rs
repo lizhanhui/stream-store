@@ -36,7 +36,7 @@ use tracing_subscriber::EnvFilter;
 const NUM_CLIENTS: usize = 10;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const BENCH_DURATION: Duration = Duration::from_secs(5);
-const REPLICATION_FACTOR: u16 = 2;
+const REPLICATION_FACTOR: u8 = 2;
 const EXTENT_CAPACITY: usize = 4 * 1024 * 1024; // 4 MiB -- triggers frequent seals
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 16)]
