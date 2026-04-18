@@ -216,6 +216,13 @@ pub enum VariableHeader {
         extent_id: ExtentId,
         current_offset: Offset,
     },
+    /// Extent flushed to S3 (UpdateExtent, flag=0x02).
+    /// Fire-and-forget: Secondary-1 notifies SM after successful S3 upload.
+    UpdateExtentFlushed {
+        stream_id: StreamId,
+        epoch: Epoch,
+        extent_id: ExtentId,
+    },
     /// SM queries an EN for all extents it holds for a stream at a given epoch (0x19).
     ReportExtents {
         request_id: u32,
@@ -355,7 +362,8 @@ impl VariableHeader {
             | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterExtent,
             VariableHeader::Watermark { .. } => Opcode::Watermark,
             VariableHeader::UpdateExtentSealed { .. }
-            | VariableHeader::UpdateExtentProgress { .. } => Opcode::UpdateExtent,
+            | VariableHeader::UpdateExtentProgress { .. }
+            | VariableHeader::UpdateExtentFlushed { .. } => Opcode::UpdateExtent,
             VariableHeader::ReportExtents { .. }
             | VariableHeader::ReportExtentsResp { .. }
             | VariableHeader::ReportExtentsRespError { .. } => Opcode::ReportExtents,

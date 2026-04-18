@@ -1,10 +1,10 @@
 use bytes::{Buf, Bytes, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_PROGRESS,
-    FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT,
-    FLAG_RESPONSE, FLAG_RESPONSE_ERROR, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
-    StreamId,
+    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
+    FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
+    FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, HEADER_LEN, MAGIC, Offset,
+    Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 use super::{FixedHeader, Frame, VariableHeader};
@@ -706,6 +706,17 @@ impl Frame {
                                 epoch,
                                 extent_id,
                                 current_offset,
+                            },
+                            None,
+                        ))
+                    }
+                    FLAG_EXTENT_FLUSHED => {
+                        let extent_id = ExtentId(body.get_u32());
+                        Ok((
+                            VariableHeader::UpdateExtentFlushed {
+                                stream_id,
+                                epoch,
+                                extent_id,
                             },
                             None,
                         ))

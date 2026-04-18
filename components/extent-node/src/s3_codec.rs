@@ -79,17 +79,17 @@ impl Compression {
         }
     }
 
-    pub fn decompress(&self, data: &[u8], max_decompressed_size: usize) -> Result<Vec<u8>, CodecError> {
+    pub fn decompress(
+        &self,
+        data: &[u8],
+        max_decompressed_size: usize,
+    ) -> Result<Vec<u8>, CodecError> {
         match self {
             Compression::None => Ok(data.to_vec()),
-            Compression::Zstd => {
-                zstd::bulk::decompress(data, max_decompressed_size)
-                    .map_err(|e| CodecError::DecompressFailed(format!("zstd: {e}")))
-            }
-            Compression::Lz4 => {
-                lz4::block::decompress(data, Some(max_decompressed_size as i32))
-                    .map_err(|e| CodecError::DecompressFailed(format!("lz4: {e}")))
-            }
+            Compression::Zstd => zstd::bulk::decompress(data, max_decompressed_size)
+                .map_err(|e| CodecError::DecompressFailed(format!("zstd: {e}"))),
+            Compression::Lz4 => lz4::block::decompress(data, Some(max_decompressed_size as i32))
+                .map_err(|e| CodecError::DecompressFailed(format!("lz4: {e}"))),
         }
     }
 }
@@ -249,10 +249,8 @@ pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compress
 
     for i in 0..chunk_count {
         let chunk_start_seq = (i * S3_INDEX_INTERVAL) as u64;
-        let chunk_end_seq = std::cmp::min(
-            ((i + 1) * S3_INDEX_INTERVAL) as u64,
-            record_count as u64,
-        );
+        let chunk_end_seq =
+            std::cmp::min(((i + 1) * S3_INDEX_INTERVAL) as u64, record_count as u64);
 
         // Determine byte range for this chunk's records in the raw arena data.
         let byte_start = if chunk_start_seq == 0 {
@@ -265,7 +263,9 @@ pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compress
             // Last chunk: goes to the end of committed data.
             data.len()
         } else {
-            extent.index_lookup(chunk_end_seq).unwrap_or(data.len() as u64) as usize
+            extent
+                .index_lookup(chunk_end_seq)
+                .unwrap_or(data.len() as u64) as usize
         };
 
         let raw_chunk = &data[byte_start..byte_end];
@@ -386,21 +386,14 @@ mod tests {
     }
 
     /// Decompress a single chunk from encoded bytes.
-    fn decompress_chunk(
-        encoded: &[u8],
-        header: &S3ExtentHeader,
-        chunk_idx: u32,
-    ) -> Vec<u8> {
+    fn decompress_chunk(encoded: &[u8], header: &S3ExtentHeader, chunk_idx: u32) -> Vec<u8> {
         let data_start = header.data_offset();
         let idx_base = S3_EXTENT_HEADER_SIZE + chunk_idx as usize * 4;
-        let chunk_byte_start = u32::from_be_bytes(
-            encoded[idx_base..idx_base + 4].try_into().unwrap(),
-        ) as usize;
+        let chunk_byte_start =
+            u32::from_be_bytes(encoded[idx_base..idx_base + 4].try_into().unwrap()) as usize;
         let chunk_byte_end = if chunk_idx + 1 < header.chunk_count {
             let next_base = idx_base + 4;
-            u32::from_be_bytes(
-                encoded[next_base..next_base + 4].try_into().unwrap(),
-            ) as usize
+            u32::from_be_bytes(encoded[next_base..next_base + 4].try_into().unwrap()) as usize
         } else {
             header.data_size as usize
         };
@@ -456,7 +449,10 @@ mod tests {
             };
             let buf = header.encode();
             let decoded = S3ExtentHeader::decode(&buf).unwrap();
-            assert_eq!(decoded.compression, comp, "compression round-trip for {comp:?}");
+            assert_eq!(
+                decoded.compression, comp,
+                "compression round-trip for {comp:?}"
+            );
         }
     }
 
@@ -563,7 +559,11 @@ mod tests {
             let len = u32::from_be_bytes(decompressed[0..4].try_into().unwrap()) as usize;
             let record = &decompressed[4..4 + len];
             let expected = format!("record-{first_seq:04}");
-            assert_eq!(record, expected.as_bytes(), "chunk {chunk_idx} first record");
+            assert_eq!(
+                record,
+                expected.as_bytes(),
+                "chunk {chunk_idx} first record"
+            );
         }
     }
 

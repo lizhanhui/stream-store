@@ -1346,6 +1346,69 @@ impl MetadataStore {
         Ok(())
     }
 
+    /// Record that an extent was flushed to S3 (Secondary-1 confirms upload).
+    ///
+    /// Transitions the extent state from Sealed to Flushed. Idempotent: no-op if
+    /// already Flushed or if the extent is still Active. Epoch-validated.
+    pub async fn record_extent_flushed(
+        &self,
+        stream_id: StreamId,
+        epoch: Epoch,
+        extent_id: ExtentId,
+    ) -> Result<(), StorageError> {
+        let mut conn = self
+            .pool
+            .acquire()
+            .await
+            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
+        let mut tx = conn
+            .begin()
+            .await
+            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+
+        // Validate epoch matches current stream epoch.
+        let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
+            .bind(stream_id.0 as i64)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
+
+        if let Some(row) = row {
+            let current_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
+            if epoch != current_epoch {
+                // Stale notification from an old epoch — skip.
+                tx.commit()
+                    .await
+                    .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+                return Ok(());
+            }
+        } else {
+            return Err(StorageError::Internal(format!(
+                "stream {:?} not found",
+                stream_id
+            )));
+        }
+
+        // Transition Sealed → Flushed (idempotent: no-op if already Flushed).
+        sqlx::query(
+            "UPDATE extent SET state = ? \
+             WHERE stream_id = ? AND extent_id = ? AND state = ?",
+        )
+        .bind(ExtentState::Flushed.as_u8())
+        .bind(stream_id.0 as i64)
+        .bind(extent_id.0 as i64)
+        .bind(ExtentState::Sealed.as_u8())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| StorageError::Internal(format!("update extent flushed: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+
+        Ok(())
+    }
+
     /// Reconcile extents reported by a surviving EN during crash recovery.
     ///
     /// For each extent in the report, insert it if missing and update stream_sequence.

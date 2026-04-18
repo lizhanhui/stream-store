@@ -36,15 +36,18 @@ impl S3Client {
 
         let client = s3::Client::from_conf(builder.build());
 
-        let compression = Compression::from_config(&config.s3_compression)
-            .unwrap_or_else(|e| {
-                tracing::warn!("invalid s3_compression config: {e}, defaulting to None");
-                Compression::None
-            });
+        let compression = Compression::from_config(&config.s3_compression).unwrap_or_else(|e| {
+            tracing::warn!("invalid s3_compression config: {e}, defaulting to None");
+            Compression::None
+        });
 
         info!(
             "S3Client initialized: profile={}, bucket={}, namespace={}, path_style={}, compression={:?}",
-            config.s3_profile, config.s3_bucket, config.s3_namespace, config.s3_path_style, compression,
+            config.s3_profile,
+            config.s3_bucket,
+            config.s3_namespace,
+            config.s3_path_style,
+            compression,
         );
 
         Some(Self {

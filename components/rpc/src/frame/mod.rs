@@ -9,9 +9,10 @@ mod tests;
 
 use bytes::Bytes;
 use common::types::{
-    Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED,
-    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE,
-    FLAG_RESPONSE_ERROR, FLAG_SYSTEM_TICK, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
+    FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT,
+    FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SYSTEM_TICK, Offset, Opcode, PROTOCOL_VERSION,
+    StreamId,
 };
 
 pub use header::{FixedHeader, VariableHeader};
@@ -143,6 +144,7 @@ impl Frame {
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::UpdateExtentSealed { .. }
             | VariableHeader::UpdateExtentProgress { .. }
+            | VariableHeader::UpdateExtentFlushed { .. }
             | VariableHeader::StreamManagerMembershipChange => 0,
         }
     }
@@ -328,6 +330,7 @@ impl Frame {
             // ── Per-opcode request-side flags ──
             VariableHeader::UpdateExtentSealed { .. } => FLAG_EXTENT_SEALED,
             VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
+            VariableHeader::UpdateExtentFlushed { .. } => FLAG_EXTENT_FLUSHED,
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
             VariableHeader::ForwardInitExtent { .. } => FLAG_FORWARD_INIT_EXTENT,
             VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,

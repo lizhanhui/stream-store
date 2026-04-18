@@ -516,6 +516,21 @@ impl StreamManagerClient {
                 ),
                 format!("UpdateExtentProgress stream={stream_id}"),
             ),
+            ExtentUpdate::Flushed {
+                stream_id,
+                extent_id,
+                epoch,
+            } => (
+                Frame::new(
+                    VariableHeader::UpdateExtentFlushed {
+                        stream_id,
+                        epoch,
+                        extent_id,
+                    },
+                    None,
+                ),
+                format!("UpdateExtentFlushed stream={stream_id} extent={extent_id}"),
+            ),
         };
         match tokio::time::timeout(rpc_request_timeout, framed.send(frame)).await {
             Ok(Ok(())) => {}

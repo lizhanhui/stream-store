@@ -1696,11 +1696,12 @@ impl StreamManagerStore {
         }
     }
 
-    /// UpdateExtent: fire-and-forget extent updates from Primary EN.
+    /// UpdateExtent: fire-and-forget extent updates from EN.
     ///
     /// Dispatches on variant:
     /// - Sealed: extent was sealed, insert new extent (autonomous extent creation).
     /// - Progress: periodic offset update for an active extent (observability).
+    /// - Flushed: extent was flushed to S3 (Secondary-1 confirms upload).
     async fn handle_extent_update(&self, frame: Frame) {
         match &frame.variable_header {
             VariableHeader::UpdateExtentSealed {
@@ -1745,6 +1746,26 @@ impl StreamManagerStore {
                 {
                     warn!(
                         "Failed to record extent progress for stream {:?}: {e}",
+                        stream_id
+                    );
+                }
+            }
+            VariableHeader::UpdateExtentFlushed {
+                stream_id,
+                epoch,
+                extent_id,
+            } => {
+                info!(
+                    "UpdateExtentFlushed: stream={}, epoch={}, extent={}",
+                    stream_id, epoch, extent_id
+                );
+                if let Err(e) = self
+                    .store
+                    .record_extent_flushed(*stream_id, *epoch, *extent_id)
+                    .await
+                {
+                    warn!(
+                        "Failed to record extent flushed for stream {:?}: {e}",
                         stream_id
                     );
                 }
