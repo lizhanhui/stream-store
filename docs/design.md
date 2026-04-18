@@ -190,7 +190,7 @@ A DB-based leadership lease (`stream_manager_leadership` table) ensures that onl
 | **Storage Service (stream-store)** | Rust | Dedicated process. Extent nodes, stream manager, broadcast replication, S3 flush/read. |
 | **Stream Manager** | Rust | Metadata coordinator within storage service. Manages stream->extent mappings, seal/allocate, offset translation. MySQL client for metadata persistence. |
 | **Extent Node** | Rust | Holds in-memory extent replicas. Participates in broadcast replication (Primary broadcasts, Secondaries ACK). |
-| **S3 Flusher** | Rust | Background task on Extent Node. Uploads sealed extents to S3 via `aws-sdk-s3`. |
+| **S3 Flusher** | Rust | Background task on Secondary-1 Extent Node. Encodes sealed extents with chunk compression and uploads to S3 via `aws-sdk-s3`. Notifies SM on completion. |
 | **S3 Reader** | Rust | Fetches flushed extents from S3 with local LRU read cache. |
 
 ### Custom TCP Wire Protocol
@@ -251,7 +251,7 @@ Lower flag bits (0x02, 0x04) are available for per-opcode request-side semantics
 - APPEND: 0x02 = FLAG_SYSTEM_TICK (synthetic capacity-scaling tick)
 - DESCRIBE_STREAM: 0x02 = FLAG_DESCRIBE_STREAM_BY_NAME (name-based lookup)
 - FORWARD: uses 0x00/0x01/0x02 for forward variants (no response)
-- UPDATE_EXTENT: uses 0x00/0x01 for sealed/progress (fire-and-forget, no response)
+- UPDATE_EXTENT: uses 0x00/0x01/0x02 for sealed/progress/flushed (fire-and-forget, no response)
 
 **Data path (0x01-0x0F) -- Client <-> Extent Node**
 
@@ -753,11 +753,11 @@ Variable Header (20B):
 No Payload.
 ```
 
-##### 0x18 UPDATE_EXTENT (Primary ExtentNode -> Stream Manager)
+##### 0x18 UPDATE_EXTENT (ExtentNode -> Stream Manager)
 
-Async notification from Primary EN. Fire-and-forget: no response expected. Uses flags to distinguish two variants:
+Async notification from EN to SM. Fire-and-forget: no response expected. Uses flags to distinguish three variants:
 
-**flag=0x00 UpdateExtentSealed** — Sent after autonomous extent creation (extent-full within an epoch). SM updates metadata asynchronously.
+**flag=0x00 UpdateExtentSealed** — Sent by Primary after autonomous extent creation (extent-full within an epoch). SM updates metadata asynchronously.
 
 ```
 Fixed Header (8B)    -- flags=0x00
@@ -779,6 +779,17 @@ Variable Header (24B):
   [epoch            : u32]    -- current epoch
   [extent_id        : u32]    -- active extent
   [current_offset   : u64]    -- current committed offset
+No Payload.
+```
+
+**flag=0x02 UpdateExtentFlushed** — Sent by Secondary-1 (flush role) after a sealed extent is successfully uploaded to S3. SM transitions extent state from Sealed to Flushed.
+
+```
+Fixed Header (8B)    -- flags=0x02
+Variable Header (16B):
+  [stream_id    : u64]    -- stream whose extent was flushed
+  [epoch        : u32]    -- epoch at time of flush
+  [extent_id    : u32]    -- flushed extent
 No Payload.
 ```
 
@@ -1044,10 +1055,21 @@ stream-store/                          (Workspace root)
     │       ├── lib.rs                 -- run(): Extent Node bootstrap, heartbeat to Stream Manager
     │       ├── extent.rs              -- Extent: in-memory buffer + state machine (Active/Sealed/Flushed)
     │       ├── stream.rs              -- Stream: ordered extent list, active extent tracking, seal-and-new
-    │       ├── store.rs               -- ExtentNodeStore: request handler, ReplicaInfo, PendingAck, AckQueue
+    │       ├── store/                 -- ExtentNodeStore: split into focused submodules
+    │       │   ├── mod.rs             -- ExtentNodeStore struct, construction, accessors, RequestHandler dispatch
+    │       │   ├── types.rs           -- ExtentUpdate, ReplicaInfo, AppendJob
+    │       │   ├── append.rs          -- Write/append path, pipelined group commit, seal_and_create
+    │       │   ├── forward.rs         -- Replication receive: Forward, ForwardInitExtent, ForwardChecksum
+    │       │   ├── register.rs        -- RegisterExtent handler (SM → EN)
+    │       │   ├── read.rs            -- Read and QueryOffset handlers
+    │       │   ├── seal.rs            -- Seal, ReportExtents, build_seal_predecessor_payload
+    │       │   └── tests.rs           -- Unit tests for store operations
     │       ├── stream_manager_client.rs -- StreamManagerClient: RAII connection + heartbeat lifecycle
     │       ├── downstream.rs          -- DownstreamManager: per-node-addr TCP for broadcast forwarding
-    │       └── watermark.rs           -- WatermarkHandler: cumulative ACK + quorum drain, deferred client ACK
+    │       ├── ack_queue.rs           -- AckQueue: per-stream quorum tracking, PendingAck, timeout expiry
+    │       ├── s3.rs                  -- S3Client: aws-sdk-s3 wrapper with namespace and compression config
+    │       ├── s3_codec.rs            -- S3 extent file codec: chunk-compressed encode/decode with sparse index
+    │       └── s3_flusher.rs          -- Background S3 flusher: uploads sealed extents, notifies SM on completion
     │
     └── stream-manager/                -- Stream Manager library (depends: common, rpc, server, client)
         └── src/
@@ -1079,7 +1101,7 @@ src/bin/stream-manager.rs ──> stream-manager (lib) ──┬──> server �
 | **rpc** | lib | Custom TCP wire protocol: frame codec, payload helpers. |
 | **server** | lib | Server infrastructure: RequestHandler trait with deferred response support, connection accept loop. |
 | **client** | lib | Client for talking to Extent Node and Stream Manager: append/read messages, seal/create streams. Used by Extent Node (keepalive heartbeat to Stream Manager) and Stream Manager (seal commands to Extent Nodes). |
-| **extent-node** | lib | Extent Node logic. Holds in-memory extent replicas, participates in broadcast replication (Primary broadcasts to secondaries, receives watermark ACKs, computes quorum), serves APPEND/READ/SEAL requests. Uses client to heartbeat to Stream Manager. Built into a binary via `src/bin/extent-node.rs`. |
+| **extent-node** | lib | Extent Node logic. Holds in-memory extent replicas, participates in broadcast replication (Primary broadcasts to secondaries, receives watermark ACKs, computes quorum), serves APPEND/READ/SEAL requests. Secondary-1 runs background S3 flusher for sealed extents. Uses client to heartbeat to Stream Manager. Built into a binary via `src/bin/extent-node.rs`. |
 | **stream-manager** | lib | Stream Manager logic. Manages stream->extent mappings, orchestrates seal-and-new, allocates extents across Extent Nodes, persists metadata to MySQL. Uses client to issue seal/allocate to Extent Nodes. Built into a binary via `src/bin/stream-manager.rs`. |
 
 The `client` crate is used internally by both process types: Extent Node uses it to send keepalive heartbeats to Stream Manager, and Stream Manager uses it to issue seal/allocate commands to Extent Nodes. It is also the protocol interface for external consumers -- any client can re-implement the same wire format in their language of choice.
@@ -1096,6 +1118,9 @@ The `client` crate is used internally by both process types: Extent Node uses it
 | `tokio-util` | Codec framework for TCP frame encoding/decoding |
 | `tracing` | Structured logging and distributed tracing |
 | `serde` + `toml` | Configuration file deserialization (TOML format) |
+| `crc32fast` | CRC32 checksums for extent data integrity (replication + S3) |
+| `zstd` | Zstandard compression for S3 extent chunks |
+| `lz4` | LZ4 compression for S3 extent chunks (alternative to zstd) |
 
 ## Replication: Broadcast Replication
 
@@ -1283,7 +1308,7 @@ Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (lea
 | No overlap | Single writer advances `write_cursor` — each record occupies a disjoint region |
 | Read consistency | `committed_bytes` advances in-order; readers see a gap-free prefix |
 | Zero-copy reads | `Bytes::slice` into the arena buffer; no allocation or copy |
-| Zero-copy S3 flush | Arena bytes are in wire format; sealed extent uploads the buffer directly |
+| S3 flush | Sealed extent records encoded into chunk-compressed S3 format; uploaded by Secondary-1 |
 | No mutex on hot path | Leader election uses a single `fetch_add`; followers push to unbounded channel |
 | O(1) random read | Internal extent index resolves offset→byte_pos; no sequential walk needed |
 | Scalable under contention | Followers delegate to leader, eliminating cache-line bouncing |
@@ -1335,37 +1360,53 @@ read(stream, offset, count)
 
 ### S3 Object Layout
 
+Extent data is stored in S3 using a chunk-compressed format designed for random-access range reads.
+
+**S3 key**: `{namespace}/data/{stream_id}/{start_offset}_{end_offset}.dat`
+
+The key uses offset ranges (not extent IDs) to support future compaction of small extents into merged objects.
+
 ```
-s3://{bucket}/{namespace}/data/{stream_id}/{extent_id}.dat
-s3://{bucket}/{namespace}/index/{stream_id}/{extent_id}.idx
+┌─ Header (fixed 64 bytes) ──────────────────────────────┐
+│  magic              : u32  (0x53455854 "SEXT")          │
+│  version            : u16  (2)                          │
+│  flags              : u16  (reserved, 0)                │
+│  stream_id          : u64                               │
+│  start_offset       : u64                               │
+│  end_offset         : u64  (exclusive)                  │
+│  record_count       : u32                               │
+│  index_interval     : u32  (64)                         │
+│  chunk_count        : u32  (ceil(record_count / 64))    │
+│  data_size          : u32  (total compressed data bytes)│
+│  crc32              : u32  (over chunk index + data)    │
+│  compression        : u8   (0=none, 1=zstd, 2=lz4)     │
+│  _reserved          : [u8; 11]                          │
+├─ Chunk Index ───────────────────────────────────────────┤
+│  [chunk_count × u32]                                    │
+│  entry[i] = byte offset of chunk[i] within data section │
+├─ Data (compressed chunks) ──────────────────────────────┤
+│  chunk[0]: compress(records[0..64])                     │
+│  chunk[1]: compress(records[64..128])                   │
+│  ...                                                    │
+│  Each chunk is independently (de)compressible.          │
+│  Uncompressed: [len:u32 BE][payload]... (arena format)  │
+└─────────────────────────────────────────────────────────┘
 ```
 
-Each extent object is self-contained:
+**Chunk-based compression**: Records are grouped into chunks of 64 (aligned with the sparse index interval). Each chunk is compressed independently using the configured algorithm (zstd or lz4), enabling random-access reads without decompressing the entire object. The chunk index stores byte offsets into the compressed data section, so a reader can fetch a single chunk via an S3 range read and decompress it locally.
 
-```
-+-----------------------------------+
-| Extent Header (magic, version,    |
-|   stream_id, start_offset,        |
-|   end_offset)                     |
-| Message 0: [len][headers][body]   |
-| Message 1: [len][headers][body]   |
-| ...                               |
-| Message N: [len][headers][body]   |
-| Footer: offset_index[]            |
-|   seq_0 -> byte_offset_0          |
-|   seq_1 -> byte_offset_1          |
-|   ...                             |
-| CRC32                             |
-+-----------------------------------+
-```
+**Index interval = 64**: Chosen to ensure the header + chunk index fits within a 1 MiB initial S3 range read even for large extents (~1 GiB data, ~1 KiB avg record size → ~16K records → 256 chunks → 1 KiB index).
 
-Footer index enables efficient random reads within an extent without downloading the whole object (S3 range reads).
+**Flush role**: Only Secondary-1 (role=1) uploads sealed extents to S3. The Primary stays on the hot write path and does not perform S3 I/O. After successful upload, the flushing EN sends `UpdateExtentFlushed` to SM, which transitions the extent state from Sealed to Flushed in the database.
+
+**Compression config**: Global EN setting (`s3_compression` in config, default "none"). Valid values: "none", "zstd", "lz4". Per-stream compression may be added in the future.
 
 ### Post-Flush
 
-1. Stream Manager marks extent as "flushed" with S3 key in metadata.
-2. In-memory replicas eligible for eviction (per-stream `cache_extents` policy, default 4).
-3. Sealed extents can optionally be erasure-coded (e.g., Reed-Solomon 4+2) to reduce S3 storage from 3x to ~1.5x.
+1. Secondary-1 sends `UpdateExtentFlushed` to Stream Manager after successful S3 upload.
+2. Stream Manager transitions extent state from Sealed to Flushed in MySQL (idempotent, epoch-validated).
+3. In-memory replicas eligible for eviction (per-stream `cache_extents` policy, default 4).
+4. Sealed extents can optionally be erasure-coded (e.g., Reed-Solomon 4+2) to reduce S3 storage from 3x to ~1.5x.
 
 ## Stream Manager Metadata
 
@@ -1527,8 +1568,9 @@ read(stream, offset=1050, count=10)
 - Integration tests with multi-node setup
 
 ### Phase 3: S3 Flush and Read
-- Extent codec: binary format with header, messages, footer index
-- S3 Flusher: sealed extent upload via aws-sdk-s3
+- S3 extent codec: chunk-compressed binary format with 64-byte header, sparse chunk index, and independently compressible 64-record chunks (zstd/lz4/none)
+- S3 Flusher: background task on Secondary-1 encodes sealed extents and uploads via aws-sdk-s3 with retry
+- UpdateExtentFlushed notification: Secondary-1 → SM after successful upload; SM transitions Sealed → Flushed in MySQL
 - S3 Reader: range-read with local LRU cache (moka)
 - Flush triggers: size, time, node failure
 - Post-flush memory eviction
