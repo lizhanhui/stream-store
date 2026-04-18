@@ -1,11 +1,46 @@
+// PoC: access Tencent Cloud COS using the AWS S3 SDK.
+//
+// Required config files:
+//
+// ~/.aws/config:
+//   [default]
+//   region = ap-guangzhou
+//   services = cos
+//
+//   [profile dev]
+//   region = ap-beijing
+//   services = cos-bj
+//
+//   [services cos]
+//   s3 =
+//       endpoint_url = https://cos.ap-guangzhou.myqcloud.com
+//       addressing_style = virtual
+//
+//   [services cos-bj]
+//   s3 =
+//       endpoint_url = https://cos.ap-beijing.myqcloud.com
+//       addressing_style = virtual
+//
+// ~/.aws/credentials:
+//   [default]
+//   aws_access_key_id = <COS_SECRETID>
+//   aws_secret_access_key = <COS_SECRETKEY>
+//
+//   [dev]
+//   aws_access_key_id = <DEV_COS_SECRETID>
+//   aws_secret_access_key = <DEV_COS_SECRETKEY>
+//
+// Select profile: AWS_PROFILE=dev cargo run --example s3-example
+// Override bucket: COS_BUCKET=my-bucket-12345 cargo run --example s3-example
+
 use aws_sdk_s3 as s3;
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
     // endpoint_url, region, and addressing_style come from ~/.aws/config.
-    // credentials come from ~/.aws/credentials.
-    let config = aws_config::from_env().profile_name("default").load().await;
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+    let config = aws_config::from_env().profile_name(&profile).load().await;
     let mut config_builder = s3::config::Builder::from(&config);
     config_builder.set_force_path_style(Some(false));
 
