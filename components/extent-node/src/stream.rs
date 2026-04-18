@@ -8,7 +8,7 @@ use common::config::{
     DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::errors::StorageError;
-use common::types::{Epoch, ExtentId, ExtentState, Offset, StreamId};
+use common::types::{Epoch, ExtentId, ExtentState, Offset, StorageClass, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::RwLock;
 use rpc::frame::Frame;
@@ -76,8 +76,8 @@ struct StreamInner {
     /// replenished by evict_oldest_extents.
     extent_pool: VecDeque<Extent>,
 
-    /// Storage medium for sealed extents (0 = S3, 1 = Memory).
-    storage_medium: u8,
+    /// Storage class for sealed extents: S3 or Memory.
+    storage_class: StorageClass,
 }
 
 impl StreamInner {
@@ -250,7 +250,7 @@ impl Stream {
                 max_extents: DEFAULT_CACHE_EXTENTS as usize,
                 downstream_txs: Vec::new(),
                 extent_pool: VecDeque::new(),
-                storage_medium: 0,
+                storage_class: StorageClass::S3,
             }),
         }
     }
@@ -557,9 +557,9 @@ impl Stream {
         self.inner.read().max_extents
     }
 
-    /// Return the storage medium for this stream (0 = S3, 1 = Memory).
-    pub fn storage_medium(&self) -> u8 {
-        self.inner.read().storage_medium
+    /// Return the storage class for this stream.
+    pub fn storage_class(&self) -> StorageClass {
+        self.inner.read().storage_class
     }
 
     // ── Write-lock methods ─────────────────────────────────────────────
@@ -570,9 +570,9 @@ impl Stream {
         self.inner.write().max_extents = max;
     }
 
-    /// Set the storage medium for this stream (0 = S3, 1 = Memory).
-    pub fn set_storage_medium(&self, medium: u8) {
-        self.inner.write().storage_medium = medium;
+    /// Set the storage class for this stream.
+    pub fn set_storage_class(&self, class: StorageClass) {
+        self.inner.write().storage_class = class;
     }
 
     /// Register a new extent on this stream (called when SM sends RegisterExtent).

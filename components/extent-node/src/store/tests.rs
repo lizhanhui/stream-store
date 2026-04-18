@@ -7,7 +7,7 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY, DEFAULT_EXTENT_GROWTH_FACTOR,
     DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
 };
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use server::handler::RequestHandler;
 use tokio::sync::mpsc;
@@ -36,7 +36,7 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                     cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_medium: 0,
+                    storage_class: StorageClass::S3,
                 },
                 Some(payload),
             ),
@@ -248,7 +248,7 @@ async fn register_extent_creates_stream() {
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                     cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_medium: 0,
+                    storage_class: StorageClass::S3,
                 },
                 Some(payload),
             ),
@@ -300,7 +300,7 @@ async fn register_extent_secondary() {
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                     cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_medium: 0,
+                    storage_class: StorageClass::S3,
                 },
                 Some(payload),
             ),
@@ -344,7 +344,7 @@ async fn register_extent_then_append_rf1() {
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                     cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_medium: 0,
+                    storage_class: StorageClass::S3,
                 },
                 Some(payload),
             ),
@@ -409,7 +409,7 @@ async fn primary_append_defers_and_broadcasts() {
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                     cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_medium: 0,
+                    storage_class: StorageClass::S3,
                 },
                 Some(payload),
             ),
@@ -502,7 +502,7 @@ async fn secondary_returns_watermark() {
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                     cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_medium: 0,
+                    storage_class: StorageClass::S3,
                 },
                 Some(payload),
             ),
@@ -1045,7 +1045,7 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
                     cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_medium: 0,
+                    storage_class: StorageClass::S3,
                 },
                 Some(payload),
             ),

@@ -11,7 +11,7 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
     DEFAULT_MIN_EXTENT_CAPACITY, StreamManagerConfig,
 };
-use common::types::{Epoch, ExtentState, NodeMetrics};
+use common::types::{Epoch, ExtentState, NodeMetrics, StorageClass};
 use serial_test::serial;
 
 /// Initialize tracing for tests.
@@ -123,7 +123,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
-            0,
+            StorageClass::S3,
         )
         .await
         .unwrap();
@@ -150,7 +150,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
-            0,
+            StorageClass::S3,
         )
         .await
         .unwrap();
@@ -172,7 +172,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
-            0,
+            StorageClass::S3,
         )
         .await
         .unwrap();

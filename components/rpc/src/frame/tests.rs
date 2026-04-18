@@ -3,7 +3,7 @@ use bytes::{BufMut, BytesMut};
 use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE, HEADER_LEN, MAGIC,
-    Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
 };
 
 fn sample_append_frame() -> Frame {
@@ -469,7 +469,7 @@ fn create_stream_round_trip() {
             max_extent_capacity: 268_435_456,
             cache_extents: 4,
             extent_growth_factor: 8,
-            storage_medium: 0,
+            storage_class: StorageClass::S3,
         },
         None,
     );

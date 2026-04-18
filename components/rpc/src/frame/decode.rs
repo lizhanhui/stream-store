@@ -4,7 +4,7 @@ use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
     FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
     FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, HEADER_LEN,
-    MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
 };
 
 use super::{FixedHeader, Frame, VariableHeader};
@@ -301,7 +301,8 @@ impl Frame {
                     let max_extent_capacity = body.get_u32();
                     let cache_extents = body.get_u16();
                     let extent_growth_factor = body.get_u8();
-                    let storage_medium = body.get_u8();
+                    let storage_class = StorageClass::from_u8(body.get_u8())
+                        .ok_or_else(|| StorageError::InvalidFrame("unknown storage class".into()))?;
                     Ok((
                         VariableHeader::CreateStream {
                             request_id,
@@ -311,7 +312,7 @@ impl Frame {
                             max_extent_capacity,
                             cache_extents,
                             extent_growth_factor,
-                            storage_medium,
+                            storage_class,
                         },
                         None,
                     ))
@@ -455,7 +456,8 @@ impl Frame {
                     let min_extent_capacity = body.get_u32();
                     let max_extent_capacity = body.get_u32();
                     let extent_growth_factor = body.get_u8();
-                    let storage_medium = body.get_u8();
+                    let storage_class = StorageClass::from_u8(body.get_u8())
+                        .ok_or_else(|| StorageError::InvalidFrame("unknown storage class".into()))?;
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::RegisterExtent {
@@ -470,7 +472,7 @@ impl Frame {
                             min_extent_capacity,
                             max_extent_capacity,
                             extent_growth_factor,
-                            storage_medium,
+                            storage_class,
                         },
                         payload,
                     ))
@@ -539,7 +541,8 @@ impl Frame {
                         let start_offset = Offset(body.get_u64());
                         let extent_capacity = body.get_u32();
                         let cache_extents = body.get_u16();
-                        let storage_medium = body.get_u8();
+                        let storage_class = StorageClass::from_u8(body.get_u8())
+                            .ok_or_else(|| StorageError::InvalidFrame("unknown storage class".into()))?;
                         Ok((
                             VariableHeader::ForwardInitExtent {
                                 stream_id,
@@ -548,7 +551,7 @@ impl Frame {
                                 start_offset,
                                 extent_capacity,
                                 cache_extents,
-                                storage_medium,
+                                storage_class,
                             },
                             None,
                         ))

@@ -40,7 +40,7 @@ use bytes::Bytes;
 use client::StreamClient;
 use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR};
 use common::errors::StorageError;
-use common::types::{Epoch, StreamId};
+use common::types::{Epoch, StorageClass, StreamId};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use hdrhistogram::Histogram;
@@ -186,7 +186,7 @@ async fn main() {
             MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
-            0,
+            StorageClass::S3,
         )
         .await
         .expect("open stream");

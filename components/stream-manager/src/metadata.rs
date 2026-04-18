@@ -2,7 +2,8 @@ use std::collections::HashMap;
 
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ExtentId, ExtentInfo, ExtentState, NodeMetrics, NodeState, ReplicaDetail, StreamId,
+    Epoch, ExtentId, ExtentInfo, ExtentState, NodeMetrics, NodeState, ReplicaDetail, StorageClass,
+    StreamId,
 };
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{Acquire, MySqlPool, Row};
@@ -25,7 +26,7 @@ pub struct StreamRow {
     pub max_extent_capacity: u32,
     pub cache_extents: u16,
     pub extent_growth_factor: u8,
-    pub storage_medium: u8,
+    pub storage_class: StorageClass,
 }
 
 /// A row from the `extent` table.
@@ -142,10 +143,10 @@ impl MetadataStore {
         max_extent_capacity: u32,
         cache_extents: u16,
         extent_growth_factor: u8,
-        storage_medium: u8,
+        storage_class: StorageClass,
     ) -> Result<StreamId, StorageError> {
         let result = sqlx::query(
-            "INSERT INTO stream (stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_medium) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO stream (stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name)
         .bind(stream_type)
@@ -155,7 +156,7 @@ impl MetadataStore {
         .bind(max_extent_capacity as i32)
         .bind(cache_extents)
         .bind(extent_growth_factor)
-        .bind(storage_medium)
+        .bind(storage_class.as_u8())
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("create_stream: {e}")))?;
@@ -175,7 +176,7 @@ impl MetadataStore {
     /// Get a stream by ID.
     pub async fn get_stream(&self, id: StreamId) -> Result<Option<StreamRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_medium FROM stream WHERE stream_id = ?",
+            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class FROM stream WHERE stream_id = ?",
         )
         .bind(id.0 as i64)
         .fetch_optional(&self.pool)
@@ -192,14 +193,14 @@ impl MetadataStore {
             max_extent_capacity: r.get::<i32, _>("max_extent_capacity") as u32,
             cache_extents: r.get::<u16, _>("cache_extents"),
             extent_growth_factor: r.get::<u8, _>("extent_growth_factor"),
-            storage_medium: r.get::<u8, _>("storage_medium"),
+            storage_class: StorageClass::from_u8(r.get::<u8, _>("storage_class")).unwrap_or(StorageClass::S3),
         }))
     }
 
     /// Get a stream by name.
     pub async fn get_stream_by_name(&self, name: &str) -> Result<Option<StreamRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_medium FROM stream WHERE stream_name = ?",
+            "SELECT stream_id, stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class FROM stream WHERE stream_name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -216,7 +217,7 @@ impl MetadataStore {
             max_extent_capacity: r.get::<i32, _>("max_extent_capacity") as u32,
             cache_extents: r.get::<u16, _>("cache_extents"),
             extent_growth_factor: r.get::<u8, _>("extent_growth_factor"),
-            storage_medium: r.get::<u8, _>("storage_medium"),
+            storage_class: StorageClass::from_u8(r.get::<u8, _>("storage_class")).unwrap_or(StorageClass::S3),
         }))
     }
 

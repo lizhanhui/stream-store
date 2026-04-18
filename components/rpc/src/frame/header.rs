@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StorageClass, StreamId};
 
 /// Fixed header fields present in every frame on the wire.
 ///
@@ -109,8 +109,8 @@ pub enum VariableHeader {
         /// Growth factor for adaptive capacity scaling (0 = use default).
         /// On extent-full, next_capacity = min(current * growth_factor, max).
         extent_growth_factor: u8,
-        /// Storage medium for sealed extents (0 = S3, 1 = Memory).
-        storage_medium: u8,
+        /// Storage class for sealed extents: S3 (0) or Memory (1).
+        storage_class: StorageClass,
     },
     CreateStreamResp {
         request_id: u32,
@@ -182,8 +182,8 @@ pub enum VariableHeader {
         max_extent_capacity: u32,
         /// Growth factor for adaptive capacity scaling (0 = use default).
         extent_growth_factor: u8,
-        /// Storage medium for sealed extents (0 = S3, 1 = Memory).
-        storage_medium: u8,
+        /// Storage class for sealed extents: S3 (0) or Memory (1).
+        storage_class: StorageClass,
     },
     RegisterExtentAck {
         request_id: u32,
@@ -268,8 +268,8 @@ pub enum VariableHeader {
         start_offset: Offset,
         extent_capacity: u32,
         cache_extents: u16,
-        /// Storage medium for sealed extents (0 = S3, 1 = Memory).
-        storage_medium: u8,
+        /// Storage class for sealed extents: S3 (0) or Memory (1).
+        storage_class: StorageClass,
     },
     /// CRC32 checksum verification (Forward, flag=0x02). Fire-and-forget.
     /// Sent by primary after sealing an extent so secondaries can verify
