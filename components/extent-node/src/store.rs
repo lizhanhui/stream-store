@@ -21,6 +21,7 @@ use tracing::{debug, info, warn};
 use crate::ack_queue::{AckQueue, DEFAULT_REPLICATION_TIMEOUT, PendingAck};
 use crate::downstream::DownstreamPool;
 use crate::extent::AppendResult;
+use crate::s3::S3Client;
 use crate::stream::{SealNotification, SealReason, Stream};
 
 /// Notification emitted by the Primary to update Stream Manager about extent state.
@@ -119,6 +120,9 @@ pub struct ExtentNodeStore {
     /// Direct TCP connection pool for broadcast replication (None for standalone/test mode).
     /// Initialized via `set_downstream()` after construction (OnceLock breaks circular dep).
     downstream: OnceLock<Arc<DownstreamPool>>,
+    /// S3 client for flushed extent storage (None when s3_bucket is empty).
+    /// Initialized via `set_s3_client()` after construction (OnceLock for async init).
+    s3_client: OnceLock<Arc<S3Client>>,
     /// Channel to send ExtentUpdate notifications to SM (Primary only).
     /// The SM connection task receives these and sends UPDATE_EXTENT frames.
     update_tx: Option<Sender<ExtentUpdate>>,
@@ -142,6 +146,7 @@ impl ExtentNodeStore {
             next_stream_id: AtomicU64::new(1),
             replicas: papaya::HashMap::new(),
             downstream: OnceLock::new(),
+            s3_client: OnceLock::new(),
             update_tx: None,
             ack_queues: papaya::HashMap::new(),
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
@@ -160,6 +165,17 @@ impl ExtentNodeStore {
     /// Uses OnceLock to break the circular dependency: store needs pool, pool needs store.
     pub fn set_downstream(&self, pool: Arc<DownstreamPool>) {
         self.downstream.set(pool).ok();
+    }
+
+    /// Set the S3 client for flushed extent storage.
+    /// Called once during ExtentNode bootstrap after async initialization.
+    pub fn set_s3_client(&self, client: Arc<S3Client>) {
+        self.s3_client.set(client).ok();
+    }
+
+    /// Get a reference to the S3 client, if configured.
+    pub fn s3_client(&self) -> Option<&Arc<S3Client>> {
+        self.s3_client.get()
     }
 
     /// Set the seal request channel (called during ExtentNode bootstrap).
