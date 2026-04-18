@@ -194,7 +194,7 @@ A DB-based leadership lease (`stream_manager_leadership` table) ensures that onl
 | **Storage Service (stream-store)** | Rust | Dedicated process. Extent nodes, stream manager, broadcast replication, S3 flush/read. |
 | **Stream Manager** | Rust | Metadata coordinator within storage service. Manages stream->extent mappings, seal/allocate, offset translation. MySQL client for metadata persistence. |
 | **Extent Node** | Rust | Holds in-memory extent replicas. Participates in broadcast replication (Primary broadcasts, Secondaries ACK). |
-| **S3 Flusher** | Rust | Background task on Primary Extent Node. Encodes sealed extents with chunk compression and uploads to S3 via `aws-sdk-s3`. Broadcasts ForwardFlushed to secondaries and notifies SM on completion. |
+| **S3 Flusher** | Rust | Background task on Primary Extent Node. Encodes sealed extents with chunk compression and uploads to S3 via `aws-sdk-s3` (automatic multipart for large objects). Broadcasts ForwardFlushed to secondaries and notifies SM on completion. |
 | **S3 Reader** | Rust | Fetches flushed extents from S3 with local LRU read cache. |
 
 ### Custom TCP Wire Protocol
@@ -1589,6 +1589,7 @@ read(stream, offset=1050, count=10)
 ### Phase 3: S3 Flush and Read
 - S3 extent codec: chunk-compressed binary format with 64-byte header, sparse chunk index, and independently compressible 64-record chunks (zstd/lz4/none)
 - S3 Flusher: background task on Primary encodes sealed extents and uploads via aws-sdk-s3 with retry
+- S3 multipart upload: objects above `s3_multipart_threshold` (default 64 MiB) are split into `s3_multipart_part_size` chunks (default 8 MiB) and uploaded concurrently (up to `s3_multipart_concurrency` parts in flight, default 8). Each part has independent retry with exponential backoff. On failure, uploaded parts are cleaned up via `abort_multipart_upload`.
 - ForwardFlushed broadcast: Primary → Secondaries after successful upload, enabling eviction across all replicas
 - UpdateExtentFlushed notification: Primary → SM after successful upload; SM transitions Sealed → Flushed in MySQL
 - S3 Reader: range-read with local LRU cache (moka)

@@ -89,7 +89,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
     let mut attempt = 0u32;
     loop {
         attempt += 1;
-        match s3_client.put_object(&key, encoded.clone()).await {
+        match s3_client.upload(&key, encoded.clone()).await {
             Ok(()) => {
                 info!(
                     "flushed extent {} for stream {} to s3://{}/{} ({} bytes)",

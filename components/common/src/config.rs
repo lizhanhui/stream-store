@@ -123,6 +123,18 @@ pub struct ExtentNodeConfig {
     /// for random-access reads. Valid values: "none", "zstd", "lz4".
     /// Defaults to "none".
     pub s3_compression: String,
+
+    /// Multipart upload threshold in bytes. Objects larger than this use S3
+    /// multipart upload for parallel part uploads. Defaults to 64 MiB.
+    pub s3_multipart_threshold: usize,
+
+    /// Part size in bytes for multipart uploads. AWS minimum is 5 MiB.
+    /// Defaults to 8 MiB.
+    pub s3_multipart_part_size: usize,
+
+    /// Maximum number of concurrent part uploads during multipart upload.
+    /// Defaults to 8.
+    pub s3_multipart_concurrency: usize,
 }
 
 impl Default for ExtentNodeConfig {
@@ -143,6 +155,9 @@ impl Default for ExtentNodeConfig {
             s3_path_style: false,
             s3_namespace: "default".to_string(),
             s3_compression: "none".to_string(),
+            s3_multipart_threshold: 64 * 1024 * 1024,
+            s3_multipart_part_size: 8 * 1024 * 1024,
+            s3_multipart_concurrency: 8,
         }
     }
 }
