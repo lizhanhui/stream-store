@@ -1097,11 +1097,15 @@ mod tests {
 
         // Create 3 extents: extent 0 (sealed), extent 1 (sealed), extent 2 (active).
         stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
-        stream.append(ExtentId(0), Bytes::from_static(b"a")).unwrap();
+        stream
+            .append(ExtentId(0), Bytes::from_static(b"a"))
+            .unwrap();
         stream.seal(ExtentId(0), None);
 
         stream.register_extent_simple(ExtentId(1), Offset(1), DEFAULT_EXTENT_CAPACITY, Epoch(0));
-        stream.append(ExtentId(1), Bytes::from_static(b"b")).unwrap();
+        stream
+            .append(ExtentId(1), Bytes::from_static(b"b"))
+            .unwrap();
         stream.seal(ExtentId(1), None);
 
         stream.register_extent_simple(ExtentId(2), Offset(2), DEFAULT_EXTENT_CAPACITY, Epoch(0));
@@ -1114,7 +1118,9 @@ mod tests {
 
         // Mark extent 0 as flushed, then trigger eviction by adding extent 3.
         stream.with_extent(ExtentId(0), |ext| ext.mark_flushed());
-        stream.append(ExtentId(2), Bytes::from_static(b"c")).unwrap();
+        stream
+            .append(ExtentId(2), Bytes::from_static(b"c"))
+            .unwrap();
         stream.seal(ExtentId(2), None);
         stream.register_extent_simple(ExtentId(3), Offset(3), DEFAULT_EXTENT_CAPACITY, Epoch(0));
 
@@ -1142,12 +1148,16 @@ mod tests {
 
         // Create extent 0, append, seal it (but NOT flushed).
         stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
-        stream.append(ExtentId(0), Bytes::from_static(b"a")).unwrap();
+        stream
+            .append(ExtentId(0), Bytes::from_static(b"a"))
+            .unwrap();
         stream.seal(ExtentId(0), None);
 
         // Create extent 1 (active) — 2 extents, at limit.
         stream.register_extent_simple(ExtentId(1), Offset(1), DEFAULT_EXTENT_CAPACITY, Epoch(0));
-        stream.append(ExtentId(1), Bytes::from_static(b"b")).unwrap();
+        stream
+            .append(ExtentId(1), Bytes::from_static(b"b"))
+            .unwrap();
 
         // Try seal_and_create_next — should fail (extent 0 not flushed).
         let result = stream.seal_and_create_next(SealReason::ExtentFull);
@@ -1157,8 +1167,14 @@ mod tests {
         );
 
         // Extent 1 should be sealed (seal happened), but no new extent created.
-        assert!(stream.with_extent(ExtentId(0), |_| ()).is_some(), "extent 0 still present");
-        assert!(stream.with_extent(ExtentId(1), |_| ()).is_some(), "extent 1 still present");
+        assert!(
+            stream.with_extent(ExtentId(0), |_| ()).is_some(),
+            "extent 0 still present"
+        );
+        assert!(
+            stream.with_extent(ExtentId(1), |_| ()).is_some(),
+            "extent 1 still present"
+        );
 
         // Flush both sealed extents (simulating S3 upload completing).
         stream.with_extent(ExtentId(0), |ext| ext.mark_flushed());
@@ -1166,7 +1182,9 @@ mod tests {
 
         // Register a new active extent so we can seal+create again.
         stream.register_extent_simple(ExtentId(2), Offset(2), DEFAULT_EXTENT_CAPACITY, Epoch(0));
-        stream.append(ExtentId(2), Bytes::from_static(b"c")).unwrap();
+        stream
+            .append(ExtentId(2), Bytes::from_static(b"c"))
+            .unwrap();
 
         // Now both old extents are flushed — eviction is unblocked.
         let result = stream.seal_and_create_next(SealReason::ExtentFull);

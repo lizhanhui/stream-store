@@ -1164,7 +1164,9 @@ impl StreamManagerStore {
             self.store.get_stream_capacity_bounds(stream_id).await?;
         let extent_growth_factor = self.store.get_stream_growth_factor(stream_id).await?;
         let stream_row = self.store.get_stream(stream_id).await?;
-        let storage_class = stream_row.map(|r| r.storage_class).unwrap_or(StorageClass::S3);
+        let storage_class = stream_row
+            .map(|r| r.storage_class)
+            .unwrap_or(StorageClass::S3);
         // Failover allocation: degrade RF if necessary, as long as quorum is preserved.
         // Quorum = floor(RF/2) + 1. E.g., RF=3 → quorum=2, so degraded RF=2 is acceptable.
         let quorum = replication_factor / 2 + 1;
