@@ -195,6 +195,7 @@ pub enum VariableHeader {
     Watermark {
         stream_id: StreamId,
         extent_id: ExtentId,
+        epoch: Epoch,
         offset: Offset,
     },
     /// Extent sealed: Primary EN sealed an extent and created a new one (UpdateExtent, flag=0x00).
@@ -270,6 +271,7 @@ pub enum VariableHeader {
     ForwardChecksum {
         stream_id: StreamId,
         extent_id: ExtentId,
+        epoch: Epoch,
         checksum: u32,
         committed_bytes: u64,
     },
@@ -279,6 +281,7 @@ pub enum VariableHeader {
     ForwardFlushed {
         stream_id: StreamId,
         extent_id: ExtentId,
+        epoch: Epoch,
     },
     StreamManagerMembershipChange,
     DescribeStream {

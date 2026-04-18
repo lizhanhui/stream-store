@@ -76,8 +76,8 @@ impl Frame {
             VariableHeader::RegisterExtentAck { .. } => 4 + 8 + 4,
             // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
             VariableHeader::RegisterExtentAckError { .. } => 4 + 8 + 4 + 2,
-            // stream_id(8) + extent_id(4) + offset(8) -- no request_id
-            VariableHeader::Watermark { .. } => 8 + 4 + 8,
+            // stream_id(8) + extent_id(4) + epoch(4) + offset(8) -- no request_id
+            VariableHeader::Watermark { .. } => 8 + 4 + 4 + 8,
             // stream_id(8) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4) + new_extent_capacity(4)
             VariableHeader::UpdateExtentSealed { .. } => 8 + 4 + 4 + 8 + 4 + 4,
             // stream_id(8) + epoch(4) + extent_id(4) + current_offset(8)
@@ -94,10 +94,10 @@ impl Frame {
             VariableHeader::Forward { .. } => 8 + 4 + 4 + 8 + 8,
             // stream_id(8) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(4)
             VariableHeader::ForwardInitExtent { .. } => 8 + 4 + 4 + 8 + 4 + 4,
-            // stream_id(8) + extent_id(4) + checksum(4) + committed_bytes(8)
-            VariableHeader::ForwardChecksum { .. } => 8 + 4 + 4 + 8,
-            // stream_id(8) + extent_id(4)
-            VariableHeader::ForwardFlushed { .. } => 8 + 4,
+            // stream_id(8) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
+            VariableHeader::ForwardChecksum { .. } => 8 + 4 + 4 + 4 + 8,
+            // stream_id(8) + extent_id(4) + epoch(4)
+            VariableHeader::ForwardFlushed { .. } => 8 + 4 + 4,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
             // request_id(4) + stream_id(8) + count(4) [+ name_len(2) + name(N) if FLAG_DESCRIBE_STREAM_BY_NAME]
@@ -458,10 +458,12 @@ impl Frame {
             VariableHeader::Watermark {
                 stream_id,
                 extent_id,
+                epoch,
                 offset,
             } => {
                 dst.put_u64(stream_id.0);
                 dst.put_u32(extent_id.0);
+                dst.put_u32(epoch.0);
                 dst.put_u64(offset.0);
             }
             VariableHeader::Forward {
@@ -495,20 +497,24 @@ impl Frame {
             VariableHeader::ForwardChecksum {
                 stream_id,
                 extent_id,
+                epoch,
                 checksum,
                 committed_bytes,
             } => {
                 dst.put_u64(stream_id.0);
                 dst.put_u32(extent_id.0);
+                dst.put_u32(epoch.0);
                 dst.put_u32(*checksum);
                 dst.put_u64(*committed_bytes);
             }
             VariableHeader::ForwardFlushed {
                 stream_id,
                 extent_id,
+                epoch,
             } => {
                 dst.put_u64(stream_id.0);
                 dst.put_u32(extent_id.0);
+                dst.put_u32(epoch.0);
             }
             VariableHeader::StreamManagerMembershipChange => {
                 // no variable header fields, just payload

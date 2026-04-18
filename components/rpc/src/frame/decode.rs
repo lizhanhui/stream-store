@@ -476,20 +476,23 @@ impl Frame {
             Opcode::Watermark => {
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
+                let epoch = Epoch(body.get_u32());
                 let offset = Offset(body.get_u64());
                 Ok((
                     VariableHeader::Watermark {
                         stream_id,
                         extent_id,
+                        epoch,
                         offset,
                     },
                     None,
                 ))
             }
-            // ── Forward: flag-based variants (append/init/checksum) ──
+            // ── Forward: flag-based variants (append/init/checksum/flushed) ──
             Opcode::Forward => {
                 let stream_id = StreamId(body.get_u64());
                 let extent_id = ExtentId(body.get_u32());
+                let epoch = Epoch(body.get_u32());
                 match flags {
                     FLAG_FORWARD_CHECKSUM => {
                         let checksum = body.get_u32();
@@ -498,6 +501,7 @@ impl Frame {
                             VariableHeader::ForwardChecksum {
                                 stream_id,
                                 extent_id,
+                                epoch,
                                 checksum,
                                 committed_bytes,
                             },
@@ -508,48 +512,44 @@ impl Frame {
                         VariableHeader::ForwardFlushed {
                             stream_id,
                             extent_id,
+                            epoch,
                         },
                         None,
                     )),
-                    _ => {
-                        let epoch = Epoch(body.get_u32());
-                        match flags {
-                            FLAG_FORWARD_APPEND => {
-                                let offset = Offset(body.get_u64());
-                                let byte_pos = body.get_u64();
-                                let payload = Self::read_payload(body);
-                                Ok((
-                                    VariableHeader::Forward {
-                                        stream_id,
-                                        extent_id,
-                                        epoch,
-                                        offset,
-                                        byte_pos,
-                                    },
-                                    payload,
-                                ))
-                            }
-                            FLAG_FORWARD_INIT_EXTENT => {
-                                let start_offset = Offset(body.get_u64());
-                                let extent_capacity = body.get_u32();
-                                let cache_extents = body.get_u32();
-                                Ok((
-                                    VariableHeader::ForwardInitExtent {
-                                        stream_id,
-                                        extent_id,
-                                        epoch,
-                                        start_offset,
-                                        extent_capacity,
-                                        cache_extents,
-                                    },
-                                    None,
-                                ))
-                            }
-                            _ => Err(StorageError::Internal(format!(
-                                "unknown Forward flag: {flags:#x}"
-                            ))),
-                        }
+                    FLAG_FORWARD_APPEND => {
+                        let offset = Offset(body.get_u64());
+                        let byte_pos = body.get_u64();
+                        let payload = Self::read_payload(body);
+                        Ok((
+                            VariableHeader::Forward {
+                                stream_id,
+                                extent_id,
+                                epoch,
+                                offset,
+                                byte_pos,
+                            },
+                            payload,
+                        ))
                     }
+                    FLAG_FORWARD_INIT_EXTENT => {
+                        let start_offset = Offset(body.get_u64());
+                        let extent_capacity = body.get_u32();
+                        let cache_extents = body.get_u32();
+                        Ok((
+                            VariableHeader::ForwardInitExtent {
+                                stream_id,
+                                extent_id,
+                                epoch,
+                                start_offset,
+                                extent_capacity,
+                                cache_extents,
+                            },
+                            None,
+                        ))
+                    }
+                    _ => Err(StorageError::Internal(format!(
+                        "unknown Forward flag: {flags:#x}"
+                    ))),
                 }
             }
             // ── StreamManagerMembershipChange: fire-and-forget ──

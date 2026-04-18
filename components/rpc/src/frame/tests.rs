@@ -141,6 +141,7 @@ fn watermark_no_request_id() {
         VariableHeader::Watermark {
             stream_id: StreamId(42),
             extent_id: ExtentId(7),
+            epoch: Epoch(1),
             offset: Offset(100),
         },
         None,
@@ -148,8 +149,8 @@ fn watermark_no_request_id() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 8 (stream_id) + 4 (extent_id) + 8 (offset) = 28 bytes
-    assert_eq!(buf.len(), 28);
+    // 8 (fixed) + 8 (stream_id) + 4 (extent_id) + 4 (epoch) + 8 (offset) = 32 bytes
+    assert_eq!(buf.len(), 32);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::Watermark);
