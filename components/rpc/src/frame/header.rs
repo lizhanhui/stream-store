@@ -273,6 +273,13 @@ pub enum VariableHeader {
         checksum: u32,
         committed_bytes: u64,
     },
+    /// Extent flushed to S3 notification (Forward, flag=0x03). Fire-and-forget.
+    /// Sent by Primary after successful S3 upload so secondaries can mark
+    /// the extent as eligible for memory eviction.
+    ForwardFlushed {
+        stream_id: StreamId,
+        extent_id: ExtentId,
+    },
     StreamManagerMembershipChange,
     DescribeStream {
         request_id: u32,
@@ -369,7 +376,8 @@ impl VariableHeader {
             | VariableHeader::ReportExtentsRespError { .. } => Opcode::ReportExtents,
             VariableHeader::Forward { .. }
             | VariableHeader::ForwardInitExtent { .. }
-            | VariableHeader::ForwardChecksum { .. } => Opcode::Forward,
+            | VariableHeader::ForwardChecksum { .. }
+            | VariableHeader::ForwardFlushed { .. } => Opcode::Forward,
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
             VariableHeader::DescribeStream { .. }
             | VariableHeader::DescribeStreamResp { .. }

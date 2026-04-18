@@ -174,17 +174,17 @@ impl ExtentNodeStore {
                 // Primary seals finalize CRC32 — send checksum to secondaries inline.
                 self.send_forward_checksum(stream_id, sealed_extent_id);
 
-                // Queue sealed extent for S3 flush (Secondary-1 only).
-                // Only the first secondary (role=1) uploads to S3 — the Primary
-                // is on the hot write path and should not perform S3 I/O.
+                // Queue sealed extent for S3 flush (Primary only).
+                // The Primary uploads to S3 and broadcasts ForwardFlushed to
+                // secondaries on completion, enabling eviction across all replicas.
                 if let Some(ref tx) = self.flush_tx {
-                    let is_flush_role = self
+                    let is_primary = self
                         .replicas
                         .pin()
                         .get(&stream_id)
-                        .map(|ri| ri.role == 1)
+                        .map(|ri| ri.is_primary())
                         .unwrap_or(false);
-                    if is_flush_role {
+                    if is_primary {
                         let _ = tx.try_send(FlushRequest {
                             stream_id,
                             extent_id: sealed_extent_id,

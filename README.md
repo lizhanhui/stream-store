@@ -84,19 +84,19 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
        ┌─────────────┐   broadcast    ┌─────────────┐
        │  ExtentNode │───────────────►│  ExtentNode │
        │  (Primary)  │                │ (Secondary) │
-       └─────────────┘                └──────┬──────┘
-              ◄──────────────────────────────┘
-                    watermark ACK               │
-                                          S3 Flusher
-                                                │
-                                          ┌─────▼─────┐
-                                          │  S3 Bucket │
-                                          └───────────┘
+       └──────┬──────┘                └──────┬──────┘
+              │◄─────────────────────────────┘
+              │       watermark ACK
+        S3 Flusher
+              │
+        ┌─────▼─────┐
+        │  S3 Bucket │
+        └───────────┘
 ```
 
 ### Process Types
 
-- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Secondary-1 runs background S3 flusher for sealed extents.
+- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Primary runs background S3 flusher for sealed extents and broadcasts ForwardFlushed to secondaries for coordinated eviction.
 - **Stream Manager** -- Stateless metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Fully stateless design (no in-memory caches) allows multiple SM nodes to run against the same database for high availability. Includes load-aware extent placement, heartbeat-based failure detection, and DB-based leadership lease for failover coordination.
 
 ## Performance
@@ -195,7 +195,7 @@ cargo bench
 | 2 | Broadcast replication, quorum ACK, Stream Manager (MySQL), seal-and-new | Done |
 | 2.5 | Stateless multi-active SM with DB-based leader lease, CAS-fenced failover | Done |
 | 2b | Lock-free hot-path: papaya HashMap, AckQueue producer/consumer split, Arc\<ReplicaInfo\> | Done |
-| 3 | S3 flush: chunk-compressed codec (zstd/lz4), background flusher on Secondary-1, UpdateExtentFlushed notification | In Progress |
+| 3 | S3 flush: chunk-compressed codec (zstd/lz4), background flusher on Primary, ForwardFlushed broadcast, UpdateExtentFlushed notification | In Progress |
 | 4 | Multi-Dispatch (data + index streams) | Planned |
 
 ## Contributing

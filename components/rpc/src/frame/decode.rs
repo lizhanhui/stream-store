@@ -3,8 +3,8 @@ use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
     FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
-    FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, HEADER_LEN, MAGIC, Offset,
-    Opcode, PROTOCOL_VERSION, StreamId,
+    FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, HEADER_LEN,
+    MAGIC, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 use super::{FixedHeader, Frame, VariableHeader};
@@ -504,6 +504,13 @@ impl Frame {
                             None,
                         ))
                     }
+                    FLAG_FORWARD_FLUSHED => Ok((
+                        VariableHeader::ForwardFlushed {
+                            stream_id,
+                            extent_id,
+                        },
+                        None,
+                    )),
                     _ => {
                         let epoch = Epoch(body.get_u32());
                         match flags {

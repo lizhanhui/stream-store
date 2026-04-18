@@ -143,14 +143,14 @@ RF=2 (default):  Primary broadcasts to Secondary
         | ExtentNode |    broadcast append        | ExtentNode |
         | (Primary)  | =========================> | (Secondary)|
         |  in-mem    | <--- watermark ACK ------- |  in-mem    |
-        +-----------+                             +-----+------+
-                                                        |
-                                                  S3 Flusher
-                                                        |
-                                                  +-----v-----+
-                                                  |  S3 Bucket |
-                                                  |  (cold)    |
-                                                  +------------+
+        +-----------+                             +-----------+
+              |
+        S3 Flusher
+              |
+        +-----v-----+
+        |  S3 Bucket |
+        |  (cold)    |
+        +------------+
 
 RF=3 (optional, quorum = Primary + 1 Secondary):
 
@@ -190,7 +190,7 @@ A DB-based leadership lease (`stream_manager_leadership` table) ensures that onl
 | **Storage Service (stream-store)** | Rust | Dedicated process. Extent nodes, stream manager, broadcast replication, S3 flush/read. |
 | **Stream Manager** | Rust | Metadata coordinator within storage service. Manages stream->extent mappings, seal/allocate, offset translation. MySQL client for metadata persistence. |
 | **Extent Node** | Rust | Holds in-memory extent replicas. Participates in broadcast replication (Primary broadcasts, Secondaries ACK). |
-| **S3 Flusher** | Rust | Background task on Secondary-1 Extent Node. Encodes sealed extents with chunk compression and uploads to S3 via `aws-sdk-s3`. Notifies SM on completion. |
+| **S3 Flusher** | Rust | Background task on Primary Extent Node. Encodes sealed extents with chunk compression and uploads to S3 via `aws-sdk-s3`. Broadcasts ForwardFlushed to secondaries and notifies SM on completion. |
 | **S3 Reader** | Rust | Fetches flushed extents from S3 with local LRU read cache. |
 
 ### Custom TCP Wire Protocol
@@ -250,7 +250,7 @@ All request-response opcodes use a uniform flag convention:
 Lower flag bits (0x02, 0x04) are available for per-opcode request-side semantics:
 - APPEND: 0x02 = FLAG_SYSTEM_TICK (synthetic capacity-scaling tick)
 - DESCRIBE_STREAM: 0x02 = FLAG_DESCRIBE_STREAM_BY_NAME (name-based lookup)
-- FORWARD: uses 0x00/0x01/0x02 for forward variants (no response)
+- FORWARD: uses 0x00/0x01/0x02/0x03 for forward variants (no response)
 - UPDATE_EXTENT: uses 0x00/0x01/0x02 for sealed/progress/flushed (fire-and-forget, no response)
 
 **Data path (0x01-0x0F) -- Client <-> Extent Node**
@@ -392,6 +392,16 @@ Variable Header (24B):
   [extent_id        : u32]    -- sealed extent
   [checksum         : u32]    -- CRC32 of the extent's committed data
   [committed_bytes  : u64]    -- byte count of committed data
+No Payload.
+```
+
+**flag=0x03 ForwardFlushed** — Sent by the Primary after a sealed extent is successfully uploaded to S3. Secondaries mark the extent as eligible for memory eviction. No response.
+
+```
+Fixed Header (8B)    -- flags=0x03
+Variable Header (12B):
+  [stream_id    : u64]    -- target stream
+  [extent_id    : u32]    -- flushed extent
 No Payload.
 ```
 
@@ -1101,7 +1111,7 @@ src/bin/stream-manager.rs ──> stream-manager (lib) ──┬──> server �
 | **rpc** | lib | Custom TCP wire protocol: frame codec, payload helpers. |
 | **server** | lib | Server infrastructure: RequestHandler trait with deferred response support, connection accept loop. |
 | **client** | lib | Client for talking to Extent Node and Stream Manager: append/read messages, seal/create streams. Used by Extent Node (keepalive heartbeat to Stream Manager) and Stream Manager (seal commands to Extent Nodes). |
-| **extent-node** | lib | Extent Node logic. Holds in-memory extent replicas, participates in broadcast replication (Primary broadcasts to secondaries, receives watermark ACKs, computes quorum), serves APPEND/READ/SEAL requests. Secondary-1 runs background S3 flusher for sealed extents. Uses client to heartbeat to Stream Manager. Built into a binary via `src/bin/extent-node.rs`. |
+| **extent-node** | lib | Extent Node logic. Holds in-memory extent replicas, participates in broadcast replication (Primary broadcasts to secondaries, receives watermark ACKs, computes quorum), serves APPEND/READ/SEAL requests. Primary runs background S3 flusher for sealed extents and broadcasts ForwardFlushed to secondaries. Uses client to heartbeat to Stream Manager. Built into a binary via `src/bin/extent-node.rs`. |
 | **stream-manager** | lib | Stream Manager logic. Manages stream->extent mappings, orchestrates seal-and-new, allocates extents across Extent Nodes, persists metadata to MySQL. Uses client to issue seal/allocate to Extent Nodes. Built into a binary via `src/bin/stream-manager.rs`. |
 
 The `client` crate is used internally by both process types: Extent Node uses it to send keepalive heartbeats to Stream Manager, and Stream Manager uses it to issue seal/allocate commands to Extent Nodes. It is also the protocol interface for external consumers -- any client can re-implement the same wire format in their language of choice.
@@ -1397,16 +1407,16 @@ The key uses offset ranges (not extent IDs) to support future compaction of smal
 
 **Index interval = 64**: Chosen to ensure the header + chunk index fits within a 1 MiB initial S3 range read even for large extents (~1 GiB data, ~1 KiB avg record size → ~16K records → 256 chunks → 1 KiB index).
 
-**Flush role**: Only Secondary-1 (role=1) uploads sealed extents to S3. The Primary stays on the hot write path and does not perform S3 I/O. After successful upload, the flushing EN sends `UpdateExtentFlushed` to SM, which transitions the extent state from Sealed to Flushed in the database.
+**Flush role**: The Primary uploads sealed extents to S3 via a background flusher task. After successful upload, the Primary broadcasts `ForwardFlushed` (Forward opcode 0x05, flag=0x03) to all secondaries so they can mark the extent as eligible for memory eviction. The Primary also sends `UpdateExtentFlushed` to SM, which transitions the extent state from Sealed to Flushed in the database. This reuses the existing broadcast replication channels — no additional infrastructure is needed for eviction notification.
 
 **Compression config**: Global EN setting (`s3_compression` in config, default "none"). Valid values: "none", "zstd", "lz4". Per-stream compression may be added in the future.
 
 ### Post-Flush
 
-1. Secondary-1 sends `UpdateExtentFlushed` to Stream Manager after successful S3 upload.
-2. Stream Manager transitions extent state from Sealed to Flushed in MySQL (idempotent, epoch-validated).
-3. In-memory replicas eligible for eviction (per-stream `cache_extents` policy, default 4).
-4. Sealed extents can optionally be erasure-coded (e.g., Reed-Solomon 4+2) to reduce S3 storage from 3x to ~1.5x.
+1. Primary broadcasts `ForwardFlushed` to all secondaries after successful S3 upload.
+2. Primary sends `UpdateExtentFlushed` to Stream Manager.
+3. Stream Manager transitions extent state from Sealed to Flushed in MySQL (idempotent, epoch-validated).
+4. All replicas (Primary + secondaries) can evict the extent from memory (per-stream `cache_extents` policy, default 4).
 
 ## Stream Manager Metadata
 
@@ -1569,8 +1579,9 @@ read(stream, offset=1050, count=10)
 
 ### Phase 3: S3 Flush and Read
 - S3 extent codec: chunk-compressed binary format with 64-byte header, sparse chunk index, and independently compressible 64-record chunks (zstd/lz4/none)
-- S3 Flusher: background task on Secondary-1 encodes sealed extents and uploads via aws-sdk-s3 with retry
-- UpdateExtentFlushed notification: Secondary-1 → SM after successful upload; SM transitions Sealed → Flushed in MySQL
+- S3 Flusher: background task on Primary encodes sealed extents and uploads via aws-sdk-s3 with retry
+- ForwardFlushed broadcast: Primary → Secondaries after successful upload, enabling eviction across all replicas
+- UpdateExtentFlushed notification: Primary → SM after successful upload; SM transitions Sealed → Flushed in MySQL
 - S3 Reader: range-read with local LRU cache (moka)
 - Flush triggers: size, time, node failure
 - Post-flush memory eviction
