@@ -118,6 +118,11 @@ pub struct ExtentNodeConfig {
     /// `{s3_namespace}/data/{stream_id}/...`. Allows multiple deployments to
     /// share a bucket. Defaults to "default".
     pub s3_namespace: String,
+
+    /// Compression algorithm for S3 extent files. Applied per-chunk (64 records)
+    /// for random-access reads. Valid values: "none", "zstd", "lz4".
+    /// Defaults to "none".
+    pub s3_compression: String,
 }
 
 impl Default for ExtentNodeConfig {
@@ -137,6 +142,7 @@ impl Default for ExtentNodeConfig {
             s3_bucket: String::from("stream-storage-1366919849"),
             s3_path_style: false,
             s3_namespace: "default".to_string(),
+            s3_compression: "none".to_string(),
         }
     }
 }

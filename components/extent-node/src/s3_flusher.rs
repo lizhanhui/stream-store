@@ -60,7 +60,9 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                 return;
             }
         };
-        match stream.with_extent(req.extent_id, |ext| encode_extent(req.stream_id, ext)) {
+        match stream.with_extent(req.extent_id, |ext| {
+            encode_extent(req.stream_id, ext, s3_client.compression())
+        }) {
             Some(data) => data,
             None => {
                 warn!(
