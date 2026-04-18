@@ -29,6 +29,10 @@ pub const FLAG_INIT_FORWARD: u8 = 0x01;
 /// Used by `try_verify_checksum()` to know when to compare.
 const FLAG_CHECKSUM_RECEIVED: u8 = 0x02;
 
+/// Extent has been flushed to S3 and is eligible for memory eviction.
+/// Set by Primary locally after upload, and by Secondaries on ForwardFlushed.
+pub const FLAG_FLUSHED: u8 = 0x04;
+
 /// Owns the raw heap allocation for an extent's arena buffer.
 /// Wrapped in `Arc` so that `Bytes` slices keep the buffer alive
 /// even after the `Extent` is dropped.
@@ -211,12 +215,14 @@ pub struct Extent {
     /// Capacity = extent_capacity / MIN_RECORD_SIZE.
     index: Box<[AtomicU32]>,
 
-    /// Bitmap of deferred forward actions:
+    /// Bitmap of extent lifecycle flags (AtomicU8):
     /// - `FLAG_INIT_FORWARD` (0x01): prepend ForwardInitExtent before first Forward
     ///   (checked inline during `send_forward()`)
     /// - `FLAG_CHECKSUM_RECEIVED` (0x02): ForwardChecksum received from primary
     ///   (secondary side, checked by `try_verify_checksum()`)
-    forward_flags: AtomicU8,
+    /// - `FLAG_FLUSHED` (0x04): extent flushed to S3, eligible for eviction
+    ///   (set by Primary after upload, by Secondaries on ForwardFlushed)
+    flags: AtomicU8,
 
     /// Incremental CRC32 hasher.
     ///
@@ -297,7 +303,7 @@ impl Extent {
             committed_bytes: AtomicU64::new(0),
             limit: AtomicU64::new(LIMIT_OPEN),
             index,
-            forward_flags: AtomicU8::new(FLAG_INIT_FORWARD),
+            flags: AtomicU8::new(FLAG_INIT_FORWARD),
             hasher: UnsafeCell::new(crc32fast::Hasher::new()),
             finalized_crc32: AtomicU32::new(0),
         }
@@ -306,10 +312,17 @@ impl Extent {
     /// Atomically check and clear the `FLAG_INIT_FORWARD` bit.
     /// Returns `true` if the flag was set (i.e., caller should prepend ForwardInitExtent).
     pub fn take_init_forward(&self) -> bool {
-        self.forward_flags
-            .fetch_and(!FLAG_INIT_FORWARD, Ordering::AcqRel)
-            & FLAG_INIT_FORWARD
-            != 0
+        self.flags.fetch_and(!FLAG_INIT_FORWARD, Ordering::AcqRel) & FLAG_INIT_FORWARD != 0
+    }
+
+    /// Mark this extent as flushed to S3 (eligible for memory eviction).
+    pub fn mark_flushed(&self) {
+        self.flags.fetch_or(FLAG_FLUSHED, Ordering::Release);
+    }
+
+    /// Whether this extent has been flushed to S3.
+    pub fn is_flushed(&self) -> bool {
+        self.flags.load(Ordering::Acquire) & FLAG_FLUSHED != 0
     }
 
     /// Whether this extent's arena buffer has no outstanding reader references
@@ -334,8 +347,7 @@ impl Extent {
             .store(start_offset.0, Ordering::Relaxed);
         self.committed_bytes.store(0, Ordering::Relaxed);
         self.limit.store(LIMIT_OPEN, Ordering::Relaxed);
-        self.forward_flags
-            .store(FLAG_INIT_FORWARD, Ordering::Relaxed);
+        self.flags.store(FLAG_INIT_FORWARD, Ordering::Relaxed);
         self.finalized_crc32.store(0, Ordering::Relaxed);
         // SAFETY: exclusive access via &mut self — no concurrent readers/writers.
         unsafe {
@@ -767,14 +779,14 @@ impl Extent {
 
     /// Store the primary's CRC32 checksum from a ForwardChecksum frame.
     ///
-    /// Sets `FLAG_CHECKSUM_RECEIVED` on `forward_flags` to indicate the primary
+    /// Sets `FLAG_CHECKSUM_RECEIVED` on `flags` to indicate the primary
     /// checksum has been received on this secondary.
     ///
     /// committed_bytes is not stored separately — if CRC32 matches, byte layout
     /// is guaranteed identical (same byte_pos assignments, same record format).
     pub fn store_primary_checksum(&self, crc32: u32) {
         self.finalized_crc32.store(crc32, Ordering::Release);
-        self.forward_flags
+        self.flags
             .fetch_or(FLAG_CHECKSUM_RECEIVED, Ordering::Release);
     }
 
@@ -788,7 +800,7 @@ impl Extent {
     /// When ready, finalizes the local hasher and compares with the stored primary CRC32.
     pub fn try_verify_checksum(&self) -> Option<bool> {
         // Check if ForwardChecksum has been received.
-        let flags = self.forward_flags.load(Ordering::Acquire);
+        let flags = self.flags.load(Ordering::Acquire);
         if flags & FLAG_CHECKSUM_RECEIVED == 0 {
             return None;
         }

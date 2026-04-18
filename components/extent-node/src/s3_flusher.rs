@@ -125,6 +125,8 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     None,
                 );
                 if let Some(stream) = store.streams.pin().get(&req.stream_id) {
+                    // Mark locally on Primary as well.
+                    stream.with_extent(req.extent_id, |ext| ext.mark_flushed());
                     stream.send_forward(flushed_frame);
                 }
 

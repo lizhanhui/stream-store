@@ -315,13 +315,32 @@ impl ExtentNodeStore {
             _ => return,
         };
 
-        info!(
-            "ForwardFlushed: stream={}, extent={} — eligible for eviction",
-            stream_id, extent_id,
-        );
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
+            Some(s) => s,
+            None => {
+                warn!(
+                    "ForwardFlushed for unknown stream {}, extent {}",
+                    stream_id, extent_id,
+                );
+                return;
+            }
+        };
 
-        // TODO: mark extent as flushed in Stream for eviction policy.
-        // For now, just log. The actual eviction will be implemented
-        // when the eviction policy is built.
+        let found = stream.with_extent(extent_id, |ext| {
+            ext.mark_flushed();
+        });
+
+        if found.is_some() {
+            info!(
+                "ForwardFlushed: stream={}, extent={} — marked flushed, eligible for eviction",
+                stream_id, extent_id,
+            );
+        } else {
+            warn!(
+                "ForwardFlushed for unknown extent {} on stream {}",
+                extent_id, stream_id,
+            );
+        }
     }
 }
