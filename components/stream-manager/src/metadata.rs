@@ -157,11 +157,11 @@ impl MetadataStore {
         .await
         .map_err(|e| StorageError::Internal(format!("create_stream: {e}")))?;
 
-        let stream_id = StreamId(result.last_insert_id());
+        let stream_id = StreamId(result.last_insert_id() as u32);
 
         // Initialize stream_sequence for per-stream extent_id generation.
         sqlx::query("INSERT INTO stream_sequence (stream_id, next_extent_id) VALUES (?, 0)")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .execute(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("init stream_sequence: {e}")))?;
@@ -180,7 +180,7 @@ impl MetadataStore {
         .map_err(|e| StorageError::Internal(format!("get_stream: {e}")))?;
 
         Ok(row.map(|r| StreamRow {
-            stream_id: StreamId(r.get::<i64, _>("stream_id") as u64),
+            stream_id: StreamId(r.get::<u32, _>("stream_id")),
             stream_name: r.get("stream_name"),
             stream_type: r.get("stream_type"),
             replication_factor: r.get::<i16, _>("replication_factor") as u16,
@@ -203,7 +203,7 @@ impl MetadataStore {
         .map_err(|e| StorageError::Internal(format!("get_stream_by_name: {e}")))?;
 
         Ok(row.map(|r| StreamRow {
-            stream_id: StreamId(r.get::<i64, _>("stream_id") as u64),
+            stream_id: StreamId(r.get::<u32, _>("stream_id")),
             stream_name: r.get("stream_name"),
             stream_type: r.get("stream_type"),
             replication_factor: r.get::<i16, _>("replication_factor") as u16,
@@ -236,7 +236,7 @@ impl MetadataStore {
             .into_iter()
             .map(|r| {
                 (
-                    StreamId(r.get::<i64, _>("stream_id") as u64),
+                    StreamId(r.get::<u32, _>("stream_id")),
                     Epoch(r.get::<i32, _>("epoch") as u32),
                 )
             })
@@ -249,7 +249,7 @@ impl MetadataStore {
         stream_id: StreamId,
     ) -> Result<u16, StorageError> {
         let row = sqlx::query("SELECT replication_factor FROM stream WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_replication_factor: {e}")))?;
@@ -263,7 +263,7 @@ impl MetadataStore {
         stream_id: StreamId,
     ) -> Result<u32, StorageError> {
         let row = sqlx::query("SELECT extent_capacity FROM stream WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_extent_capacity: {e}")))?;
@@ -274,7 +274,7 @@ impl MetadataStore {
     /// Get the cache_extents (max extents to retain in memory) for a stream.
     pub async fn get_stream_cache_extents(&self, stream_id: StreamId) -> Result<u32, StorageError> {
         let row = sqlx::query("SELECT cache_extents FROM stream WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_cache_extents: {e}")))?;
@@ -290,7 +290,7 @@ impl MetadataStore {
         let row = sqlx::query(
             "SELECT min_extent_capacity, max_extent_capacity FROM stream WHERE stream_id = ?",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .fetch_one(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("get_stream_capacity_bounds: {e}")))?;
@@ -303,7 +303,7 @@ impl MetadataStore {
     /// Get the extent growth factor for a stream.
     pub async fn get_stream_growth_factor(&self, stream_id: StreamId) -> Result<u32, StorageError> {
         let row = sqlx::query("SELECT extent_growth_factor FROM stream WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_growth_factor: {e}")))?;
@@ -314,7 +314,7 @@ impl MetadataStore {
     /// Get the minimum extent capacity for a stream.
     pub async fn get_stream_min_capacity(&self, stream_id: StreamId) -> Result<u32, StorageError> {
         let row = sqlx::query("SELECT min_extent_capacity FROM stream WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_min_capacity: {e}")))?;
@@ -325,7 +325,7 @@ impl MetadataStore {
     /// Get the maximum extent capacity for a stream.
     pub async fn get_stream_max_capacity(&self, stream_id: StreamId) -> Result<u32, StorageError> {
         let row = sqlx::query("SELECT max_extent_capacity FROM stream WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_max_capacity: {e}")))?;
@@ -368,7 +368,7 @@ impl MetadataStore {
 
         // Step 1: Lock and increment stream_sequence atomically within the transaction.
         sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ? FOR UPDATE")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("lock stream_sequence: {e}")))?;
@@ -376,13 +376,13 @@ impl MetadataStore {
         sqlx::query(
             "UPDATE stream_sequence SET next_extent_id = next_extent_id + 1 WHERE stream_id = ?",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("increment stream_sequence: {e}")))?;
 
         let row = sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
@@ -394,7 +394,7 @@ impl MetadataStore {
         sqlx::query(
             "INSERT INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(extent_id.0 as i64)
         .bind(start_offset as i64)
         .bind(start_offset as i64) // end_offset = start_offset for new active extent
@@ -410,7 +410,7 @@ impl MetadataStore {
             sqlx::query(
                 "INSERT IGNORE INTO stream_replica (stream_id, epoch, node_addr, role) VALUES (?, ?, ?, ?)",
             )
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .bind(epoch.0 as i32)
             .bind(addr)
             .bind(*role)
@@ -439,7 +439,7 @@ impl MetadataStore {
         )
         .bind(ExtentState::Sealed.as_u8())
         .bind(end_offset as i64)
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(extent_id.0 as i64)
         .execute(&self.pool)
         .await
@@ -475,7 +475,7 @@ impl MetadataStore {
             "SELECT state, start_offset \
              FROM extent WHERE stream_id = ? AND extent_id = ? FOR UPDATE",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(extent_id.0 as i64)
         .fetch_optional(&mut *tx)
         .await
@@ -498,7 +498,7 @@ impl MetadataStore {
                  WHERE stream_id = ? AND extent_id > ? \
                  ORDER BY extent_id ASC LIMIT 1",
             )
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .bind(extent_id.0 as i64)
             .fetch_optional(&mut *tx)
             .await
@@ -513,7 +513,7 @@ impl MetadataStore {
                     "SELECT node_addr FROM stream_replica \
                      WHERE stream_id = ? AND epoch = ? AND role = 0",
                 )
-                .bind(stream_id.0 as i64)
+                .bind(stream_id.0)
                 .bind(epoch.0 as i32)
                 .fetch_optional(&mut *tx)
                 .await
@@ -545,7 +545,7 @@ impl MetadataStore {
         )
         .bind(ExtentState::Sealed.as_u8())
         .bind(end_offset as i64)
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(extent_id.0 as i64)
         .bind(ExtentState::Active.as_u8())
         .execute(&mut *tx)
@@ -556,13 +556,13 @@ impl MetadataStore {
         sqlx::query(
             "UPDATE stream_sequence SET next_extent_id = next_extent_id + 1 WHERE stream_id = ?",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("increment stream_sequence: {e}")))?;
 
         let seq_row = sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
@@ -574,7 +574,7 @@ impl MetadataStore {
         sqlx::query(
             "INSERT INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(new_extent_id.0 as i64)
         .bind(new_start_offset as i64)
         .bind(new_start_offset as i64) // end_offset = start_offset for new active extent
@@ -590,7 +590,7 @@ impl MetadataStore {
             sqlx::query(
                 "INSERT IGNORE INTO stream_replica (stream_id, epoch, node_addr, role) VALUES (?, ?, ?, ?)",
             )
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .bind(epoch.0 as i32)
             .bind(addr)
             .bind(*role)
@@ -615,7 +615,7 @@ impl MetadataStore {
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
              FROM extent WHERE stream_id = ? AND state = ? LIMIT 1",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(ExtentState::Active.as_u8())
         .fetch_optional(&self.pool)
         .await
@@ -630,7 +630,7 @@ impl MetadataStore {
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
              FROM extent WHERE stream_id = ? ORDER BY extent_id",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .fetch_all(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("get_extents: {e}")))?;
@@ -669,7 +669,7 @@ impl MetadataStore {
              FROM stream_replica \
              WHERE stream_id = ? AND epoch = ? ORDER BY role",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(epoch.0 as i32)
         .fetch_all(&self.pool)
         .await
@@ -678,7 +678,7 @@ impl MetadataStore {
         Ok(rows
             .into_iter()
             .map(|r| StreamReplicaRow {
-                stream_id: StreamId(r.get::<i64, _>("stream_id") as u64),
+                stream_id: StreamId(r.get::<u32, _>("stream_id")),
                 epoch: Epoch(r.get::<i32, _>("epoch") as u32),
                 node_addr: r.get("node_addr"),
                 role: r.get::<i8, _>("role") as u8,
@@ -691,7 +691,7 @@ impl MetadataStore {
         let state_val = r.get::<i8, _>("state") as u8;
         ExtentRow {
             extent_id: ExtentId(r.get::<i64, _>("extent_id") as u32),
-            stream_id: StreamId(r.get::<i64, _>("stream_id") as u64),
+            stream_id: StreamId(r.get::<u32, _>("stream_id")),
             start_offset: r.get::<i64, _>("start_offset") as u64,
             end_offset: r.get::<i64, _>("end_offset") as u64,
             state: ExtentState::from_u8(state_val).unwrap_or(ExtentState::Unspecified),
@@ -714,7 +714,7 @@ impl MetadataStore {
              WHERE r.stream_id = ? AND r.epoch = ? \
              ORDER BY r.role",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(epoch.0 as i32)
         .fetch_all(&self.pool)
         .await
@@ -749,7 +749,7 @@ impl MetadataStore {
                 "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
                  FROM extent WHERE stream_id = ? ORDER BY extent_id DESC",
             )
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_all(&self.pool)
             .await
         } else {
@@ -757,7 +757,7 @@ impl MetadataStore {
                 "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
                  FROM extent WHERE stream_id = ? ORDER BY extent_id DESC LIMIT ?",
             )
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .bind(count)
             .fetch_all(&self.pool)
             .await
@@ -794,7 +794,7 @@ impl MetadataStore {
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
              FROM extent WHERE stream_id = ? AND extent_id = ?",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(extent_id.0 as i64)
         .fetch_optional(&self.pool)
         .await
@@ -841,7 +841,7 @@ impl MetadataStore {
                AND start_offset <= ? AND ? < end_offset \
              ORDER BY extent_id ASC LIMIT 1",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(ExtentState::Sealed.as_u8())
         .bind(ExtentState::Flushed.as_u8())
         .bind(offset as i64)
@@ -872,7 +872,7 @@ impl MetadataStore {
              WHERE stream_id = ? AND state = ? AND start_offset <= ? \
              ORDER BY extent_id DESC LIMIT 1",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(ExtentState::Active.as_u8())
         .bind(offset as i64)
         .fetch_optional(&self.pool)
@@ -1048,7 +1048,7 @@ impl MetadataStore {
     /// Get the current epoch for a stream.
     pub async fn get_stream_epoch(&self, stream_id: StreamId) -> Result<Epoch, StorageError> {
         let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ?")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_epoch: {e}")))?;
@@ -1064,7 +1064,7 @@ impl MetadataStore {
 
         let result =
             sqlx::query("UPDATE stream SET epoch = epoch + 1 WHERE stream_id = ? AND epoch = ?")
-                .bind(stream_id.0 as i64)
+                .bind(stream_id.0)
                 .bind(current.0 as i32)
                 .execute(&self.pool)
                 .await
@@ -1182,7 +1182,7 @@ impl MetadataStore {
 
         // Validate epoch matches current stream epoch.
         let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
@@ -1208,7 +1208,7 @@ impl MetadataStore {
             "INSERT IGNORE INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) \
              VALUES (?, ?, 0, ?, ?, ?)",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(sealed_extent_id.0 as i64)
         .bind(end_offset as i64)
         .bind(ExtentState::Sealed.as_u8())
@@ -1224,7 +1224,7 @@ impl MetadataStore {
         )
         .bind(ExtentState::Sealed.as_u8())
         .bind(end_offset as i64)
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(sealed_extent_id.0 as i64)
         .bind(ExtentState::Active.as_u8())
         .execute(&mut *tx)
@@ -1236,7 +1236,7 @@ impl MetadataStore {
             "INSERT IGNORE INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) \
              VALUES (?, ?, ?, ?, ?, ?)",
         )
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(new_extent_id.0 as i64)
         .bind(end_offset as i64)
         .bind(end_offset as i64)
@@ -1254,7 +1254,7 @@ impl MetadataStore {
              WHERE stream_id = ? AND extent_id = ? AND start_offset = 0 AND ? > 0",
         )
         .bind(end_offset as i64)
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(new_extent_id.0 as i64)
         .bind(end_offset as i64)
         .execute(&mut *tx)
@@ -1269,7 +1269,7 @@ impl MetadataStore {
             "UPDATE stream_sequence SET next_extent_id = GREATEST(next_extent_id, ?) WHERE stream_id = ?",
         )
         .bind((new_extent_id.0 + 1) as i64)
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .execute(&mut *tx)
         .await
         .map_err(|e| StorageError::Internal(format!("update stream_sequence: {e}")))?;
@@ -1304,7 +1304,7 @@ impl MetadataStore {
 
         // Validate epoch matches current stream epoch.
         let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
@@ -1331,7 +1331,7 @@ impl MetadataStore {
              WHERE stream_id = ? AND extent_id = ? AND state = ? AND end_offset < ?",
         )
         .bind(current_offset as i64)
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(extent_id.0 as i64)
         .bind(ExtentState::Active.as_u8())
         .bind(current_offset as i64)
@@ -1368,7 +1368,7 @@ impl MetadataStore {
 
         // Validate epoch matches current stream epoch.
         let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .fetch_optional(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
@@ -1395,7 +1395,7 @@ impl MetadataStore {
              WHERE stream_id = ? AND extent_id = ? AND state = ?",
         )
         .bind(ExtentState::Flushed.as_u8())
-        .bind(stream_id.0 as i64)
+        .bind(stream_id.0)
         .bind(extent_id.0 as i64)
         .bind(ExtentState::Sealed.as_u8())
         .execute(&mut *tx)
@@ -1451,7 +1451,7 @@ impl MetadataStore {
                    state = IF(state = 1 AND VALUES(state) = 2, VALUES(state), state), \
                    sealed_at = IF(state = 1 AND VALUES(state) = 2, NOW(), sealed_at)",
             )
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .bind(extent_id.0 as i64)
             .bind(*start_offset as i64)
             .bind(*end_offset as i64)
@@ -1468,7 +1468,7 @@ impl MetadataStore {
                 "UPDATE stream_sequence SET next_extent_id = GREATEST(next_extent_id, ?) WHERE stream_id = ?",
             )
             .bind((max_extent_id + 1) as i64)
-            .bind(stream_id.0 as i64)
+            .bind(stream_id.0)
             .execute(&mut *tx)
             .await
             .map_err(|e| StorageError::Internal(format!("update stream_sequence: {e}")))?;

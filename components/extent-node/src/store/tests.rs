@@ -16,7 +16,7 @@ use crate::ack_queue::{AckQueue, DEFAULT_REPLICATION_TIMEOUT, PendingAck};
 
 /// Register a stream on the ExtentNode via RegisterExtent (RF=1, Primary, no secondaries).
 /// This is the production path: StreamManager assigns a stream_id and sends RegisterExtent.
-async fn register_stream(store: &ExtentNodeStore, stream_id: u64, req_id: u32) -> StreamId {
+async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -> StreamId {
     use rpc::payload::build_register_extent_payload;
 
     let sid = StreamId(stream_id);
@@ -636,7 +636,7 @@ async fn pending_ack_timeout() {
 /// Benchmark: N tokio tasks appending concurrently to N independent streams.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_multi_stream_appends() {
-    const NUM_STREAMS: u64 = 8;
+    const NUM_STREAMS: u32 = 8;
     const APPENDS_PER_STREAM: u64 = 5_000;
     const PAYLOAD_SIZE: usize = 128;
 
@@ -766,7 +766,7 @@ async fn concurrent_multi_stream_appends() {
         );
     }
 
-    let total_expected = NUM_STREAMS * APPENDS_PER_STREAM;
+    let total_expected = NUM_STREAMS as u64 * APPENDS_PER_STREAM;
     let (appends, bytes, active_count) = store.snapshot_metrics();
     assert_eq!(appends, total_expected, "metrics: append count mismatch");
     assert_eq!(
@@ -796,8 +796,8 @@ async fn concurrent_multi_stream_appends() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn concurrent_readers_and_writers_different_streams() {
-    const NUM_WRITER_STREAMS: u64 = 4;
-    const NUM_READER_STREAMS: u64 = 4;
+    const NUM_WRITER_STREAMS: u32 = 4;
+    const NUM_READER_STREAMS: u32 = 4;
     const APPENDS_PER_STREAM: u64 = 2_000;
     const READS_PER_STREAM: u64 = 2_000;
 
@@ -805,13 +805,13 @@ async fn concurrent_readers_and_writers_different_streams() {
 
     let mut writer_sids = Vec::new();
     for i in 0..NUM_WRITER_STREAMS {
-        let sid = register_stream(&store, i + 1, i as u32).await;
+        let sid = register_stream(&store, i + 1, i).await;
         writer_sids.push(sid);
     }
 
     let mut reader_sids = Vec::new();
     for i in 0..NUM_READER_STREAMS {
-        let sid = register_stream(&store, 100 + i + 1, (100 + i) as u32).await;
+        let sid = register_stream(&store, 100 + i + 1, 100 + i).await;
         for j in 0..100u32 {
             store
                 .handle_frame(

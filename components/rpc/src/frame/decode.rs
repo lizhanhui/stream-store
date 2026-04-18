@@ -75,7 +75,7 @@ impl Frame {
             // ── Append: request (0x00), ack (0x01), error (0x80) ──
             Opcode::Append => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let extent_id = ExtentId(body.get_u32());
@@ -121,7 +121,7 @@ impl Frame {
             // ── Read: request (0x00), response (0x01), error (0x80) ──
             Opcode::Read => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let extent_id = ExtentId(body.get_u32());
                     let offset = Offset(body.get_u64());
@@ -171,7 +171,7 @@ impl Frame {
             // ── SealStreamManager: request (0x00), response (0x01), error (0x80) ──
             Opcode::SealStreamManager => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         StorageError::InvalidFrame("unknown SealStreamManager error code".into())
@@ -215,7 +215,7 @@ impl Frame {
             // ── SealExtentNode: request (0x00), response (0x01), error (0x80) ──
             Opcode::SealExtentNode => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         StorageError::InvalidFrame("unknown SealExtentNode error code".into())
@@ -278,7 +278,7 @@ impl Frame {
                         payload,
                     ))
                 } else if flags & FLAG_RESPONSE != 0 {
-                    let stream_id = StreamId(body.get_u64());
+                    let stream_id = StreamId(body.get_u32());
                     let extent_id = ExtentId(body.get_u32());
                     let epoch = Epoch(body.get_u32());
                     let addr_len = body.get_u16() as usize;
@@ -318,7 +318,7 @@ impl Frame {
             // ── QueryOffset: request (0x00), response (0x01), error (0x80) ──
             Opcode::QueryOffset => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         StorageError::InvalidFrame("unknown QueryOffset error code".into())
@@ -419,7 +419,7 @@ impl Frame {
             // ── RegisterExtent: request (0x00), ack (0x01), error (0x80) ──
             Opcode::RegisterExtent => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 let extent_id = ExtentId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
@@ -474,7 +474,7 @@ impl Frame {
             }
             // ── Watermark: fire-and-forget ──
             Opcode::Watermark => {
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 let extent_id = ExtentId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 let offset = Offset(body.get_u64());
@@ -490,7 +490,7 @@ impl Frame {
             }
             // ── Forward: flag-based variants (append/init/checksum/flushed) ──
             Opcode::Forward => {
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 let extent_id = ExtentId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 match flags {
@@ -560,7 +560,7 @@ impl Frame {
             // ── DescribeStream: request (0x00 or 0x02 for by-name), response (0x01), error (0x80) ──
             Opcode::DescribeStream => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         StorageError::InvalidFrame("unknown DescribeStream error code".into())
@@ -605,7 +605,7 @@ impl Frame {
             // ── DescribeExtent: request (0x00), response (0x01), error (0x80) ──
             Opcode::DescribeExtent => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let extent_id = ExtentId(body.get_u32());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
@@ -645,7 +645,7 @@ impl Frame {
             // ── Seek: request (0x00), response (0x01), error (0x80) ──
             Opcode::Seek => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 let offset = Offset(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
@@ -684,7 +684,7 @@ impl Frame {
             }
             // ── UpdateExtent: fire-and-forget, flag-based variants ──
             Opcode::UpdateExtent => {
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 match flags {
                     FLAG_EXTENT_SEALED => {
@@ -736,7 +736,7 @@ impl Frame {
             // ── ReportExtents: request (0x00), response (0x01), error (0x80) ──
             Opcode::ReportExtents => {
                 let request_id = body.get_u32();
-                let stream_id = StreamId(body.get_u64());
+                let stream_id = StreamId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {

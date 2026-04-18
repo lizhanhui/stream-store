@@ -1,5 +1,5 @@
 CREATE TABLE stream (
-    stream_id           BIGINT PRIMARY KEY AUTO_INCREMENT,
+    stream_id           INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
     stream_name         VARCHAR(512) NOT NULL UNIQUE,
     stream_type         VARCHAR(32) NOT NULL DEFAULT 'DATA',
     replication_factor  SMALLINT NOT NULL DEFAULT 2,
@@ -14,7 +14,7 @@ CREATE TABLE stream (
 );
 
 CREATE TABLE stream_replica (
-    stream_id     BIGINT NOT NULL,
+    stream_id     INT UNSIGNED NOT NULL,
     epoch         INT NOT NULL,
     node_addr     VARCHAR(256) NOT NULL,
     role          TINYINT NOT NULL DEFAULT 0,

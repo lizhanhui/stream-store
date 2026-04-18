@@ -149,8 +149,8 @@ fn watermark_no_request_id() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 8 (stream_id) + 4 (extent_id) + 4 (epoch) + 8 (offset) = 32 bytes
-    assert_eq!(buf.len(), 32);
+    // 8 (fixed) + 4 (stream_id) + 4 (extent_id) + 4 (epoch) + 8 (offset) = 28 bytes
+    assert_eq!(buf.len(), 28);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::Watermark);
@@ -217,8 +217,8 @@ fn seal_stream_manager_request_round_trip() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 4 + 8 + 4 = 24
-    assert_eq!(buf.len(), 24);
+    // 8 (fixed) + 4 + 4 + 4 = 20
+    assert_eq!(buf.len(), 20);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
@@ -246,8 +246,8 @@ fn seal_stream_manager_resp_round_trip() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 4 + 8 + 8 + 4 + 2 + 14 = 48
-    assert_eq!(buf.len(), 48);
+    // 8 (fixed) + 4 + 4 + 8 + 4 + 2 + 14 = 44
+    assert_eq!(buf.len(), 44);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
@@ -308,8 +308,8 @@ fn seal_extent_node_request_round_trip() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 4 + 8 + 4 + 4 + 8 = 36
-    assert_eq!(buf.len(), 36);
+    // 8 (fixed) + 4 + 4 + 4 + 4 + 8 = 32
+    assert_eq!(buf.len(), 32);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
@@ -349,8 +349,8 @@ fn seal_extent_node_resp_round_trip() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 4 + 8 + 4 + 4 + 8 + 8 = 44 (vh) + 4 + 10 = 58
-    assert_eq!(buf.len(), 58);
+    // 8 (fixed) + 4 + 4 + 4 + 4 + 8 + 8 = 40 (vh) + 4 + 10 = 54
+    assert_eq!(buf.len(), 54);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealExtentNode);

@@ -18,48 +18,48 @@ impl Frame {
     /// Variable header size in bytes for this frame's opcode+flags.
     fn variable_header_len(&self) -> usize {
         match &self.variable_header {
-            // request_id(4) + stream_id(8) + epoch(4)
-            VariableHeader::Append { .. } => 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + epoch(4) + extent_id(4) + offset(8)
-            VariableHeader::AppendAck { .. } => 4 + 8 + 4 + 4 + 8,
-            // request_id(4) + stream_id(8) + epoch(4) + extent_id(4) + error_code(2)
-            VariableHeader::AppendAckError { .. } => 4 + 8 + 4 + 4 + 2,
-            // request_id(4) + stream_id(8) + extent_id(4) + offset(8) + count(4)
-            VariableHeader::Read { .. } => 4 + 8 + 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + offset(8) + count(4)
-            VariableHeader::ReadResp { .. } => 4 + 8 + 8 + 4,
-            // request_id(4) + stream_id(8) + extent_id(4) + offset(8) + error_code(2)
-            VariableHeader::ReadRespError { .. } => 4 + 8 + 4 + 8 + 2,
-            // request_id(4) + stream_id(8) + epoch(4)
-            VariableHeader::SealStreamManagerRequest { .. } => 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + offset(8) + new_epoch(4) + addr_len(2) + addr(N)
+            // request_id(4) + stream_id(4) + epoch(4)
+            VariableHeader::Append { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + epoch(4) + extent_id(4) + offset(8)
+            VariableHeader::AppendAck { .. } => 4 + 4 + 4 + 4 + 8,
+            // request_id(4) + stream_id(4) + epoch(4) + extent_id(4) + error_code(2)
+            VariableHeader::AppendAckError { .. } => 4 + 4 + 4 + 4 + 2,
+            // request_id(4) + stream_id(4) + extent_id(4) + offset(8) + count(4)
+            VariableHeader::Read { .. } => 4 + 4 + 4 + 8 + 4,
+            // request_id(4) + stream_id(4) + offset(8) + count(4)
+            VariableHeader::ReadResp { .. } => 4 + 4 + 8 + 4,
+            // request_id(4) + stream_id(4) + extent_id(4) + offset(8) + error_code(2)
+            VariableHeader::ReadRespError { .. } => 4 + 4 + 4 + 8 + 2,
+            // request_id(4) + stream_id(4) + epoch(4)
+            VariableHeader::SealStreamManagerRequest { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + offset(8) + new_epoch(4) + addr_len(2) + addr(N)
             VariableHeader::SealStreamManagerResp { primary_addr, .. } => {
-                4 + 8 + 8 + 4 + 2 + primary_addr.len()
+                4 + 4 + 8 + 4 + 2 + primary_addr.len()
             }
-            // request_id(4) + stream_id(8) + error_code(2)
-            VariableHeader::SealStreamManagerRespError { .. } => 4 + 8 + 2,
-            // request_id(4) + stream_id(8) + epoch(4) + extent_id_from(4) + start_offset(8)
-            VariableHeader::SealExtentNodeRequest { .. } => 4 + 8 + 4 + 4 + 8,
-            // request_id(4) + stream_id(8) + epoch(4) + extent_id(4) + start_offset(8) + end_offset(8)
-            VariableHeader::SealExtentNodeResp { .. } => 4 + 8 + 4 + 4 + 8 + 8,
-            // request_id(4) + stream_id(8) + error_code(2)
-            VariableHeader::SealExtentNodeRespError { .. } => 4 + 8 + 2,
+            // request_id(4) + stream_id(4) + error_code(2)
+            VariableHeader::SealStreamManagerRespError { .. } => 4 + 4 + 2,
+            // request_id(4) + stream_id(4) + epoch(4) + extent_id_from(4) + start_offset(8)
+            VariableHeader::SealExtentNodeRequest { .. } => 4 + 4 + 4 + 4 + 8,
+            // request_id(4) + stream_id(4) + epoch(4) + extent_id(4) + start_offset(8) + end_offset(8)
+            VariableHeader::SealExtentNodeResp { .. } => 4 + 4 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(4) + error_code(2)
+            VariableHeader::SealExtentNodeRespError { .. } => 4 + 4 + 2,
             // request_id(4) + name_len(2) + name(N) + replication_factor(2) + min_extent_capacity(4) + max_extent_capacity(4) + cache_extents(4) + extent_growth_factor(4)
             VariableHeader::CreateStream { stream_name, .. } => {
                 4 + 2 + stream_name.len() + 2 + 4 + 4 + 4 + 4
             }
-            // request_id(4) + stream_id(8) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
+            // request_id(4) + stream_id(4) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
             VariableHeader::CreateStreamResp { primary_addr, .. } => {
-                4 + 8 + 4 + 4 + 2 + primary_addr.len()
+                4 + 4 + 4 + 4 + 2 + primary_addr.len()
             }
             // request_id(4) + error_code(2)
             VariableHeader::CreateStreamRespError { .. } => 4 + 2,
-            // request_id(4) + stream_id(8)
-            VariableHeader::QueryOffset { .. } => 4 + 8,
-            // request_id(4) + stream_id(8) + offset(8)
-            VariableHeader::QueryOffsetResp { .. } => 4 + 8 + 8,
-            // request_id(4) + stream_id(8) + error_code(2)
-            VariableHeader::QueryOffsetRespError { .. } => 4 + 8 + 2,
+            // request_id(4) + stream_id(4)
+            VariableHeader::QueryOffset { .. } => 4 + 4,
+            // request_id(4) + stream_id(4) + offset(8)
+            VariableHeader::QueryOffsetResp { .. } => 4 + 4 + 8,
+            // request_id(4) + stream_id(4) + error_code(2)
+            VariableHeader::QueryOffsetRespError { .. } => 4 + 4 + 2,
             // request_id(4)
             VariableHeader::Connect { .. }
             | VariableHeader::ConnectAck { .. }
@@ -70,55 +70,55 @@ impl Frame {
             VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
-            // request_id(4) + stream_id(8) + extent_id(4) + role(1) + replication_factor(2) + epoch(4) + extent_capacity(4) + cache_extents(4) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(4)
-            VariableHeader::RegisterExtent { .. } => 4 + 8 + 4 + 1 + 2 + 4 + 4 + 4 + 4 + 4 + 4,
-            // request_id(4) + stream_id(8) + extent_id(4)
-            VariableHeader::RegisterExtentAck { .. } => 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
-            VariableHeader::RegisterExtentAckError { .. } => 4 + 8 + 4 + 2,
-            // stream_id(8) + extent_id(4) + epoch(4) + offset(8) -- no request_id
-            VariableHeader::Watermark { .. } => 8 + 4 + 4 + 8,
-            // stream_id(8) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4) + new_extent_capacity(4)
-            VariableHeader::UpdateExtentSealed { .. } => 8 + 4 + 4 + 8 + 4 + 4,
-            // stream_id(8) + epoch(4) + extent_id(4) + current_offset(8)
-            VariableHeader::UpdateExtentProgress { .. } => 8 + 4 + 4 + 8,
-            // stream_id(8) + epoch(4) + extent_id(4)
-            VariableHeader::UpdateExtentFlushed { .. } => 8 + 4 + 4,
-            // request_id(4) + stream_id(8) + epoch(4)
-            VariableHeader::ReportExtents { .. } => 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + epoch(4)
-            VariableHeader::ReportExtentsResp { .. } => 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + epoch(4) + error_code(2)
-            VariableHeader::ReportExtentsRespError { .. } => 4 + 8 + 4 + 2,
-            // stream_id(8) + extent_id(4) + epoch(4) + offset(8) + byte_pos(8)
-            VariableHeader::Forward { .. } => 8 + 4 + 4 + 8 + 8,
-            // stream_id(8) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(4)
-            VariableHeader::ForwardInitExtent { .. } => 8 + 4 + 4 + 8 + 4 + 4,
-            // stream_id(8) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
-            VariableHeader::ForwardChecksum { .. } => 8 + 4 + 4 + 4 + 8,
-            // stream_id(8) + extent_id(4) + epoch(4)
-            VariableHeader::ForwardFlushed { .. } => 8 + 4 + 4,
+            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(2) + epoch(4) + extent_capacity(4) + cache_extents(4) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(4)
+            VariableHeader::RegisterExtent { .. } => 4 + 4 + 4 + 1 + 2 + 4 + 4 + 4 + 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + extent_id(4)
+            VariableHeader::RegisterExtentAck { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
+            VariableHeader::RegisterExtentAckError { .. } => 4 + 4 + 4 + 2,
+            // stream_id(4) + extent_id(4) + epoch(4) + offset(8)
+            VariableHeader::Watermark { .. } => 4 + 4 + 4 + 8,
+            // stream_id(4) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4) + new_extent_capacity(4)
+            VariableHeader::UpdateExtentSealed { .. } => 4 + 4 + 4 + 8 + 4 + 4,
+            // stream_id(4) + epoch(4) + extent_id(4) + current_offset(8)
+            VariableHeader::UpdateExtentProgress { .. } => 4 + 4 + 4 + 8,
+            // stream_id(4) + epoch(4) + extent_id(4)
+            VariableHeader::UpdateExtentFlushed { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + epoch(4)
+            VariableHeader::ReportExtents { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + epoch(4)
+            VariableHeader::ReportExtentsResp { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + epoch(4) + error_code(2)
+            VariableHeader::ReportExtentsRespError { .. } => 4 + 4 + 4 + 2,
+            // stream_id(4) + extent_id(4) + epoch(4) + offset(8) + byte_pos(8)
+            VariableHeader::Forward { .. } => 4 + 4 + 4 + 8 + 8,
+            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(4)
+            VariableHeader::ForwardInitExtent { .. } => 4 + 4 + 4 + 8 + 4 + 4,
+            // stream_id(4) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
+            VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 4 + 8,
+            // stream_id(4) + extent_id(4) + epoch(4)
+            VariableHeader::ForwardFlushed { .. } => 4 + 4 + 4,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
-            // request_id(4) + stream_id(8) + count(4) [+ name_len(2) + name(N) if FLAG_DESCRIBE_STREAM_BY_NAME]
+            // request_id(4) + stream_id(4) + count(4) [+ name_len(2) + name(N) if FLAG_DESCRIBE_STREAM_BY_NAME]
             VariableHeader::DescribeStream { stream_name, .. } => {
-                let base = 4 + 8 + 4;
+                let base = 4 + 4 + 4;
                 let name = stream_name.as_ref().map_or(0, |n| 2 + n.len());
                 base + name
             }
-            // request_id(4) + stream_id(8)
+            // request_id(4) + stream_id(4)
             VariableHeader::DescribeStreamResp { .. }
-            | VariableHeader::DescribeExtentResp { .. } => 4 + 8,
-            // request_id(4) + stream_id(8) + error_code(2)
-            VariableHeader::DescribeStreamRespError { .. } => 4 + 8 + 2,
-            // request_id(4) + stream_id(8) + extent_id(4) + error_code(2)
-            VariableHeader::DescribeExtentRespError { .. } => 4 + 8 + 4 + 2,
-            // request_id(4) + stream_id(8) + extent_id(4)
-            VariableHeader::DescribeExtent { .. } => 4 + 8 + 4,
-            // request_id(4) + stream_id(8) + offset(8)
-            VariableHeader::Seek { .. } | VariableHeader::SeekResp { .. } => 4 + 8 + 8,
-            // request_id(4) + stream_id(8) + offset(8) + error_code(2)
-            VariableHeader::SeekRespError { .. } => 4 + 8 + 8 + 2,
+            | VariableHeader::DescribeExtentResp { .. } => 4 + 4,
+            // request_id(4) + stream_id(4) + error_code(2)
+            VariableHeader::DescribeStreamRespError { .. } => 4 + 4 + 2,
+            // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
+            VariableHeader::DescribeExtentRespError { .. } => 4 + 4 + 4 + 2,
+            // request_id(4) + stream_id(4) + extent_id(4)
+            VariableHeader::DescribeExtent { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + offset(8)
+            VariableHeader::Seek { .. } | VariableHeader::SeekResp { .. } => 4 + 4 + 8,
+            // request_id(4) + stream_id(4) + offset(8) + error_code(2)
+            VariableHeader::SeekRespError { .. } => 4 + 4 + 8 + 2,
         }
     }
 
@@ -187,7 +187,7 @@ impl Frame {
                 epoch,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
             }
             VariableHeader::AppendAck {
@@ -198,7 +198,7 @@ impl Frame {
                 offset,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
@@ -211,7 +211,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u16(*error_code as u16);
@@ -224,7 +224,7 @@ impl Frame {
                 count,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u32(*count);
@@ -236,7 +236,7 @@ impl Frame {
                 count,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u32(*count);
             }
@@ -248,7 +248,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u16(*error_code as u16);
@@ -259,7 +259,7 @@ impl Frame {
                 epoch,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
             }
             VariableHeader::SealStreamManagerResp {
@@ -270,7 +270,7 @@ impl Frame {
                 primary_addr,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u32(new_epoch.0);
                 dst.put_u16(primary_addr.len() as u16);
@@ -282,7 +282,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::SealExtentNodeRequest {
@@ -293,7 +293,7 @@ impl Frame {
                 start_offset,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(extent_id_from.0);
                 dst.put_u64(*start_offset);
@@ -307,7 +307,7 @@ impl Frame {
                 end_offset,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u64(*start_offset);
@@ -319,7 +319,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::CreateStream {
@@ -348,7 +348,7 @@ impl Frame {
                 primary_addr,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u16(primary_addr.len() as u16);
@@ -366,7 +366,7 @@ impl Frame {
                 stream_id,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
             }
             VariableHeader::QueryOffsetResp {
                 request_id,
@@ -374,7 +374,7 @@ impl Frame {
                 offset,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u64(offset.0);
             }
             VariableHeader::QueryOffsetRespError {
@@ -383,7 +383,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::Connect { request_id }
@@ -405,7 +405,7 @@ impl Frame {
                 extent_growth_factor,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u8(*role);
                 dst.put_u16(*replication_factor);
@@ -441,7 +441,7 @@ impl Frame {
                 extent_id,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
             }
             VariableHeader::RegisterExtentAckError {
@@ -451,7 +451,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u16(*error_code as u16);
             }
@@ -461,7 +461,7 @@ impl Frame {
                 epoch,
                 offset,
             } => {
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(offset.0);
@@ -473,7 +473,7 @@ impl Frame {
                 offset,
                 byte_pos,
             } => {
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(offset.0);
@@ -487,7 +487,7 @@ impl Frame {
                 extent_capacity,
                 cache_extents,
             } => {
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(start_offset.0);
@@ -501,7 +501,7 @@ impl Frame {
                 checksum,
                 committed_bytes,
             } => {
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(*checksum);
@@ -512,7 +512,7 @@ impl Frame {
                 extent_id,
                 epoch,
             } => {
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
             }
@@ -526,7 +526,7 @@ impl Frame {
                 stream_name,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(*count);
                 if let Some(name) = stream_name {
                     dst.put_u16(name.len() as u16);
@@ -542,7 +542,7 @@ impl Frame {
                 stream_id,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
             }
             VariableHeader::DescribeStreamRespError {
                 request_id,
@@ -550,7 +550,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::DescribeExtentRespError {
@@ -560,7 +560,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u16(*error_code as u16);
             }
@@ -570,7 +570,7 @@ impl Frame {
                 extent_id,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
             }
             VariableHeader::Seek {
@@ -579,7 +579,7 @@ impl Frame {
                 offset,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u64(offset.0);
             }
             VariableHeader::SeekResp {
@@ -588,7 +588,7 @@ impl Frame {
                 offset,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u64(offset.0);
             }
             VariableHeader::SeekRespError {
@@ -598,7 +598,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u16(*error_code as u16);
             }
@@ -610,7 +610,7 @@ impl Frame {
                 new_extent_id,
                 new_extent_capacity,
             } => {
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(sealed_extent_id.0);
                 dst.put_u64(end_offset.0);
@@ -623,7 +623,7 @@ impl Frame {
                 extent_id,
                 current_offset,
             } => {
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u64(current_offset.0);
@@ -633,7 +633,7 @@ impl Frame {
                 epoch,
                 extent_id,
             } => {
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(extent_id.0);
             }
@@ -643,7 +643,7 @@ impl Frame {
                 epoch,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
             }
             VariableHeader::ReportExtentsResp {
@@ -652,7 +652,7 @@ impl Frame {
                 epoch,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
             }
             VariableHeader::ReportExtentsRespError {
@@ -662,7 +662,7 @@ impl Frame {
                 error_code,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u64(stream_id.0);
+                dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u16(*error_code as u16);
             }

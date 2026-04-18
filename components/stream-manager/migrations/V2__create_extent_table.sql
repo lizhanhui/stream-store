@@ -1,5 +1,5 @@
 CREATE TABLE extent (
-    stream_id     BIGINT NOT NULL,
+    stream_id     INT UNSIGNED NOT NULL,
     epoch         INT NOT NULL DEFAULT 0,    
     extent_id     INT NOT NULL,
     start_offset  BIGINT NOT NULL,
