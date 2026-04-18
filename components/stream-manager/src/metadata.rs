@@ -193,7 +193,8 @@ impl MetadataStore {
             max_extent_capacity: r.get::<i32, _>("max_extent_capacity") as u32,
             cache_extents: r.get::<u16, _>("cache_extents"),
             extent_growth_factor: r.get::<u8, _>("extent_growth_factor"),
-            storage_class: StorageClass::from_u8(r.get::<u8, _>("storage_class")).unwrap_or(StorageClass::S3),
+            storage_class: StorageClass::from_u8(r.get::<u8, _>("storage_class"))
+                .unwrap_or(StorageClass::S3),
         }))
     }
 
@@ -217,7 +218,8 @@ impl MetadataStore {
             max_extent_capacity: r.get::<i32, _>("max_extent_capacity") as u32,
             cache_extents: r.get::<u16, _>("cache_extents"),
             extent_growth_factor: r.get::<u8, _>("extent_growth_factor"),
-            storage_class: StorageClass::from_u8(r.get::<u8, _>("storage_class")).unwrap_or(StorageClass::S3),
+            storage_class: StorageClass::from_u8(r.get::<u8, _>("storage_class"))
+                .unwrap_or(StorageClass::S3),
         }))
     }
 
