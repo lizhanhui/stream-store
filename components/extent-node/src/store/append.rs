@@ -167,6 +167,41 @@ impl ExtentNodeStore {
         if extent_full {
             let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
 
+            // Backpressure: seal succeeded but no new extent could be created
+            // (S3 flush backlog blocking eviction). Return ExtentSealed to the
+            // client so it seals via SM and gets a new replica set.
+            if seal_notification.is_none() {
+                let remaining = {
+                    let guard = self.streams.pin();
+                    if let Some(stream) = guard.get(&stream_id) {
+                        stream.in_flight().fetch_sub(1, Ordering::Release)
+                    } else {
+                        0
+                    }
+                };
+                if remaining > 1 {
+                    let batch_seals = self.drain_follower_jobs(stream_id).await;
+                    for notification in &batch_seals {
+                        self.send_extent_update(stream_id, notification);
+                        self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                        self.send_flush_request(stream_id, notification);
+                    }
+                }
+                let err = Frame::append_ack_error(
+                    request_id,
+                    stream_id,
+                    epoch,
+                    ExtentId(0),
+                    ErrorCode::ExtentSealed,
+                    "extent full: eviction blocked, seal required",
+                );
+                if let Some(ref tx) = response_tx {
+                    let _ = tx.try_send(err);
+                    return None;
+                }
+                return Some(err);
+            }
+
             // Re-acquire pin guard for retry on the new extent.
             let (retry_result, remaining) = {
                 let guard = self.streams.pin();

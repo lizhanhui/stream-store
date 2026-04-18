@@ -203,7 +203,7 @@ async fn main() {
             MAX_EXTENT_CAPACITY,
             CACHE_EXTENTS,
             EXTENT_GROWTH_FACTOR,
-            StorageClass::S3,
+            StorageClass::Memory,
         )
         .await
         .expect("open stream");
