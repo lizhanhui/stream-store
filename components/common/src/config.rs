@@ -98,6 +98,14 @@ pub struct ExtentNodeConfig {
     ///   `worker_cores = [4, 5, 6, 7]`  — 4 workers pinned to cores 4-7
     ///   `worker_cores = []`            — auto-detect: cores 1..num_cpus
     pub worker_cores: Vec<usize>,
+
+    /// AWS SDK profile name for S3 access. Reads region, endpoint_url, and
+    /// credentials from ~/.aws/config and ~/.aws/credentials under this profile.
+    /// Defaults to "default".
+    pub s3_profile: String,
+
+    /// S3 bucket name for flushed extent storage. Must be configured for S3 flush.
+    pub s3_bucket: String,
 }
 
 impl Default for ExtentNodeConfig {
@@ -113,6 +121,8 @@ impl Default for ExtentNodeConfig {
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
             worker_cores: Vec::new(),
+            s3_profile: "dev".to_string(),
+            s3_bucket: String::from("stream-storage-1366919849"),
         }
     }
 }

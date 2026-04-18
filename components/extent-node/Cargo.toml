@@ -26,6 +26,8 @@ crossbeam-channel = { workspace = true }
 crc32fast = { workspace = true }
 core_affinity = { workspace = true }
 smallvec = { workspace = true }
+aws-config = { workspace = true }
+aws-sdk-s3 = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
