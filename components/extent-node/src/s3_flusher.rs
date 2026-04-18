@@ -4,9 +4,11 @@
 //! path. Each request triggers an encode + upload of the sealed extent data.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::types::{ExtentId, StreamId};
 use tokio::sync::mpsc;
+use tokio::time::sleep;
 use tracing::{error, info, warn};
 
 use crate::s3::S3Client;
@@ -107,7 +109,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     "flush attempt {}/{} failed for stream {} extent {}: {}, retrying in {}ms",
                     attempt, MAX_RETRIES, req.stream_id, req.extent_id, e, delay_ms,
                 );
-                tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                sleep(Duration::from_millis(delay_ms)).await;
             }
         }
     }
