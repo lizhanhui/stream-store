@@ -4,6 +4,8 @@ use aws_sdk_s3::{self as s3, primitives::ByteStreamError};
 use common::config::ExtentNodeConfig;
 use tracing::info;
 
+use crate::s3_codec::Compression;
+
 /// S3 client wrapper for flushed extent storage.
 ///
 /// Initialized from `ExtentNodeConfig::s3_profile` and `s3_bucket`.
@@ -12,6 +14,7 @@ pub struct S3Client {
     client: s3::Client,
     bucket: String,
     namespace: String,
+    compression: Compression,
 }
 
 impl S3Client {
@@ -33,15 +36,22 @@ impl S3Client {
 
         let client = s3::Client::from_conf(builder.build());
 
+        let compression = Compression::from_config(&config.s3_compression)
+            .unwrap_or_else(|e| {
+                tracing::warn!("invalid s3_compression config: {e}, defaulting to None");
+                Compression::None
+            });
+
         info!(
-            "S3Client initialized: profile={}, bucket={}, namespace={}, path_style={}",
-            config.s3_profile, config.s3_bucket, config.s3_namespace, config.s3_path_style,
+            "S3Client initialized: profile={}, bucket={}, namespace={}, path_style={}, compression={:?}",
+            config.s3_profile, config.s3_bucket, config.s3_namespace, config.s3_path_style, compression,
         );
 
         Some(Self {
             client,
             bucket: config.s3_bucket.clone(),
             namespace: config.s3_namespace.clone(),
+            compression,
         })
     }
 
@@ -101,6 +111,11 @@ impl S3Client {
     /// The configured S3 namespace prefix.
     pub fn namespace(&self) -> &str {
         &self.namespace
+    }
+
+    /// The configured compression algorithm for S3 extent chunks.
+    pub fn compression(&self) -> Compression {
+        self.compression
     }
 }
 
