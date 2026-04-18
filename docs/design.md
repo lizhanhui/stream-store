@@ -210,7 +210,7 @@ A DB-based leadership lease (`stream_manager_leadership` table) ensures that onl
 |  Fields determined by the Opcode. See per-opcode layouts below.     |
 +---------------------------------------------------------------------+
 +--Payload (optional, length-prefixed)--------------------------------+
-|  [Payload Length : u32]  (present when opcode defines a payload)     |
+|  [Payload Length : u64]  (present when opcode defines a payload)     |
 |  [Payload bytes  : ...]                                             |
 +---------------------------------------------------------------------+
 ```
@@ -264,14 +264,14 @@ Create a new stream. If `replication_factor = 0`, Stream Manager uses its defaul
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id            : u32]
+  [request_id            : u64]
   [name_len              : u16]
   [stream_name           : bytes]  -- human-readable stream name
   [replication_factor    : u16]
-  [min_extent_capacity   : u32]    -- minimum arena size in bytes (0 = default 8 MiB)
-  [max_extent_capacity   : u32]    -- maximum arena size in bytes (0 = default 256 MiB)
-  [cache_extents         : u32]    -- max extents to retain in memory (0 = default 4)
-  [extent_growth_factor  : u32]    -- adaptive growth multiplier (0 = default 2)
+  [min_extent_capacity   : u64]    -- minimum arena size in bytes (0 = default 8 MiB)
+  [max_extent_capacity   : u64]    -- maximum arena size in bytes (0 = default 256 MiB)
+  [cache_extents         : u64]    -- max extents to retain in memory (0 = default 4)
+  [extent_growth_factor  : u64]    -- adaptive growth multiplier (0 = default 2)
 No Payload.
 ```
 
@@ -282,10 +282,10 @@ Returns the newly created stream ID, initial extent ID, and the Primary Extent N
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]
-  [stream_id    : u64]
-  [extent_id    : u32]
-  [epoch        : u32]    -- initial stream epoch (always 0 for new streams)
+  [request_id   : u64]
+  [stream_id    : u32]
+  [extent_id    : u64]
+  [epoch        : u64]    -- initial stream epoch (always 0 for new streams)
   [addr_len     : u16]
   [primary_addr : bytes]  -- address of the initial extent's Primary node
 No Payload.
@@ -296,10 +296,10 @@ No Payload.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
+  [request_id  : u64]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -312,11 +312,11 @@ Append a message to a data stream. The client targets a stream by `(stream_id, e
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- target stream
-  [epoch        : u32]    -- target epoch (0 = accept any epoch)
+  [request_id   : u64]    -- correlates request/response
+  [stream_id    : u32]    -- target stream
+  [epoch        : u64]    -- target epoch (0 = accept any epoch)
 Payload:
-  [payload_len  : u32]    -- length of message bytes
+  [payload_len  : u64]    -- length of message bytes
   [payload      : bytes]  -- message body (application data)
 ```
 
@@ -327,10 +327,10 @@ Confirms a successful append after quorum ACK is achieved. The response includes
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates with original APPEND request
-  [stream_id    : u64]    -- stream that was appended to
-  [epoch        : u32]    -- epoch at append time (diagnostics)
-  [extent_id    : u32]    -- extent that was appended to (diagnostics)
+  [request_id   : u64]    -- correlates with original APPEND request
+  [stream_id    : u32]    -- stream that was appended to
+  [epoch        : u64]    -- epoch at append time (diagnostics)
+  [extent_id    : u64]    -- extent that was appended to (diagnostics)
   [offset       : u64]    -- assigned logical sequence number
 No Payload.
 ```
@@ -340,13 +340,13 @@ No Payload.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]
-  [stream_id    : u64]
-  [epoch        : u32]
-  [extent_id    : u32]
+  [request_id   : u64]
+  [stream_id    : u32]
+  [epoch        : u64]
+  [extent_id    : u64]
   [error_code   : u16]
 Payload:
-  [payload_len  : u32]
+  [payload_len  : u64]
   [payload      : bytes]  -- human-readable error message
 ```
 
@@ -359,13 +359,13 @@ Dedicated opcode for Primary→Secondary broadcast replication. Uses flags to di
 ```
 Fixed Header (8B)    -- flags=0x00
 Variable Header (32B):
-  [stream_id    : u64]    -- target stream
-  [extent_id    : u32]    -- target extent
-  [epoch        : u32]    -- stream epoch
+  [stream_id    : u32]    -- target stream
+  [extent_id    : u64]    -- target extent
+  [epoch        : u64]    -- stream epoch
   [offset       : u64]    -- primary-assigned logical offset for this record
   [byte_pos     : u64]    -- primary-assigned byte position in arena
 Payload:
-  [payload_len  : u32]    -- length of message bytes
+  [payload_len  : u64]    -- length of message bytes
   [payload      : bytes]  -- message body
 ```
 
@@ -374,12 +374,12 @@ Payload:
 ```
 Fixed Header (8B)    -- flags=0x01
 Variable Header (32B):
-  [stream_id        : u64]    -- target stream
-  [extent_id        : u32]    -- new extent
-  [epoch            : u32]    -- stream epoch
+  [stream_id        : u32]    -- target stream
+  [extent_id        : u64]    -- new extent
+  [epoch            : u64]    -- stream epoch
   [start_offset     : u64]    -- extent base offset
-  [extent_capacity  : u32]    -- arena size in bytes
-  [cache_extents    : u32]    -- max extents to retain in memory
+  [extent_capacity  : u64]    -- arena size in bytes
+  [cache_extents    : u64]    -- max extents to retain in memory
 No Payload.
 ```
 
@@ -388,10 +388,10 @@ No Payload.
 ```
 Fixed Header (8B)    -- flags=0x02
 Variable Header (28B):
-  [stream_id        : u64]    -- target stream
-  [extent_id        : u32]    -- sealed extent
-  [epoch            : u32]    -- stream epoch
-  [checksum         : u32]    -- CRC32 of the extent's committed data
+  [stream_id        : u32]    -- target stream
+  [extent_id        : u64]    -- sealed extent
+  [epoch            : u64]    -- stream epoch
+  [checksum         : u64]    -- CRC32 of the extent's committed data
   [committed_bytes  : u64]    -- byte count of committed data
 No Payload.
 ```
@@ -401,9 +401,9 @@ No Payload.
 ```
 Fixed Header (8B)    -- flags=0x03
 Variable Header (16B):
-  [stream_id    : u64]    -- target stream
-  [extent_id    : u32]    -- flushed extent
-  [epoch        : u32]    -- stream epoch
+  [stream_id    : u32]    -- target stream
+  [extent_id    : u64]    -- flushed extent
+  [epoch        : u64]    -- stream epoch
 No Payload.
 ```
 
@@ -417,9 +417,9 @@ Client requests SM to seal the active extent at the given epoch, bump epoch, and
 
 ```
 Variable Header:
-  [request_id : u32]
-  [stream_id  : u64]
-  [epoch      : u32]    -- seal active extent at this epoch
+  [request_id : u64]
+  [stream_id  : u32]
+  [epoch      : u64]    -- seal active extent at this epoch
 No Payload.
 ```
 
@@ -429,10 +429,10 @@ Returns the new epoch and primary address for the replacement extent.
 
 ```
 Variable Header:
-  [request_id   : u32]
-  [stream_id    : u64]
+  [request_id   : u64]
+  [stream_id    : u32]
   [offset       : u64]    -- committed end offset of sealed extent
-  [new_epoch    : u32]    -- epoch of the newly allocated extent
+  [new_epoch    : u64]    -- epoch of the newly allocated extent
   [addr_len     : u16]
   [primary_addr : bytes]  -- address of the new extent's Primary node
 No Payload.
@@ -442,11 +442,11 @@ No Payload.
 
 ```
 Variable Header:
-  [request_id : u32]
-  [stream_id  : u64]
+  [request_id : u64]
+  [stream_id  : u32]
   [error_code : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -460,10 +460,10 @@ SM seals the last mutable extent at the given epoch on an EN. The EN returns the
 
 ```
 Variable Header:
-  [request_id     : u32]
-  [stream_id      : u64]
-  [epoch          : u32]    -- seal last mutable extent at this epoch
-  [extent_id_from : u32]    -- SM's last known extent
+  [request_id     : u64]
+  [stream_id      : u32]
+  [epoch          : u64]    -- seal last mutable extent at this epoch
+  [extent_id_from : u64]    -- SM's last known extent
   [start_offset   : u64]    -- hint for absent-extent handling
 No Payload.
 ```
@@ -474,16 +474,16 @@ Header carries the just-sealed extent. Payload carries predecessor extents that 
 
 ```
 Variable Header:
-  [request_id   : u32]
-  [stream_id    : u64]
-  [epoch        : u32]
-  [extent_id    : u32]    -- the just-sealed (last mutable) extent
+  [request_id   : u64]
+  [stream_id    : u32]
+  [epoch        : u64]
+  [extent_id    : u64]    -- the just-sealed (last mutable) extent
   [start_offset : u64]
   [end_offset   : u64]    -- committed end offset
 Payload (optional):
-  [num_extents  : u32]
+  [num_extents  : u64]
   per extent:
-    [extent_id    : u32]
+    [extent_id    : u64]
     [start_offset : u64]
     [end_offset   : u64]
     [state        : u8]
@@ -496,11 +496,11 @@ Payload (optional):
 
 ```
 Variable Header:
-  [request_id : u32]
-  [stream_id  : u64]
+  [request_id : u64]
+  [stream_id  : u32]
   [error_code : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -513,8 +513,8 @@ Query the max offset (exclusive) for a stream.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- target stream
+  [request_id   : u64]    -- correlates request/response
+  [stream_id    : u32]    -- target stream
 No Payload.
 ```
 
@@ -525,8 +525,8 @@ Returns the current max offset.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates with original QUERY_OFFSET request
-  [stream_id    : u64]    -- queried stream
+  [request_id   : u64]    -- correlates with original QUERY_OFFSET request
+  [stream_id    : u32]    -- queried stream
   [offset       : u64]    -- max offset (exclusive)
 No Payload.
 ```
@@ -536,11 +536,11 @@ No Payload.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]
+  [request_id  : u64]
+  [stream_id   : u32]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -553,11 +553,11 @@ Read messages from a stream starting at a given logical offset. The server resol
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- target stream
-  [extent_id    : u32]    -- target extent
+  [request_id   : u64]    -- correlates request/response
+  [stream_id    : u32]    -- target stream
+  [extent_id    : u64]    -- target extent
   [offset       : u64]    -- start logical offset
-  [count        : u32]    -- number of messages to read
+  [count        : u64]    -- number of messages to read
 No Payload.
 ```
 
@@ -568,12 +568,12 @@ Read response carrying message data.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates with original READ request
-  [stream_id    : u64]    -- stream that was read from
+  [request_id   : u64]    -- correlates with original READ request
+  [stream_id    : u32]    -- stream that was read from
   [offset       : u64]    -- starting offset of the returned batch
-  [count        : u32]    -- actual number of messages returned
+  [count        : u64]    -- actual number of messages returned
 Payload:
-  [payload_len  : u32]    -- total length of all encoded messages
+  [payload_len  : u64]    -- total length of all encoded messages
   [payload      : bytes]  -- repeated [msg_len:u32][msg_bytes] per message
 ```
 
@@ -582,11 +582,11 @@ Payload:
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]
+  [request_id  : u64]
+  [stream_id   : u32]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -601,13 +601,13 @@ First frame after an Extent Node connects to Stream Manager. Stream Manager uses
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id    : u32]
+  [request_id    : u64]
 Payload:
   [node_id_len  : u16]
   [node_id      : bytes]  -- unique node identifier
   [addr_len     : u16]
   [addr         : bytes]  -- listen address (host:port)
-  [interval_ms  : u32]    -- heartbeat interval in milliseconds
+  [interval_ms  : u64]    -- heartbeat interval in milliseconds
 ```
 
 **Ack (flag=0x01): SM -> EN**
@@ -617,7 +617,7 @@ Acknowledges Extent Node registration.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id    : u32]
+  [request_id    : u64]
 No Payload.
 ```
 
@@ -626,10 +626,10 @@ No Payload.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
+  [request_id  : u64]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -642,7 +642,7 @@ Graceful shutdown. Stream Manager stops allocating new extents to this node.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id    : u32]
+  [request_id    : u64]
 Payload:
   [node_id_len  : u16]
   [node_id      : bytes]  -- node identifier
@@ -655,7 +655,7 @@ Acknowledges disconnect.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id    : u32]
+  [request_id    : u64]
 No Payload.
 ```
 
@@ -664,10 +664,10 @@ No Payload.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
+  [request_id  : u64]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -678,14 +678,14 @@ Connection keepalive within the interval declared in CONNECT. Carries runtime me
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id    : u32]
+  [request_id    : u64]
 Payload:
   [node_id_len  : u16]
   [node_id      : bytes]  -- node identifier
   [available_memory_bytes : u64]
   [total_memory_bytes     : u64]
-  [appends_per_sec        : u32]
-  [active_extent_count    : u32]
+  [appends_per_sec        : u64]
+  [active_extent_count    : u64]
   [bytes_written_per_sec  : u64]
 ```
 
@@ -694,7 +694,7 @@ Payload:
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id    : u32]
+  [request_id    : u64]
 No Payload.
 ```
 
@@ -707,17 +707,17 @@ Register an extent's replica membership on an Extent Node. Primary receives all 
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id              : u32]
-  [stream_id               : u64]    -- stream this extent belongs to
-  [extent_id               : u32]    -- extent being registered
+  [request_id              : u64]
+  [stream_id               : u32]    -- stream this extent belongs to
+  [extent_id               : u64]    -- extent being registered
   [role                    : u8]     -- 0 = Primary, 1+ = Secondary
   [replication_factor      : u16]
-  [epoch                   : u32]    -- stream epoch for this extent registration
-  [extent_capacity         : u32]    -- arena size in bytes for this extent
-  [cache_extents           : u32]    -- max extents to retain in memory per stream
-  [min_extent_capacity     : u32]    -- floor for adaptive shrink (0 = default)
-  [max_extent_capacity     : u32]    -- ceiling for adaptive growth (0 = default)
-  [extent_growth_factor    : u32]    -- adaptive growth multiplier (0 = default 2)
+  [epoch                   : u64]    -- stream epoch for this extent registration
+  [extent_capacity         : u64]    -- arena size in bytes for this extent
+  [cache_extents           : u64]    -- max extents to retain in memory per stream
+  [min_extent_capacity     : u64]    -- floor for adaptive shrink (0 = default)
+  [max_extent_capacity     : u64]    -- ceiling for adaptive growth (0 = default)
+  [extent_growth_factor    : u64]    -- adaptive growth multiplier (0 = default 2)
 Payload:
   [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
   per address:
@@ -732,9 +732,9 @@ Acknowledges extent registration.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]    -- stream that was registered
-  [extent_id   : u32]    -- extent that was registered
+  [request_id  : u64]
+  [stream_id   : u32]    -- stream that was registered
+  [extent_id   : u64]    -- extent that was registered
 No Payload.
 ```
 
@@ -743,12 +743,12 @@ No Payload.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]
-  [extent_id   : u32]
+  [request_id  : u64]
+  [stream_id   : u32]
+  [extent_id   : u64]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -759,9 +759,9 @@ Cumulative ACK from Secondary to Primary. Primary uses watermark ACKs from all s
 ```
 Fixed Header (8B)
 Variable Header (24B):
-  [stream_id    : u64]    -- stream the watermark applies to
-  [extent_id    : u32]    -- extent the watermark applies to
-  [epoch        : u32]    -- stream epoch for data integrity
+  [stream_id    : u32]    -- stream the watermark applies to
+  [extent_id    : u64]    -- extent the watermark applies to
+  [epoch        : u64]    -- stream epoch for data integrity
   [offset       : u64]    -- highest committed offset (inclusive, cumulative)
 No Payload.
 ```
@@ -775,11 +775,11 @@ Async notification from EN to SM. Fire-and-forget: no response expected. Uses fl
 ```
 Fixed Header (8B)    -- flags=0x00
 Variable Header (28B):
-  [stream_id           : u64]    -- stream that was sealed
-  [epoch               : u32]    -- current epoch at time of seal
-  [sealed_extent_id    : u32]    -- extent that was sealed
+  [stream_id           : u32]    -- stream that was sealed
+  [epoch               : u64]    -- current epoch at time of seal
+  [sealed_extent_id    : u64]    -- extent that was sealed
   [end_offset          : u64]    -- committed end_offset of sealed extent
-  [new_extent_id       : u32]    -- newly created extent (same epoch, same replica set)
+  [new_extent_id       : u64]    -- newly created extent (same epoch, same replica set)
 No Payload.
 ```
 
@@ -788,9 +788,9 @@ No Payload.
 ```
 Fixed Header (8B)    -- flags=0x01
 Variable Header (24B):
-  [stream_id        : u64]    -- stream being reported
-  [epoch            : u32]    -- current epoch
-  [extent_id        : u32]    -- active extent
+  [stream_id        : u32]    -- stream being reported
+  [epoch            : u64]    -- current epoch
+  [extent_id        : u64]    -- active extent
   [current_offset   : u64]    -- current committed offset
 No Payload.
 ```
@@ -800,9 +800,9 @@ No Payload.
 ```
 Fixed Header (8B)    -- flags=0x02
 Variable Header (16B):
-  [stream_id    : u64]    -- stream whose extent was flushed
-  [epoch        : u32]    -- epoch at time of flush
-  [extent_id    : u32]    -- flushed extent
+  [stream_id    : u32]    -- stream whose extent was flushed
+  [epoch        : u64]    -- epoch at time of flush
+  [extent_id    : u64]    -- flushed extent
 No Payload.
 ```
 
@@ -815,9 +815,9 @@ SM queries an EN for all extents it holds for a stream at a given epoch (recover
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- target stream
-  [epoch        : u32]    -- epoch to report
+  [request_id   : u64]    -- correlates request/response
+  [stream_id    : u32]    -- target stream
+  [epoch        : u64]    -- epoch to report
 No Payload.
 ```
 
@@ -828,14 +828,14 @@ EN response with extent state for reconciliation.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- queried stream
-  [epoch        : u32]    -- epoch reported
+  [request_id   : u64]    -- correlates request/response
+  [stream_id    : u32]    -- queried stream
+  [epoch        : u64]    -- epoch reported
 Payload:
-  [payload_len  : u32]
-  [num_extents  : u32]
+  [payload_len  : u64]
+  [num_extents  : u64]
   per extent:
-    [extent_id    : u32]
+    [extent_id    : u64]
     [start_offset : u64]
     [end_offset   : u64]
     [state        : u8]
@@ -846,11 +846,11 @@ Payload:
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]
+  [request_id  : u64]
+  [stream_id   : u32]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -863,7 +863,7 @@ Stream Manager cluster membership update. Extent Nodes and clients update their 
 ```
 Fixed Header (8B)
 Payload:
-  [payload_len  : u32]
+  [payload_len  : u64]
   [payload      : bytes]  -- list of active SM peer addresses
                              [num_addrs:u16][addr_len:u16][addr]...
 ```
@@ -881,9 +881,9 @@ When `FLAG_DESCRIBE_STREAM_BY_NAME` (0x02) is set, the frame includes `stream_na
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- target stream (ignored when flag 0x02 set)
-  [count        : u32]    -- 0 = all extents, 1 = active only, N = at most N from latest
+  [request_id   : u64]    -- correlates request/response
+  [stream_id    : u32]    -- target stream (ignored when flag 0x02 set)
+  [count        : u64]    -- 0 = all extents, 1 = active only, N = at most N from latest
   If FLAG_DESCRIBE_STREAM_BY_NAME (0x02):
     [name_len   : u16]
     [stream_name: bytes]  -- resolve stream by name instead of stream_id
@@ -897,10 +897,10 @@ Payload = encoded `Vec<ExtentInfo>`, ordered by extent_id **descending** (latest
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates with original DESCRIBE_STREAM request
-  [stream_id    : u64]    -- queried stream
+  [request_id   : u64]    -- correlates with original DESCRIBE_STREAM request
+  [stream_id    : u32]    -- queried stream
 Payload:
-  [payload_len  : u32]
+  [payload_len  : u64]
   [payload      : bytes]  -- encoded Vec<ExtentInfo> (see ExtentInfo format below)
 ```
 
@@ -909,11 +909,11 @@ Payload:
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]
+  [request_id  : u64]
+  [stream_id   : u32]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -926,9 +926,9 @@ Describe a single extent.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- target stream
-  [extent_id    : u32]    -- target extent
+  [request_id   : u64]    -- correlates request/response
+  [stream_id    : u32]    -- target stream
+  [extent_id    : u64]    -- target extent
 No Payload.
 ```
 
@@ -939,10 +939,10 @@ Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates with original DESCRIBE_EXTENT request
-  [stream_id    : u64]    -- queried stream
+  [request_id   : u64]    -- correlates with original DESCRIBE_EXTENT request
+  [stream_id    : u32]    -- queried stream
 Payload:
-  [payload_len  : u32]
+  [payload_len  : u64]
   [payload      : bytes]  -- encoded Vec<ExtentInfo> (1 entry)
 ```
 
@@ -951,12 +951,12 @@ Payload:
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]
-  [extent_id   : u32]
+  [request_id  : u64]
+  [stream_id   : u32]
+  [extent_id   : u64]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -969,8 +969,8 @@ Resolve a logical offset to the extent that contains it.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates request/response
-  [stream_id    : u64]    -- target stream
+  [request_id   : u64]    -- correlates request/response
+  [stream_id    : u32]    -- target stream
   [offset       : u64]    -- target logical offset
 No Payload.
 ```
@@ -982,11 +982,11 @@ Payload = encoded `Vec<ExtentInfo>` with exactly 1 entry.
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id   : u32]    -- correlates with original SEEK request
-  [stream_id    : u64]    -- queried stream
+  [request_id   : u64]    -- correlates with original SEEK request
+  [stream_id    : u32]    -- queried stream
   [offset       : u64]    -- resolved offset
 Payload:
-  [payload_len  : u32]
+  [payload_len  : u64]
   [payload      : bytes]  -- encoded Vec<ExtentInfo> (1 entry)
 ```
 
@@ -995,12 +995,12 @@ Payload:
 ```
 Fixed Header (8B)
 Variable Header:
-  [request_id  : u32]
-  [stream_id   : u64]
+  [request_id  : u64]
+  [stream_id   : u32]
   [offset      : u64]
   [error_code  : u16]
 Payload:
-  [payload_len : u32]
+  [payload_len : u64]
   [payload     : bytes]  -- human-readable error message
 ```
 
@@ -1429,7 +1429,7 @@ Stored in MySQL. Uses sqlx (async MySQL client) and Refinery (schema migrations)
 
 ```sql
 CREATE TABLE stream (
-    stream_id            BIGINT PRIMARY KEY AUTO_INCREMENT,
+    stream_id            INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
     stream_name          VARCHAR(512) NOT NULL UNIQUE,
     stream_type          VARCHAR(32) NOT NULL DEFAULT 'DATA',
     replication_factor   SMALLINT NOT NULL DEFAULT 2,
@@ -1444,7 +1444,7 @@ CREATE TABLE stream (
 );
 
 CREATE TABLE extent (
-    stream_id     BIGINT NOT NULL,
+    stream_id     INT UNSIGNED NOT NULL,
     epoch         INT NOT NULL DEFAULT 0,
     extent_id     INT NOT NULL,
     start_offset  BIGINT NOT NULL,
@@ -1459,7 +1459,7 @@ CREATE TABLE extent (
 );
 
 CREATE TABLE stream_replica (
-    stream_id     BIGINT NOT NULL,
+    stream_id     INT UNSIGNED NOT NULL,
     epoch         INT NOT NULL,                 -- epoch this replica set belongs to
     node_addr     VARCHAR(256) NOT NULL,
     role          TINYINT NOT NULL DEFAULT 0,   -- 0=Primary, 1+=Secondary
@@ -1470,7 +1470,7 @@ CREATE TABLE stream_replica (
 );
 
 CREATE TABLE stream_sequence (
-    stream_id      BIGINT PRIMARY KEY,
+    stream_id      INT UNSIGNED PRIMARY KEY,
     next_extent_id INT NOT NULL DEFAULT 0,
     created_at     DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at     DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)

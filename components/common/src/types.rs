@@ -48,7 +48,7 @@ pub const FLAG_SYSTEM_TICK: u8 = 0x02;
 
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct StreamId(pub u64);
+pub struct StreamId(pub u32);
 
 impl Display for StreamId {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {

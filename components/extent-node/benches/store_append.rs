@@ -31,7 +31,7 @@ const PAYLOAD_SIZES: &[(usize, &str)] =
 const THREAD_COUNTS: &[usize] = &[1, 2, 4, 8];
 
 /// Register a stream+extent on the store, mirroring the test helper in store.rs.
-async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u64, extent_id: u32) {
+async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u32, extent_id: u32) {
     let payload = build_register_extent_payload(&[]);
     let _ = store
         .handle_frame(

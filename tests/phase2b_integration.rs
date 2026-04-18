@@ -57,7 +57,7 @@ async fn start_extent_node() -> (String, Arc<ExtentNodeStore>) {
 /// - Secondaries receive `replica_addrs` = empty.
 async fn register_extent(
     addr: &str,
-    stream_id: u64,
+    stream_id: u32,
     extent_id: u32,
     role: u8,
     replication_factor: u16,
@@ -111,7 +111,7 @@ async fn broadcast_replication_rf2() {
     let (primary_addr, _primary_store) = start_extent_node().await;
     let (secondary_addr, _secondary_store) = start_extent_node().await;
 
-    let stream_id = 100u64;
+    let stream_id = 100;
     let extent_id = 1u32;
 
     // Register broadcast replication.
@@ -191,7 +191,7 @@ async fn broadcast_replication_rf3() {
     let (secondary1_addr, _) = start_extent_node().await;
     let (secondary2_addr, _) = start_extent_node().await;
 
-    let stream_id = 200u64;
+    let stream_id = 200;
     let extent_id = 1u32;
 
     // Register broadcast replication.
@@ -261,8 +261,8 @@ async fn multi_stream_shared_downstream() {
     let (primary_addr, _) = start_extent_node().await;
     let (secondary_addr, _) = start_extent_node().await;
 
-    let stream_a = 300u64;
-    let stream_b = 301u64;
+    let stream_a = 300;
+    let stream_b = 301;
 
     // Both streams use the same secondary.
     register_extent(&secondary_addr, stream_a, 1, 1, 2, &[]).await;
@@ -337,7 +337,7 @@ async fn broadcast_replication_rf1_immediate_ack() {
     init_tracing();
     let (primary_addr, _) = start_extent_node().await;
 
-    let stream_id = 400u64;
+    let stream_id = 400;
     let extent_id = 1u32;
 
     // Register as Primary with RF=1, no secondaries.

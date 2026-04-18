@@ -12,7 +12,7 @@ pub(crate) use types::AppendJob;
 pub use types::{ExtentUpdate, ReplicaInfo};
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::types::{Epoch, ErrorCode, ExtentId, Opcode, StreamId};
@@ -44,7 +44,7 @@ pub struct ExtentNodeStore {
     /// Per-stream data with fine-grained locking.
     pub(crate) streams: papaya::HashMap<StreamId, Stream>,
     /// Monotonic stream ID generator (atomic, no lock needed).
-    pub(crate) next_stream_id: AtomicU64,
+    pub(crate) next_stream_id: AtomicU32,
     /// Replication info per stream_id (registered via RegisterExtent).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
     pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>>,
@@ -77,7 +77,7 @@ impl ExtentNodeStore {
     pub fn new() -> Self {
         Self {
             streams: papaya::HashMap::new(),
-            next_stream_id: AtomicU64::new(1),
+            next_stream_id: AtomicU32::new(1),
             replicas: papaya::HashMap::new(),
             downstream: OnceLock::new(),
             s3_client: OnceLock::new(),

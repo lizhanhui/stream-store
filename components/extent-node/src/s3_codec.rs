@@ -297,7 +297,7 @@ pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compress
         magic: S3_EXTENT_MAGIC,
         version: S3_EXTENT_VERSION,
         flags: 0,
-        stream_id: stream_id.0,
+        stream_id: stream_id.0 as u64,
         start_offset,
         end_offset,
         record_count,
