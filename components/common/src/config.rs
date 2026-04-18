@@ -101,11 +101,18 @@ pub struct ExtentNodeConfig {
 
     /// AWS SDK profile name for S3 access. Reads region, endpoint_url, and
     /// credentials from ~/.aws/config and ~/.aws/credentials under this profile.
-    /// Defaults to "default".
+    /// Defaults to "dev".
     pub s3_profile: String,
 
     /// S3 bucket name for flushed extent storage. Must be configured for S3 flush.
+    /// Defaults to "stream-storage-1366919849".
     pub s3_bucket: String,
+
+    /// Use path-style S3 addressing (s3.amazonaws.com/bucket/key instead of
+    /// bucket.s3.amazonaws.com/key). Set to true for AWS S3; false for COS and
+    /// most other S3-compatible services that require virtual-hosted style.
+    /// Defaults to false.
+    pub s3_path_style: bool,
 }
 
 impl Default for ExtentNodeConfig {
@@ -123,6 +130,7 @@ impl Default for ExtentNodeConfig {
             worker_cores: Vec::new(),
             s3_profile: "dev".to_string(),
             s3_bucket: String::from("stream-storage-1366919849"),
+            s3_path_style: false,
         }
     }
 }

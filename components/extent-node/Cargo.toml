@@ -26,6 +26,7 @@ crossbeam-channel = { workspace = true }
 crc32fast = { workspace = true }
 core_affinity = { workspace = true }
 smallvec = { workspace = true }
+thiserror = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 
