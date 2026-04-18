@@ -20,6 +20,8 @@ pub const FLAG_RESPONSE: u8 = 0x01;
 pub const FLAG_EXTENT_SEALED: u8 = 0x00;
 /// Flag on UPDATE_EXTENT: progress report for an active extent.
 pub const FLAG_EXTENT_PROGRESS: u8 = 0x01;
+/// Flag on UPDATE_EXTENT: extent was flushed to S3.
+pub const FLAG_EXTENT_FLUSHED: u8 = 0x02;
 
 /// Flag on FORWARD: normal per-record replication.
 pub const FLAG_FORWARD_APPEND: u8 = 0x00;
@@ -131,7 +133,7 @@ pub enum Opcode {
     /// Register extent replica. Flags: 0x00=request, 0x01=ack, 0x80=error.
     RegisterExtent = 0x15,
     Watermark = 0x17,
-    /// Async extent update from Primary EN to SM. Fire-and-forget.
+    /// Async extent update from EN to SM. Fire-and-forget.
     /// Flags distinguish variants: sealed (0x00) or progress (0x01).
     UpdateExtent = 0x18,
     /// SM queries an EN for all extents it holds for a stream (recovery path).

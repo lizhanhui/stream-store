@@ -2,6 +2,7 @@
 //!
 //! Runs as a background tokio task, receiving [`FlushRequest`]s from the seal
 //! path. Each request triggers an encode + upload of the sealed extent data.
+//! On successful upload, notifies SM via `ExtentUpdate::Flushed`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,7 +14,7 @@ use tracing::{error, info, warn};
 
 use crate::s3::S3Client;
 use crate::s3_codec::{encode_extent, s3_key};
-use crate::store::ExtentNodeStore;
+use crate::store::{ExtentNodeStore, ExtentUpdate};
 
 /// Maximum number of upload retries before giving up on a flush request.
 const MAX_RETRIES: u32 = 3;
@@ -96,6 +97,22 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     key,
                     data_len,
                 );
+
+                // Notify SM that this extent is now flushed to S3.
+                if let Some(ref tx) = store.update_tx {
+                    let epoch = store
+                        .streams
+                        .pin()
+                        .get(&req.stream_id)
+                        .map(|s| s.epoch())
+                        .unwrap_or(common::types::Epoch(0));
+                    let _ = tx.try_send(ExtentUpdate::Flushed {
+                        stream_id: req.stream_id,
+                        extent_id: req.extent_id,
+                        epoch,
+                    });
+                }
+
                 return;
             }
             Err(e) => {
