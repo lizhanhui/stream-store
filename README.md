@@ -1,6 +1,6 @@
 # Stream Store
 
-A high-performance, replicated in-memory message storage system built in Rust, designed to replace cloud block-based disk storage with S3-compatible object storage while serving hot data from a replicated in-memory layer.
+A high-performance, replicated in-memory streaming storage system built in Rust, designed to replace cloud block-based disk storage with S3-compatible object storage while serving hot data from a replicated in-memory layer.
 
 ## Motivation
 
