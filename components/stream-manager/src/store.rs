@@ -346,12 +346,12 @@ impl StreamManagerStore {
         extent_id: ExtentId,
         primary_addr: &str,
         secondary_addrs: &[&str],
-        replication_factor: u16,
+        replication_factor: u8,
         epoch: Epoch,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
-        cache_extents: u32,
-        extent_growth_factor: u32,
+        cache_extents: u16,
+        extent_growth_factor: u8,
     ) -> Result<(), StorageError> {
         let payload = build_register_extent_payload(secondary_addrs);
         let addr = primary_addr.to_string();
@@ -434,12 +434,12 @@ impl StreamManagerStore {
         stream_id: StreamId,
         extent_id: ExtentId,
         secondary_addrs: &[String],
-        replication_factor: u16,
+        replication_factor: u8,
         epoch: Epoch,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
-        cache_extents: u32,
-        extent_growth_factor: u32,
+        cache_extents: u16,
+        extent_growth_factor: u8,
     ) {
         for (i, addr) in secondary_addrs.iter().enumerate() {
             let role = (i + 1) as u8; // 1, 2, ...
@@ -522,8 +522,8 @@ impl StreamManagerStore {
         epoch: Epoch,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
-        cache_extents: u32,
-        extent_growth_factor: u32,
+        cache_extents: u16,
+        extent_growth_factor: u8,
     ) -> Result<(ExtentId, String), StorageError> {
         // Initial allocation: require full RF.
         let nodes = self
@@ -553,7 +553,7 @@ impl StreamManagerStore {
         // the StreamManager-assigned stream_id and extent_id (required for seal coordination).
         let primary_addr = &node_addrs[0];
         let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
-        let rf = node_addrs.len() as u16;
+        let rf = node_addrs.len() as u8;
 
         self.register_primary(stream_id, extent_id, primary_addr, &secondary_addrs, rf, epoch, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor)
             .await
@@ -812,7 +812,7 @@ impl StreamManagerStore {
 
         let result = async {
             // 1. Create stream in metadata with per-stream replication factor and extent capacity.
-            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u16, min_extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor).await?;
+            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u8, min_extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor).await?;
 
             // 2. Allocate first extent replica set and notify ExtentNodes.
             let (extent_id, primary_addr) =
@@ -1037,7 +1037,7 @@ impl StreamManagerStore {
         }
 
         // Fallback: primary unreachable — seal ALL replicas concurrently.
-        let rf = replicas.len() as u16;
+        let rf = replicas.len() as u8;
         let required_secondary_acks = (rf as u32) / 2;
 
         let mut seal_futures = Vec::new();
@@ -1178,7 +1178,7 @@ impl StreamManagerStore {
                 let node_addrs: Vec<String> = new_replicas.iter().map(|(a, _)| a.clone()).collect();
                 let secondary_addrs: Vec<&str> =
                     node_addrs[1..].iter().map(|s| s.as_str()).collect();
-                let rf = node_addrs.len() as u16;
+                let rf = node_addrs.len() as u8;
 
                 info!(
                     "new extent {} allocated for stream {}, primary={primary_addr}",

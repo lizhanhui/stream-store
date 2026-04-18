@@ -31,10 +31,10 @@ pub const DEFAULT_MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024;
 /// On extent-full, `next_extent_capacity = min(current * growth_factor, max)`.
 /// Higher values (e.g. 8) reach steady-state faster with fewer extent transitions,
 /// reducing tail latency from allocation/resize during ramp-up.
-pub const DEFAULT_EXTENT_GROWTH_FACTOR: u32 = 2;
+pub const DEFAULT_EXTENT_GROWTH_FACTOR: u8 = 2;
 
 /// Default cache_extents: max extents to retain in memory per stream.
-pub const DEFAULT_CACHE_EXTENTS: u32 = 4;
+pub const DEFAULT_CACHE_EXTENTS: u16 = 4;
 
 /// Maximum supported replication factor (RF is normally 1-3).
 pub const MAX_REPLICATION_FACTOR: usize = 5;

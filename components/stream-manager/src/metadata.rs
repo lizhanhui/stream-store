@@ -19,12 +19,12 @@ pub struct StreamRow {
     pub stream_id: StreamId,
     pub stream_name: String,
     pub stream_type: String,
-    pub replication_factor: u16,
+    pub replication_factor: u8,
     pub extent_capacity: u32,
     pub min_extent_capacity: u32,
     pub max_extent_capacity: u32,
-    pub cache_extents: u32,
-    pub extent_growth_factor: u32,
+    pub cache_extents: u16,
+    pub extent_growth_factor: u8,
 }
 
 /// A row from the `extent` table.
@@ -135,24 +135,24 @@ impl MetadataStore {
         &self,
         name: &str,
         stream_type: &str,
-        replication_factor: u16,
+        replication_factor: u8,
         extent_capacity: u32,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
-        cache_extents: u32,
-        extent_growth_factor: u32,
+        cache_extents: u16,
+        extent_growth_factor: u8,
     ) -> Result<StreamId, StorageError> {
         let result = sqlx::query(
             "INSERT INTO stream (stream_name, stream_type, replication_factor, extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name)
         .bind(stream_type)
-        .bind(replication_factor as i16)
+        .bind(replication_factor)
         .bind(extent_capacity as i32)
         .bind(min_extent_capacity as i32)
         .bind(max_extent_capacity as i32)
-        .bind(cache_extents as i32)
-        .bind(extent_growth_factor as i32)
+        .bind(cache_extents)
+        .bind(extent_growth_factor)
         .execute(&self.pool)
         .await
         .map_err(|e| StorageError::Internal(format!("create_stream: {e}")))?;
@@ -183,12 +183,12 @@ impl MetadataStore {
             stream_id: StreamId(r.get::<u32, _>("stream_id")),
             stream_name: r.get("stream_name"),
             stream_type: r.get("stream_type"),
-            replication_factor: r.get::<i16, _>("replication_factor") as u16,
+            replication_factor: r.get::<u8, _>("replication_factor"),
             extent_capacity: r.get::<i32, _>("extent_capacity") as u32,
             min_extent_capacity: r.get::<i32, _>("min_extent_capacity") as u32,
             max_extent_capacity: r.get::<i32, _>("max_extent_capacity") as u32,
-            cache_extents: r.get::<i32, _>("cache_extents") as u32,
-            extent_growth_factor: r.get::<i32, _>("extent_growth_factor") as u32,
+            cache_extents: r.get::<u16, _>("cache_extents"),
+            extent_growth_factor: r.get::<u8, _>("extent_growth_factor"),
         }))
     }
 
@@ -206,12 +206,12 @@ impl MetadataStore {
             stream_id: StreamId(r.get::<u32, _>("stream_id")),
             stream_name: r.get("stream_name"),
             stream_type: r.get("stream_type"),
-            replication_factor: r.get::<i16, _>("replication_factor") as u16,
+            replication_factor: r.get::<u8, _>("replication_factor"),
             extent_capacity: r.get::<i32, _>("extent_capacity") as u32,
             min_extent_capacity: r.get::<i32, _>("min_extent_capacity") as u32,
             max_extent_capacity: r.get::<i32, _>("max_extent_capacity") as u32,
-            cache_extents: r.get::<i32, _>("cache_extents") as u32,
-            extent_growth_factor: r.get::<i32, _>("extent_growth_factor") as u32,
+            cache_extents: r.get::<u16, _>("cache_extents"),
+            extent_growth_factor: r.get::<u8, _>("extent_growth_factor"),
         }))
     }
 
@@ -247,14 +247,14 @@ impl MetadataStore {
     pub async fn get_stream_replication_factor(
         &self,
         stream_id: StreamId,
-    ) -> Result<u16, StorageError> {
+    ) -> Result<u8, StorageError> {
         let row = sqlx::query("SELECT replication_factor FROM stream WHERE stream_id = ?")
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_replication_factor: {e}")))?;
 
-        Ok(row.get::<i16, _>("replication_factor") as u16)
+        Ok(row.get::<u8, _>("replication_factor"))
     }
 
     /// Get the extent capacity (arena size in bytes) for a stream.
@@ -272,14 +272,14 @@ impl MetadataStore {
     }
 
     /// Get the cache_extents (max extents to retain in memory) for a stream.
-    pub async fn get_stream_cache_extents(&self, stream_id: StreamId) -> Result<u32, StorageError> {
+    pub async fn get_stream_cache_extents(&self, stream_id: StreamId) -> Result<u16, StorageError> {
         let row = sqlx::query("SELECT cache_extents FROM stream WHERE stream_id = ?")
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_cache_extents: {e}")))?;
 
-        Ok(row.get::<i32, _>("cache_extents") as u32)
+        Ok(row.get::<u16, _>("cache_extents"))
     }
 
     /// Get the min and max extent capacity bounds for a stream.
@@ -301,14 +301,14 @@ impl MetadataStore {
     }
 
     /// Get the extent growth factor for a stream.
-    pub async fn get_stream_growth_factor(&self, stream_id: StreamId) -> Result<u32, StorageError> {
+    pub async fn get_stream_growth_factor(&self, stream_id: StreamId) -> Result<u8, StorageError> {
         let row = sqlx::query("SELECT extent_growth_factor FROM stream WHERE stream_id = ?")
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
             .map_err(|e| StorageError::Internal(format!("get_stream_growth_factor: {e}")))?;
 
-        Ok(row.get::<i32, _>("extent_growth_factor") as u32)
+        Ok(row.get::<u8, _>("extent_growth_factor"))
     }
 
     /// Get the minimum extent capacity for a stream.

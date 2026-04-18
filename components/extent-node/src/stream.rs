@@ -57,7 +57,7 @@ struct StreamInner {
     /// On extent-full, `next_extent_capacity = min(current * growth_factor, max)`.
     /// Configurable per stream (default 2). Higher values (e.g. 8) reach
     /// steady-state faster with fewer extent transitions.
-    growth_factor: u32,
+    growth_factor: u8,
 
     /// When the current active extent was created (for the 5-minute idle-shrink rule).
     active_extent_created_at: Option<Instant>,
@@ -575,7 +575,7 @@ impl Stream {
         epoch: Epoch,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
-        growth_factor: u32,
+        growth_factor: u8,
     ) {
         self.epoch.store(epoch.0, Ordering::Release);
         let mut inner = self.inner.write();
@@ -674,7 +674,7 @@ impl Stream {
                 // Scale up: multiply capacity by growth_factor (capped at max).
                 inner.next_extent_capacity = (inner
                     .next_extent_capacity
-                    .saturating_mul(inner.growth_factor))
+                    .saturating_mul(inner.growth_factor as u32))
                 .min(inner.max_extent_capacity);
             }
             SealReason::IdleShrink => {

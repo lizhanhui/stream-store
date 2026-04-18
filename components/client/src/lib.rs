@@ -242,11 +242,11 @@ impl StreamClient {
     pub async fn create_stream(
         &self,
         name: &str,
-        replication_factor: u16,
+        replication_factor: u8,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
-        cache_extents: u32,
-        extent_growth_factor: u32,
+        cache_extents: u16,
+        extent_growth_factor: u8,
     ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
@@ -633,11 +633,11 @@ impl StreamClient {
     pub async fn open(
         &self,
         stream_name: &str,
-        replication_factor: u16,
+        replication_factor: u8,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
-        cache_extents: u32,
-        extent_growth_factor: u32,
+        cache_extents: u16,
+        extent_growth_factor: u8,
     ) -> Result<StreamId, StorageError> {
         match self.describe_stream_by_name(stream_name, 1).await {
             Ok((stream_id, extents)) => {
