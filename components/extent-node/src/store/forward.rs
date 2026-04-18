@@ -53,7 +53,7 @@ impl ExtentNodeStore {
                     start_offset: ext.start_offset,
                     extent_capacity: stream.extent_capacity(),
                     cache_extents: stream.max_extents() as u16,
-                    storage_medium: stream.storage_medium(),
+                    storage_class: stream.storage_class(),
                 },
                 None,
             ))
@@ -72,7 +72,7 @@ impl ExtentNodeStore {
             start_offset,
             extent_capacity,
             cache_extents,
-            storage_medium,
+            storage_class,
         ) = match &frame.variable_header {
             VariableHeader::ForwardInitExtent {
                 stream_id,
@@ -81,7 +81,7 @@ impl ExtentNodeStore {
                 start_offset,
                 extent_capacity,
                 cache_extents,
-                storage_medium,
+                storage_class,
             } => (
                 *stream_id,
                 *extent_id,
@@ -89,7 +89,7 @@ impl ExtentNodeStore {
                 *start_offset,
                 *extent_capacity,
                 *cache_extents,
-                *storage_medium,
+                *storage_class,
             ),
             _ => return,
         };
@@ -100,7 +100,7 @@ impl ExtentNodeStore {
             if cache_extents > 0 && stream.max_extents() == 0 {
                 stream.set_max_extents(cache_extents as usize);
             }
-            stream.set_storage_medium(storage_medium);
+            stream.set_storage_class(storage_class);
             if stream.with_extent(extent_id, |_| ()).is_none() {
                 stream.register_extent(
                     extent_id,
@@ -119,7 +119,7 @@ impl ExtentNodeStore {
         } else {
             let stream = Stream::new(stream_id);
             stream.set_max_extents(cache_extents as usize);
-            stream.set_storage_medium(storage_medium);
+            stream.set_storage_class(storage_class);
             stream.register_extent(
                 extent_id,
                 start_offset,

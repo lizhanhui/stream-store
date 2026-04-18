@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::config::DEFAULT_IDLE_SHRINK_THRESHOLD_SECS;
 use common::errors::StorageError;
-use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use smallvec::SmallVec;
 use tokio::sync::mpsc::Sender;
@@ -606,7 +606,7 @@ impl ExtentNodeStore {
             .streams
             .pin()
             .get(&stream_id)
-            .map(|s| s.storage_medium() == 1)
+            .map(|s| s.storage_class() == StorageClass::Memory)
             .unwrap_or(false);
         if is_memory {
             return;

@@ -23,7 +23,7 @@ The unit of replication and the unit of S3 flush. A stream is composed of an ord
 - **Sealed**: Immutable. Eligible for S3 flush. Once flushed to S3, they can be evicted from memory. 
 - **Flushed**: Sealed + uploaded to S3.  Served from S3 (with read cache) on demand. Flushed extents are supposed to be evicted from memory to free up space for active extents and new appends. They are subject to TTL-based policy in memory and S3.
 
-**Storage Medium** — Each stream has a `storage_medium` property set at creation time:
+**Storage Class** — Each stream has a `storage_class` property set at creation time:
 - **S3** (0, default): Sealed extents are uploaded to S3 by the Primary. Eviction from memory only after the extent is flushed (uploaded). Data is durable in S3.
 - **Memory** (1): Sealed extents are NOT uploaded to S3. Eviction happens when the `cache_extents` limit is reached — oldest sealed extents are dropped from memory. Data is lost after eviction (acceptable for ephemeral/transient workloads).
 
@@ -276,7 +276,7 @@ Variable Header:
   [max_extent_capacity   : u32]    -- maximum arena size in bytes (0 = default 256 MiB)
   [cache_extents         : u16]    -- max extents to retain in memory (0 = default 4)
   [extent_growth_factor  : u8]    -- adaptive growth multiplier (0 = default 2)
-  [storage_medium       : u8]    -- 0 = S3 (default), 1 = Memory
+  [storage_class       : u8]    -- 0 = S3 (default), 1 = Memory
 No Payload.
 ```
 
@@ -385,7 +385,7 @@ Variable Header (33B):
   [start_offset     : u64]    -- extent base offset
   [extent_capacity  : u32]    -- arena size in bytes
   [cache_extents    : u16]    -- max extents to retain in memory
-  [storage_medium   : u8]     -- 0 = S3, 1 = Memory
+  [storage_class   : u8]     -- 0 = S3, 1 = Memory
 No Payload.
 ```** — Sent by the Primary after sealing an extent so secondaries can verify data integrity. No response.
 
@@ -722,7 +722,7 @@ Variable Header:
   [min_extent_capacity     : u32]    -- floor for adaptive shrink (0 = default)
   [max_extent_capacity     : u32]    -- ceiling for adaptive growth (0 = default)
   [extent_growth_factor    : u8]    -- adaptive growth multiplier (0 = default 2)
-  [storage_medium          : u8]    -- 0 = S3, 1 = Memory
+  [storage_class          : u8]    -- 0 = S3, 1 = Memory
 Payload:
   [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
   per address:
@@ -1443,7 +1443,7 @@ CREATE TABLE stream (
     max_extent_capacity  INT NOT NULL DEFAULT 268435456,  -- ceiling for adaptive growth (256 MiB)
     extent_growth_factor TINYINT UNSIGNED NOT NULL DEFAULT 2,          -- adaptive growth multiplier
     cache_extents        SMALLINT UNSIGNED NOT NULL DEFAULT 4,          -- max extents retained in memory
-    storage_medium       TINYINT UNSIGNED NOT NULL DEFAULT 0,           -- 0 = S3, 1 = Memory
+    storage_class       TINYINT UNSIGNED NOT NULL DEFAULT 0,           -- 0 = S3, 1 = Memory
     epoch                INT NOT NULL DEFAULT 0,          -- current stream epoch
     created_at           DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at           DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)

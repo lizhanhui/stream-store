@@ -26,7 +26,7 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
     DEFAULT_MIN_EXTENT_CAPACITY, ExtentNodeConfig, StreamManagerConfig,
 };
-use common::types::Epoch;
+use common::types::{Epoch, StorageClass};
 use extent_node::ExtentNode;
 use sqlx::mysql::MySqlPoolOptions;
 use stream_manager::StreamManager;
@@ -200,7 +200,7 @@ async fn client_task(
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
-            0,
+            StorageClass::S3,
         )
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: create_stream failed: {e}"));

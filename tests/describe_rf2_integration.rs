@@ -13,7 +13,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, ExtentState, NodeMetrics, Offset};
+use common::types::{Epoch, ExtentState, NodeMetrics, Offset, StorageClass};
 
 use extent_node::downstream::DownstreamPool;
 use extent_node::store::ExtentNodeStore;
@@ -154,7 +154,7 @@ async fn describe_stream_rf2_integration() {
     );
 
     let (stream_id, first_extent_id, _epoch, primary_addr) = stream_manager
-        .create_stream(&stream_name, 2, 8 * 1024 * 1024, 256 * 1024 * 1024, 4, 0, 0)
+        .create_stream(&stream_name, 2, 8 * 1024 * 1024, 256 * 1024 * 1024, 4, 0, StorageClass::S3)
         .await
         .unwrap();
 

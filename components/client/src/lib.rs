@@ -7,7 +7,8 @@ use bytes::{Buf, Bytes};
 use common::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SM_REQUEST_TIMEOUT_MS};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentInfo, ExtentState, NodeMetrics, Offset, Opcode, StreamId,
+    Epoch, ErrorCode, ExtentId, ExtentInfo, ExtentState, NodeMetrics, Offset, Opcode, StorageClass,
+    StreamId,
 };
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
@@ -247,7 +248,7 @@ impl StreamClient {
         max_extent_capacity: u32,
         cache_extents: u16,
         extent_growth_factor: u8,
-        storage_medium: u8,
+        storage_class: StorageClass,
     ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
@@ -258,7 +259,7 @@ impl StreamClient {
                 max_extent_capacity,
                 cache_extents,
                 extent_growth_factor,
-                storage_medium,
+                storage_class,
             },
             None,
         );
@@ -640,7 +641,7 @@ impl StreamClient {
         max_extent_capacity: u32,
         cache_extents: u16,
         extent_growth_factor: u8,
-        storage_medium: u8,
+        storage_class: StorageClass,
     ) -> Result<StreamId, StorageError> {
         match self.describe_stream_by_name(stream_name, 1).await {
             Ok((stream_id, extents)) => {
@@ -659,7 +660,7 @@ impl StreamClient {
                         max_extent_capacity,
                         cache_extents,
                         extent_growth_factor,
-                        storage_medium,
+                        storage_class,
                     )
                     .await?;
                 Ok(stream_id)
