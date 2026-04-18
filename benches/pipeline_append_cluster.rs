@@ -186,6 +186,7 @@ async fn main() {
             MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
+            0,
         )
         .await
         .expect("open stream");

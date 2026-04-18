@@ -185,6 +185,31 @@ impl Opcode {
     }
 }
 
+/// Storage medium for a stream's sealed extents.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum StorageMedium {
+    /// Sealed extents are uploaded to S3 for durability. Eviction only after flush.
+    S3 = 0,
+    /// Sealed extents stay in memory only. Evicted when cache_extents limit is hit.
+    /// Data is lost after eviction (acceptable for ephemeral workloads).
+    Memory = 1,
+}
+
+impl StorageMedium {
+    pub fn from_u8(value: u8) -> Option<StorageMedium> {
+        match value {
+            0 => Some(StorageMedium::S3),
+            1 => Some(StorageMedium::Memory),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
 /// State of an extent in metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

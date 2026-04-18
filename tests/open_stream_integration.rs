@@ -123,6 +123,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
+            0,
         )
         .await
         .unwrap();
@@ -149,6 +150,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
+            0,
         )
         .await
         .unwrap();
@@ -170,6 +172,7 @@ async fn stream_client_open_integration() {
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
+            0,
         )
         .await
         .unwrap();

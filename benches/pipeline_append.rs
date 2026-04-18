@@ -35,7 +35,7 @@ use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::errors::StorageError;
-use common::types::{Epoch, StreamId};
+use common::types::{Epoch, StorageMedium, StreamId};
 use extent_node::ExtentNode;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -203,6 +203,7 @@ async fn main() {
             MAX_EXTENT_CAPACITY,
             CACHE_EXTENTS,
             EXTENT_GROWTH_FACTOR,
+            0,
         )
         .await
         .expect("open stream");

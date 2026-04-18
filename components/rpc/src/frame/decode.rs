@@ -301,6 +301,7 @@ impl Frame {
                     let max_extent_capacity = body.get_u32();
                     let cache_extents = body.get_u16();
                     let extent_growth_factor = body.get_u8();
+                    let storage_medium = body.get_u8();
                     Ok((
                         VariableHeader::CreateStream {
                             request_id,
@@ -310,6 +311,7 @@ impl Frame {
                             max_extent_capacity,
                             cache_extents,
                             extent_growth_factor,
+                            storage_medium,
                         },
                         None,
                     ))
@@ -453,6 +455,7 @@ impl Frame {
                     let min_extent_capacity = body.get_u32();
                     let max_extent_capacity = body.get_u32();
                     let extent_growth_factor = body.get_u8();
+                    let storage_medium = body.get_u8();
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::RegisterExtent {
@@ -467,6 +470,7 @@ impl Frame {
                             min_extent_capacity,
                             max_extent_capacity,
                             extent_growth_factor,
+                            storage_medium,
                         },
                         payload,
                     ))
@@ -535,6 +539,7 @@ impl Frame {
                         let start_offset = Offset(body.get_u64());
                         let extent_capacity = body.get_u32();
                         let cache_extents = body.get_u16();
+                        let storage_medium = body.get_u8();
                         Ok((
                             VariableHeader::ForwardInitExtent {
                                 stream_id,
@@ -543,6 +548,7 @@ impl Frame {
                                 start_offset,
                                 extent_capacity,
                                 cache_extents,
+                                storage_medium,
                             },
                             None,
                         ))

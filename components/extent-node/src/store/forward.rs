@@ -53,6 +53,7 @@ impl ExtentNodeStore {
                     start_offset: ext.start_offset,
                     extent_capacity: stream.extent_capacity(),
                     cache_extents: stream.max_extents() as u16,
+                    storage_medium: stream.storage_medium(),
                 },
                 None,
             ))
@@ -64,25 +65,34 @@ impl ExtentNodeStore {
     /// Creates the stream (if needed) and registers the extent with the provided
     /// start_offset and extent_capacity. Fire-and-forget: no response.
     pub(crate) fn handle_forward_init_extent(&self, frame: Frame) {
-        let (stream_id, extent_id, epoch, start_offset, extent_capacity, cache_extents) =
-            match &frame.variable_header {
-                VariableHeader::ForwardInitExtent {
-                    stream_id,
-                    extent_id,
-                    epoch,
-                    start_offset,
-                    extent_capacity,
-                    cache_extents,
-                } => (
-                    *stream_id,
-                    *extent_id,
-                    *epoch,
-                    *start_offset,
-                    *extent_capacity,
-                    *cache_extents,
-                ),
-                _ => return,
-            };
+        let (
+            stream_id,
+            extent_id,
+            epoch,
+            start_offset,
+            extent_capacity,
+            cache_extents,
+            storage_medium,
+        ) = match &frame.variable_header {
+            VariableHeader::ForwardInitExtent {
+                stream_id,
+                extent_id,
+                epoch,
+                start_offset,
+                extent_capacity,
+                cache_extents,
+                storage_medium,
+            } => (
+                *stream_id,
+                *extent_id,
+                *epoch,
+                *start_offset,
+                *extent_capacity,
+                *cache_extents,
+                *storage_medium,
+            ),
+            _ => return,
+        };
 
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id) {
@@ -90,6 +100,7 @@ impl ExtentNodeStore {
             if cache_extents > 0 && stream.max_extents() == 0 {
                 stream.set_max_extents(cache_extents as usize);
             }
+            stream.set_storage_medium(storage_medium);
             if stream.with_extent(extent_id, |_| ()).is_none() {
                 stream.register_extent(
                     extent_id,
@@ -108,6 +119,7 @@ impl ExtentNodeStore {
         } else {
             let stream = Stream::new(stream_id);
             stream.set_max_extents(cache_extents as usize);
+            stream.set_storage_medium(storage_medium);
             stream.register_extent(
                 extent_id,
                 start_offset,
