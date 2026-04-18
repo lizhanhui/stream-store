@@ -15,6 +15,8 @@ bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
 thiserror = "2"
+snafu = "0.9"
+snafu-virtstack = "0.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql"] }
@@ -33,6 +35,7 @@ papaya = "0.2"
 parking_lot = "0.12"
 aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
 aws-sdk-s3 = { version = "1.129.0" }
+env_logger = { version = "0.11" }
 
 [package]
 name = "stream-store"
@@ -64,6 +67,9 @@ hdrhistogram = "7.5"
 serial_test = "3"
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
+snafu = { workspace = true }
+snafu-virtstack = { workspace = true }
+env_logger = { workspace = true }
 
 [[bench]]
 name = "concurrent_multi_stream"
