@@ -113,6 +113,11 @@ pub struct ExtentNodeConfig {
     /// most other S3-compatible services that require virtual-hosted style.
     /// Defaults to false.
     pub s3_path_style: bool,
+
+    /// S3 key namespace prefix. All S3 objects for this node are stored under
+    /// `{s3_namespace}/data/{stream_id}/...`. Allows multiple deployments to
+    /// share a bucket. Defaults to "default".
+    pub s3_namespace: String,
 }
 
 impl Default for ExtentNodeConfig {
@@ -131,6 +136,7 @@ impl Default for ExtentNodeConfig {
             s3_profile: "dev".to_string(),
             s3_bucket: String::from("stream-storage-1366919849"),
             s3_path_style: false,
+            s3_namespace: "default".to_string(),
         }
     }
 }

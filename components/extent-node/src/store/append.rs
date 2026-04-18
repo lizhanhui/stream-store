@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -565,11 +565,7 @@ impl ExtentNodeStore {
     }
 
     /// Send an async UPDATE_EXTENT (Sealed) to SM (fire-and-forget).
-    pub(crate) fn send_extent_update(
-        &self,
-        stream_id: StreamId,
-        notification: &SealNotification,
-    ) {
+    pub(crate) fn send_extent_update(&self, stream_id: StreamId, notification: &SealNotification) {
         if let Some(ref tx) = self.update_tx {
             let _ = tx.try_send(ExtentUpdate::Sealed {
                 stream_id,

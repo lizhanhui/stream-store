@@ -23,11 +23,7 @@ impl ExtentNodeStore {
     ///
     /// Accepts a `&Stream` reference to avoid re-acquiring the map pin
     /// (the caller already holds a guard).
-    pub(crate) fn maybe_build_init_forward(
-        &self,
-        stream: &Stream,
-        frame: &Frame,
-    ) -> Option<Frame> {
+    pub(crate) fn maybe_build_init_forward(&self, stream: &Stream, frame: &Frame) -> Option<Frame> {
         let (stream_id, extent_id, epoch) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,

@@ -1,5 +1,5 @@
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use common::config::{DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY};
 use common::types::{ErrorCode, ExtentId, Offset};
