@@ -28,7 +28,15 @@ heartbeat_interval_ms = 5000
 # replication_timeout_ms = 500
 
 # RPC TCP connect timeout (ms). Default: 500
-# rpc_connect_timeout_ms = 500
+# connect_timeout_ms = 500
 
 # RPC request-response timeout for SM-facing calls (ms). Default: 2000
-# rpc_request_timeout_ms = 2000
+# request_timeout_ms = 2000
+
+# AWS SDK profile name for S3 access. Reads region, endpoint_url, and
+# credentials from ~/.aws/config and ~/.aws/credentials. Default: "default"
+# s3_profile = "default"
+
+# S3 bucket name for flushed extent storage. Must be configured to enable S3 flush.
+# Default: "" (S3 flush disabled)
+# s3_bucket = "my-bucket-12345"

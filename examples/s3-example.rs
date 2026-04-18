@@ -39,7 +39,7 @@ use aws_sdk_s3 as s3;
 async fn main() {
     env_logger::init();
     // endpoint_url, region, and addressing_style come from ~/.aws/config.
-    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "dev".to_string());
     let config = aws_config::from_env().profile_name(&profile).load().await;
     let mut config_builder = s3::config::Builder::from(&config);
     config_builder.set_force_path_style(Some(false));
