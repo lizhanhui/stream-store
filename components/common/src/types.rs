@@ -29,6 +29,8 @@ pub const FLAG_FORWARD_APPEND: u8 = 0x00;
 pub const FLAG_FORWARD_INIT_EXTENT: u8 = 0x01;
 /// Flag on FORWARD: CRC32 checksum verification for sealed extent.
 pub const FLAG_FORWARD_CHECKSUM: u8 = 0x02;
+/// Flag on FORWARD: extent flushed to S3 notification.
+pub const FLAG_FORWARD_FLUSHED: u8 = 0x03;
 
 /// Flag on DESCRIBE_STREAM: lookup by stream name instead of stream_id.
 /// When set, variable header carries [name_len:u16][name_bytes] after count.

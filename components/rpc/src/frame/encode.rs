@@ -96,6 +96,8 @@ impl Frame {
             VariableHeader::ForwardInitExtent { .. } => 8 + 4 + 4 + 8 + 4 + 4,
             // stream_id(8) + extent_id(4) + checksum(4) + committed_bytes(8)
             VariableHeader::ForwardChecksum { .. } => 8 + 4 + 4 + 8,
+            // stream_id(8) + extent_id(4)
+            VariableHeader::ForwardFlushed { .. } => 8 + 4,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
             // request_id(4) + stream_id(8) + count(4) [+ name_len(2) + name(N) if FLAG_DESCRIBE_STREAM_BY_NAME]
@@ -500,6 +502,13 @@ impl Frame {
                 dst.put_u32(extent_id.0);
                 dst.put_u32(*checksum);
                 dst.put_u64(*committed_bytes);
+            }
+            VariableHeader::ForwardFlushed {
+                stream_id,
+                extent_id,
+            } => {
+                dst.put_u64(stream_id.0);
+                dst.put_u32(extent_id.0);
             }
             VariableHeader::StreamManagerMembershipChange => {
                 // no variable header fields, just payload

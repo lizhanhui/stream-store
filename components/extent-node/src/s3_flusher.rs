@@ -16,6 +16,8 @@ use crate::s3::S3Client;
 use crate::s3_codec::{encode_extent, s3_key};
 use crate::store::{ExtentNodeStore, ExtentUpdate};
 
+use rpc::frame::{Frame, VariableHeader};
+
 /// Maximum number of upload retries before giving up on a flush request.
 const MAX_RETRIES: u32 = 3;
 
@@ -111,6 +113,19 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                         extent_id: req.extent_id,
                         epoch,
                     });
+                }
+
+                // Broadcast ForwardFlushed to secondaries so they can mark
+                // the extent as eligible for eviction.
+                let flushed_frame = Frame::new(
+                    VariableHeader::ForwardFlushed {
+                        stream_id: req.stream_id,
+                        extent_id: req.extent_id,
+                    },
+                    None,
+                );
+                if let Some(stream) = store.streams.pin().get(&req.stream_id) {
+                    stream.send_forward(flushed_frame);
                 }
 
                 return;

@@ -300,4 +300,28 @@ impl ExtentNodeStore {
             );
         }
     }
+
+    /// Handle ForwardFlushed (0x05, flag=0x03) — extent flushed to S3 notification.
+    ///
+    /// Sent by the Primary after a sealed extent is uploaded to S3.
+    /// Secondaries use this to mark the extent as eligible for memory eviction.
+    /// Fire-and-forget: no response.
+    pub(crate) fn handle_forward_flushed(&self, frame: Frame) {
+        let (stream_id, extent_id) = match &frame.variable_header {
+            VariableHeader::ForwardFlushed {
+                stream_id,
+                extent_id,
+            } => (*stream_id, *extent_id),
+            _ => return,
+        };
+
+        info!(
+            "ForwardFlushed: stream={}, extent={} — eligible for eviction",
+            stream_id, extent_id,
+        );
+
+        // TODO: mark extent as flushed in Stream for eviction policy.
+        // For now, just log. The actual eviction will be implemented
+        // when the eviction policy is built.
+    }
 }

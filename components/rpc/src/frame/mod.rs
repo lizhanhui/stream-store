@@ -10,9 +10,9 @@ mod tests;
 use bytes::Bytes;
 use common::types::{
     Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
-    FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_INIT_EXTENT,
-    FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SYSTEM_TICK, Offset, Opcode, PROTOCOL_VERSION,
-    StreamId,
+    FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
+    FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SYSTEM_TICK, Offset, Opcode,
+    PROTOCOL_VERSION, StreamId,
 };
 
 pub use header::{FixedHeader, VariableHeader};
@@ -142,6 +142,7 @@ impl Frame {
             | VariableHeader::Forward { .. }
             | VariableHeader::ForwardInitExtent { .. }
             | VariableHeader::ForwardChecksum { .. }
+            | VariableHeader::ForwardFlushed { .. }
             | VariableHeader::UpdateExtentSealed { .. }
             | VariableHeader::UpdateExtentProgress { .. }
             | VariableHeader::UpdateExtentFlushed { .. }
@@ -334,6 +335,7 @@ impl Frame {
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
             VariableHeader::ForwardInitExtent { .. } => FLAG_FORWARD_INIT_EXTENT,
             VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,
+            VariableHeader::ForwardFlushed { .. } => FLAG_FORWARD_FLUSHED,
             VariableHeader::DescribeStream { stream_name, .. } => {
                 if stream_name.is_some() {
                     FLAG_DESCRIBE_STREAM_BY_NAME

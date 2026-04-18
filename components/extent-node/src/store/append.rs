@@ -141,6 +141,7 @@ impl ExtentNodeStore {
                 for notification in &batch_seals {
                     self.send_extent_update(stream_id, notification);
                     self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                    self.send_flush_request(stream_id, notification);
                 }
             }
             if should_shrink {
@@ -149,6 +150,7 @@ impl ExtentNodeStore {
                 {
                     self.send_extent_update(stream_id, notification);
                     self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                    self.send_flush_request(stream_id, notification);
                     info!(
                         "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
                         stream_id,
@@ -190,11 +192,13 @@ impl ExtentNodeStore {
                 for notification in &batch_seals {
                     self.send_extent_update(stream_id, notification);
                     self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                    self.send_flush_request(stream_id, notification);
                 }
             }
             if let Some(ref notification) = seal_notification {
                 self.send_extent_update(stream_id, notification);
                 self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                self.send_flush_request(stream_id, notification);
             }
             return retry_result;
         }
@@ -204,6 +208,7 @@ impl ExtentNodeStore {
             let batch_seals = self.drain_follower_jobs(stream_id).await;
             for notification in &batch_seals {
                 self.send_extent_update(stream_id, notification);
+                self.send_flush_request(stream_id, notification);
             }
         }
 
@@ -578,6 +583,38 @@ impl ExtentNodeStore {
         }
     }
 
+    /// Queue a sealed extent for S3 flush (Primary only).
+    ///
+    /// The Primary uploads to S3 and broadcasts `ForwardFlushed` to secondaries
+    /// on completion, enabling eviction across all replicas without extra infra.
+    pub(crate) fn send_flush_request(&self, stream_id: StreamId, notification: &SealNotification) {
+        let tx = match self.flush_tx {
+            Some(ref tx) => tx,
+            None => return,
+        };
+        let is_primary = self
+            .replicas
+            .pin()
+            .get(&stream_id)
+            .map(|ri| ri.is_primary())
+            .unwrap_or(false);
+        if !is_primary {
+            return;
+        }
+        let start_offset = self
+            .streams
+            .pin()
+            .get(&stream_id)
+            .and_then(|s| s.with_extent(notification.sealed_extent_id, |e| e.start_offset.0))
+            .unwrap_or(0);
+        let _ = tx.try_send(crate::s3_flusher::FlushRequest {
+            stream_id,
+            extent_id: notification.sealed_extent_id,
+            start_offset,
+            end_offset: notification.end_offset,
+        });
+    }
+
     /// Send a ForwardChecksum for a sealed extent inline via per-stream channels.
     ///
     /// Fire-and-forget: the secondary defers verification via `try_verify_checksum()`.
@@ -914,11 +951,13 @@ impl ExtentNodeStore {
                 for notif in &batch_seals {
                     self.send_extent_update(stream_id, notif);
                     self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                    self.send_flush_request(stream_id, notif);
                 }
             }
             if let Some(ref notif) = seal_notification {
                 self.send_extent_update(stream_id, notif);
                 self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                self.send_flush_request(stream_id, notif);
             }
             return responses;
         }
@@ -938,6 +977,7 @@ impl ExtentNodeStore {
             for notif in &batch_seals {
                 self.send_extent_update(stream_id, notif);
                 self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                self.send_flush_request(stream_id, notif);
             }
         }
 
