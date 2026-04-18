@@ -352,6 +352,7 @@ impl StreamManagerStore {
         max_extent_capacity: u32,
         cache_extents: u16,
         extent_growth_factor: u8,
+        storage_medium: u8,
     ) -> Result<(), StorageError> {
         let payload = build_register_extent_payload(secondary_addrs);
         let addr = primary_addr.to_string();
@@ -363,6 +364,7 @@ impl StreamManagerStore {
         let maxc = max_extent_capacity;
         let ce = cache_extents;
         let gf = extent_growth_factor;
+        let sm = storage_medium;
 
         let result = tokio::time::timeout(Duration::from_millis(500), async {
             let client = client::StreamClient::connect(&addr).await.map_err(|e| {
@@ -385,6 +387,7 @@ impl StreamManagerStore {
                         max_extent_capacity: maxc,
                         cache_extents: ce,
                         extent_growth_factor: gf,
+                        storage_medium: sm,
                     },
                     Some(payload),
                 ))
@@ -440,6 +443,7 @@ impl StreamManagerStore {
         max_extent_capacity: u32,
         cache_extents: u16,
         extent_growth_factor: u8,
+        storage_medium: u8,
     ) {
         for (i, addr) in secondary_addrs.iter().enumerate() {
             let role = (i + 1) as u8; // 1, 2, ...
@@ -452,6 +456,7 @@ impl StreamManagerStore {
             let maxc = max_extent_capacity;
             let ce = cache_extents;
             let gf = extent_growth_factor;
+            let sm = storage_medium;
 
             tokio::spawn(async move {
                 let payload = build_register_extent_payload(&[]); // secondaries get no downstream addrs
@@ -471,6 +476,7 @@ impl StreamManagerStore {
                                     max_extent_capacity: maxc,
                                     cache_extents: ce,
                                     extent_growth_factor: gf,
+                                    storage_medium: sm,
                                 },
                                 Some(payload),
                             ))
@@ -524,6 +530,7 @@ impl StreamManagerStore {
         max_extent_capacity: u32,
         cache_extents: u16,
         extent_growth_factor: u8,
+        storage_medium: u8,
     ) -> Result<(ExtentId, String), StorageError> {
         // Initial allocation: require full RF.
         let nodes = self
@@ -555,7 +562,7 @@ impl StreamManagerStore {
         let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
         let rf = node_addrs.len() as u8;
 
-        self.register_primary(stream_id, extent_id, primary_addr, &secondary_addrs, rf, epoch, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor)
+        self.register_primary(stream_id, extent_id, primary_addr, &secondary_addrs, rf, epoch, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_medium)
             .await
             .unwrap_or_else(|e| {
                 warn!("register_primary failed for initial extent {}: {e}; client will discover on first append", extent_id);
@@ -570,6 +577,7 @@ impl StreamManagerStore {
             max_extent_capacity,
             cache_extents,
             extent_growth_factor,
+            storage_medium,
         );
 
         Ok((extent_id, node_addrs[0].clone()))
@@ -749,6 +757,7 @@ impl StreamManagerStore {
             max_extent_capacity,
             cache_extents,
             extent_growth_factor,
+            storage_medium,
         ) = match &frame.variable_header {
             VariableHeader::CreateStream {
                 stream_name,
@@ -757,6 +766,7 @@ impl StreamManagerStore {
                 max_extent_capacity,
                 cache_extents,
                 extent_growth_factor,
+                storage_medium,
                 ..
             } => (
                 String::from_utf8_lossy(stream_name).to_string(),
@@ -765,6 +775,7 @@ impl StreamManagerStore {
                 *max_extent_capacity,
                 *cache_extents,
                 *extent_growth_factor,
+                *storage_medium,
             ),
             _ => {
                 return Frame::error_from_request(
@@ -812,11 +823,11 @@ impl StreamManagerStore {
 
         let result = async {
             // 1. Create stream in metadata with per-stream replication factor and extent capacity.
-            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u8, min_extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor).await?;
+            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u8, min_extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_medium).await?;
 
             // 2. Allocate first extent replica set and notify ExtentNodes.
             let (extent_id, primary_addr) =
-                self.allocate_and_notify_replica_set(stream_id, 0, replication_factor, Epoch(0), min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor).await?;
+                self.allocate_and_notify_replica_set(stream_id, 0, replication_factor, Epoch(0), min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_medium).await?;
 
             info!(
                 "stream {stream_name} created: stream_id={}, extent_id={}, primary={primary_addr}, min_extent_capacity={min_extent_capacity}, max_extent_capacity={max_extent_capacity}, cache_extents={cache_extents}, extent_growth_factor={extent_growth_factor}",
@@ -1152,6 +1163,8 @@ impl StreamManagerStore {
         let (min_extent_capacity, max_extent_capacity) =
             self.store.get_stream_capacity_bounds(stream_id).await?;
         let extent_growth_factor = self.store.get_stream_growth_factor(stream_id).await?;
+        let stream_row = self.store.get_stream(stream_id).await?;
+        let storage_medium = stream_row.map(|r| r.storage_medium).unwrap_or(0);
         // Failover allocation: degrade RF if necessary, as long as quorum is preserved.
         // Quorum = floor(RF/2) + 1. E.g., RF=3 → quorum=2, so degraded RF=2 is acceptable.
         let quorum = replication_factor / 2 + 1;
@@ -1199,6 +1212,7 @@ impl StreamManagerStore {
                         max_extent_capacity,
                         cache_extents,
                         extent_growth_factor,
+                        storage_medium,
                     )
                     .await
                 {
@@ -1219,6 +1233,7 @@ impl StreamManagerStore {
                     max_extent_capacity,
                     cache_extents,
                     extent_growth_factor,
+                    storage_medium,
                 );
 
                 (new_extent_id, primary_addr)

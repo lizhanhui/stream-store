@@ -200,6 +200,7 @@ async fn client_task(
             DEFAULT_MAX_EXTENT_CAPACITY,
             DEFAULT_CACHE_EXTENTS,
             DEFAULT_EXTENT_GROWTH_FACTOR,
+            0,
         )
         .await
         .unwrap_or_else(|e| panic!("client {client_id}: create_stream failed: {e}"));

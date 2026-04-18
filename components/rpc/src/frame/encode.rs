@@ -44,9 +44,9 @@ impl Frame {
             VariableHeader::SealExtentNodeResp { .. } => 4 + 4 + 4 + 4 + 8 + 8,
             // request_id(4) + stream_id(4) + error_code(2)
             VariableHeader::SealExtentNodeRespError { .. } => 4 + 4 + 2,
-            // request_id(4) + name_len(2) + name(N) + replication_factor(1) + min_extent_capacity(4) + max_extent_capacity(4) + cache_extents(2) + extent_growth_factor(1)
+            // request_id(4) + name_len(2) + name(N) + replication_factor(1) + min_extent_capacity(4) + max_extent_capacity(4) + cache_extents(2) + extent_growth_factor(1) + storage_medium(1)
             VariableHeader::CreateStream { stream_name, .. } => {
-                4 + 2 + stream_name.len() + 1 + 4 + 4 + 2 + 1
+                4 + 2 + stream_name.len() + 1 + 4 + 4 + 2 + 1 + 1
             }
             // request_id(4) + stream_id(4) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
             VariableHeader::CreateStreamResp { primary_addr, .. } => {
@@ -70,8 +70,8 @@ impl Frame {
             VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
-            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + extent_capacity(4) + cache_extents(2) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(1)
-            VariableHeader::RegisterExtent { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 4 + 2 + 4 + 4 + 1,
+            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + extent_capacity(4) + cache_extents(2) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(1) + storage_medium(1)
+            VariableHeader::RegisterExtent { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 4 + 2 + 4 + 4 + 1 + 1,
             // request_id(4) + stream_id(4) + extent_id(4)
             VariableHeader::RegisterExtentAck { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
@@ -92,8 +92,8 @@ impl Frame {
             VariableHeader::ReportExtentsRespError { .. } => 4 + 4 + 4 + 2,
             // stream_id(4) + extent_id(4) + epoch(4) + offset(8) + byte_pos(8)
             VariableHeader::Forward { .. } => 4 + 4 + 4 + 8 + 8,
-            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2)
-            VariableHeader::ForwardInitExtent { .. } => 4 + 4 + 4 + 8 + 4 + 2,
+            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_medium(1)
+            VariableHeader::ForwardInitExtent { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 1,
             // stream_id(4) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
             VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 4 + 8,
             // stream_id(4) + extent_id(4) + epoch(4)
@@ -330,6 +330,7 @@ impl Frame {
                 max_extent_capacity,
                 cache_extents,
                 extent_growth_factor,
+                storage_medium,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u16(stream_name.len() as u16);
@@ -339,6 +340,7 @@ impl Frame {
                 dst.put_u32(*max_extent_capacity);
                 dst.put_u16(*cache_extents);
                 dst.put_u8(*extent_growth_factor);
+                dst.put_u8(*storage_medium);
             }
             VariableHeader::CreateStreamResp {
                 request_id,
@@ -403,6 +405,7 @@ impl Frame {
                 min_extent_capacity,
                 max_extent_capacity,
                 extent_growth_factor,
+                storage_medium,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
@@ -415,6 +418,7 @@ impl Frame {
                 dst.put_u32(*min_extent_capacity);
                 dst.put_u32(*max_extent_capacity);
                 dst.put_u8(*extent_growth_factor);
+                dst.put_u8(*storage_medium);
             }
             VariableHeader::ConnectAck { request_id }
             | VariableHeader::DisconnectAck { request_id } => {
@@ -486,6 +490,7 @@ impl Frame {
                 start_offset,
                 extent_capacity,
                 cache_extents,
+                storage_medium,
             } => {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
@@ -493,6 +498,7 @@ impl Frame {
                 dst.put_u64(start_offset.0);
                 dst.put_u32(*extent_capacity);
                 dst.put_u16(*cache_extents);
+                dst.put_u8(*storage_medium);
             }
             VariableHeader::ForwardChecksum {
                 stream_id,

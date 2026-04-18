@@ -169,7 +169,7 @@ async fn client_recovers_after_primary_killed() {
     // (quorum=2 preserved) instead of failing allocation.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
     let (stream_id, _extent_id, _epoch, primary_addr) = sm_client
-        .create_stream("test-primary-outage", 3, 0, 0, 0, 0)
+        .create_stream("test-primary-outage", 3, 0, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     info!("[test] Stream {stream_id} created with RF=3, primary={primary_addr}");
@@ -337,7 +337,7 @@ async fn client_recovers_after_secondary_killed() {
     // (quorum=2 preserved) instead of failing allocation.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
     let (stream_id, _extent_id, _epoch, primary_addr) = sm_client
-        .create_stream("test-secondary-outage", 3, 0, 0, 0, 0)
+        .create_stream("test-secondary-outage", 3, 0, 0, 0, 0, 0)
         .await
         .expect("create_stream");
     info!("[test] Stream {stream_id} created with RF=3, primary={primary_addr}");

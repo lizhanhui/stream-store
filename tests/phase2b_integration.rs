@@ -85,6 +85,7 @@ async fn register_extent(
                 min_extent_capacity: 8 * 1024 * 1024,
                 max_extent_capacity: 256 * 1024 * 1024,
                 extent_growth_factor: 2,
+                storage_medium: 0,
             },
             Some(payload),
         ))

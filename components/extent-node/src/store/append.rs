@@ -601,6 +601,16 @@ impl ExtentNodeStore {
         if !is_primary {
             return;
         }
+        // Memory-only streams don't flush to S3.
+        let is_memory = self
+            .streams
+            .pin()
+            .get(&stream_id)
+            .map(|s| s.storage_medium() == 1)
+            .unwrap_or(false);
+        if is_memory {
+            return;
+        }
         let start_offset = self
             .streams
             .pin()

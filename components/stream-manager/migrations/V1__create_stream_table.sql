@@ -8,6 +8,7 @@ CREATE TABLE stream (
     max_extent_capacity INT NOT NULL DEFAULT 268435456,
     extent_growth_factor TINYINT UNSIGNED NOT NULL DEFAULT 2,
     cache_extents       SMALLINT UNSIGNED NOT NULL DEFAULT 4,
+    storage_medium      TINYINT UNSIGNED NOT NULL DEFAULT 0,
     epoch               INT NOT NULL DEFAULT 0,    
     created_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at          DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)

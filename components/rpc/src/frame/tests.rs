@@ -469,6 +469,7 @@ fn create_stream_round_trip() {
             max_extent_capacity: 268_435_456,
             cache_extents: 4,
             extent_growth_factor: 8,
+            storage_medium: 0,
         },
         None,
     );

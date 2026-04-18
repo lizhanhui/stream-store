@@ -26,6 +26,7 @@ impl ExtentNodeStore {
             extent_capacity,
             cache_extents,
             extent_growth_factor,
+            storage_medium,
         ) = match &frame.variable_header {
             VariableHeader::RegisterExtent {
                 stream_id,
@@ -36,6 +37,7 @@ impl ExtentNodeStore {
                 extent_capacity,
                 cache_extents,
                 extent_growth_factor,
+                storage_medium,
                 ..
             } => (
                 *stream_id,
@@ -46,6 +48,7 @@ impl ExtentNodeStore {
                 *extent_capacity,
                 *cache_extents,
                 *extent_growth_factor,
+                *storage_medium,
             ),
             _ => {
                 return Frame::error_from_request(
@@ -80,6 +83,7 @@ impl ExtentNodeStore {
             // Always apply — the stream may have been lazily created by
             // ForwardInitExtent before this arrives with max_extents=0.
             stream.set_max_extents(cache_extents as usize);
+            stream.set_storage_medium(storage_medium);
             if stream.with_extent(extent_id, |_| ()).is_none() {
                 stream.register_extent(
                     extent_id,
@@ -98,6 +102,7 @@ impl ExtentNodeStore {
         } else {
             let stream = Stream::new(stream_id);
             stream.set_max_extents(cache_extents as usize);
+            stream.set_storage_medium(storage_medium);
             stream.register_extent(
                 extent_id,
                 Offset(0),

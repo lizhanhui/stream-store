@@ -247,6 +247,7 @@ impl StreamClient {
         max_extent_capacity: u32,
         cache_extents: u16,
         extent_growth_factor: u8,
+        storage_medium: u8,
     ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
@@ -257,6 +258,7 @@ impl StreamClient {
                 max_extent_capacity,
                 cache_extents,
                 extent_growth_factor,
+                storage_medium,
             },
             None,
         );
@@ -638,6 +640,7 @@ impl StreamClient {
         max_extent_capacity: u32,
         cache_extents: u16,
         extent_growth_factor: u8,
+        storage_medium: u8,
     ) -> Result<StreamId, StorageError> {
         match self.describe_stream_by_name(stream_name, 1).await {
             Ok((stream_id, extents)) => {
@@ -656,6 +659,7 @@ impl StreamClient {
                         max_extent_capacity,
                         cache_extents,
                         extent_growth_factor,
+                        storage_medium,
                     )
                     .await?;
                 Ok(stream_id)
