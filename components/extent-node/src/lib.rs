@@ -1,6 +1,7 @@
 pub mod ack_queue;
 pub mod downstream;
 pub mod extent;
+pub mod s3;
 pub mod store;
 pub mod stream;
 pub mod stream_manager_client;
