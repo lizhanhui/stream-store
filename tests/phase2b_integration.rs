@@ -60,7 +60,7 @@ async fn register_extent(
     stream_id: u32,
     extent_id: u32,
     role: u8,
-    replication_factor: u16,
+    replication_factor: u8,
     replica_addrs: &[&str],
 ) {
     use futures_util::{SinkExt, StreamExt};

@@ -45,7 +45,7 @@ pub struct ReplicaInfo {
     /// 0 = Primary, 1+ = Secondary.
     pub role: u8,
     /// Total replication factor (used for quorum calculation).
-    pub replication_factor: u16,
+    pub replication_factor: u8,
     /// All secondary addresses (Primary only). Empty for secondaries.
     pub replica_addrs: Vec<String>,
 }

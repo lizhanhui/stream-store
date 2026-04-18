@@ -100,15 +100,15 @@ pub enum VariableHeader {
     CreateStream {
         request_id: u32,
         stream_name: Bytes,
-        replication_factor: u16,
+        replication_factor: u8,
         /// Minimum extent capacity for new extents (0 = use default min).
         min_extent_capacity: u32,
         /// Maximum extent capacity for new extents (0 = use default max).
         max_extent_capacity: u32,
-        cache_extents: u32,
+        cache_extents: u16,
         /// Growth factor for adaptive capacity scaling (0 = use default).
         /// On extent-full, next_capacity = min(current * growth_factor, max).
-        extent_growth_factor: u32,
+        extent_growth_factor: u8,
     },
     CreateStreamResp {
         request_id: u32,
@@ -167,19 +167,19 @@ pub enum VariableHeader {
         stream_id: StreamId,
         extent_id: ExtentId,
         role: u8,
-        replication_factor: u16,
+        replication_factor: u8,
         /// Stream epoch for this extent registration.
         epoch: Epoch,
         /// Per-stream extent arena capacity in bytes.
         extent_capacity: u32,
         /// Maximum extents to retain in memory for this stream. 0 = no limit.
-        cache_extents: u32,
+        cache_extents: u16,
         /// Minimum extent capacity for this stream (0 = use default min).
         min_extent_capacity: u32,
         /// Maximum extent capacity for this stream (0 = use default max).
         max_extent_capacity: u32,
         /// Growth factor for adaptive capacity scaling (0 = use default).
-        extent_growth_factor: u32,
+        extent_growth_factor: u8,
     },
     RegisterExtentAck {
         request_id: u32,
@@ -263,7 +263,7 @@ pub enum VariableHeader {
         epoch: Epoch,
         start_offset: Offset,
         extent_capacity: u32,
-        cache_extents: u32,
+        cache_extents: u16,
     },
     /// CRC32 checksum verification (Forward, flag=0x02). Fire-and-forget.
     /// Sent by primary after sealing an extent so secondaries can verify

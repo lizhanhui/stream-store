@@ -52,7 +52,7 @@ impl ExtentNodeStore {
                     epoch,
                     start_offset: ext.start_offset,
                     extent_capacity: stream.extent_capacity(),
-                    cache_extents: stream.max_extents() as u32,
+                    cache_extents: stream.max_extents() as u16,
                 },
                 None,
             ))

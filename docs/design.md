@@ -267,11 +267,11 @@ Variable Header:
   [request_id            : u32]
   [name_len              : u16]
   [stream_name           : bytes]  -- human-readable stream name
-  [replication_factor    : u16]
+  [replication_factor    : u8]
   [min_extent_capacity   : u32]    -- minimum arena size in bytes (0 = default 8 MiB)
   [max_extent_capacity   : u32]    -- maximum arena size in bytes (0 = default 256 MiB)
-  [cache_extents         : u32]    -- max extents to retain in memory (0 = default 4)
-  [extent_growth_factor  : u32]    -- adaptive growth multiplier (0 = default 2)
+  [cache_extents         : u16]    -- max extents to retain in memory (0 = default 4)
+  [extent_growth_factor  : u8]    -- adaptive growth multiplier (0 = default 2)
 No Payload.
 ```
 
@@ -379,7 +379,7 @@ Variable Header (32B):
   [epoch            : u32]    -- stream epoch
   [start_offset     : u64]    -- extent base offset
   [extent_capacity  : u32]    -- arena size in bytes
-  [cache_extents    : u32]    -- max extents to retain in memory
+  [cache_extents    : u16]    -- max extents to retain in memory
 No Payload.
 ```
 
@@ -711,13 +711,13 @@ Variable Header:
   [stream_id               : u32]    -- stream this extent belongs to
   [extent_id               : u32]    -- extent being registered
   [role                    : u8]     -- 0 = Primary, 1+ = Secondary
-  [replication_factor      : u16]
+  [replication_factor      : u8]
   [epoch                   : u32]    -- stream epoch for this extent registration
   [extent_capacity         : u32]    -- arena size in bytes for this extent
-  [cache_extents           : u32]    -- max extents to retain in memory per stream
+  [cache_extents           : u16]    -- max extents to retain in memory per stream
   [min_extent_capacity     : u32]    -- floor for adaptive shrink (0 = default)
   [max_extent_capacity     : u32]    -- ceiling for adaptive growth (0 = default)
-  [extent_growth_factor    : u32]    -- adaptive growth multiplier (0 = default 2)
+  [extent_growth_factor    : u8]    -- adaptive growth multiplier (0 = default 2)
 Payload:
   [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
   per address:
@@ -1432,12 +1432,12 @@ CREATE TABLE stream (
     stream_id            INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
     stream_name          VARCHAR(512) NOT NULL UNIQUE,
     stream_type          VARCHAR(32) NOT NULL DEFAULT 'DATA',
-    replication_factor   SMALLINT NOT NULL DEFAULT 2,
+    replication_factor   TINYINT UNSIGNED NOT NULL DEFAULT 2,
     extent_capacity      INT NOT NULL DEFAULT 67108864,   -- initial arena size (default 64 MiB)
     min_extent_capacity  INT NOT NULL DEFAULT 8388608,    -- floor for adaptive shrink (8 MiB)
     max_extent_capacity  INT NOT NULL DEFAULT 268435456,  -- ceiling for adaptive growth (256 MiB)
-    extent_growth_factor INT NOT NULL DEFAULT 2,          -- adaptive growth multiplier
-    cache_extents        INT NOT NULL DEFAULT 4,          -- max extents retained in memory
+    extent_growth_factor TINYINT UNSIGNED NOT NULL DEFAULT 2,          -- adaptive growth multiplier
+    cache_extents        SMALLINT UNSIGNED NOT NULL DEFAULT 4,          -- max extents retained in memory
     epoch                INT NOT NULL DEFAULT 0,          -- current stream epoch
     created_at           DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at           DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)

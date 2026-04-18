@@ -296,11 +296,11 @@ impl Frame {
                 } else {
                     let name_len = body.get_u16() as usize;
                     let stream_name = body.split_to(name_len).freeze();
-                    let replication_factor = body.get_u16();
+                    let replication_factor = body.get_u8();
                     let min_extent_capacity = body.get_u32();
                     let max_extent_capacity = body.get_u32();
-                    let cache_extents = body.get_u32();
-                    let extent_growth_factor = body.get_u32();
+                    let cache_extents = body.get_u16();
+                    let extent_growth_factor = body.get_u8();
                     Ok((
                         VariableHeader::CreateStream {
                             request_id,
@@ -446,13 +446,13 @@ impl Frame {
                     ))
                 } else {
                     let role = body.get_u8();
-                    let replication_factor = body.get_u16();
+                    let replication_factor = body.get_u8();
                     let epoch = Epoch(body.get_u32());
                     let extent_capacity = body.get_u32();
-                    let cache_extents = body.get_u32();
+                    let cache_extents = body.get_u16();
                     let min_extent_capacity = body.get_u32();
                     let max_extent_capacity = body.get_u32();
-                    let extent_growth_factor = body.get_u32();
+                    let extent_growth_factor = body.get_u8();
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::RegisterExtent {
@@ -534,7 +534,7 @@ impl Frame {
                     FLAG_FORWARD_INIT_EXTENT => {
                         let start_offset = Offset(body.get_u64());
                         let extent_capacity = body.get_u32();
-                        let cache_extents = body.get_u32();
+                        let cache_extents = body.get_u16();
                         Ok((
                             VariableHeader::ForwardInitExtent {
                                 stream_id,
