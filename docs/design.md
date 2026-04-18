@@ -1592,6 +1592,8 @@ read(stream, offset=1050, count=10)
 - S3 multipart upload: objects above `s3_multipart_threshold` (default 64 MiB) are split into `s3_multipart_part_size` chunks (default 8 MiB) and uploaded concurrently (up to `s3_multipart_concurrency` parts in flight, default 8). Each part has independent retry with exponential backoff. On failure, uploaded parts are cleaned up via `abort_multipart_upload`.
 - ForwardFlushed broadcast: Primary → Secondaries after successful upload, enabling eviction across all replicas
 - UpdateExtentFlushed notification: Primary → SM after successful upload; SM transitions Sealed → Flushed in MySQL
+- Per-stream StorageClass: S3 (sealed extents uploaded to S3, eviction only after flush) or Memory (no S3 upload, eviction on cache_extents limit)
+- S3 backpressure: when S3 flush is blocked (network/service issue), extent creation is refused and the client is redirected to seal via SM, which reallocates to different nodes
 - S3 Reader: range-read with local LRU cache (moka)
 - Flush triggers: size, time, node failure
 - Post-flush memory eviction

@@ -17,7 +17,8 @@ The core storage engine uses a **pre-allocated contiguous arena** with a **pipel
 - **No cache-line bouncing** — followers push to an unbounded channel and return immediately; only the leader touches arena cursors.
 - Internal compressed index (`AtomicU32` pointers) enables **O(1) random reads** at ~950M lookups/sec.
 - **Zero-copy reads** via `Bytes::slice` into the arena buffer.
-- **Chunk-compressed S3 flush** -- sealed extents are encoded with sparse index and independently compressible 64-record chunks (zstd/lz4) for random-access S3 range reads.
+- **Chunk-compressed S3 flush** -- sealed extents are encoded with sparse index and independently compressible 64-record chunks (zstd/lz4) for random-access S3 range reads. Multipart upload for large extents (parallel part uploads with per-part retry).
+- **Per-stream StorageClass** -- S3 (durable, eviction only after flush) or Memory (ephemeral, eviction on cache limit). S3 backpressure redirects writes to healthy nodes when flush is blocked.
 
 Micro-benchmark: ~230M appends/sec single-threaded, ~10ns per append.
 
@@ -96,7 +97,7 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
 
 ### Process Types
 
-- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Primary runs background S3 flusher for sealed extents and broadcasts ForwardFlushed to secondaries for coordinated eviction.
+- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Primary runs background S3 flusher for sealed extents (multipart upload for large objects) and broadcasts ForwardFlushed to secondaries for coordinated eviction. Per-stream StorageClass controls flush behavior (S3 vs Memory). S3 backpressure blocks new extent creation when flush is stalled, redirecting clients to healthy nodes via seal.
 - **Stream Manager** -- Stateless metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Fully stateless design (no in-memory caches) allows multiple SM nodes to run against the same database for high availability. Includes load-aware extent placement, heartbeat-based failure detection, and DB-based leadership lease for failover coordination.
 
 ## Performance
@@ -136,7 +137,7 @@ stream-store/
 │   ├── server/                     # Server infrastructure (RequestHandler, ServerBuilder)
 │   ├── client/                     # StreamClient for Extent Node & Stream Manager
 │   ├── extent-node/                # Pipelined group commit arena, stream, replication,
-│   │                               # S3 codec (chunk-compressed), S3 flusher, watermark
+│   │                               # S3 codec (chunk-compressed), S3 flusher (multipart), watermark
 │   └── stream-manager/             # Metadata store, allocator, heartbeat checker
 ├── conf/                           # Example TOML configuration files
 ├── tests/                          # Integration tests
@@ -195,7 +196,7 @@ cargo bench
 | 2 | Broadcast replication, quorum ACK, Stream Manager (MySQL), seal-and-new | Done |
 | 2.5 | Stateless multi-active SM with DB-based leader lease, CAS-fenced failover | Done |
 | 2b | Lock-free hot-path: papaya HashMap, AckQueue producer/consumer split, Arc\<ReplicaInfo\> | Done |
-| 3 | S3 flush: chunk-compressed codec (zstd/lz4), background flusher on Primary, ForwardFlushed broadcast, UpdateExtentFlushed notification | In Progress |
+| 3 | S3 flush: chunk-compressed codec (zstd/lz4), background flusher on Primary, ForwardFlushed broadcast, UpdateExtentFlushed notification, per-stream StorageClass (S3/Memory), S3 backpressure, multipart upload | Done |
 | 4 | Multi-Dispatch (data + index streams) | Planned |
 
 ## Contributing
