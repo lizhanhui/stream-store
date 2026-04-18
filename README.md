@@ -17,7 +17,7 @@ The core storage engine uses a **pre-allocated contiguous arena** with a **pipel
 - **No cache-line bouncing** — followers push to an unbounded channel and return immediately; only the leader touches arena cursors.
 - Internal compressed index (`AtomicU32` pointers) enables **O(1) random reads** at ~950M lookups/sec.
 - **Zero-copy reads** via `Bytes::slice` into the arena buffer.
-- **Zero-copy S3 flush** -- arena bytes are already in wire format.
+- **Chunk-compressed S3 flush** -- sealed extents are encoded with sparse index and independently compressible 64-record chunks (zstd/lz4) for random-access S3 range reads.
 
 Micro-benchmark: ~230M appends/sec single-threaded, ~10ns per append.
 
@@ -86,12 +86,17 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
        │  (Primary)  │                │ (Secondary) │
        └─────────────┘                └──────┬──────┘
               ◄──────────────────────────────┘
-                    watermark ACK
+                    watermark ACK               │
+                                          S3 Flusher
+                                                │
+                                          ┌─────▼─────┐
+                                          │  S3 Bucket │
+                                          └───────────┘
 ```
 
 ### Process Types
 
-- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests.
+- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Secondary-1 runs background S3 flusher for sealed extents.
 - **Stream Manager** -- Stateless metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Fully stateless design (no in-memory caches) allows multiple SM nodes to run against the same database for high availability. Includes load-aware extent placement, heartbeat-based failure detection, and DB-based leadership lease for failover coordination.
 
 ## Performance
@@ -130,7 +135,8 @@ stream-store/
 │   ├── rpc/                        # Custom TCP wire protocol (frame, codec, payload)
 │   ├── server/                     # Server infrastructure (RequestHandler, ServerBuilder)
 │   ├── client/                     # StreamClient for Extent Node & Stream Manager
-│   ├── extent-node/                # Pipelined group commit arena, stream, replication, watermark
+│   ├── extent-node/                # Pipelined group commit arena, stream, replication,
+│   │                               # S3 codec (chunk-compressed), S3 flusher, watermark
 │   └── stream-manager/             # Metadata store, allocator, heartbeat checker
 ├── conf/                           # Example TOML configuration files
 ├── tests/                          # Integration tests
@@ -145,6 +151,7 @@ stream-store/
 
 - Rust 2024 edition (1.85+)
 - MySQL 8.0+ (for Stream Manager metadata)
+- S3-compatible object storage (optional, for extent flush -- AWS S3, MinIO, etc.)
 
 ### Build
 
@@ -188,7 +195,7 @@ cargo bench
 | 2 | Broadcast replication, quorum ACK, Stream Manager (MySQL), seal-and-new | Done |
 | 2.5 | Stateless multi-active SM with DB-based leader lease, CAS-fenced failover | Done |
 | 2b | Lock-free hot-path: papaya HashMap, AckQueue producer/consumer split, Arc\<ReplicaInfo\> | Done |
-| 3 | S3 flush/read, S3 Reader/Flusher, LRU read cache | Planned |
+| 3 | S3 flush: chunk-compressed codec (zstd/lz4), background flusher on Secondary-1, UpdateExtentFlushed notification | In Progress |
 | 4 | Multi-Dispatch (data + index streams) | Planned |
 
 ## Contributing
