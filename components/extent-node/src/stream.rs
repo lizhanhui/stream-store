@@ -105,13 +105,37 @@ impl StreamInner {
         Some((start_offset, end_offset))
     }
 
-    /// Autonomously create the next extent (write lock must be held by caller).
+    /// Try to create the next extent (write lock must be held by caller).
     ///
     /// Uses `next_extent_capacity` for the new extent (adaptive sizing).
     /// Extent ID is incremented locally — no SM round-trip needed.
     ///
-    /// Returns `(new_extent_id, start_offset)` of the created extent.
-    fn create_next_extent(&mut self, stream_id: StreamId, epoch: Epoch) -> (ExtentId, Offset) {
+    /// **S3 backpressure**: Before allocating, checks if the stream is at or
+    /// over its extent limit with the oldest extent not yet flushed to S3.
+    /// In that case, eviction is blocked and creating another extent would
+    /// grow memory without bound. Returns `None` — the caller propagates
+    /// this as an error so the client seals via SM and gets a new replica
+    /// set on different nodes.
+    ///
+    /// **Memory streams**: Allocation always proceeds; eviction runs after
+    /// allocation and cleans up oldest extents unconditionally.
+    ///
+    /// Returns `Some((new_extent_id, start_offset))` on success, `None` on
+    /// backpressure.
+    fn try_create_next_extent(
+        &mut self,
+        stream_id: StreamId,
+        epoch: Epoch,
+    ) -> Option<(ExtentId, Offset)> {
+        // S3 backpressure: refuse to allocate if eviction is blocked.
+        if self.max_extents > 0
+            && self.extents.len() >= self.max_extents
+            && self.storage_class == StorageClass::S3
+            && self.extents.first().map_or(false, |e| !e.is_flushed())
+        {
+            return None;
+        }
+
         let end_offset = self
             .extents
             .last()
@@ -142,15 +166,21 @@ impl StreamInner {
         self.extent_capacity = target_capacity;
         self.active_extent_created_at = Some(Instant::now());
         self.evict_oldest_extents(stream_id);
-        (new_id, end_offset)
+        Some((new_id, end_offset))
     }
 
     /// Recycle oldest extents into the pool when count exceeds `max_extents`.
     ///
     /// Evicts from the front of the extent list (oldest first). The last extent
     /// (active/current) is never evicted. Recycled extents are pushed to the
-    /// pool for O(1) reuse by `create_next_extent`. If an extent has outstanding
+    /// pool for O(1) reuse by `try_create_next_extent`. If an extent has outstanding
     /// reader references (Arc refcount > 1), it is dropped instead of recycled.
+    ///
+    /// **S3 streams**: Only flushed extents are eligible for eviction. Sealed-but-
+    /// not-flushed extents are skipped — they must remain in memory until the S3
+    /// upload completes and `mark_flushed()` is called.
+    ///
+    /// **Memory streams**: All sealed extents are eligible (no S3 upload).
     fn evict_oldest_extents(&mut self, stream_id: StreamId) {
         if self.max_extents == 0 {
             if self.extents.len() > 4 {
@@ -163,7 +193,14 @@ impl StreamInner {
             }
             return;
         }
+        let is_s3 = self.storage_class == StorageClass::S3;
         while self.extents.len() > self.max_extents && self.extents.len() > 1 {
+            // For S3 streams, only evict extents that have been flushed to S3.
+            // The oldest extent is at index 0; if it's not eligible, stop —
+            // we can't skip it and evict a newer one (ordering matters).
+            if is_s3 && !self.extents[0].is_flushed() {
+                break;
+            }
             let evicted = self.extents.remove(0);
             // Only pool extents that already match the target capacity.
             // Mismatched extents (from growth transitions) are dropped to avoid
@@ -665,11 +702,12 @@ impl Stream {
     /// Uses `next_extent_capacity` for the new extent (adaptive sizing).
     /// Extent ID is incremented locally — no SM round-trip needed.
     ///
-    /// Returns `(new_extent_id, start_offset)` of the created extent.
-    pub fn create_next_extent(&self) -> (ExtentId, Offset) {
+    /// Returns `Some((new_extent_id, start_offset))` on success, `None` if
+    /// backpressure blocks creation (S3 flush backlog).
+    pub fn create_next_extent(&self) -> Option<(ExtentId, Offset)> {
         let epoch = Epoch(self.epoch.load(Ordering::Acquire));
         let mut inner = self.inner.write();
-        inner.create_next_extent(self.id, epoch)
+        inner.try_create_next_extent(self.id, epoch)
     }
 
     /// Seal the active extent and create a new one with adaptive capacity.
@@ -704,9 +742,10 @@ impl Stream {
             }
         }
 
-        // create_next_extent already calls evict_oldest_extents
+        // try_create_next_extent runs eviction first, then allocates.
+        // Returns None on backpressure (S3 flush backlog blocking eviction).
         let epoch = Epoch(self.epoch.load(Ordering::Acquire));
-        let (new_id, _) = inner.create_next_extent(self.id, epoch);
+        let (new_id, _) = inner.try_create_next_extent(self.id, epoch)?;
         Some(SealNotification {
             sealed_extent_id: active_id,
             end_offset,
@@ -934,6 +973,7 @@ mod tests {
     #[test]
     fn evict_oldest_sealed_extents() {
         let stream = Stream::new(StreamId(1));
+        stream.set_storage_class(StorageClass::Memory);
         stream.set_max_extents(2);
 
         // Register extent 0 and append a message.
@@ -966,6 +1006,7 @@ mod tests {
     #[test]
     fn evict_via_create_next_extent() {
         let stream = Stream::new(StreamId(1));
+        stream.set_storage_class(StorageClass::Memory);
         stream.set_max_extents(2);
 
         stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
@@ -1022,8 +1063,9 @@ mod tests {
     #[test]
     fn evict_unsealed_extents_secondary_scenario() {
         // On secondaries, old extents may not be sealed (autonomous extent-full
-        // only seals on the Primary). Eviction should still work.
+        // only seals on the Primary). Eviction should still work for Memory-class streams.
         let stream = Stream::new(StreamId(1));
+        stream.set_storage_class(StorageClass::Memory);
         stream.set_max_extents(2);
 
         // Register extent 0 (not sealed — simulating secondary).
@@ -1043,6 +1085,104 @@ mod tests {
         );
         assert!(stream.with_extent(ExtentId(1), |_| ()).is_some());
         assert!(stream.with_extent(ExtentId(2), |_| ()).is_some());
+    }
+
+    #[test]
+    fn s3_stream_skips_eviction_until_flushed() {
+        // S3-class streams must NOT evict extents that haven't been flushed.
+        let stream = Stream::new(StreamId(1));
+        // Default is StorageClass::S3, verify explicitly.
+        assert_eq!(stream.storage_class(), StorageClass::S3);
+        stream.set_max_extents(2);
+
+        // Create 3 extents: extent 0 (sealed), extent 1 (sealed), extent 2 (active).
+        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        stream.append(ExtentId(0), Bytes::from_static(b"a")).unwrap();
+        stream.seal(ExtentId(0), None);
+
+        stream.register_extent_simple(ExtentId(1), Offset(1), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        stream.append(ExtentId(1), Bytes::from_static(b"b")).unwrap();
+        stream.seal(ExtentId(1), None);
+
+        stream.register_extent_simple(ExtentId(2), Offset(2), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+
+        // 3 extents exceed limit=2, but extent 0 is not flushed — no eviction.
+        assert!(
+            stream.with_extent(ExtentId(0), |_| ()).is_some(),
+            "unflushed S3 extent 0 must NOT be evicted"
+        );
+
+        // Mark extent 0 as flushed, then trigger eviction by adding extent 3.
+        stream.with_extent(ExtentId(0), |ext| ext.mark_flushed());
+        stream.append(ExtentId(2), Bytes::from_static(b"c")).unwrap();
+        stream.seal(ExtentId(2), None);
+        stream.register_extent_simple(ExtentId(3), Offset(3), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+
+        // Now extent 0 is flushed — should be evicted.
+        assert!(
+            stream.with_extent(ExtentId(0), |_| ()).is_none(),
+            "flushed S3 extent 0 should be evicted"
+        );
+        // Extent 1 is still not flushed — should remain even though we're over limit.
+        assert!(
+            stream.with_extent(ExtentId(1), |_| ()).is_some(),
+            "unflushed S3 extent 1 must NOT be evicted"
+        );
+        assert!(stream.with_extent(ExtentId(2), |_| ()).is_some());
+        assert!(stream.with_extent(ExtentId(3), |_| ()).is_some());
+    }
+
+    #[test]
+    fn s3_backpressure_blocks_new_extent_creation() {
+        // S3-class stream: when eviction is blocked (unflushed extents),
+        // seal_and_create_next should return None (backpressure).
+        let stream = Stream::new(StreamId(1));
+        assert_eq!(stream.storage_class(), StorageClass::S3);
+        stream.set_max_extents(2);
+
+        // Create extent 0, append, seal it (but NOT flushed).
+        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        stream.append(ExtentId(0), Bytes::from_static(b"a")).unwrap();
+        stream.seal(ExtentId(0), None);
+
+        // Create extent 1 (active) — 2 extents, at limit.
+        stream.register_extent_simple(ExtentId(1), Offset(1), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        stream.append(ExtentId(1), Bytes::from_static(b"b")).unwrap();
+
+        // Try seal_and_create_next — should fail (extent 0 not flushed).
+        let result = stream.seal_and_create_next(SealReason::ExtentFull);
+        assert!(
+            result.is_none(),
+            "backpressure: should not create new extent when eviction is blocked"
+        );
+
+        // Extent 1 should be sealed (seal happened), but no new extent created.
+        assert!(stream.with_extent(ExtentId(0), |_| ()).is_some(), "extent 0 still present");
+        assert!(stream.with_extent(ExtentId(1), |_| ()).is_some(), "extent 1 still present");
+
+        // Flush both sealed extents (simulating S3 upload completing).
+        stream.with_extent(ExtentId(0), |ext| ext.mark_flushed());
+        stream.with_extent(ExtentId(1), |ext| ext.mark_flushed());
+
+        // Register a new active extent so we can seal+create again.
+        stream.register_extent_simple(ExtentId(2), Offset(2), DEFAULT_EXTENT_CAPACITY, Epoch(0));
+        stream.append(ExtentId(2), Bytes::from_static(b"c")).unwrap();
+
+        // Now both old extents are flushed — eviction is unblocked.
+        let result = stream.seal_and_create_next(SealReason::ExtentFull);
+        assert!(
+            result.is_some(),
+            "after flush, seal_and_create_next should succeed"
+        );
+        // Both old extents should be evicted (flushed + over limit).
+        assert!(
+            stream.with_extent(ExtentId(0), |_| ()).is_none(),
+            "flushed extent 0 should be evicted"
+        );
+        assert!(
+            stream.with_extent(ExtentId(1), |_| ()).is_none(),
+            "flushed extent 1 should be evicted"
+        );
     }
 
     // ── Adaptive capacity tests ─────────────────────────────────────────
