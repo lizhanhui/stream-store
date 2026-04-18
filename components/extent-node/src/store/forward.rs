@@ -4,7 +4,7 @@ use common::config::{
     DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::errors::StorageError;
-use common::types::{ExtentId, StreamId};
+use common::types::{Epoch, ExtentId, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
@@ -137,7 +137,7 @@ impl ExtentNodeStore {
     /// Returns a cumulative Watermark with the contiguous committed offset,
     /// or None if the forward cannot be processed (bad frame, unknown stream, etc.).
     pub(crate) fn handle_forward(&self, frame: Frame) -> Option<Frame> {
-        let (stream_id, extent_id, _epoch, offset, byte_pos) = match &frame.variable_header {
+        let (stream_id, extent_id, epoch, offset, byte_pos) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
                 extent_id,
@@ -168,7 +168,14 @@ impl ExtentNodeStore {
             frame.payload.clone().unwrap_or_default(),
         );
 
-        self.finish_forward(stream, stream_id, extent_id, replicate_result, &frame)
+        self.finish_forward(
+            stream,
+            stream_id,
+            extent_id,
+            epoch,
+            replicate_result,
+            &frame,
+        )
     }
 
     /// Shared tail of handle_forward: process replicate result, update metrics, return watermark.
@@ -177,6 +184,7 @@ impl ExtentNodeStore {
         stream: &Stream,
         stream_id: StreamId,
         extent_id: ExtentId,
+        epoch: Epoch,
         replicate_result: Result<AppendResult, StorageError>,
         frame: &Frame,
     ) -> Option<Frame> {
@@ -223,6 +231,7 @@ impl ExtentNodeStore {
             VariableHeader::Watermark {
                 stream_id,
                 extent_id,
+                epoch,
                 offset: watermark,
             },
             None,
@@ -245,6 +254,7 @@ impl ExtentNodeStore {
                     extent_id,
                     checksum,
                     committed_bytes,
+                    ..
                 } => (*stream_id, *extent_id, *checksum, *committed_bytes),
                 _ => return,
             };
@@ -311,6 +321,7 @@ impl ExtentNodeStore {
             VariableHeader::ForwardFlushed {
                 stream_id,
                 extent_id,
+                ..
             } => (*stream_id, *extent_id),
             _ => return,
         };

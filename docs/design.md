@@ -387,9 +387,10 @@ No Payload.
 
 ```
 Fixed Header (8B)    -- flags=0x02
-Variable Header (24B):
+Variable Header (28B):
   [stream_id        : u64]    -- target stream
   [extent_id        : u32]    -- sealed extent
+  [epoch            : u32]    -- stream epoch
   [checksum         : u32]    -- CRC32 of the extent's committed data
   [committed_bytes  : u64]    -- byte count of committed data
 No Payload.
@@ -399,9 +400,10 @@ No Payload.
 
 ```
 Fixed Header (8B)    -- flags=0x03
-Variable Header (12B):
+Variable Header (16B):
   [stream_id    : u64]    -- target stream
   [extent_id    : u32]    -- flushed extent
+  [epoch        : u32]    -- stream epoch
 No Payload.
 ```
 
@@ -756,9 +758,10 @@ Cumulative ACK from Secondary to Primary. Primary uses watermark ACKs from all s
 
 ```
 Fixed Header (8B)
-Variable Header (20B):
+Variable Header (24B):
   [stream_id    : u64]    -- stream the watermark applies to
   [extent_id    : u32]    -- extent the watermark applies to
+  [epoch        : u32]    -- stream epoch for data integrity
   [offset       : u64]    -- highest committed offset (inclusive, cumulative)
 No Payload.
 ```

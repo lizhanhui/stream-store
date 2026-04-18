@@ -100,14 +100,16 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     data_len,
                 );
 
+                // Look up epoch once for both SM notification and ForwardFlushed.
+                let epoch = store
+                    .streams
+                    .pin()
+                    .get(&req.stream_id)
+                    .map(|s| s.epoch())
+                    .unwrap_or(common::types::Epoch(0));
+
                 // Notify SM that this extent is now flushed to S3.
                 if let Some(ref tx) = store.update_tx {
-                    let epoch = store
-                        .streams
-                        .pin()
-                        .get(&req.stream_id)
-                        .map(|s| s.epoch())
-                        .unwrap_or(common::types::Epoch(0));
                     let _ = tx.try_send(ExtentUpdate::Flushed {
                         stream_id: req.stream_id,
                         extent_id: req.extent_id,
@@ -121,6 +123,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     VariableHeader::ForwardFlushed {
                         stream_id: req.stream_id,
                         extent_id: req.extent_id,
+                        epoch,
                     },
                     None,
                 );

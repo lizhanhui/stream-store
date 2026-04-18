@@ -641,6 +641,7 @@ impl ExtentNodeStore {
             VariableHeader::ForwardChecksum {
                 stream_id,
                 extent_id: sealed_extent_id,
+                epoch: stream.epoch(),
                 checksum,
                 committed_bytes,
             },
