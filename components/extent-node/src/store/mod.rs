@@ -23,7 +23,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc::Sender;
 use tracing::warn;
 
-use crate::ack_queue::{AckQueue, DEFAULT_REPLICATION_TIMEOUT};
+use crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT;
 use crate::downstream::DownstreamPool;
 use crate::s3::S3Client;
 use crate::s3_flusher::FlushRequest;
@@ -58,9 +58,6 @@ pub struct ExtentNodeStore {
     /// Channel to send ExtentUpdate notifications to SM (Primary only).
     /// The SM connection task receives these and sends UPDATE_EXTENT frames.
     pub(crate) update_tx: Option<Sender<ExtentUpdate>>,
-    /// Per-stream ACK queues for the Primary (only used when this node is Primary for a stream).
-    /// AckQueue has its own internal Mutex — no outer Mutex needed.
-    pub ack_queues: papaya::HashMap<StreamId, AckQueue, IdentityBuildHasher>,
     /// Configurable timeout for replication quorum ACK expiry.
     pub(crate) replication_timeout: Duration,
     // -- Metrics counters (reset on each heartbeat snapshot) --
@@ -83,7 +80,6 @@ impl ExtentNodeStore {
             downstream: OnceLock::new(),
             s3_client: OnceLock::new(),
             update_tx: None,
-            ack_queues: papaya::HashMap::with_hasher(IdentityBuildHasher),
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
             append_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
@@ -123,7 +119,11 @@ impl ExtentNodeStore {
                 stream.set_max_extents(cache_extents as usize);
             }
             stream.set_storage_class(storage_class);
-            stream.set_capacity_bounds(min_extent_capacity, max_extent_capacity, extent_growth_factor);
+            stream.set_capacity_bounds(
+                min_extent_capacity,
+                max_extent_capacity,
+                extent_growth_factor,
+            );
             false
         } else {
             let stream = Stream::new(stream_id);
@@ -131,7 +131,11 @@ impl ExtentNodeStore {
                 stream.set_max_extents(cache_extents as usize);
             }
             stream.set_storage_class(storage_class);
-            stream.set_capacity_bounds(min_extent_capacity, max_extent_capacity, extent_growth_factor);
+            stream.set_capacity_bounds(
+                min_extent_capacity,
+                max_extent_capacity,
+                extent_growth_factor,
+            );
             guard.insert(stream_id, stream);
             true
         }
@@ -173,11 +177,13 @@ impl ExtentNodeStore {
     /// Without this, RF=2 clients would stall for the full SM heartbeat detection
     /// window (~7.5s) because no watermark ACKs arrive to trigger `drain_quorum`.
     pub fn expire_pending_acks(&self) {
-        let guard = self.ack_queues.pin();
-        for (_k, v) in guard.iter() {
-            let mut inner = v.lock_inner();
-            inner.receive_pending();
-            inner.drain_quorum();
+        let guard = self.streams.pin();
+        for (_k, stream) in guard.iter() {
+            if let Some(aq) = stream.ack_queue() {
+                let mut inner = aq.lock_inner();
+                inner.receive_pending();
+                inner.drain_quorum();
+            }
         }
     }
 
@@ -317,7 +323,7 @@ impl RequestHandler for ExtentNodeStore {
     /// - Do a single streams.pin().get() instead of N
     /// - Do a single leader election (fetch_add(batch.len())) instead of N
     /// - Borrow ReplicaInfo once (no clone) instead of N clones
-    /// - Do a single ack_queues.pin().get() push instead of N
+    /// - Enqueue all PendingAcks in a single loop instead of N separate lookups
     async fn handle_append_batch(
         &self,
         frames: &[Frame],

@@ -12,7 +12,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::{debug, info};
 
 use super::{AppendJob, ExtentNodeStore, ExtentUpdate};
-use crate::ack_queue::{AckQueue, PendingAck};
+use crate::ack_queue::PendingAck;
 use crate::stream::{SealNotification, SealReason, Stream};
 
 impl ExtentNodeStore {
@@ -389,13 +389,8 @@ impl ExtentNodeStore {
 
                     // Queue deferred ACK — lock-free, no contention with watermark readers.
                     if let Some(ref resp_tx) = response_tx {
-                        let aq_guard = self.ack_queues.pin();
-                        let aq = aq_guard.get_or_insert_with(stream_id, || {
-                            AckQueue::with_timeout(
-                                ri.required_secondary_acks(),
-                                self.replication_timeout,
-                            )
-                        });
+                        let aq = stream
+                            .init_ack_queue(ri.required_secondary_acks(), self.replication_timeout);
                         aq.enqueue(PendingAck {
                             request_id,
                             stream_id,
@@ -920,13 +915,10 @@ impl ExtentNodeStore {
                                 }
                             }
                             if let Some(resp_tx) = response_tx {
-                                let aq_guard = self.ack_queues.pin();
-                                let aq = aq_guard.get_or_insert_with(stream_id, || {
-                                    AckQueue::with_timeout(
-                                        ri.required_secondary_acks(),
-                                        self.replication_timeout,
-                                    )
-                                });
+                                let aq = stream.init_ack_queue(
+                                    ri.required_secondary_acks(),
+                                    self.replication_timeout,
+                                );
                                 let now = Instant::now();
                                 for entry in &entries {
                                     aq.enqueue(PendingAck {

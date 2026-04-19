@@ -4,8 +4,8 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::config::{
-    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR,
-    DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
+    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
+    DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
@@ -269,8 +269,12 @@ async fn register_extent_creates_stream() {
 
     // AckQueue should be initialized for Primary.
     {
-        let aq_guard = store.ack_queues.pin();
-        let aq = aq_guard.get(&StreamId(42)).unwrap().lock_inner();
+        let streams = store.streams.pin();
+        let stream = streams.get(&StreamId(42)).unwrap();
+        let aq = stream
+            .ack_queue()
+            .expect("Primary should have AckQueue")
+            .lock_inner();
         assert_eq!(aq.required_acks, 1);
     }
 }
@@ -315,7 +319,11 @@ async fn register_extent_secondary() {
     assert_eq!(ri.replication_factor, 2);
 
     // Secondary should NOT have an AckQueue.
-    assert!(!store.ack_queues.pin().contains_key(&StreamId(42)));
+    {
+        let streams = store.streams.pin();
+        let stream = streams.get(&StreamId(42)).unwrap();
+        assert!(stream.ack_queue().is_none());
+    }
 }
 
 #[tokio::test]
@@ -448,11 +456,13 @@ async fn primary_append_defers_and_broadcasts() {
     assert_eq!(fwd2.stream_id(), StreamId(10));
     assert_eq!(fwd2.offset(), Offset(0));
 
-    let ack_queues = store.ack_queues.pin();
+    let streams_guard = store.streams.pin();
+    let stream = streams_guard.get(&StreamId(10)).unwrap();
+    let aq = stream.ack_queue().expect("Primary should have AckQueue");
 
     // PendingAck should be in the ack_queue.
     {
-        let mut inner = ack_queues.get(&StreamId(10)).unwrap().lock_inner();
+        let mut inner = aq.lock_inner();
         inner.receive_pending();
         assert_eq!(inner.pending.len(), 1);
         assert_eq!(inner.pending[0].assigned_offset, 0);
@@ -462,7 +472,7 @@ async fn primary_append_defers_and_broadcasts() {
 
     // Simulate watermark from first secondary (quorum met with 1 ACK for RF=3).
     {
-        let mut inner = ack_queues.get(&StreamId(10)).unwrap().lock_inner();
+        let mut inner = aq.lock_inner();
         inner.ack_from_secondary(0, 0);
         inner.drain_quorum();
     }

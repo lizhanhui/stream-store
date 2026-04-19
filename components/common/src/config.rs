@@ -14,7 +14,6 @@ pub const DEFAULT_SM_REQUEST_TIMEOUT_MS: u64 = 2000;
 /// Default timeout for replication quorum ACK (Primary waiting for Secondary watermarks).
 pub const DEFAULT_REPLICATION_TIMEOUT_MS: u64 = 500;
 
-
 /// Default minimum extent capacity: 8 MiB (floor for adaptive sizing).
 /// New streams start at this capacity and scale up on demand.
 pub const DEFAULT_MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024;

@@ -7,7 +7,6 @@ use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use tracing::info;
 
 use super::{ExtentNodeStore, ReplicaInfo};
-use crate::ack_queue::AckQueue;
 
 impl ExtentNodeStore {
     /// Handle RegisterExtent from StreamManager: assign this ExtentNode a role in broadcast replication.
@@ -103,12 +102,7 @@ impl ExtentNodeStore {
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
             if stream.with_extent(extent_id, |_| ()).is_none() {
-                stream.register_extent(
-                    extent_id,
-                    stream.max_offset(),
-                    epoch,
-                    min_extent_capacity,
-                );
+                stream.register_extent(extent_id, stream.max_offset(), epoch, min_extent_capacity);
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
                 // from authoritative source (RegisterExtent carries the real epoch).
@@ -139,13 +133,10 @@ impl ExtentNodeStore {
             replica_addrs,
         };
 
-        // If this node is Primary, initialize an AckQueue.
+        // If this node is Primary, initialize an AckQueue on the stream.
         if ri.is_primary() {
-            {
-                let aq_guard = self.ack_queues.pin();
-                aq_guard.get_or_insert_with(stream_id, || {
-                    AckQueue::with_timeout(ri.required_secondary_acks(), self.replication_timeout)
-                });
+            if let Some(stream) = streams_guard.get(&stream_id) {
+                stream.init_ack_queue(ri.required_secondary_acks(), self.replication_timeout);
             }
 
             // Cache per-secondary Sender handles in the Stream so the

@@ -317,17 +317,21 @@ async fn downstream_reader_inline(
                     };
 
                     // Inline watermark processing — no channel hop, no string allocation.
-                    let aq_guard = store.ack_queues.pin();
-                    if let Some(aq) = aq_guard.get(&stream_id) {
-                        let mut inner = aq.lock_inner();
-                        inner.receive_pending();
-                        inner.ack_from_secondary(secondary_index, acked_offset);
-                        inner.drain_quorum();
+                    let streams_guard = store.streams.pin();
+                    if let Some(stream) = streams_guard.get(&stream_id) {
+                        if let Some(aq) = stream.ack_queue() {
+                            let mut inner = aq.lock_inner();
+                            inner.receive_pending();
+                            inner.ack_from_secondary(secondary_index, acked_offset);
+                            inner.drain_quorum();
+                        } else {
+                            warn!(
+                                "received watermark for stream {:?} but no ack_queue exists",
+                                stream_id
+                            );
+                        }
                     } else {
-                        warn!(
-                            "received watermark for stream {:?} but no ack_queue exists",
-                            stream_id
-                        );
+                        warn!("received watermark for unknown stream {:?}", stream_id);
                     }
                 } else {
                     warn!(

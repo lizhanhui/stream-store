@@ -249,9 +249,7 @@ async fn main() {
             .unwrap_or_else(|e| panic!("describe_stream {i}: {e}"));
         let epoch = extents.first().map(|e| e.epoch).unwrap_or(Epoch(0));
 
-        info!(
-            "[setup] Stream {i} ({stream_id}) opened: primary={primary_addr}, epoch={epoch}"
-        );
+        info!("[setup] Stream {i} ({stream_id}) opened: primary={primary_addr}, epoch={epoch}");
         streams.push(StreamInfo {
             stream_id,
             epoch,
@@ -276,7 +274,16 @@ async fn main() {
             let wid = writer_id;
 
             tokio::spawn(async move {
-                writer_task(wid, stream_id, epoch, primary_addr, sm_addr, duration, counters).await;
+                writer_task(
+                    wid,
+                    stream_id,
+                    epoch,
+                    primary_addr,
+                    sm_addr,
+                    duration,
+                    counters,
+                )
+                .await;
             });
             writer_id += 1;
         }
