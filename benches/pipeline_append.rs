@@ -34,7 +34,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::errors::StorageError;
+use common::errors::{InternalSnafu, StorageError};
 use common::types::{Epoch, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use futures_util::StreamExt;
@@ -122,14 +122,14 @@ static GLOBAL: Jemalloc = Jemalloc;
 
 fn is_connection_broken(err: &StorageError) -> bool {
     match err {
-        StorageError::Internal(msg) => {
+        StorageError::Internal { message: msg, .. } => {
             msg.contains("connection closed")
                 || msg.contains("connection read error")
                 || msg.contains("RPC request timeout")
                 || msg.contains("connect timeout")
                 || msg.contains("send failed")
         }
-        StorageError::Io(_) => true,
+        StorageError::Io { .. } => true,
         _ => false,
     }
 }
@@ -137,12 +137,12 @@ fn is_connection_broken(err: &StorageError) -> bool {
 fn is_routing_error(err: &StorageError) -> bool {
     matches!(
         err,
-        StorageError::ExtentSealed(_) | StorageError::EpochStale(_, _)
+        StorageError::ExtentSealed { .. } | StorageError::EpochStale { .. }
     )
 }
 
 fn is_primary_lost_stream(err: &StorageError) -> bool {
-    matches!(err, StorageError::UnknownStream(_))
+    matches!(err, StorageError::UnknownStream { .. })
 }
 
 fn needs_reconnect(err: &StorageError) -> bool {
@@ -577,10 +577,10 @@ async fn try_reconnect(
     let sm_client = StreamClient::connect(stream_manager_addr).await?;
     let extents = sm_client.describe_stream(stream_id, 1).await?;
     let primary_addr = sm_client.cached_primary(stream_id).await.ok_or_else(|| {
-        StorageError::Internal(format!(
-            "stream {} missing primary after describe_stream",
-            stream_id
-        ))
+        InternalSnafu {
+            message: format!("stream {} missing primary after describe_stream", stream_id),
+        }
+        .build()
     })?;
     let epoch = extents
         .first()

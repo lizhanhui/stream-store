@@ -63,7 +63,10 @@ fn invalid_magic_returns_error() {
     buf.put_u32(0); // request_id
 
     let result = Frame::decode(&mut buf);
-    assert!(matches!(result, Err(StorageError::InvalidFrame(_))));
+    assert!(matches!(
+        result,
+        Err(StorageError::InvalidFrame { message: _, .. })
+    ));
 }
 
 #[test]
@@ -76,7 +79,10 @@ fn unknown_opcode_returns_error() {
     buf.put_u32(0); // remaining_length = 0
 
     let result = Frame::decode(&mut buf);
-    assert!(matches!(result, Err(StorageError::UnknownOpcode(0xFE))));
+    assert!(matches!(
+        result,
+        Err(StorageError::UnknownOpcode { opcode: 0xFE, .. })
+    ));
 }
 
 #[test]

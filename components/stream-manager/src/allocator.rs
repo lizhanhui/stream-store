@@ -1,5 +1,5 @@
 use crate::metadata::{MetadataStore, NodeRow};
-use common::errors::StorageError;
+use common::errors::{InternalSnafu, StorageError};
 use common::types::NodeMetrics;
 
 /// Stateless load-aware allocator that picks the least-loaded ExtentNode(s) for extent placement.
@@ -70,16 +70,17 @@ impl Allocator {
         min_count: usize,
     ) -> Result<Vec<NodeRow>, StorageError> {
         if desired == 0 || min_count == 0 {
-            return Err(StorageError::Internal(
-                "replication_factor must be >= 1".into(),
-            ));
+            return Err(InternalSnafu {
+                message: "replication_factor must be >= 1",
+            }
+            .build());
         }
         let alive = self.store.get_alive_nodes().await?;
         if alive.len() < min_count {
-            return Err(StorageError::Internal(format!(
+            return Err(InternalSnafu { message: format!(
                 "need at least {min_count} alive ExtentNode nodes (desired {desired}), but only {} available",
                 alive.len()
-            )));
+            ) }.build());
         }
         let count = desired.min(alive.len());
 

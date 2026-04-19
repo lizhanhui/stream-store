@@ -39,7 +39,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR};
-use common::errors::StorageError;
+use common::errors::{InternalSnafu, StorageError};
 use common::types::{Epoch, StorageClass, StreamId};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -130,14 +130,14 @@ impl SharedCounters {
 /// and we need to create a new client (not just retry on the same connection).
 fn is_connection_broken(err: &StorageError) -> bool {
     match err {
-        StorageError::Internal(msg) => {
+        StorageError::Internal { message: msg, .. } => {
             msg.contains("connection closed")
                 || msg.contains("connection read error")
                 || msg.contains("RPC request timeout")
                 || msg.contains("connect timeout")
                 || msg.contains("send failed")
         }
-        StorageError::Io(_) => true,
+        StorageError::Io { .. } => true,
         _ => false,
     }
 }
@@ -147,14 +147,14 @@ fn is_connection_broken(err: &StorageError) -> bool {
 fn is_routing_error(err: &StorageError) -> bool {
     matches!(
         err,
-        StorageError::ExtentSealed(_) | StorageError::EpochStale(_, _)
+        StorageError::ExtentSealed { .. } | StorageError::EpochStale { .. }
     )
 }
 
 /// Returns true if the error indicates the primary lost the stream
 /// (e.g., primary restarted and wiped in-memory state).
 fn is_primary_lost_stream(err: &StorageError) -> bool {
-    matches!(err, StorageError::UnknownStream(_))
+    matches!(err, StorageError::UnknownStream { .. })
 }
 
 /// Returns true if the error requires draining in-flight futures and reconnecting.
@@ -594,10 +594,10 @@ async fn try_reconnect(
         .cached_primary(stream_id)
         .await
         .ok_or_else(|| {
-            StorageError::Internal(format!(
-                "stream {} missing primary after describe_stream",
-                stream_id
-            ))
+            InternalSnafu {
+                message: format!("stream {} missing primary after describe_stream", stream_id),
+            }
+            .build()
         })?;
     let epoch = extents
         .first()

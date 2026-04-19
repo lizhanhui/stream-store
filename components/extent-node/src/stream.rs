@@ -7,7 +7,7 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
     DEFAULT_MIN_EXTENT_CAPACITY,
 };
-use common::errors::StorageError;
+use common::errors::{InternalSnafu, StorageError};
 use common::types::{Epoch, ExtentId, ExtentState, Offset, StorageClass, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::RwLock;
@@ -335,10 +335,10 @@ impl Stream {
     ) -> Result<AppendResult, StorageError> {
         let inner = self.inner.read();
         let extent = inner.find_extent(extent_id).ok_or_else(|| {
-            StorageError::Internal(format!(
-                "stream {}: extent {} not found",
-                self.id, extent_id
-            ))
+            InternalSnafu {
+                message: format!("stream {}: extent {} not found", self.id, extent_id),
+            }
+            .build()
         })?;
         extent.append(payload)
     }
@@ -353,7 +353,10 @@ impl Stream {
     ) -> Result<(AppendResult, ExtentId), StorageError> {
         let inner = self.inner.read();
         let extent = inner.extents.last().ok_or_else(|| {
-            StorageError::Internal(format!("stream {}: no active extent", self.id))
+            InternalSnafu {
+                message: format!("stream {}: no active extent", self.id),
+            }
+            .build()
         })?;
         let result = extent.append_inner(payload)?;
         Ok((result, extent.id))
@@ -373,10 +376,10 @@ impl Stream {
         let inner = self.inner.read();
         let extent = inner.find_extent(extent_id).ok_or_else(|| {
             error!("Stream: {}, Extent: {} is not found", self.id, extent_id);
-            StorageError::Internal(format!(
-                "stream {}: extent {} not found",
-                self.id, extent_id
-            ))
+            InternalSnafu {
+                message: format!("stream {}: extent {} not found", self.id, extent_id),
+            }
+            .build()
         })?;
         extent.replicate(offset, byte_pos, payload)
     }
@@ -395,10 +398,10 @@ impl Stream {
     ) -> Result<Vec<Bytes>, StorageError> {
         let inner = self.inner.read();
         let extent = inner.find_extent(extent_id).ok_or_else(|| {
-            StorageError::Internal(format!(
-                "stream {}: extent {} not found",
-                self.id, extent_id
-            ))
+            InternalSnafu {
+                message: format!("stream {}: extent {} not found", self.id, extent_id),
+            }
+            .build()
         })?;
 
         // Check offset is within this extent's range.
@@ -408,7 +411,10 @@ impl Stream {
 
         let seq = offset.0 - extent.start_offset.0;
         let byte_pos = extent.index_lookup(seq).ok_or_else(|| {
-            StorageError::Internal(format!("index lookup failed for offset {}", offset.0))
+            InternalSnafu {
+                message: format!("index lookup failed for offset {}", offset.0),
+            }
+            .build()
         })?;
         extent.read(byte_pos, count)
     }
@@ -1227,7 +1233,7 @@ mod tests {
         loop {
             match stream.append(ExtentId(0), Bytes::from_static(b"xx")) {
                 Ok(r) => offset = r.offset.0 + 1,
-                Err(StorageError::ExtentFull(_)) => break,
+                Err(StorageError::ExtentFull { .. }) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1241,7 +1247,7 @@ mod tests {
         loop {
             match stream.append(notif.new_extent_id, Bytes::from_static(b"xx")) {
                 Ok(_) => {}
-                Err(StorageError::ExtentFull(_)) => break,
+                Err(StorageError::ExtentFull { .. }) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1269,7 +1275,7 @@ mod tests {
         loop {
             match stream.append(ExtentId(0), Bytes::from_static(b"xx")) {
                 Ok(_) => {}
-                Err(StorageError::ExtentFull(_)) => break,
+                Err(StorageError::ExtentFull { .. }) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1280,7 +1286,7 @@ mod tests {
         loop {
             match stream.append(notif.new_extent_id, Bytes::from_static(b"xx")) {
                 Ok(_) => {}
-                Err(StorageError::ExtentFull(_)) => break,
+                Err(StorageError::ExtentFull { .. }) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }
@@ -1390,7 +1396,7 @@ mod tests {
         loop {
             match stream.append(ExtentId(0), Bytes::from_static(b"xx")) {
                 Ok(_) => {}
-                Err(StorageError::ExtentFull(_)) => break,
+                Err(StorageError::ExtentFull { .. }) => break,
                 Err(e) => panic!("unexpected error: {e}"),
             }
         }

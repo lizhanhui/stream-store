@@ -1,10 +1,11 @@
 use std::collections::HashMap;
 
-use common::errors::StorageError;
+use common::errors::{DatabaseSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
     Epoch, ExtentId, ExtentInfo, ExtentState, NodeMetrics, NodeState, ReplicaDetail, StorageClass,
     StreamId,
 };
+use snafu::ResultExt;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
 use sqlx::{Acquire, MySqlPool, Row};
 use tracing::info;
@@ -91,16 +92,21 @@ impl MetadataStore {
         } else {
             format!("{url}?charset=utf8mb4")
         };
-        let options: MySqlConnectOptions = sqlx_url
-            .parse()
-            .map_err(|e| StorageError::Internal(format!("parse MySQL URL: {e}")))?;
+        let options: MySqlConnectOptions = sqlx_url.parse().map_err(|e| {
+            InternalSnafu {
+                message: format!("parse MySQL URL: {e}"),
+            }
+            .build()
+        })?;
         let options = options.charset("utf8mb4");
 
         let pool = MySqlPoolOptions::new()
             .max_connections(10)
             .connect_with(options)
             .await
-            .map_err(|e| StorageError::Internal(format!("MySQL connect: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "MySQL connect",
+            })?;
         Ok(Self {
             pool,
             // Store the base URL (without charset) for Refinery migrations
@@ -115,16 +121,28 @@ impl MetadataStore {
     /// It creates a `refinery_schema_history` table to track applied migrations
     /// and only runs new ones.
     pub async fn migrate(&self) -> Result<(), StorageError> {
-        let opts = mysql_async::Opts::from_url(&self.url)
-            .map_err(|e| StorageError::Internal(format!("parse mysql url: {e}")))?;
+        let opts = mysql_async::Opts::from_url(&self.url).map_err(|e| {
+            MigrationSnafu {
+                message: format!("parse mysql url: {e}"),
+            }
+            .build()
+        })?;
         let mut pool = mysql_async::Pool::new(opts);
         embedded::migrations::runner()
             .run_async(&mut pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("migration: {e}")))?;
-        pool.disconnect()
-            .await
-            .map_err(|e| StorageError::Internal(format!("disconnect migration pool: {e}")))?;
+            .map_err(|e| {
+                MigrationSnafu {
+                    message: format!("migration: {e}"),
+                }
+                .build()
+            })?;
+        pool.disconnect().await.map_err(|e| {
+            MigrationSnafu {
+                message: format!("disconnect migration pool: {e}"),
+            }
+            .build()
+        })?;
         info!("database migrations applied");
         Ok(())
     }
@@ -159,7 +177,7 @@ impl MetadataStore {
         .bind(storage_class.as_u8())
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("create_stream: {e}")))?;
+        .context(DatabaseSnafu { message: "create_stream" })?;
 
         let stream_id = StreamId(result.last_insert_id() as u32);
 
@@ -168,7 +186,9 @@ impl MetadataStore {
             .bind(stream_id.0)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("init stream_sequence: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "init stream_sequence",
+            })?;
 
         Ok(stream_id)
     }
@@ -181,7 +201,7 @@ impl MetadataStore {
         .bind(id.0 as i64)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_stream: {e}")))?;
+        .context(DatabaseSnafu { message: "get_stream" })?;
 
         Ok(row.map(|r| StreamRow {
             stream_id: StreamId(r.get::<u32, _>("stream_id")),
@@ -206,7 +226,7 @@ impl MetadataStore {
         .bind(name)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_stream_by_name: {e}")))?;
+        .context(DatabaseSnafu { message: "get_stream_by_name" })?;
 
         Ok(row.map(|r| StreamRow {
             stream_id: StreamId(r.get::<u32, _>("stream_id")),
@@ -238,7 +258,9 @@ impl MetadataStore {
         .bind(ExtentState::Active.as_u8())
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_streams_with_active_extents: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_streams_with_active_extents",
+        })?;
 
         Ok(rows
             .into_iter()
@@ -260,7 +282,9 @@ impl MetadataStore {
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("get_stream_replication_factor: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "get_stream_replication_factor",
+            })?;
 
         Ok(row.get::<u8, _>("replication_factor"))
     }
@@ -274,7 +298,9 @@ impl MetadataStore {
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("get_stream_extent_capacity: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "get_stream_extent_capacity",
+            })?;
 
         Ok(row.get::<i32, _>("extent_capacity") as u32)
     }
@@ -285,7 +311,9 @@ impl MetadataStore {
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("get_stream_cache_extents: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "get_stream_cache_extents",
+            })?;
 
         Ok(row.get::<u16, _>("cache_extents"))
     }
@@ -301,7 +329,9 @@ impl MetadataStore {
         .bind(stream_id.0)
         .fetch_one(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_stream_capacity_bounds: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_stream_capacity_bounds",
+        })?;
 
         let min = row.get::<i32, _>("min_extent_capacity") as u32;
         let max = row.get::<i32, _>("max_extent_capacity") as u32;
@@ -314,7 +344,9 @@ impl MetadataStore {
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("get_stream_growth_factor: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "get_stream_growth_factor",
+            })?;
 
         Ok(row.get::<u8, _>("extent_growth_factor"))
     }
@@ -325,7 +357,9 @@ impl MetadataStore {
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("get_stream_min_capacity: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "get_stream_min_capacity",
+            })?;
 
         Ok(row.get::<i32, _>("min_extent_capacity") as u32)
     }
@@ -336,7 +370,9 @@ impl MetadataStore {
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("get_stream_max_capacity: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "get_stream_max_capacity",
+            })?;
 
         Ok(row.get::<i32, _>("max_extent_capacity") as u32)
     }
@@ -359,27 +395,27 @@ impl MetadataStore {
         epoch: Epoch,
     ) -> Result<ExtentId, StorageError> {
         if nodes.is_empty() {
-            return Err(StorageError::Internal(
-                "allocate_extent: empty node list".into(),
-            ));
+            return InternalSnafu {
+                message: "allocate_extent: empty node list",
+            }
+            .fail();
         }
 
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+        let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
+            message: "acquire connection",
+        })?;
+        let mut tx = conn.begin().await.context(DatabaseSnafu {
+            message: "begin transaction",
+        })?;
 
         // Step 1: Lock and increment stream_sequence atomically within the transaction.
         sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ? FOR UPDATE")
             .bind(stream_id.0)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("lock stream_sequence: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "lock stream_sequence",
+            })?;
 
         sqlx::query(
             "UPDATE stream_sequence SET next_extent_id = next_extent_id + 1 WHERE stream_id = ?",
@@ -387,13 +423,17 @@ impl MetadataStore {
         .bind(stream_id.0)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("increment stream_sequence: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "increment stream_sequence",
+        })?;
 
         let row = sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?")
             .bind(stream_id.0)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "read stream_sequence",
+            })?;
 
         // next_extent_id was already incremented, so the allocated ID is next_extent_id (post-increment value).
         let extent_id = ExtentId(row.get::<i64, _>("next_extent_id") as u32);
@@ -410,7 +450,7 @@ impl MetadataStore {
         .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("insert extent: {e}")))?;
+        .context(DatabaseSnafu { message: "insert extent" })?;
 
         // Step 3: Insert stream_replica rows keyed by (stream_id, epoch).
         // INSERT IGNORE — within an epoch the replica set is written once.
@@ -424,12 +464,12 @@ impl MetadataStore {
             .bind(*role)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("insert stream_replica: {e}")))?;
+            .context(DatabaseSnafu { message: "insert stream_replica" })?;
         }
 
         tx.commit()
             .await
-            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+            .context(DatabaseSnafu { message: "commit" })?;
 
         Ok(extent_id)
     }
@@ -451,7 +491,9 @@ impl MetadataStore {
         .bind(extent_id.0 as i64)
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("seal_extent: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "seal_extent",
+        })?;
         Ok(())
     }
 
@@ -468,15 +510,12 @@ impl MetadataStore {
         nodes: &[(String, u8)],
         epoch: Epoch,
     ) -> Result<SealResult, StorageError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+        let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
+            message: "acquire connection",
+        })?;
+        let mut tx = conn.begin().await.context(DatabaseSnafu {
+            message: "begin transaction",
+        })?;
 
         // Step 1: Lock the target extent row and check state.
         let row = sqlx::query(
@@ -487,13 +526,18 @@ impl MetadataStore {
         .bind(extent_id.0 as i64)
         .fetch_optional(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("lock extent: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "lock extent",
+        })?;
 
         let row = row.ok_or_else(|| {
-            StorageError::Internal(format!(
-                "extent not found: stream={}, extent={}",
-                stream_id, extent_id
-            ))
+            InternalSnafu {
+                message: format!(
+                    "extent not found: stream={}, extent={}",
+                    stream_id, extent_id
+                ),
+            }
+            .build()
         })?;
 
         let state_val = row.get::<i8, _>("state") as u8;
@@ -510,7 +554,9 @@ impl MetadataStore {
             .bind(extent_id.0 as i64)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("find successor: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "find successor",
+            })?;
 
             if let Some(successor) = successor {
                 let new_extent_id = ExtentId(successor.get::<i64, _>("extent_id") as u32);
@@ -525,7 +571,9 @@ impl MetadataStore {
                 .bind(epoch.0 as i32)
                 .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| StorageError::Internal(format!("find successor primary: {e}")))?;
+                .context(DatabaseSnafu {
+                    message: "find successor primary",
+                })?;
 
                 let primary_addr = replica
                     .map(|r| r.get::<String, _>("node_addr"))
@@ -533,7 +581,7 @@ impl MetadataStore {
 
                 tx.commit()
                     .await
-                    .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+                    .context(DatabaseSnafu { message: "commit" })?;
 
                 return Ok(SealResult::AlreadySealed {
                     new_extent_id,
@@ -558,7 +606,9 @@ impl MetadataStore {
         .bind(ExtentState::Active.as_u8())
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("seal extent: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "seal extent",
+        })?;
 
         // Step 3: Allocate new extent_id.
         sqlx::query(
@@ -567,13 +617,17 @@ impl MetadataStore {
         .bind(stream_id.0)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("increment stream_sequence: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "increment stream_sequence",
+        })?;
 
         let seq_row = sqlx::query("SELECT next_extent_id FROM stream_sequence WHERE stream_id = ?")
             .bind(stream_id.0)
             .fetch_one(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("read stream_sequence: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "read stream_sequence",
+            })?;
 
         let new_extent_id = ExtentId(seq_row.get::<i64, _>("next_extent_id") as u32);
         let new_start_offset = end_offset;
@@ -590,7 +644,7 @@ impl MetadataStore {
         .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("insert extent: {e}")))?;
+        .context(DatabaseSnafu { message: "insert extent" })?;
 
         // Step 5: Insert stream_replica rows for this (stream, epoch).
         // INSERT IGNORE — within an epoch the replica set is written once.
@@ -604,12 +658,12 @@ impl MetadataStore {
             .bind(*role)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("insert stream_replica: {e}")))?;
+            .context(DatabaseSnafu { message: "insert stream_replica" })?;
         }
 
         tx.commit()
             .await
-            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+            .context(DatabaseSnafu { message: "commit" })?;
 
         Ok(SealResult::Sealed { new_extent_id })
     }
@@ -627,7 +681,9 @@ impl MetadataStore {
         .bind(ExtentState::Active.as_u8())
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_active_extent: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_active_extent",
+        })?;
 
         Ok(row.map(Self::map_extent_row))
     }
@@ -641,7 +697,9 @@ impl MetadataStore {
         .bind(stream_id.0)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_extents: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_extents",
+        })?;
 
         Ok(rows.into_iter().map(Self::map_extent_row).collect())
     }
@@ -661,7 +719,9 @@ impl MetadataStore {
         .bind(ExtentState::Active.as_u8())
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_active_extents_on_node: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_active_extents_on_node",
+        })?;
 
         Ok(rows.into_iter().map(Self::map_extent_row).collect())
     }
@@ -681,7 +741,9 @@ impl MetadataStore {
         .bind(epoch.0 as i32)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_replicas: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_replicas",
+        })?;
 
         Ok(rows
             .into_iter()
@@ -726,7 +788,9 @@ impl MetadataStore {
         .bind(epoch.0 as i32)
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_replicas_with_liveness: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_replicas_with_liveness",
+        })?;
 
         Ok(rows
             .into_iter()
@@ -770,7 +834,9 @@ impl MetadataStore {
             .fetch_all(&self.pool)
             .await
         }
-        .map_err(|e| StorageError::Internal(format!("describe_stream_extents: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "describe_stream_extents",
+        })?;
 
         let mut result = Vec::with_capacity(extent_rows.len());
         for row in extent_rows {
@@ -806,7 +872,9 @@ impl MetadataStore {
         .bind(extent_id.0 as i64)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("describe_extent: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "describe_extent",
+        })?;
 
         match row {
             None => Ok(None),
@@ -856,7 +924,9 @@ impl MetadataStore {
         .bind(offset as i64)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("seek_extent (sealed): {e}")))?;
+        .context(DatabaseSnafu {
+            message: "seek_extent (sealed)",
+        })?;
 
         if let Some(r) = row {
             let ext = Self::map_extent_row(r);
@@ -885,7 +955,9 @@ impl MetadataStore {
         .bind(offset as i64)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("seek_extent (active): {e}")))?;
+        .context(DatabaseSnafu {
+            message: "seek_extent (active)",
+        })?;
 
         match row {
             None => Ok(None),
@@ -928,7 +1000,9 @@ impl MetadataStore {
         .bind(NodeState::Alive.as_u8())
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("register_node: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "register_node",
+        })?;
         Ok(())
     }
 
@@ -938,7 +1012,9 @@ impl MetadataStore {
             .bind(node_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("update_heartbeat: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "update_heartbeat",
+            })?;
         Ok(())
     }
 
@@ -950,7 +1026,9 @@ impl MetadataStore {
         .bind(NodeState::Alive.as_u8())
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_alive_nodes: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_alive_nodes",
+        })?;
 
         Ok(rows.into_iter().map(Self::map_node_row).collect())
     }
@@ -965,7 +1043,9 @@ impl MetadataStore {
         .bind(NodeState::Alive.as_u8())
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_expired_nodes: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_expired_nodes",
+        })?;
 
         Ok(rows.into_iter().map(Self::map_node_row).collect())
     }
@@ -977,7 +1057,9 @@ impl MetadataStore {
             .bind(node_id)
             .execute(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("mark_node_dead: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "mark_node_dead",
+            })?;
         Ok(())
     }
 
@@ -1009,7 +1091,9 @@ impl MetadataStore {
         .bind(metrics.bytes_written_per_sec)
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("persist_node_metrics: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "persist_node_metrics",
+        })?;
         Ok(())
     }
 
@@ -1022,7 +1106,9 @@ impl MetadataStore {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_all_node_metrics: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_all_node_metrics",
+        })?;
 
         Ok(rows
             .into_iter()
@@ -1059,7 +1145,9 @@ impl MetadataStore {
             .bind(stream_id.0)
             .fetch_one(&self.pool)
             .await
-            .map_err(|e| StorageError::Internal(format!("get_stream_epoch: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "get_stream_epoch",
+            })?;
         Ok(Epoch(row.get::<i32, _>("epoch") as u32))
     }
 
@@ -1076,12 +1164,15 @@ impl MetadataStore {
                 .bind(current.0 as i32)
                 .execute(&self.pool)
                 .await
-                .map_err(|e| StorageError::Internal(format!("bump_epoch: {e}")))?;
+                .context(DatabaseSnafu {
+                    message: "bump_epoch",
+                })?;
 
         if result.rows_affected() == 0 {
-            return Err(StorageError::Internal(
-                "epoch CAS failed: concurrent bump detected".into(),
-            ));
+            return InternalSnafu {
+                message: "epoch CAS failed: concurrent bump detected",
+            }
+            .fail();
         }
 
         Ok(Epoch(current.0 + 1))
@@ -1107,7 +1198,9 @@ impl MetadataStore {
         .bind(node_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("acquire_leadership: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "acquire_leadership",
+        })?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -1127,7 +1220,9 @@ impl MetadataStore {
         .bind(node_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("renew_leadership: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "renew_leadership",
+        })?;
 
         Ok(result.rows_affected() > 0)
     }
@@ -1142,7 +1237,9 @@ impl MetadataStore {
         .bind(node_id)
         .execute(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("release_leadership: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "release_leadership",
+        })?;
         Ok(())
     }
 
@@ -1154,7 +1251,9 @@ impl MetadataStore {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|e| StorageError::Internal(format!("get_leader: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "get_leader",
+        })?;
         Ok(row.map(|(id,)| id))
     }
 
@@ -1178,22 +1277,21 @@ impl MetadataStore {
         end_offset: u64,
         new_extent_id: ExtentId,
     ) -> Result<(), StorageError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+        let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
+            message: "acquire connection",
+        })?;
+        let mut tx = conn.begin().await.context(DatabaseSnafu {
+            message: "begin transaction",
+        })?;
 
         // Validate epoch matches current stream epoch.
         let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
             .bind(stream_id.0)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "lock stream",
+            })?;
 
         if let Some(row) = row {
             let current_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
@@ -1201,14 +1299,14 @@ impl MetadataStore {
                 // Stale notification from an old epoch — skip.
                 tx.commit()
                     .await
-                    .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+                    .context(DatabaseSnafu { message: "commit" })?;
                 return Ok(());
             }
         } else {
-            return Err(StorageError::Internal(format!(
-                "stream {:?} not found",
-                stream_id
-            )));
+            return InternalSnafu {
+                message: format!("stream {:?} not found", stream_id),
+            }
+            .fail();
         }
 
         // Insert sealed extent if not yet known (handles out-of-order arrival).
@@ -1223,7 +1321,7 @@ impl MetadataStore {
         .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("insert sealed extent: {e}")))?;
+        .context(DatabaseSnafu { message: "insert sealed extent" })?;
 
         // Seal it (idempotent — only updates if currently Active).
         sqlx::query(
@@ -1237,7 +1335,9 @@ impl MetadataStore {
         .bind(ExtentState::Active.as_u8())
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("seal extent: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "seal extent",
+        })?;
 
         // Insert new active extent (idempotent — ignore duplicate).
         sqlx::query(
@@ -1252,7 +1352,7 @@ impl MetadataStore {
         .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("insert new extent: {e}")))?;
+        .context(DatabaseSnafu { message: "insert new extent" })?;
 
         // Fix start_offset on the sealed extent if it was inserted out-of-order
         // with a placeholder (start_offset=0). Also fix start_offset on the new
@@ -1267,7 +1367,9 @@ impl MetadataStore {
         .bind(end_offset as i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("fix new extent start_offset: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "fix new extent start_offset",
+        })?;
 
         // No replica manipulation — replicas are stored at (stream_id, epoch)
         // level and all extents within an epoch inherit the same replica set.
@@ -1280,11 +1382,11 @@ impl MetadataStore {
         .bind(stream_id.0)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("update stream_sequence: {e}")))?;
+        .context(DatabaseSnafu { message: "update stream_sequence" })?;
 
         tx.commit()
             .await
-            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+            .context(DatabaseSnafu { message: "commit" })?;
 
         Ok(())
     }
@@ -1300,22 +1402,21 @@ impl MetadataStore {
         extent_id: ExtentId,
         current_offset: u64,
     ) -> Result<(), StorageError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+        let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
+            message: "acquire connection",
+        })?;
+        let mut tx = conn.begin().await.context(DatabaseSnafu {
+            message: "begin transaction",
+        })?;
 
         // Validate epoch matches current stream epoch.
         let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
             .bind(stream_id.0)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "lock stream",
+            })?;
 
         if let Some(row) = row {
             let current_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
@@ -1323,14 +1424,14 @@ impl MetadataStore {
                 // Stale notification from an old epoch — skip.
                 tx.commit()
                     .await
-                    .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+                    .context(DatabaseSnafu { message: "commit" })?;
                 return Ok(());
             }
         } else {
-            return Err(StorageError::Internal(format!(
-                "stream {:?} not found",
-                stream_id
-            )));
+            return InternalSnafu {
+                message: format!("stream {:?} not found", stream_id),
+            }
+            .fail();
         }
 
         // Update end_offset only if the new value is larger (monotonic progress).
@@ -1345,11 +1446,13 @@ impl MetadataStore {
         .bind(current_offset as i64)
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("update extent progress: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "update extent progress",
+        })?;
 
         tx.commit()
             .await
-            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+            .context(DatabaseSnafu { message: "commit" })?;
 
         Ok(())
     }
@@ -1364,22 +1467,21 @@ impl MetadataStore {
         epoch: Epoch,
         extent_id: ExtentId,
     ) -> Result<(), StorageError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+        let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
+            message: "acquire connection",
+        })?;
+        let mut tx = conn.begin().await.context(DatabaseSnafu {
+            message: "begin transaction",
+        })?;
 
         // Validate epoch matches current stream epoch.
         let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
             .bind(stream_id.0)
             .fetch_optional(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("lock stream: {e}")))?;
+            .context(DatabaseSnafu {
+                message: "lock stream",
+            })?;
 
         if let Some(row) = row {
             let current_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
@@ -1387,14 +1489,14 @@ impl MetadataStore {
                 // Stale notification from an old epoch — skip.
                 tx.commit()
                     .await
-                    .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+                    .context(DatabaseSnafu { message: "commit" })?;
                 return Ok(());
             }
         } else {
-            return Err(StorageError::Internal(format!(
-                "stream {:?} not found",
-                stream_id
-            )));
+            return InternalSnafu {
+                message: format!("stream {:?} not found", stream_id),
+            }
+            .fail();
         }
 
         // Transition Sealed → Flushed (idempotent: no-op if already Flushed).
@@ -1408,11 +1510,13 @@ impl MetadataStore {
         .bind(ExtentState::Sealed.as_u8())
         .execute(&mut *tx)
         .await
-        .map_err(|e| StorageError::Internal(format!("update extent flushed: {e}")))?;
+        .context(DatabaseSnafu {
+            message: "update extent flushed",
+        })?;
 
         tx.commit()
             .await
-            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+            .context(DatabaseSnafu { message: "commit" })?;
 
         Ok(())
     }
@@ -1427,15 +1531,12 @@ impl MetadataStore {
         epoch: Epoch,
         extents: &[(ExtentId, u64, u64, ExtentState)], // (extent_id, start_offset, end_offset, state)
     ) -> Result<(), StorageError> {
-        let mut conn = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|e| StorageError::Internal(format!("acquire connection: {e}")))?;
-        let mut tx = conn
-            .begin()
-            .await
-            .map_err(|e| StorageError::Internal(format!("begin transaction: {e}")))?;
+        let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
+            message: "acquire connection",
+        })?;
+        let mut tx = conn.begin().await.context(DatabaseSnafu {
+            message: "begin transaction",
+        })?;
 
         let mut max_extent_id: u32 = 0;
 
@@ -1467,7 +1568,7 @@ impl MetadataStore {
             .bind(epoch.0 as i32)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("reconcile extent: {e}")))?;
+            .context(DatabaseSnafu { message: "reconcile extent" })?;
         }
 
         // Update stream_sequence to be at least max_extent_id + 1.
@@ -1479,12 +1580,12 @@ impl MetadataStore {
             .bind(stream_id.0)
             .execute(&mut *tx)
             .await
-            .map_err(|e| StorageError::Internal(format!("update stream_sequence: {e}")))?;
+            .context(DatabaseSnafu { message: "update stream_sequence" })?;
         }
 
         tx.commit()
             .await
-            .map_err(|e| StorageError::Internal(format!("commit: {e}")))?;
+            .context(DatabaseSnafu { message: "commit" })?;
 
         Ok(())
     }

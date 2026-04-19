@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
+use common::errors::{ExtentFullSnafu, ExtentSealedSnafu, InternalSnafu};
 use common::types::{Epoch, ExtentId, ExtentState, Offset};
 
 /// Sentinel for unwritten index entries.
@@ -416,7 +417,7 @@ impl Extent {
         if limit != LIMIT_OPEN {
             let current = self.record_count.load(Ordering::Relaxed);
             if current >= limit {
-                return Err(StorageError::ExtentSealed(self.id));
+                return Err(ExtentSealedSnafu { extent_id: self.id }.build());
             }
         }
 
@@ -427,7 +428,7 @@ impl Extent {
         // 1. Reserve byte slot (plain load + store, single writer).
         let byte_pos = self.write_cursor.load(Ordering::Relaxed);
         if byte_pos + record_len as u64 > self.capacity as u64 {
-            return Err(StorageError::ExtentFull(self.id));
+            return Err(ExtentFullSnafu { extent_id: self.id }.build());
         }
         self.write_cursor
             .store(byte_pos + record_len as u64, Ordering::Relaxed);
@@ -491,16 +492,19 @@ impl Extent {
     ) -> Result<AppendResult, StorageError> {
         // Reject stale Forward frames from a previous extent (offset < start_offset).
         if offset.0 < self.start_offset.0 {
-            return Err(StorageError::Internal(format!(
-                "stale forward: offset {} < extent start_offset {}",
-                offset.0, self.start_offset.0
-            )));
+            return Err(InternalSnafu {
+                message: format!(
+                    "stale forward: offset {} < extent start_offset {}",
+                    offset.0, self.start_offset.0
+                ),
+            }
+            .build());
         }
         let seq = offset.0 - self.start_offset.0;
         // Check seal limit (limit is count-based).
         let limit = self.limit.load(Ordering::Acquire);
         if limit != LIMIT_OPEN && seq >= limit {
-            return Err(StorageError::ExtentSealed(self.id));
+            return Err(ExtentSealedSnafu { extent_id: self.id }.build());
         }
 
         let payload_len = payload.len();
@@ -508,7 +512,7 @@ impl Extent {
 
         // Check capacity.
         if byte_pos + record_len as u64 > self.capacity as u64 {
-            return Err(StorageError::ExtentFull(self.id));
+            return Err(ExtentFullSnafu { extent_id: self.id }.build());
         }
 
         // Write record at exact byte_pos (same layout as append).
@@ -981,7 +985,7 @@ mod tests {
         ext.seal(None);
 
         let result = ext.append(Bytes::from_static(b"fail"));
-        assert!(matches!(result, Err(StorageError::ExtentSealed(_))));
+        assert!(matches!(result, Err(StorageError::ExtentSealed { .. })));
         assert_eq!(ext.message_count(), 1);
     }
 
@@ -1004,7 +1008,7 @@ mod tests {
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 16, Epoch(0));
         ext.append(Bytes::from_static(b"hello")).unwrap(); // 9 bytes, fits
         let result = ext.append(Bytes::from_static(b"world")); // 9 bytes, doesn't fit
-        assert!(matches!(result, Err(StorageError::ExtentFull(_))));
+        assert!(matches!(result, Err(StorageError::ExtentFull { .. })));
     }
 
     #[test]
@@ -1127,7 +1131,7 @@ mod tests {
 
         // Replicate at offset=1 (at limit) should fail.
         let result = ext.replicate(Offset(1), 8, Bytes::from_static(b"msg1"));
-        assert!(matches!(result, Err(StorageError::ExtentSealed(_))));
+        assert!(matches!(result, Err(StorageError::ExtentSealed { .. })));
     }
 
     #[test]
@@ -1155,7 +1159,7 @@ mod tests {
         // Now at the limit — further appends should be rejected.
         assert!(!ext.accepts_post_seal_writes());
         let result = ext.append(Bytes::from_static(b"should-fail"));
-        assert!(matches!(result, Err(StorageError::ExtentSealed(_))));
+        assert!(matches!(result, Err(StorageError::ExtentSealed { .. })));
     }
 
     #[test]
@@ -1170,7 +1174,7 @@ mod tests {
         // limit = record_count = 2, committed count = 2 → no room.
         assert!(!ext.accepts_post_seal_writes());
         let result = ext.append(Bytes::from_static(b"should-fail"));
-        assert!(matches!(result, Err(StorageError::ExtentSealed(_))));
+        assert!(matches!(result, Err(StorageError::ExtentSealed { .. })));
     }
 
     #[test]

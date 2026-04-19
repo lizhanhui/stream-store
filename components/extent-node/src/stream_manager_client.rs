@@ -20,7 +20,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::errors::StorageError;
+use common::errors::{InternalSnafu, StorageError};
 use common::types::{NodeMetrics, Offset, Opcode};
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
@@ -280,7 +280,12 @@ impl StreamManagerClient {
 
             tokio::time::timeout(rpc_request_timeout, framed.send(hb_frame))
                 .await
-                .map_err(|_| StorageError::Internal("timeout sending Heartbeat".into()))??;
+                .map_err(|_| {
+                    InternalSnafu {
+                        message: "timeout sending Heartbeat",
+                    }
+                    .build()
+                })??;
 
             match tokio::time::timeout(rpc_request_timeout, framed.next()).await {
                 Ok(Some(Ok(resp))) if resp.opcode() == Opcode::Heartbeat => {
@@ -291,14 +296,16 @@ impl StreamManagerClient {
                 }
                 Ok(Some(Err(e))) => return Err(e),
                 Ok(None) => {
-                    return Err(StorageError::Internal(
-                        "StreamManager connection closed".into(),
-                    ));
+                    return Err(InternalSnafu {
+                        message: "StreamManager connection closed",
+                    }
+                    .build());
                 }
                 Err(_) => {
-                    return Err(StorageError::Internal(
-                        "timeout waiting for Heartbeat response".into(),
-                    ));
+                    return Err(InternalSnafu {
+                        message: "timeout waiting for Heartbeat response",
+                    }
+                    .build());
                 }
             }
         }
@@ -429,11 +436,17 @@ impl StreamManagerClient {
             tokio::time::timeout(rpc_connect_timeout, TcpStream::connect(stream_manager_addr))
                 .await
                 .map_err(|_| {
-                    StorageError::Internal(format!("connect timeout to {stream_manager_addr}"))
+                    InternalSnafu {
+                        message: format!("connect timeout to {stream_manager_addr}"),
+                    }
+                    .build()
                 })??;
-        stream
-            .set_nodelay(true)
-            .map_err(|e| StorageError::Internal(format!("set TCP_NODELAY: {e}")))?;
+        stream.set_nodelay(true).map_err(|e| {
+            InternalSnafu {
+                message: format!("set TCP_NODELAY: {e}"),
+            }
+            .build()
+        })?;
         let mut framed = Framed::new(stream, FrameCodec);
 
         // Send Connect.
@@ -444,7 +457,12 @@ impl StreamManagerClient {
         );
         tokio::time::timeout(rpc_request_timeout, framed.send(connect_frame))
             .await
-            .map_err(|_| StorageError::Internal("timeout sending Connect frame".into()))??;
+            .map_err(|_| {
+                InternalSnafu {
+                    message: "timeout sending Connect frame",
+                }
+                .build()
+            })??;
 
         match tokio::time::timeout(rpc_request_timeout, framed.next()).await {
             Ok(Some(Ok(resp))) if resp.opcode() == Opcode::Connect => {
@@ -452,18 +470,23 @@ impl StreamManagerClient {
             }
             Ok(Some(Ok(resp))) => {
                 error!("unexpected Connect response: {:?}", resp.opcode());
-                return Err(StorageError::Internal("unexpected Connect response".into()));
+                return Err(InternalSnafu {
+                    message: "unexpected Connect response",
+                }
+                .build());
             }
             Ok(Some(Err(e))) => return Err(e),
             Ok(None) => {
-                return Err(StorageError::Internal(
-                    "StreamManager connection closed after Connect".into(),
-                ));
+                return Err(InternalSnafu {
+                    message: "StreamManager connection closed after Connect",
+                }
+                .build());
             }
             Err(_) => {
-                return Err(StorageError::Internal(
-                    "timeout waiting for ConnectAck from StreamManager".into(),
-                ));
+                return Err(InternalSnafu {
+                    message: "timeout waiting for ConnectAck from StreamManager",
+                }
+                .build());
             }
         }
 

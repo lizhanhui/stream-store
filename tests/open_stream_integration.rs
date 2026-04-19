@@ -210,7 +210,10 @@ async fn stream_client_open_integration() {
     let result = sm.describe_stream_by_name("nonexistent", 0).await;
     assert!(result.is_err());
     assert!(
-        matches!(result, Err(common::errors::StorageError::UnknownStream(_))),
+        matches!(
+            result,
+            Err(common::errors::StorageError::UnknownStream { .. })
+        ),
         "expected UnknownStream error for nonexistent stream"
     );
 }

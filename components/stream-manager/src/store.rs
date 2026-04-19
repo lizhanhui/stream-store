@@ -9,7 +9,7 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
     DEFAULT_MIN_EXTENT_CAPACITY,
 };
-use common::errors::StorageError;
+use common::errors::{InternalSnafu, StorageError};
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StorageClass, StreamId};
 use futures_util::future;
 use rpc::frame::{Frame, VariableHeader};
@@ -32,7 +32,10 @@ async fn seal_extent_node_static(
     start_offset: u64,
 ) -> Result<(ExtentId, u64, u64, Option<Bytes>), StorageError> {
     let client = client::StreamClient::connect(addr).await.map_err(|e| {
-        StorageError::Internal(format!("connect to ExtentNode {addr} for Seal: {e}"))
+        InternalSnafu {
+            message: format!("connect to ExtentNode {addr} for Seal: {e}"),
+        }
+        .build()
     })?;
 
     let resp = client
@@ -47,13 +50,19 @@ async fn seal_extent_node_static(
             None,
         ))
         .await
-        .map_err(|e| StorageError::Internal(format!("Seal to ExtentNode {addr}: {e}")))?;
+        .map_err(|e| {
+            InternalSnafu {
+                message: format!("Seal to ExtentNode {addr}: {e}"),
+            }
+            .build()
+        })?;
 
     if resp.is_error_response() {
         let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
-        return Err(StorageError::Internal(format!(
-            "ExtentNode {addr} rejected Seal: {msg}"
-        )));
+        return Err(InternalSnafu {
+            message: format!("ExtentNode {addr} rejected Seal: {msg}"),
+        }
+        .build());
     }
 
     // Parse SealExtentNodeResp.
@@ -64,10 +73,13 @@ async fn seal_extent_node_static(
             end_offset,
             ..
         } => Ok((*extent_id, *so, *end_offset, resp.payload.clone())),
-        _ => Err(StorageError::Internal(format!(
-            "ExtentNode {addr} returned unexpected response: {:?}",
-            resp.opcode()
-        ))),
+        _ => Err(InternalSnafu {
+            message: format!(
+                "ExtentNode {addr} returned unexpected response: {:?}",
+                resp.opcode()
+            ),
+        }
+        .build()),
     }
 }
 
@@ -111,9 +123,10 @@ async fn report_extents_from_node_static(
     use bytes::Buf;
 
     let client = client::StreamClient::connect(addr).await.map_err(|e| {
-        StorageError::Internal(format!(
-            "connect to ExtentNode {addr} for ReportExtents: {e}"
-        ))
+        InternalSnafu {
+            message: format!("connect to ExtentNode {addr} for ReportExtents: {e}"),
+        }
+        .build()
     })?;
 
     let resp = client
@@ -126,13 +139,19 @@ async fn report_extents_from_node_static(
             None,
         ))
         .await
-        .map_err(|e| StorageError::Internal(format!("ReportExtents to ExtentNode {addr}: {e}")))?;
+        .map_err(|e| {
+            InternalSnafu {
+                message: format!("ReportExtents to ExtentNode {addr}: {e}"),
+            }
+            .build()
+        })?;
 
     if resp.is_error_response() {
         let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
-        return Err(StorageError::Internal(format!(
-            "ExtentNode {addr} rejected ReportExtents: {msg}"
-        )));
+        return Err(InternalSnafu {
+            message: format!("ExtentNode {addr} rejected ReportExtents: {msg}"),
+        }
+        .build());
     }
 
     // Parse ReportExtentsResp payload: [num_extents:u32] then for each: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
@@ -140,9 +159,10 @@ async fn report_extents_from_node_static(
     let mut buf = &payload[..];
 
     if buf.len() < 4 {
-        return Err(StorageError::Internal(format!(
-            "ReportExtentsResp from {addr} has invalid payload: too short"
-        )));
+        return Err(InternalSnafu {
+            message: format!("ReportExtentsResp from {addr} has invalid payload: too short"),
+        }
+        .build());
     }
 
     let num_extents = buf.get_u32() as usize;
@@ -150,9 +170,10 @@ async fn report_extents_from_node_static(
 
     for _ in 0..num_extents {
         if buf.len() < 4 + 8 + 8 + 1 {
-            return Err(StorageError::Internal(format!(
-                "ReportExtentsResp from {addr} has truncated extent record"
-            )));
+            return Err(InternalSnafu {
+                message: format!("ReportExtentsResp from {addr} has truncated extent record"),
+            }
+            .build());
         }
 
         let extent_id = ExtentId(buf.get_u32());
@@ -368,9 +389,12 @@ impl StreamManagerStore {
 
         let result = tokio::time::timeout(Duration::from_millis(500), async {
             let client = client::StreamClient::connect(&addr).await.map_err(|e| {
-                StorageError::Internal(format!(
-                    "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
-                ))
+                InternalSnafu {
+                    message: format!(
+                        "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
+                    ),
+                }
+                .build()
             })?;
 
             let resp = client
@@ -393,17 +417,19 @@ impl StreamManagerStore {
                 ))
                 .await
                 .map_err(|e| {
-                    StorageError::Internal(format!(
-                        "RegisterExtent to Primary ExtentNode {addr}: {e}"
-                    ))
+                    InternalSnafu {
+                        message: format!("RegisterExtent to Primary ExtentNode {addr}: {e}"),
+                    }
+                    .build()
                 })?;
 
             if resp.is_error_response() {
                 let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default())
                     .to_string();
-                return Err(StorageError::Internal(format!(
-                    "Primary ExtentNode {addr} rejected RegisterExtent: {msg}"
-                )));
+                return Err(InternalSnafu {
+                    message: format!("Primary ExtentNode {addr} rejected RegisterExtent: {msg}"),
+                }
+                .build());
             }
 
             Ok(())
@@ -421,9 +447,10 @@ impl StreamManagerStore {
                 Ok(())
             }
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(StorageError::Internal(format!(
-                "RegisterExtent to Primary {primary_addr} timed out (1s)"
-            ))),
+            Err(_) => Err(InternalSnafu {
+                message: format!("RegisterExtent to Primary {primary_addr} timed out (1s)"),
+            }
+            .build()),
         }
     }
 
@@ -911,10 +938,13 @@ impl StreamManagerStore {
             .get_active_extent(stream_id)
             .await?
             .ok_or_else(|| {
-                StorageError::Internal(format!(
-                    "no active extent found for stream {} during seal_extent",
-                    stream_id
-                ))
+                InternalSnafu {
+                    message: format!(
+                        "no active extent found for stream {} during seal_extent",
+                        stream_id
+                    ),
+                }
+                .build()
             })?;
         let extent_start_offset = extent_row.start_offset;
 
@@ -993,10 +1023,13 @@ impl StreamManagerStore {
     ) -> Result<u64, StorageError> {
         let replicas = self.store.get_replicas(stream_id, epoch).await?;
         if replicas.is_empty() {
-            return Err(StorageError::Internal(format!(
-                "no replicas found for stream {} extent {}",
-                stream_id, extent_id
-            )));
+            return Err(InternalSnafu {
+                message: format!(
+                    "no replicas found for stream {} extent {}",
+                    stream_id, extent_id
+                ),
+            }
+            .build());
         }
 
         // Partition replicas into primary and secondaries.
@@ -1113,16 +1146,20 @@ impl StreamManagerStore {
         } else {
             // Primary completely unreachable: compute from secondary quorum.
             if (secondary_offsets.len() as u32) < required_secondary_acks {
-                return Err(StorageError::Internal(format!(
-                    "insufficient replicas for seal: need {} secondary ACKs, got {}",
-                    required_secondary_acks,
-                    secondary_offsets.len()
-                )));
+                return Err(InternalSnafu {
+                    message: format!(
+                        "insufficient replicas for seal: need {} secondary ACKs, got {}",
+                        required_secondary_acks,
+                        secondary_offsets.len()
+                    ),
+                }
+                .build());
             }
             if secondary_offsets.is_empty() {
-                return Err(StorageError::Internal(
-                    "no ExtentNodes responded to seal".into(),
-                ));
+                return Err(InternalSnafu {
+                    message: "no ExtentNodes responded to seal",
+                }
+                .build());
             }
             // Take kth largest, where k = required_secondary_acks.
             secondary_offsets.sort_unstable_by(|a, b| b.cmp(a));
@@ -1132,10 +1169,13 @@ impl StreamManagerStore {
             } else if k <= secondary_offsets.len() {
                 secondary_offsets[k - 1]
             } else {
-                return Err(StorageError::Internal(format!(
-                    "insufficient secondary offsets for quorum: need {k}, have {}",
-                    secondary_offsets.len()
-                )));
+                return Err(InternalSnafu {
+                    message: format!(
+                        "insufficient secondary offsets for quorum: need {k}, have {}",
+                        secondary_offsets.len()
+                    ),
+                }
+                .build());
             }
         };
 

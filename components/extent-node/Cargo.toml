@@ -28,9 +28,10 @@ client = { path = "../client" }
 fastant = { workspace = true }
 crossbeam-channel = { workspace = true }
 crc32fast = { workspace = true }
+snafu = { workspace = true }
+snafu-virtstack = { workspace = true }
 core_affinity = { workspace = true }
 smallvec = { workspace = true }
-thiserror = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 zstd = { workspace = true }
