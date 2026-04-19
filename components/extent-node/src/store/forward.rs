@@ -4,7 +4,7 @@ use common::config::{
     DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::errors::StorageError;
-use common::types::{Epoch, ExtentId, StreamId};
+use common::types::{Epoch, ExtentId, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
@@ -66,8 +66,9 @@ impl ExtentNodeStore {
 
     /// Handle ForwardInitExtent (0x0B, flag=0x01) — init-extent notification.
     ///
-    /// Creates the stream (if needed) and registers the extent with the provided
-    /// start_offset and extent_capacity. Fire-and-forget: no response.
+    /// Ensures the stream exists (creating it if needed), then registers the
+    /// extent with the primary's actual capacity and adaptive config.
+    /// Fire-and-forget: no response.
     pub(crate) fn handle_forward_init_extent(&self, frame: Frame) {
         let (
             stream_id,
@@ -124,48 +125,56 @@ impl ExtentNodeStore {
             extent_growth_factor
         };
 
+        let is_new = self.get_or_create_stream(stream_id, cache_extents, storage_class);
+        self.register_extent_if_absent(
+            stream_id,
+            extent_id,
+            start_offset,
+            epoch,
+            extent_capacity,
+            min_extent_capacity,
+            max_extent_capacity,
+            extent_growth_factor,
+        );
+
+        if is_new {
+            info!(
+                "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
+                stream_id, extent_id, start_offset, extent_capacity, min_extent_capacity, max_extent_capacity, extent_growth_factor,
+            );
+        } else {
+            info!(
+                "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
+                stream_id, extent_id, start_offset, extent_capacity, min_extent_capacity, max_extent_capacity, extent_growth_factor,
+            );
+        }
+    }
+
+    /// Register an extent on a stream if it doesn't already exist.
+    fn register_extent_if_absent(
+        &self,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        start_offset: Offset,
+        epoch: Epoch,
+        initial_capacity: u32,
+        min_extent_capacity: u32,
+        max_extent_capacity: u32,
+        extent_growth_factor: u8,
+    ) {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id) {
-            // Apply cache policy if not yet set (RegisterExtent may arrive later).
-            if cache_extents > 0 && stream.max_extents() == 0 {
-                stream.set_max_extents(cache_extents as usize);
-            }
-            stream.set_storage_class(storage_class);
             if stream.with_extent(extent_id, |_| ()).is_none() {
                 stream.register_extent(
                     extent_id,
                     start_offset,
                     epoch,
-                    extent_capacity,
+                    initial_capacity,
                     min_extent_capacity,
                     max_extent_capacity,
                     extent_growth_factor,
                 );
-                info!(
-                    "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
-                    stream_id, extent_id, start_offset, extent_capacity, min_extent_capacity, max_extent_capacity, extent_growth_factor,
-                );
             }
-        } else {
-            let stream = Stream::new(stream_id);
-            stream.set_max_extents(cache_extents as usize);
-            stream.set_storage_class(storage_class);
-            stream.register_extent(
-                extent_id,
-                start_offset,
-                epoch,
-                extent_capacity,
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
-            );
-            guard.insert(stream_id, stream);
-            self.next_stream_id
-                .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
-            info!(
-                "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
-                stream_id, extent_id, start_offset, extent_capacity, min_extent_capacity, max_extent_capacity, extent_growth_factor,
-            );
         }
     }
 
