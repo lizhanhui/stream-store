@@ -1,0 +1,17 @@
+coverage:
+  status:
+    project:
+      default:
+        # Allow 1% overall decrease without failing — lenient during early adoption.
+        threshold: 1%
+    patch:
+      default:
+        # New code in PRs should aim for reasonable coverage.
+        target: 70%
+        threshold: 5%
+
+ignore:
+  - "benches/**"
+  - "examples/**"
+  - "tests/**"
+  - "components/*/benches/**"

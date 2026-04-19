@@ -30,3 +30,23 @@ jobs:
       env:
         RUST_LOG: "warn"
       run: cargo bench --bench pipeline_append
+
+  coverage:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+    - uses: shogo82148/actions-setup-mysql@v1
+      with:
+        mysql-version: "8.4"
+        root-password: password
+    - run: mysql -uroot -ppassword -e 'CREATE DATABASE IF NOT EXISTS stream_store'
+    - uses: taiki-e/install-action@cargo-llvm-cov
+    - name: Generate coverage
+      run: cargo llvm-cov --all-features --workspace --lcov --output-path lcov.info
+    - name: Upload to Codecov
+      uses: codecov/codecov-action@v5
+      with:
+        files: lcov.info
+        fail_ci_if_error: false
