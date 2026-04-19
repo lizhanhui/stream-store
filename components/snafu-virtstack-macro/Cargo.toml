@@ -1,0 +1,15 @@
+[package]
+name = "snafu-virtstack-macro"
+version = "0.1.0"
+edition = "2024"
+description = "Proc macro for snafu-virtstack providing automatic virtual stack trace implementation"
+license = "Apache-2.0"
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0"
+quote = "1.0"
+snafu = { workspace = true }
+syn = { version = "2.0", features = ["full"] }
