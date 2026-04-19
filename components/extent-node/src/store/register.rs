@@ -105,6 +105,7 @@ impl ExtentNodeStore {
                     stream.max_offset(),
                     epoch,
                     min_extent_capacity,
+                    min_extent_capacity,
                     max_extent_capacity,
                     extent_growth_factor,
                 );
@@ -121,6 +122,7 @@ impl ExtentNodeStore {
                 extent_id,
                 Offset(0),
                 epoch,
+                min_extent_capacity,
                 min_extent_capacity,
                 max_extent_capacity,
                 extent_growth_factor,

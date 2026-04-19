@@ -92,8 +92,8 @@ impl Frame {
             VariableHeader::ReportExtentsRespError { .. } => 4 + 4 + 4 + 2,
             // stream_id(4) + extent_id(4) + epoch(4) + offset(8) + byte_pos(8)
             VariableHeader::Forward { .. } => 4 + 4 + 4 + 8 + 8,
-            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_class(1)
-            VariableHeader::ForwardInitExtent { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 1,
+            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(1) + storage_class(1)
+            VariableHeader::ForwardInitExtent { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 4 + 4 + 1 + 1,
             // stream_id(4) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
             VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 4 + 8,
             // stream_id(4) + extent_id(4) + epoch(4)
@@ -488,6 +488,9 @@ impl Frame {
                 start_offset,
                 extent_capacity,
                 cache_extents,
+                min_extent_capacity,
+                max_extent_capacity,
+                extent_growth_factor,
                 storage_class,
             } => {
                 dst.put_u32(stream_id.0);
@@ -496,6 +499,9 @@ impl Frame {
                 dst.put_u64(start_offset.0);
                 dst.put_u32(*extent_capacity);
                 dst.put_u16(*cache_extents);
+                dst.put_u32(*min_extent_capacity);
+                dst.put_u32(*max_extent_capacity);
+                dst.put_u8(*extent_growth_factor);
                 dst.put_u8(storage_class.as_u8());
             }
             VariableHeader::ForwardChecksum {

@@ -266,6 +266,12 @@ pub enum VariableHeader {
         start_offset: Offset,
         extent_capacity: u32,
         cache_extents: u16,
+        /// Minimum extent capacity for adaptive sizing on this stream.
+        min_extent_capacity: u32,
+        /// Maximum extent capacity for adaptive sizing on this stream.
+        max_extent_capacity: u32,
+        /// Growth factor for adaptive capacity scaling.
+        extent_growth_factor: u8,
         /// Storage class for sealed extents: S3 (0) or Memory (1).
         storage_class: StorageClass,
     },

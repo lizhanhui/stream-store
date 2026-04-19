@@ -583,6 +583,9 @@ impl Frame {
                         let start_offset = Offset(body.get_u64());
                         let extent_capacity = body.get_u32();
                         let cache_extents = body.get_u16();
+                        let min_extent_capacity = body.get_u32();
+                        let max_extent_capacity = body.get_u32();
+                        let extent_growth_factor = body.get_u8();
                         let storage_class =
                             StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
                                 InvalidFrameSnafu {
@@ -598,6 +601,9 @@ impl Frame {
                                 start_offset,
                                 extent_capacity,
                                 cache_extents,
+                                min_extent_capacity,
+                                max_extent_capacity,
+                                extent_growth_factor,
                                 storage_class,
                             },
                             None,

@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use common::config::{
-    DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
+    DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, StreamId};
@@ -39,6 +39,7 @@ impl ExtentNodeStore {
             _ => return None,
         };
 
+        let (min_cap, max_cap, growth) = stream.capacity_bounds();
         stream.with_extent(extent_id, |ext| {
             if !ext.take_init_forward() {
                 return None;
@@ -53,6 +54,9 @@ impl ExtentNodeStore {
                     start_offset: ext.start_offset,
                     extent_capacity: ext.capacity(),
                     cache_extents: stream.max_extents() as u16,
+                    min_extent_capacity: min_cap,
+                    max_extent_capacity: max_cap,
+                    extent_growth_factor: growth,
                     storage_class: stream.storage_class(),
                 },
                 None,
@@ -72,6 +76,9 @@ impl ExtentNodeStore {
             start_offset,
             extent_capacity,
             cache_extents,
+            min_extent_capacity,
+            max_extent_capacity,
+            extent_growth_factor,
             storage_class,
         ) = match &frame.variable_header {
             VariableHeader::ForwardInitExtent {
@@ -81,6 +88,9 @@ impl ExtentNodeStore {
                 start_offset,
                 extent_capacity,
                 cache_extents,
+                min_extent_capacity,
+                max_extent_capacity,
+                extent_growth_factor,
                 storage_class,
             } => (
                 *stream_id,
@@ -89,9 +99,29 @@ impl ExtentNodeStore {
                 *start_offset,
                 *extent_capacity,
                 *cache_extents,
+                *min_extent_capacity,
+                *max_extent_capacity,
+                *extent_growth_factor,
                 *storage_class,
             ),
             _ => return,
+        };
+
+        // Normalize: 0 means use default.
+        let min_extent_capacity = if min_extent_capacity == 0 {
+            DEFAULT_MIN_EXTENT_CAPACITY
+        } else {
+            min_extent_capacity
+        };
+        let max_extent_capacity = if max_extent_capacity == 0 {
+            DEFAULT_MAX_EXTENT_CAPACITY
+        } else {
+            max_extent_capacity
+        };
+        let extent_growth_factor = if extent_growth_factor == 0 {
+            DEFAULT_EXTENT_GROWTH_FACTOR
+        } else {
+            extent_growth_factor
         };
 
         let guard = self.streams.pin();
@@ -107,12 +137,13 @@ impl ExtentNodeStore {
                     start_offset,
                     epoch,
                     extent_capacity,
-                    DEFAULT_MAX_EXTENT_CAPACITY,
-                    DEFAULT_EXTENT_GROWTH_FACTOR,
+                    min_extent_capacity,
+                    max_extent_capacity,
+                    extent_growth_factor,
                 );
                 info!(
-                    "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}",
-                    stream_id, extent_id, start_offset, extent_capacity,
+                    "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
+                    stream_id, extent_id, start_offset, extent_capacity, min_extent_capacity, max_extent_capacity, extent_growth_factor,
                 );
             }
         } else {
@@ -124,15 +155,16 @@ impl ExtentNodeStore {
                 start_offset,
                 epoch,
                 extent_capacity,
-                DEFAULT_MAX_EXTENT_CAPACITY,
-                DEFAULT_EXTENT_GROWTH_FACTOR,
+                min_extent_capacity,
+                max_extent_capacity,
+                extent_growth_factor,
             );
             guard.insert(stream_id, stream);
             self.next_stream_id
                 .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
             info!(
-                "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}",
-                stream_id, extent_id, start_offset, extent_capacity,
+                "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
+                stream_id, extent_id, start_offset, extent_capacity, min_extent_capacity, max_extent_capacity, extent_growth_factor,
             );
         }
     }
@@ -249,13 +281,6 @@ impl ExtentNodeStore {
     }
 
     /// Handle ForwardChecksum (0x0B, flag=0x02) — CRC32 verification for sealed extent.
-    ///
-    /// Due to leader Mutex races on the primary, this frame may arrive before all
-    /// Forward frames have been processed on the secondary. The primary's checksum
-    /// and committed_bytes are stored in the extent for deferred verification.
-    /// `try_advance_committed()` is called to advance as far as possible, and
-    /// `try_verify_checksum()` checks if all records have been hashed.
-    /// If not yet ready, verification will complete on a subsequent `replicate()` call.
     pub(crate) fn handle_forward_checksum(&self, frame: Frame) {
         let (stream_id, extent_id, primary_crc32, primary_committed_bytes) =
             match &frame.variable_header {
@@ -282,13 +307,8 @@ impl ExtentNodeStore {
         };
 
         let found = stream.with_extent(extent_id, |extent| {
-            // Store primary's checksum for deferred comparison.
             extent.store_primary_checksum(primary_crc32);
-
-            // Advance incremental CRC32 as far as possible.
             extent.try_advance_committed();
-
-            // Check if verification can complete now.
             match extent.try_verify_checksum() {
                 Some(true) => {
                     info!(
@@ -299,8 +319,7 @@ impl ExtentNodeStore {
                 Some(false) => {
                     warn!(
                         "CRC32 checksum mismatch: stream={}, extent={}, \
-                         primary_crc32={:#010x}, primary_bytes={} \
-                         (verification will be logged by try_verify_checksum)",
+                         primary_crc32={:#010x}, primary_bytes={}",
                         stream_id, extent_id, primary_crc32, primary_committed_bytes,
                     );
                 }
@@ -322,10 +341,6 @@ impl ExtentNodeStore {
     }
 
     /// Handle ForwardFlushed (0x05, flag=0x03) — extent flushed to S3 notification.
-    ///
-    /// Sent by the Primary after a sealed extent is uploaded to S3.
-    /// Secondaries use this to mark the extent as eligible for memory eviction.
-    /// Fire-and-forget: no response.
     pub(crate) fn handle_forward_flushed(&self, frame: Frame) {
         let (stream_id, extent_id) = match &frame.variable_header {
             VariableHeader::ForwardFlushed {

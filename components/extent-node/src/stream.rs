@@ -589,6 +589,12 @@ impl Stream {
         self.inner.read().max_extents
     }
 
+    /// Return (min_extent_capacity, max_extent_capacity, growth_factor) for this stream.
+    pub fn capacity_bounds(&self) -> (u32, u32, u8) {
+        let inner = self.inner.read();
+        (inner.min_extent_capacity, inner.max_extent_capacity, inner.growth_factor)
+    }
+
     /// Return the storage class for this stream.
     pub fn storage_class(&self) -> StorageClass {
         self.inner.read().storage_class
@@ -607,17 +613,21 @@ impl Stream {
         self.inner.write().storage_class = class;
     }
 
-    /// Register a new extent on this stream (called when SM sends RegisterExtent).
-    /// Updates the epoch and sets up the next extent ID for autonomous creation.
+    /// Register a new extent on this stream (called when SM sends RegisterExtent
+    /// or when a secondary receives ForwardInitExtent).
     ///
-    /// `extent_capacity` is the capacity for this specific extent (SM-decided).
+    /// `initial_capacity` is the arena size for this specific extent.
+    /// For primaries (SM path), this equals `min_extent_capacity` (first extent starts at min).
+    /// For secondaries (ForwardInitExtent), this equals the primary's actual extent capacity.
+    ///
     /// `min_extent_capacity` and `max_extent_capacity` are the stream-level bounds
-    /// for adaptive sizing. The initial extent is allocated at `min_extent_capacity`.
+    /// for adaptive sizing during autonomous extent creation.
     pub fn register_extent(
         &self,
         id: ExtentId,
         start_offset: Offset,
         epoch: Epoch,
+        initial_capacity: u32,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
         growth_factor: u8,
@@ -627,13 +637,13 @@ impl Stream {
         inner.min_extent_capacity = min_extent_capacity;
         inner.max_extent_capacity = max_extent_capacity;
         inner.growth_factor = growth_factor;
-        inner.next_extent_capacity = min_extent_capacity;
+        inner.next_extent_capacity = initial_capacity;
         inner.next_extent_id = ExtentId(id.0 + 1);
         inner.active_extent_created_at = Some(Instant::now());
         inner.extents.push(Extent::with_capacity(
             id,
             start_offset,
-            min_extent_capacity,
+            initial_capacity,
             epoch,
         ));
         inner.evict_oldest_extents(self.id);
@@ -644,7 +654,7 @@ impl Stream {
             inner.extent_pool.push_back(Extent::with_capacity(
                 ExtentId(0), // placeholder — reset() overwrites on use
                 Offset(0),
-                min_extent_capacity,
+                initial_capacity,
                 Epoch(0),
             ));
         }
@@ -664,6 +674,7 @@ impl Stream {
             id,
             start_offset,
             epoch,
+            extent_capacity,
             extent_capacity,
             extent_capacity,
             2, // default growth factor for tests
@@ -738,12 +749,13 @@ impl Stream {
         // Returns None on backpressure (S3 flush backlog blocking eviction).
         let epoch = Epoch(self.epoch.load(Ordering::Acquire));
         let (new_id, _) = inner.try_create_next_extent(self.id, epoch)?;
+        let new_capacity = inner.extents.last().map(|e| e.capacity()).unwrap_or(0);
         Some(SealNotification {
             sealed_extent_id: active_id,
             end_offset,
             new_extent_id: new_id,
             epoch,
-            new_extent_capacity: inner.next_extent_capacity,
+            new_extent_capacity: new_capacity,
         })
     }
 
@@ -1207,6 +1219,7 @@ mod tests {
             Offset(0),
             Epoch(0),
             min_cap,
+            min_cap,
             max_cap,
             2,
         );
@@ -1250,6 +1263,7 @@ mod tests {
             Offset(0),
             Epoch(0),
             min_cap,
+            min_cap,
             max_cap,
             2,
         );
@@ -1283,7 +1297,7 @@ mod tests {
         let max_cap: u32 = 2048;
         let stream = Stream::new(StreamId(1));
         stream.set_max_extents(4);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap, max_cap, 2);
+        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap, min_cap, max_cap, 2);
 
         // Fill extent to trigger growth (256 → 512 via ExtentFull).
         loop {
@@ -1312,7 +1326,7 @@ mod tests {
         let max_cap: u32 = 2048;
         let stream = Stream::new(StreamId(1));
         stream.set_max_extents(4);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap, max_cap, 2);
+        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap, min_cap, max_cap, 2);
         // Don't write anything — extent is completely empty.
 
         let notif = stream.seal_and_create_next(SealReason::IdleShrink).unwrap();
@@ -1329,6 +1343,7 @@ mod tests {
             ExtentId(0),
             Offset(0),
             Epoch(0),
+            min_cap,
             min_cap,
             max_cap,
             2,
@@ -1352,6 +1367,7 @@ mod tests {
             ExtentId(0),
             Offset(0),
             Epoch(0),
+            min_cap,
             min_cap,
             max_cap,
             2,
@@ -1377,6 +1393,7 @@ mod tests {
             ExtentId(0),
             Offset(0),
             Epoch(0),
+            min_cap,
             min_cap,
             max_cap,
             2,
