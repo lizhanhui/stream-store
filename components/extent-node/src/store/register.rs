@@ -25,6 +25,8 @@ impl ExtentNodeStore {
             epoch,
             extent_capacity,
             cache_extents,
+            min_extent_capacity,
+            max_extent_capacity,
             extent_growth_factor,
             storage_class,
         ) = match &frame.variable_header {
@@ -36,6 +38,8 @@ impl ExtentNodeStore {
                 epoch,
                 extent_capacity,
                 cache_extents,
+                min_extent_capacity,
+                max_extent_capacity,
                 extent_growth_factor,
                 storage_class,
                 ..
@@ -47,6 +51,8 @@ impl ExtentNodeStore {
                 *epoch,
                 *extent_capacity,
                 *cache_extents,
+                *min_extent_capacity,
+                *max_extent_capacity,
                 *extent_growth_factor,
                 *storage_class,
             ),
@@ -58,6 +64,18 @@ impl ExtentNodeStore {
                     ExtentId(0),
                 );
             }
+        };
+
+        // Normalize capacity bounds: 0 means use default.
+        let min_extent_capacity = if min_extent_capacity == 0 {
+            DEFAULT_MIN_EXTENT_CAPACITY
+        } else {
+            min_extent_capacity
+        };
+        let max_extent_capacity = if max_extent_capacity == 0 {
+            DEFAULT_MAX_EXTENT_CAPACITY
+        } else {
+            max_extent_capacity
         };
 
         // Parse replica addresses from the payload.
@@ -90,8 +108,8 @@ impl ExtentNodeStore {
                     stream.max_offset(),
                     extent_capacity,
                     epoch,
-                    DEFAULT_MIN_EXTENT_CAPACITY,
-                    DEFAULT_MAX_EXTENT_CAPACITY,
+                    min_extent_capacity,
+                    max_extent_capacity,
                     extent_growth_factor,
                 );
             } else {
@@ -108,8 +126,8 @@ impl ExtentNodeStore {
                 Offset(0),
                 extent_capacity,
                 epoch,
-                DEFAULT_MIN_EXTENT_CAPACITY,
-                DEFAULT_MAX_EXTENT_CAPACITY,
+                min_extent_capacity,
+                max_extent_capacity,
                 extent_growth_factor,
             );
             streams_guard.insert(stream_id, stream);
