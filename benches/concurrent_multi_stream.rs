@@ -52,19 +52,19 @@ static GLOBAL: Jemalloc = Jemalloc;
 // -- Benchmark Parameters -----------------------------------------------------
 
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
-const REPORT_INTERVAL: Duration = Duration::from_secs(5);
+const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const REPLICATION_FACTOR: u8 = 2;
-const MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024; // 8 MiB
-const MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024; // 256 MiB
-const CACHE_EXTENTS: u16 = 4;
+const MIN_EXTENT_CAPACITY: u32 = 1 * 1024 * 1024; // 1 MiB
+const MAX_EXTENT_CAPACITY: u32 = 16 * 1024 * 1024; // 16 MiB
+const CACHE_EXTENTS: u16 = 3;
 const EXTENT_GROWTH_FACTOR: u8 = 8;
-const PIPELINE_DEPTH: usize = 16;
+const PIPELINE_DEPTH: usize = 2;
 
 fn num_streams() -> usize {
     std::env::var("BENCH_STREAMS")
         .ok()
         .and_then(|s| s.parse().ok())
-        .unwrap_or(4)
+        .unwrap_or(32)
 }
 
 fn writers_per_stream() -> usize {
@@ -78,7 +78,7 @@ fn bench_duration() -> Duration {
     let secs = std::env::var("BENCH_DURATION_SECS")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(10);
+        .unwrap_or(60);
     Duration::from_secs(secs)
 }
 
@@ -199,6 +199,7 @@ async fn main() {
             bind_ip: "127.0.0.1".into(),
             port: 0,
             stream_manager_addrs: vec![stream_manager_addr.clone()],
+            replication_timeout_ms: 1500,
             ..Default::default()
         };
         let node = ExtentNode::start(config).await;
