@@ -126,7 +126,7 @@ impl ExtentNodeStore {
         };
 
         let is_new = self.get_or_create_stream(stream_id, cache_extents, storage_class);
-        self.register_extent_if_absent(
+        self.try_register_extent(
             stream_id,
             extent_id,
             start_offset,
@@ -151,13 +151,13 @@ impl ExtentNodeStore {
     }
 
     /// Register an extent on a stream if it doesn't already exist.
-    fn register_extent_if_absent(
+    fn try_register_extent(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
         start_offset: Offset,
         epoch: Epoch,
-        initial_capacity: u32,
+        extent_capacity: u32,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
         extent_growth_factor: u8,
@@ -169,7 +169,7 @@ impl ExtentNodeStore {
                     extent_id,
                     start_offset,
                     epoch,
-                    initial_capacity,
+                    extent_capacity,
                     min_extent_capacity,
                     max_extent_capacity,
                     extent_growth_factor,
