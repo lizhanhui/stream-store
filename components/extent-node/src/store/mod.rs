@@ -12,7 +12,7 @@ pub(crate) use types::AppendJob;
 pub use types::{ExtentUpdate, ReplicaInfo};
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::hasher::IdentityBuildHasher;
@@ -46,8 +46,6 @@ pub struct ExtentNodeStore {
     /// Uses `IdentityBuildHasher` — StreamId is a server-assigned u32, so the
     /// identity hash (no mixing) is safe and eliminates ~15 ns of SipHash per lookup.
     pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
-    /// Monotonic stream ID generator (atomic, no lock needed).
-    pub(crate) next_stream_id: AtomicU32,
     /// Replication info per stream_id (registered via RegisterExtent).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
     pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>, IdentityBuildHasher>,
@@ -80,7 +78,7 @@ impl ExtentNodeStore {
     pub fn new() -> Self {
         Self {
             streams: papaya::HashMap::with_hasher(IdentityBuildHasher),
-            next_stream_id: AtomicU32::new(1),
+
             replicas: papaya::HashMap::with_hasher(IdentityBuildHasher),
             downstream: OnceLock::new(),
             s3_client: OnceLock::new(),
@@ -107,13 +105,17 @@ impl ExtentNodeStore {
 
     /// Ensure a stream exists, creating it if needed.
     ///
-    /// Always applies `cache_extents` (if > 0) and `storage_class` to the stream,
-    /// whether existing or new. Returns `true` if the stream was just created.
+    /// Always applies all stream-level configs (cache_extents, storage_class,
+    /// capacity bounds) to the stream, whether existing or new.
+    /// Returns `true` if the stream was just created.
     pub(crate) fn try_create_stream(
         &self,
         stream_id: StreamId,
         cache_extents: u16,
         storage_class: StorageClass,
+        min_extent_capacity: u32,
+        max_extent_capacity: u32,
+        extent_growth_factor: u8,
     ) -> bool {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id) {
@@ -121,6 +123,7 @@ impl ExtentNodeStore {
                 stream.set_max_extents(cache_extents as usize);
             }
             stream.set_storage_class(storage_class);
+            stream.set_capacity_bounds(min_extent_capacity, max_extent_capacity, extent_growth_factor);
             false
         } else {
             let stream = Stream::new(stream_id);
@@ -128,9 +131,8 @@ impl ExtentNodeStore {
                 stream.set_max_extents(cache_extents as usize);
             }
             stream.set_storage_class(storage_class);
+            stream.set_capacity_bounds(min_extent_capacity, max_extent_capacity, extent_growth_factor);
             guard.insert(stream_id, stream);
-            self.next_stream_id
-                .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
             true
         }
     }

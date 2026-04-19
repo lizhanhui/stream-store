@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use common::config::{DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY};
 use common::types::{ErrorCode, ExtentId};
@@ -91,7 +90,14 @@ impl ExtentNodeStore {
         // Create the stream locally if it doesn't exist, then register the new extent.
         // Skip extent creation if it already exists (idempotent — extent may have been
         // lazily created by a forwarded append that arrived before this RegisterExtent).
-        self.try_create_stream(stream_id, cache_extents, storage_class);
+        self.try_create_stream(
+            stream_id,
+            cache_extents,
+            storage_class,
+            min_extent_capacity,
+            max_extent_capacity,
+            extent_growth_factor,
+        );
 
         // Register the extent (idempotent — skips if already exists).
         let streams_guard = self.streams.pin();
@@ -102,9 +108,6 @@ impl ExtentNodeStore {
                     stream.max_offset(),
                     epoch,
                     min_extent_capacity,
-                    min_extent_capacity,
-                    max_extent_capacity,
-                    extent_growth_factor,
                 );
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
@@ -112,11 +115,6 @@ impl ExtentNodeStore {
                 stream.set_epoch(epoch);
             }
         }
-
-        // Update next_stream_id to avoid collision with StreamManager-assigned IDs.
-        // Use fetch_max to atomically ensure we stay above the assigned ID.
-        self.next_stream_id
-            .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
 
         let role_name = if role == ROLE_PRIMARY {
             "Primary"
