@@ -125,16 +125,20 @@ impl ExtentNodeStore {
             extent_growth_factor
         };
 
-        let is_new = self.try_create_stream(stream_id, cache_extents, storage_class);
+        let is_new = self.try_create_stream(
+            stream_id,
+            cache_extents,
+            storage_class,
+            min_extent_capacity,
+            max_extent_capacity,
+            extent_growth_factor,
+        );
         self.try_register_extent(
             stream_id,
             extent_id,
             start_offset,
             epoch,
             extent_capacity,
-            min_extent_capacity,
-            max_extent_capacity,
-            extent_growth_factor,
         );
 
         if is_new {
@@ -158,9 +162,6 @@ impl ExtentNodeStore {
         start_offset: Offset,
         epoch: Epoch,
         extent_capacity: u32,
-        min_extent_capacity: u32,
-        max_extent_capacity: u32,
-        extent_growth_factor: u8,
     ) {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id) {
@@ -170,9 +171,6 @@ impl ExtentNodeStore {
                     start_offset,
                     epoch,
                     extent_capacity,
-                    min_extent_capacity,
-                    max_extent_capacity,
-                    extent_growth_factor,
                 );
             }
         }
