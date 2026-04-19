@@ -406,7 +406,6 @@ impl StreamManagerStore {
                         role: 0, // Primary
                         replication_factor: rf,
                         epoch: ep,
-                        extent_capacity: minc,
                         min_extent_capacity: minc,
                         max_extent_capacity: maxc,
                         cache_extents: ce,
@@ -498,7 +497,6 @@ impl StreamManagerStore {
                                     role,
                                     replication_factor: rf,
                                     epoch: ep,
-                                    extent_capacity: minc,
                                     min_extent_capacity: minc,
                                     max_extent_capacity: maxc,
                                     cache_extents: ce,
@@ -850,7 +848,7 @@ impl StreamManagerStore {
 
         let result = async {
             // 1. Create stream in metadata with per-stream replication factor and extent capacity.
-            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u8, min_extent_capacity, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class).await?;
+            let stream_id = self.store.create_stream(&stream_name, "DATA", replication_factor as u8, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class).await?;
 
             // 2. Allocate first extent replica set and notify ExtentNodes.
             let (extent_id, primary_addr) =
@@ -1198,7 +1196,6 @@ impl StreamManagerStore {
         // Pick nodes for new extent replica set using per-stream replication factor.
         let replication_factor =
             self.store.get_stream_replication_factor(stream_id).await? as usize;
-        let _extent_capacity = self.store.get_stream_extent_capacity(stream_id).await?;
         let cache_extents = self.store.get_stream_cache_extents(stream_id).await?;
         let (min_extent_capacity, max_extent_capacity) =
             self.store.get_stream_capacity_bounds(stream_id).await?;

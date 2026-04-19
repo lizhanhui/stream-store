@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use common::config::{
-    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY, DEFAULT_EXTENT_GROWTH_FACTOR,
+    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR,
     DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StorageClass, StreamId};
@@ -31,7 +31,6 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
                     role: 0,
                     replication_factor: 1,
                     epoch: Epoch(0),
-                    extent_capacity: DEFAULT_EXTENT_CAPACITY,
                     min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
@@ -243,7 +242,6 @@ async fn register_extent_creates_stream() {
                     role: 0,
                     replication_factor: 2,
                     epoch: Epoch(0),
-                    extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
@@ -295,7 +293,6 @@ async fn register_extent_secondary() {
                     role: 1,
                     replication_factor: 2,
                     epoch: Epoch(0),
-                    extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
@@ -339,7 +336,6 @@ async fn register_extent_then_append_rf1() {
                     role: 0,
                     replication_factor: 1,
                     epoch: Epoch(0),
-                    extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
@@ -404,7 +400,6 @@ async fn primary_append_defers_and_broadcasts() {
                     role: 0,
                     replication_factor: 3,
                     epoch: Epoch(0),
-                    extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
@@ -497,7 +492,6 @@ async fn secondary_returns_watermark() {
                     role: 1,
                     replication_factor: 2,
                     epoch: Epoch(0),
-                    extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
@@ -1040,7 +1034,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                     role: 1,
                     replication_factor: 2,
                     epoch: Epoch(0),
-                    extent_capacity: DEFAULT_EXTENT_CAPACITY as u32,
                     min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
                     max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                     extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,

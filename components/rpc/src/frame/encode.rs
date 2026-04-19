@@ -70,8 +70,8 @@ impl Frame {
             VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
-            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + extent_capacity(4) + cache_extents(2) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(1) + storage_class(1)
-            VariableHeader::RegisterExtent { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 4 + 2 + 4 + 4 + 1 + 1,
+            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + cache_extents(2) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(1) + storage_class(1)
+            VariableHeader::RegisterExtent { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 2 + 4 + 4 + 1 + 1,
             // request_id(4) + stream_id(4) + extent_id(4)
             VariableHeader::RegisterExtentAck { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
@@ -400,7 +400,6 @@ impl Frame {
                 role,
                 replication_factor,
                 epoch,
-                extent_capacity,
                 cache_extents,
                 min_extent_capacity,
                 max_extent_capacity,
@@ -413,7 +412,6 @@ impl Frame {
                 dst.put_u8(*role);
                 dst.put_u8(*replication_factor);
                 dst.put_u32(epoch.0);
-                dst.put_u32(*extent_capacity);
                 dst.put_u16(*cache_extents);
                 dst.put_u32(*min_extent_capacity);
                 dst.put_u32(*max_extent_capacity);

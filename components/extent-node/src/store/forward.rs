@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use common::config::{
-    DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
+    DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
 };
 use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, StreamId};
@@ -51,7 +51,7 @@ impl ExtentNodeStore {
                     extent_id,
                     epoch,
                     start_offset: ext.start_offset,
-                    extent_capacity: stream.extent_capacity(),
+                    extent_capacity: ext.capacity(),
                     cache_extents: stream.max_extents() as u16,
                     storage_class: stream.storage_class(),
                 },
@@ -105,9 +105,8 @@ impl ExtentNodeStore {
                 stream.register_extent(
                     extent_id,
                     start_offset,
-                    extent_capacity,
                     epoch,
-                    DEFAULT_MIN_EXTENT_CAPACITY,
+                    extent_capacity,
                     DEFAULT_MAX_EXTENT_CAPACITY,
                     DEFAULT_EXTENT_GROWTH_FACTOR,
                 );
@@ -123,9 +122,8 @@ impl ExtentNodeStore {
             stream.register_extent(
                 extent_id,
                 start_offset,
-                extent_capacity,
                 epoch,
-                DEFAULT_MIN_EXTENT_CAPACITY,
+                extent_capacity,
                 DEFAULT_MAX_EXTENT_CAPACITY,
                 DEFAULT_EXTENT_GROWTH_FACTOR,
             );

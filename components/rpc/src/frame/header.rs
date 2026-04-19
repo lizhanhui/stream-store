@@ -172,8 +172,6 @@ pub enum VariableHeader {
         replication_factor: u8,
         /// Stream epoch for this extent registration.
         epoch: Epoch,
-        /// Per-stream extent arena capacity in bytes.
-        extent_capacity: u32,
         /// Maximum extents to retain in memory for this stream. 0 = no limit.
         cache_extents: u16,
         /// Minimum extent capacity for this stream (0 = use default min).

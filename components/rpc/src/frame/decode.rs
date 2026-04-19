@@ -491,7 +491,6 @@ impl Frame {
                     let role = body.get_u8();
                     let replication_factor = body.get_u8();
                     let epoch = Epoch(body.get_u32());
-                    let extent_capacity = body.get_u32();
                     let cache_extents = body.get_u16();
                     let min_extent_capacity = body.get_u32();
                     let max_extent_capacity = body.get_u32();
@@ -511,7 +510,6 @@ impl Frame {
                             role,
                             replication_factor,
                             epoch,
-                            extent_capacity,
                             cache_extents,
                             min_extent_capacity,
                             max_extent_capacity,

@@ -43,7 +43,6 @@ async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u32, extent_i
                     role: 0,
                     replication_factor: 1,
                     epoch: Epoch(0),
-                    extent_capacity: 64 * 1024 * 1024,
                     cache_extents: 4,
                     min_extent_capacity: 8 * 1024 * 1024,
                     max_extent_capacity: 256 * 1024 * 1024,
