@@ -9,5 +9,6 @@ bytes = { workspace = true }
 tokio-util = { workspace = true }
 futures-util = { workspace = true }
 tracing = { workspace = true }
+snafu = { workspace = true }
 common = { path = "../common" }
 rpc = { path = "../rpc" }

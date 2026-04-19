@@ -57,7 +57,7 @@ impl Compression {
             0 => Ok(Self::None),
             1 => Ok(Self::Zstd),
             2 => Ok(Self::Lz4),
-            _ => Err(CodecError::UnsupportedCompression(v)),
+            _ => Err(UnsupportedCompressionSnafu { tag: v }.build()),
         }
     }
 
@@ -67,7 +67,10 @@ impl Compression {
             "none" | "" => Ok(Self::None),
             "zstd" => Ok(Self::Zstd),
             "lz4" => Ok(Self::Lz4),
-            _ => Err(CodecError::UnknownCompressionName(s.to_string())),
+            _ => Err(UnknownCompressionNameSnafu {
+                name: s.to_string(),
+            }
+            .build()),
         }
     }
 
@@ -86,10 +89,19 @@ impl Compression {
     ) -> Result<Vec<u8>, CodecError> {
         match self {
             Compression::None => Ok(data.to_vec()),
-            Compression::Zstd => zstd::bulk::decompress(data, max_decompressed_size)
-                .map_err(|e| CodecError::DecompressFailed(format!("zstd: {e}"))),
+            Compression::Zstd => zstd::bulk::decompress(data, max_decompressed_size).map_err(|e| {
+                DecompressFailedSnafu {
+                    message: format!("zstd: {e}"),
+                }
+                .build()
+            }),
             Compression::Lz4 => lz4::block::decompress(data, Some(max_decompressed_size as i32))
-                .map_err(|e| CodecError::DecompressFailed(format!("lz4: {e}"))),
+                .map_err(|e| {
+                    DecompressFailedSnafu {
+                        message: format!("lz4: {e}"),
+                    }
+                    .build()
+                }),
         }
     }
 }
@@ -159,15 +171,15 @@ impl S3ExtentHeader {
     /// Decode a header from a byte slice (must be at least 64 bytes).
     pub fn decode(buf: &[u8]) -> Result<Self, CodecError> {
         if buf.len() < S3_EXTENT_HEADER_SIZE {
-            return Err(CodecError::HeaderTooShort(buf.len()));
+            return Err(HeaderTooShortSnafu { size: buf.len() }.build());
         }
         let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != S3_EXTENT_MAGIC {
-            return Err(CodecError::BadMagic(magic));
+            return Err(BadMagicSnafu { magic: magic }.build());
         }
         let version = u16::from_be_bytes([buf[4], buf[5]]);
         if version != S3_EXTENT_VERSION {
-            return Err(CodecError::UnsupportedVersion(version));
+            return Err(UnsupportedVersionSnafu { version: version }.build());
         }
         let flags = u16::from_be_bytes([buf[6], buf[7]]);
         let stream_id = u64::from_be_bytes(buf[8..16].try_into().unwrap());
@@ -319,25 +331,51 @@ pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compress
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 /// Errors from S3 extent codec operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(snafu::Snafu)]
+#[snafu(visibility(pub))]
+#[snafu_virtstack::stack_trace_debug]
 pub enum CodecError {
-    #[error("header too short: {0} bytes (need {S3_EXTENT_HEADER_SIZE})")]
-    HeaderTooShort(usize),
+    #[snafu(display("header too short: {size} bytes (need {S3_EXTENT_HEADER_SIZE})"))]
+    HeaderTooShort {
+        size: usize,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("bad magic: {0:#010x} (expected {S3_EXTENT_MAGIC:#010x})")]
-    BadMagic(u32),
+    #[snafu(display("bad magic: {magic:#010x} (expected {S3_EXTENT_MAGIC:#010x})"))]
+    BadMagic {
+        magic: u32,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("unsupported version: {0} (expected {S3_EXTENT_VERSION})")]
-    UnsupportedVersion(u16),
+    #[snafu(display("unsupported version: {version} (expected {S3_EXTENT_VERSION})"))]
+    UnsupportedVersion {
+        version: u16,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("unsupported compression tag: {0}")]
-    UnsupportedCompression(u8),
+    #[snafu(display("unsupported compression tag: {tag}"))]
+    UnsupportedCompression {
+        tag: u8,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("unknown compression name: {0:?} (expected none/zstd/lz4)")]
-    UnknownCompressionName(String),
+    #[snafu(display("unknown compression name: {name:?} (expected none/zstd/lz4)"))]
+    UnknownCompressionName {
+        name: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("decompression failed: {0}")]
-    DecompressFailed(String),
+    #[snafu(display("decompression failed: {message}"))]
+    DecompressFailed {
+        message: String,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -462,7 +500,7 @@ mod tests {
         buf[0..4].copy_from_slice(&0xBAD_u32.to_be_bytes());
         assert!(matches!(
             S3ExtentHeader::decode(&buf),
-            Err(CodecError::BadMagic(0xBAD))
+            Err(CodecError::BadMagic { .. })
         ));
     }
 
@@ -471,7 +509,7 @@ mod tests {
         let buf = [0u8; 32];
         assert!(matches!(
             S3ExtentHeader::decode(&buf),
-            Err(CodecError::HeaderTooShort(32))
+            Err(CodecError::HeaderTooShort { .. })
         ));
     }
 

@@ -278,7 +278,7 @@ impl ExtentNodeStore {
         // Write locally via single-writer append on the active extent.
         let (append_result, extent_id) = match stream.try_append_active(payload) {
             Ok(r) => r,
-            Err(StorageError::ExtentSealed(extent_id)) => {
+            Err(StorageError::ExtentSealed { extent_id, .. }) => {
                 let err = Frame::append_ack_error(
                     request_id,
                     stream_id,
@@ -293,7 +293,7 @@ impl ExtentNodeStore {
                 }
                 return (Some(err), false);
             }
-            Err(StorageError::ExtentFull(_)) => {
+            Err(StorageError::ExtentFull { .. }) => {
                 // Don't send error to client — the caller will seal, create a new extent,
                 // and retry the append transparently. Return extent_full=true.
                 return (None, true);
@@ -806,7 +806,7 @@ impl ExtentNodeStore {
                             extent_id: eid,
                         });
                     }
-                    Err(StorageError::ExtentSealed(extent_id)) => {
+                    Err(StorageError::ExtentSealed { extent_id, .. }) => {
                         let err = Frame::append_ack_error(
                             request_id,
                             stream_id,
@@ -821,7 +821,7 @@ impl ExtentNodeStore {
                             responses.push(err);
                         }
                     }
-                    Err(StorageError::ExtentFull(_)) => {
+                    Err(StorageError::ExtentFull { .. }) => {
                         extent_full = true;
                         failed_frames.push(FailedFrame {
                             request_id,

@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use bytes::{Buf, Bytes};
 use common::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SM_REQUEST_TIMEOUT_MS};
-use common::errors::StorageError;
+use common::errors::{
+    EpochStaleSnafu, ExtentSealedSnafu, InternalSnafu, NetworkSnafu, StorageError,
+    UnknownStreamSnafu,
+};
 use common::types::{
     Epoch, ErrorCode, ExtentId, ExtentInfo, ExtentState, NodeMetrics, Offset, Opcode, StorageClass,
     StreamId,
@@ -79,10 +82,18 @@ impl StreamClient {
     ) -> Result<Self, StorageError> {
         let stream = tokio::time::timeout(connect_timeout, TcpStream::connect(addr))
             .await
-            .map_err(|_| StorageError::Internal(format!("connect timeout to {addr}")))??;
-        stream
-            .set_nodelay(true)
-            .map_err(|e| StorageError::Internal(format!("set TCP_NODELAY: {e}")))?;
+            .map_err(|_| {
+                NetworkSnafu {
+                    message: format!("connect timeout to {addr}"),
+                }
+                .build()
+            })??;
+        stream.set_nodelay(true).map_err(|e| {
+            NetworkSnafu {
+                message: format!("set TCP_NODELAY: {e}"),
+            }
+            .build()
+        })?;
 
         let (read_half, write_half) = stream.into_split();
         let framed_read = FramedRead::new(read_half, FrameCodec);
@@ -143,9 +154,10 @@ impl StreamClient {
                     // Notify all pending callers of the error.
                     let mut pending = inner.pending.lock().await;
                     for (_, tx) in pending.drain() {
-                        let _ = tx.send(Err(StorageError::Internal(format!(
-                            "connection read error: {e}"
-                        ))));
+                        let _ = tx.send(Err(NetworkSnafu {
+                            message: format!("connection read error: {e}"),
+                        }
+                        .build()));
                     }
                     break;
                 }
@@ -153,7 +165,10 @@ impl StreamClient {
                     // Connection closed.
                     let mut pending = inner.pending.lock().await;
                     for (_, tx) in pending.drain() {
-                        let _ = tx.send(Err(StorageError::Internal("connection closed".into())));
+                        let _ = tx.send(Err(NetworkSnafu {
+                            message: "connection closed",
+                        }
+                        .build()));
                     }
                     break;
                 }
@@ -182,7 +197,10 @@ impl StreamClient {
             // Writer task is gone — clean up and report.
             let mut pending = self.inner.pending.lock().await;
             pending.remove(&request_id);
-            return Err(StorageError::Internal("connection closed".into()));
+            return Err(NetworkSnafu {
+                message: "connection closed",
+            }
+            .build());
         }
 
         // Wait for response with timeout.
@@ -190,13 +208,19 @@ impl StreamClient {
             Ok(Ok(result)) => result,
             Ok(Err(_recv_err)) => {
                 // Sender was dropped (reader task died).
-                Err(StorageError::Internal("connection closed".into()))
+                Err(NetworkSnafu {
+                    message: "connection closed",
+                }
+                .build())
             }
             Err(_timeout) => {
                 // Timed out — clean up pending slot.
                 let mut pending = self.inner.pending.lock().await;
                 pending.remove(&request_id);
-                Err(StorageError::Internal("RPC request timeout".into()))
+                Err(NetworkSnafu {
+                    message: "RPC request timeout",
+                }
+                .build())
             }
         }
     }
@@ -209,11 +233,12 @@ impl StreamClient {
     /// Send a raw frame without waiting for a response (fire-and-forget).
     /// Used for async notifications like NOTIFY_SEALED_EXTENT.
     pub async fn send_frame_no_response(&self, frame: Frame) -> Result<(), StorageError> {
-        self.inner
-            .write_tx
-            .send(frame)
-            .await
-            .map_err(|e| StorageError::Internal(format!("send failed: {e}")))?;
+        self.inner.write_tx.send(frame).await.map_err(|e| {
+            NetworkSnafu {
+                message: format!("send failed: {e}"),
+            }
+            .build()
+        })?;
         Ok(())
     }
 
@@ -225,10 +250,20 @@ impl StreamClient {
         let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default()).to_string();
         let error_code = ErrorCode::from_u16(resp.error_code());
         Err(match error_code {
-            Some(ErrorCode::UnknownStream) => StorageError::UnknownStream(resp.stream_id()),
-            Some(ErrorCode::ExtentSealed) => StorageError::ExtentSealed(resp.extent_id()),
-            Some(ErrorCode::EpochStale) => StorageError::EpochStale(resp.stream_id(), resp.epoch()),
-            _ => StorageError::Internal(msg),
+            Some(ErrorCode::UnknownStream) => UnknownStreamSnafu {
+                stream_id: resp.stream_id(),
+            }
+            .build(),
+            Some(ErrorCode::ExtentSealed) => ExtentSealedSnafu {
+                extent_id: resp.extent_id(),
+            }
+            .build(),
+            Some(ErrorCode::EpochStale) => EpochStaleSnafu {
+                stream_id: resp.stream_id(),
+                epoch: resp.epoch(),
+            }
+            .build(),
+            _ => InternalSnafu { message: msg }.build(),
         })
     }
 
@@ -266,19 +301,20 @@ impl StreamClient {
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::CreateStream {
-            return Err(StorageError::Internal(format!(
-                "expected CreateStream response, got {:?}",
-                resp.opcode()
-            )));
+            return Err(InternalSnafu {
+                message: format!("expected CreateStream response, got {:?}", resp.opcode()),
+            }
+            .build());
         }
 
         let addr =
             if let VariableHeader::CreateStreamResp { primary_addr, .. } = &resp.variable_header {
                 String::from_utf8_lossy(primary_addr).to_string()
             } else {
-                return Err(StorageError::Internal(
-                    "unexpected variable header in CreateStreamResp".into(),
-                ));
+                return Err(InternalSnafu {
+                    message: "unexpected variable header in CreateStreamResp",
+                }
+                .build());
             };
 
         let stream_id = resp.stream_id();
@@ -392,10 +428,10 @@ impl StreamClient {
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::Connect {
-            return Err(StorageError::Internal(format!(
-                "expected Connect response, got {:?}",
-                resp.opcode()
-            )));
+            return Err(InternalSnafu {
+                message: format!("expected Connect response, got {:?}", resp.opcode()),
+            }
+            .build());
         }
         Ok(())
     }
@@ -428,10 +464,10 @@ impl StreamClient {
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::Disconnect {
-            return Err(StorageError::Internal(format!(
-                "expected Disconnect response, got {:?}",
-                resp.opcode()
-            )));
+            return Err(InternalSnafu {
+                message: format!("expected Disconnect response, got {:?}", resp.opcode()),
+            }
+            .build());
         }
         Ok(())
     }
@@ -469,10 +505,10 @@ impl StreamClient {
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::SealStreamManager {
-            return Err(StorageError::Internal(format!(
-                "expected SealStreamManagerResp, got {:?}",
-                resp.opcode()
-            )));
+            return Err(InternalSnafu {
+                message: format!("expected SealStreamManagerResp, got {:?}", resp.opcode()),
+            }
+            .build());
         }
 
         if let VariableHeader::SealStreamManagerResp {
@@ -487,9 +523,10 @@ impl StreamClient {
             }
             Ok((*new_epoch, addr))
         } else {
-            Err(StorageError::Internal(
-                "unexpected variable header in SealStreamManagerResp".into(),
-            ))
+            Err(InternalSnafu {
+                message: "unexpected variable header in SealStreamManagerResp",
+            }
+            .build())
         }
     }
 
@@ -517,14 +554,17 @@ impl StreamClient {
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::DescribeStream {
-            return Err(StorageError::Internal(format!(
-                "expected DescribeStream response, got {:?}",
-                resp.opcode()
-            )));
+            return Err(InternalSnafu {
+                message: format!("expected DescribeStream response, got {:?}", resp.opcode()),
+            }
+            .build());
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
             .ok_or_else(|| {
-                StorageError::Internal("invalid DescribeStream response payload".into())
+                InternalSnafu {
+                    message: "invalid DescribeStream response payload",
+                }
+                .build()
             })?;
         self.cache_primary_from_extents(stream_id, &extents).await;
         Ok(extents)
@@ -547,17 +587,23 @@ impl StreamClient {
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::DescribeExtent {
-            return Err(StorageError::Internal(format!(
-                "expected DescribeExtent response, got {:?}",
-                resp.opcode()
-            )));
+            return Err(InternalSnafu {
+                message: format!("expected DescribeExtent response, got {:?}", resp.opcode()),
+            }
+            .build());
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
             .ok_or_else(|| {
-                StorageError::Internal("invalid DescribeExtent response payload".into())
+                InternalSnafu {
+                    message: "invalid DescribeExtent response payload",
+                }
+                .build()
             })?;
         extents.into_iter().next().ok_or_else(|| {
-            StorageError::Internal("DescribeExtent response returned empty result".into())
+            InternalSnafu {
+                message: "DescribeExtent response returned empty result",
+            }
+            .build()
         })
     }
 
@@ -581,17 +627,24 @@ impl StreamClient {
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::Seek {
-            return Err(StorageError::Internal(format!(
-                "expected Seek response, got {:?}",
-                resp.opcode()
-            )));
+            return Err(InternalSnafu {
+                message: format!("expected Seek response, got {:?}", resp.opcode()),
+            }
+            .build());
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
-            .ok_or_else(|| StorageError::Internal("invalid Seek response payload".into()))?;
-        extents
-            .into_iter()
-            .next()
-            .ok_or_else(|| StorageError::Internal("Seek response returned empty result".into()))
+            .ok_or_else(|| {
+                InternalSnafu {
+                    message: "invalid Seek response payload",
+                }
+                .build()
+            })?;
+        extents.into_iter().next().ok_or_else(|| {
+            InternalSnafu {
+                message: "Seek response returned empty result",
+            }
+            .build()
+        })
     }
 
     // ── High-level operations ──
@@ -614,15 +667,18 @@ impl StreamClient {
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::DescribeStream {
-            return Err(StorageError::Internal(format!(
-                "expected DescribeStream response, got {:?}",
-                resp.opcode()
-            )));
+            return Err(InternalSnafu {
+                message: format!("expected DescribeStream response, got {:?}", resp.opcode()),
+            }
+            .build());
         }
         let stream_id = resp.stream_id();
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
             .ok_or_else(|| {
-                StorageError::Internal("invalid DescribeStream response payload".into())
+                InternalSnafu {
+                    message: "invalid DescribeStream response payload",
+                }
+                .build()
             })?;
         self.cache_primary_from_extents(stream_id, &extents).await;
         Ok((stream_id, extents))
@@ -651,7 +707,7 @@ impl StreamClient {
                 }
                 Ok(stream_id)
             }
-            Err(StorageError::UnknownStream(_)) => {
+            Err(StorageError::UnknownStream { .. }) => {
                 let (stream_id, _, _, _) = self
                     .create_stream(
                         stream_name,

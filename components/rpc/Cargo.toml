@@ -7,4 +7,5 @@ edition = "2024"
 tokio = { workspace = true }
 bytes = { workspace = true }
 tokio-util = { workspace = true }
+snafu = { workspace = true }
 common = { path = "../common" }

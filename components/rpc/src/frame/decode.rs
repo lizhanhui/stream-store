@@ -1,5 +1,5 @@
 use bytes::{Buf, Bytes, BytesMut};
-use common::errors::StorageError;
+use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpcodeSnafu};
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
     FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
@@ -30,21 +30,27 @@ impl Frame {
         // We have a complete frame -- consume it.
         let magic = src.get_u8();
         if magic != MAGIC {
-            return Err(StorageError::InvalidFrame(format!(
-                "bad magic: expected 0x{MAGIC:02X}, got 0x{magic:02X}"
-            )));
+            return Err(InvalidFrameSnafu {
+                message: format!("bad magic: expected 0x{MAGIC:02X}, got 0x{magic:02X}"),
+            }
+            .build());
         }
 
         let version = src.get_u8();
         if version != PROTOCOL_VERSION {
-            return Err(StorageError::InvalidFrame(format!(
-                "unsupported version: {version}"
-            )));
+            return Err(InvalidFrameSnafu {
+                message: format!("unsupported version: {version}"),
+            }
+            .build());
         }
 
         let opcode_byte = src.get_u8();
-        let opcode =
-            Opcode::from_u8(opcode_byte).ok_or(StorageError::UnknownOpcode(opcode_byte))?;
+        let opcode = Opcode::from_u8(opcode_byte).ok_or_else(|| {
+            UnknownOpcodeSnafu {
+                opcode: opcode_byte,
+            }
+            .build()
+        })?;
 
         let flags = src.get_u8();
         let _remaining_len = src.get_u32(); // already peeked above
@@ -80,7 +86,10 @@ impl Frame {
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let extent_id = ExtentId(body.get_u32());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown Append error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown Append error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -126,7 +135,10 @@ impl Frame {
                     let extent_id = ExtentId(body.get_u32());
                     let offset = Offset(body.get_u64());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown Read error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown Read error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -174,7 +186,10 @@ impl Frame {
                 let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown SealStreamManager error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown SealStreamManager error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -218,7 +233,10 @@ impl Frame {
                 let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown SealExtentNode error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown SealExtentNode error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -267,7 +285,10 @@ impl Frame {
                 let request_id = body.get_u32();
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown CreateStream error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown CreateStream error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -302,7 +323,10 @@ impl Frame {
                     let cache_extents = body.get_u16();
                     let extent_growth_factor = body.get_u8();
                     let storage_class = StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown storage class".into())
+                        InvalidFrameSnafu {
+                            message: "unknown storage class",
+                        }
+                        .build()
                     })?;
                     Ok((
                         VariableHeader::CreateStream {
@@ -325,7 +349,10 @@ impl Frame {
                 let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown QueryOffset error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown QueryOffset error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -361,7 +388,10 @@ impl Frame {
                 let request_id = body.get_u32();
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown Connect error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown Connect error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -383,7 +413,10 @@ impl Frame {
                 let request_id = body.get_u32();
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown Disconnect error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown Disconnect error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -405,7 +438,10 @@ impl Frame {
                 let request_id = body.get_u32();
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown Heartbeat error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown Heartbeat error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -427,7 +463,10 @@ impl Frame {
                 let extent_id = ExtentId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown RegisterExtent error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown RegisterExtent error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -458,7 +497,10 @@ impl Frame {
                     let max_extent_capacity = body.get_u32();
                     let extent_growth_factor = body.get_u8();
                     let storage_class = StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown storage class".into())
+                        InvalidFrameSnafu {
+                            message: "unknown storage class",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -545,7 +587,10 @@ impl Frame {
                         let cache_extents = body.get_u16();
                         let storage_class =
                             StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
-                                StorageError::InvalidFrame("unknown storage class".into())
+                                InvalidFrameSnafu {
+                                    message: "unknown storage class",
+                                }
+                                .build()
                             })?;
                         Ok((
                             VariableHeader::ForwardInitExtent {
@@ -560,9 +605,10 @@ impl Frame {
                             None,
                         ))
                     }
-                    _ => Err(StorageError::Internal(format!(
-                        "unknown Forward flag: {flags:#x}"
-                    ))),
+                    _ => Err(InternalSnafu {
+                        message: format!("unknown Forward flag: {flags:#x}"),
+                    }
+                    .build()),
                 }
             }
             // ── StreamManagerMembershipChange: fire-and-forget ──
@@ -576,7 +622,10 @@ impl Frame {
                 let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown DescribeStream error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown DescribeStream error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -622,7 +671,10 @@ impl Frame {
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let extent_id = ExtentId(body.get_u32());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown DescribeExtent error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown DescribeExtent error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -662,7 +714,10 @@ impl Frame {
                 let offset = Offset(body.get_u64());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown Seek error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown Seek error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
@@ -741,9 +796,10 @@ impl Frame {
                             None,
                         ))
                     }
-                    _ => Err(StorageError::Internal(format!(
-                        "unknown UpdateExtent flag: {flags:#x}"
-                    ))),
+                    _ => Err(InternalSnafu {
+                        message: format!("unknown UpdateExtent flag: {flags:#x}"),
+                    }
+                    .build()),
                 }
             }
             // ── ReportExtents: request (0x00), response (0x01), error (0x80) ──
@@ -753,7 +809,10 @@ impl Frame {
                 let epoch = Epoch(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
-                        StorageError::InvalidFrame("unknown ReportExtents error code".into())
+                        InvalidFrameSnafu {
+                            message: "unknown ReportExtents error code",
+                        }
+                        .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((

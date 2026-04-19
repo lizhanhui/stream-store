@@ -4,6 +4,7 @@ use aws_sdk_s3::{self as s3, primitives::ByteStreamError};
 use bytes::Bytes;
 use common::config::ExtentNodeConfig;
 use futures_util::stream::{self, StreamExt};
+use snafu::IntoError;
 use tracing::{info, warn};
 
 use crate::s3_codec::Compression;
@@ -111,7 +112,12 @@ impl S3Client {
             .body(data.into())
             .send()
             .await
-            .map_err(|e| S3Error::PutFailed(key.to_string(), e.into()))?;
+            .map_err(|e| {
+                PutFailedSnafu {
+                    key: key.to_string(),
+                }
+                .into_error(e.into())
+            })?;
 
         Ok(())
     }
@@ -125,13 +131,23 @@ impl S3Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| S3Error::GetFailed(key.to_string(), e.into()))?;
+            .map_err(|e| {
+                GetFailedSnafu {
+                    key: key.to_string(),
+                }
+                .into_error(e.into())
+            })?;
 
         let data = resp
             .body
             .collect()
             .await
-            .map_err(|e| S3Error::BodyReadFailed(key.to_string(), e))?
+            .map_err(|e| {
+                BodyReadFailedSnafu {
+                    key: key.to_string(),
+                }
+                .into_error(e)
+            })?
             .into_bytes();
 
         Ok(data.into())
@@ -145,7 +161,12 @@ impl S3Client {
             .key(key)
             .send()
             .await
-            .map_err(|e| S3Error::DeleteFailed(key.to_string(), e.into()))?;
+            .map_err(|e| {
+                DeleteFailedSnafu {
+                    key: key.to_string(),
+                }
+                .into_error(e.into())
+            })?;
 
         Ok(())
     }
@@ -194,12 +215,13 @@ async fn multipart_upload(
         .key(&key)
         .send()
         .await
-        .map_err(|e| S3Error::CreateMultipartFailed(key.clone(), e.into()))?;
+        .map_err(|e| CreateMultipartFailedSnafu { key: key.clone() }.into_error(e.into()))?;
 
     let upload_id = create_resp
         .upload_id()
         .ok_or_else(|| {
-            S3Error::CreateMultipartFailed(key.clone(), "no upload_id in response".into())
+            CreateMultipartFailedSnafu { key: key.clone() }
+                .into_error("no upload_id in response".into())
         })?
         .to_string();
 
@@ -260,7 +282,9 @@ async fn multipart_upload(
                 .multipart_upload(completed)
                 .send()
                 .await
-                .map_err(|e| S3Error::CompleteMultipartFailed(key.clone(), e.into()))?;
+                .map_err(|e| {
+                    CompleteMultipartFailedSnafu { key: key.clone() }.into_error(e.into())
+                })?;
 
             Ok(())
         }
@@ -315,11 +339,11 @@ async fn upload_part_with_retry(
             }
             Err(e) => {
                 if attempt >= PART_MAX_RETRIES {
-                    return Err(S3Error::UploadPartFailed(
-                        key.to_string(),
-                        part_number,
-                        e.into(),
-                    ));
+                    return Err(UploadPartFailedSnafu {
+                        key: key.to_string(),
+                        part_number: part_number,
+                    }
+                    .into_error(e.into()));
                 }
                 let delay_ms = 100 * (1u64 << attempt); // 200ms, 400ms
                 warn!(
@@ -333,26 +357,64 @@ async fn upload_part_with_retry(
 }
 
 /// Errors from S3 operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(snafu::Snafu)]
+#[snafu(visibility(pub))]
+#[snafu_virtstack::stack_trace_debug]
 pub enum S3Error {
-    #[error("put_object({0}) failed: {1}")]
-    PutFailed(String, #[source] Box<dyn Error + Send + Sync>),
+    #[snafu(display("put_object({key}) failed"))]
+    PutFailed {
+        key: String,
+        source: Box<dyn Error + Send + Sync>,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("get_object({0}) failed: {1}")]
-    GetFailed(String, #[source] Box<dyn Error + Send + Sync>),
+    #[snafu(display("get_object({key}) failed"))]
+    GetFailed {
+        key: String,
+        source: Box<dyn Error + Send + Sync>,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("delete_object({0}) failed: {1}")]
-    DeleteFailed(String, #[source] Box<dyn Error + Send + Sync>),
+    #[snafu(display("delete_object({key}) failed"))]
+    DeleteFailed {
+        key: String,
+        source: Box<dyn Error + Send + Sync>,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("body read for {0} failed: {1}")]
-    BodyReadFailed(String, #[source] ByteStreamError),
+    #[snafu(display("body read for {key} failed"))]
+    BodyReadFailed {
+        key: String,
+        source: ByteStreamError,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("create_multipart_upload({0}) failed: {1}")]
-    CreateMultipartFailed(String, #[source] Box<dyn Error + Send + Sync>),
+    #[snafu(display("create_multipart_upload({key}) failed"))]
+    CreateMultipartFailed {
+        key: String,
+        source: Box<dyn Error + Send + Sync>,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("upload_part({0}, part {1}) failed: {2}")]
-    UploadPartFailed(String, i32, #[source] Box<dyn Error + Send + Sync>),
+    #[snafu(display("upload_part({key}, part {part_number}) failed"))]
+    UploadPartFailed {
+        key: String,
+        part_number: i32,
+        source: Box<dyn Error + Send + Sync>,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 
-    #[error("complete_multipart_upload({0}) failed: {1}")]
-    CompleteMultipartFailed(String, #[source] Box<dyn Error + Send + Sync>),
+    #[snafu(display("complete_multipart_upload({key}) failed"))]
+    CompleteMultipartFailed {
+        key: String,
+        source: Box<dyn Error + Send + Sync>,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
 }
