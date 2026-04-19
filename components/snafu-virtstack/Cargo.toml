@@ -1,0 +1,9 @@
+[package]
+name = "snafu-virtstack"
+version = "0.1.0"
+edition = "2024"
+description = "A lightweight, efficient error handling library for Rust that implements virtual stack traces based on GreptimeDB's error handling approach"
+license = "Apache-2.0"
+
+[dependencies]
+snafu-virtstack-macro = { path = "../snafu-virtstack-macro" }

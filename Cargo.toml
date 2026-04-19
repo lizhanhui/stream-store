@@ -1,11 +1,13 @@
 [workspace]
 resolver = "3"
 members = [
-    "components/common", 
-    "components/rpc", 
-    "components/client", 
-    "components/server", 
-    "components/extent-node", 
+    "components/snafu-virtstack-macro",
+    "components/snafu-virtstack",
+    "components/common",
+    "components/rpc",
+    "components/client",
+    "components/server",
+    "components/extent-node",
     "components/stream-manager",
 ]
 
@@ -15,7 +17,7 @@ bytes = "1"
 tokio-util = { version = "0.7", features = ["codec"] }
 futures-util = { version = "0.3", features = ["sink"] }
 snafu = "0.9"
-snafu-virtstack = "0.1"
+snafu-virtstack = { path = "components/snafu-virtstack" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.8", features = ["runtime-tokio", "mysql"] }
