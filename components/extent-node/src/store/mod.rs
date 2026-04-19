@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::hasher::IdentityBuildHasher;
-use common::types::{Epoch, ErrorCode, ExtentId, Opcode, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, Opcode, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use server::handler::RequestHandler;
 use std::sync::Arc;
@@ -103,6 +103,36 @@ impl ExtentNodeStore {
     /// Uses OnceLock to break the circular dependency: store needs pool, pool needs store.
     pub fn set_downstream(&self, pool: Arc<DownstreamPool>) {
         self.downstream.set(pool).ok();
+    }
+
+    /// Ensure a stream exists, creating it if needed.
+    ///
+    /// Always applies `cache_extents` (if > 0) and `storage_class` to the stream,
+    /// whether existing or new. Returns `true` if the stream was just created.
+    pub(crate) fn get_or_create_stream(
+        &self,
+        stream_id: StreamId,
+        cache_extents: u16,
+        storage_class: StorageClass,
+    ) -> bool {
+        let guard = self.streams.pin();
+        if let Some(stream) = guard.get(&stream_id) {
+            if cache_extents > 0 {
+                stream.set_max_extents(cache_extents as usize);
+            }
+            stream.set_storage_class(storage_class);
+            false
+        } else {
+            let stream = Stream::new(stream_id);
+            if cache_extents > 0 {
+                stream.set_max_extents(cache_extents as usize);
+            }
+            stream.set_storage_class(storage_class);
+            guard.insert(stream_id, stream);
+            self.next_stream_id
+                .fetch_max(stream_id.0 + 1, Ordering::Relaxed);
+            true
+        }
     }
 
     /// Set the S3 client for flushed extent storage.

@@ -2,14 +2,13 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use common::config::{DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY};
-use common::types::{ErrorCode, ExtentId, Offset};
+use common::types::{ErrorCode, ExtentId};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use tracing::info;
 
 use super::{ExtentNodeStore, ReplicaInfo};
 use crate::ack_queue::AckQueue;
-use crate::stream::Stream;
 
 impl ExtentNodeStore {
     /// Handle RegisterExtent from StreamManager: assign this ExtentNode a role in broadcast replication.
@@ -92,13 +91,11 @@ impl ExtentNodeStore {
         // Create the stream locally if it doesn't exist, then register the new extent.
         // Skip extent creation if it already exists (idempotent — extent may have been
         // lazily created by a forwarded append that arrived before this RegisterExtent).
+        self.get_or_create_stream(stream_id, cache_extents, storage_class);
+
+        // Register the extent (idempotent — skips if already exists).
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
-            // RegisterExtent is the authoritative source for cache policy.
-            // Always apply — the stream may have been lazily created by
-            // ForwardInitExtent before this arrives with max_extents=0.
-            stream.set_max_extents(cache_extents as usize);
-            stream.set_storage_class(storage_class);
             if stream.with_extent(extent_id, |_| ()).is_none() {
                 stream.register_extent(
                     extent_id,
@@ -114,21 +111,7 @@ impl ExtentNodeStore {
                 // from authoritative source (RegisterExtent carries the real epoch).
                 stream.set_epoch(epoch);
             }
-        } else {
-            let stream = Stream::new(stream_id);
-            stream.set_max_extents(cache_extents as usize);
-            stream.set_storage_class(storage_class);
-            stream.register_extent(
-                extent_id,
-                Offset(0),
-                epoch,
-                min_extent_capacity,
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
-            );
-            streams_guard.insert(stream_id, stream);
-        };
+        }
 
         // Update next_stream_id to avoid collision with StreamManager-assigned IDs.
         // Use fetch_max to atomically ensure we stay above the assigned ID.
