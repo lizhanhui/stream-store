@@ -284,7 +284,6 @@ impl MetadataStore {
         Ok(row.get::<u8, _>("replication_factor"))
     }
 
-
     /// Get the cache_extents (max extents to retain in memory) for a stream.
     pub async fn get_stream_cache_extents(&self, stream_id: StreamId) -> Result<u16, StorageError> {
         let row = sqlx::query("SELECT cache_extents FROM stream WHERE stream_id = ?")

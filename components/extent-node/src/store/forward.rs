@@ -133,23 +133,29 @@ impl ExtentNodeStore {
             max_extent_capacity,
             extent_growth_factor,
         );
-        self.try_register_extent(
-            stream_id,
-            extent_id,
-            start_offset,
-            epoch,
-            extent_capacity,
-        );
+        self.try_register_extent(stream_id, extent_id, start_offset, epoch, extent_capacity);
 
         if is_new {
             info!(
                 "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
-                stream_id, extent_id, start_offset, extent_capacity, min_extent_capacity, max_extent_capacity, extent_growth_factor,
+                stream_id,
+                extent_id,
+                start_offset,
+                extent_capacity,
+                min_extent_capacity,
+                max_extent_capacity,
+                extent_growth_factor,
             );
         } else {
             info!(
                 "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
-                stream_id, extent_id, start_offset, extent_capacity, min_extent_capacity, max_extent_capacity, extent_growth_factor,
+                stream_id,
+                extent_id,
+                start_offset,
+                extent_capacity,
+                min_extent_capacity,
+                max_extent_capacity,
+                extent_growth_factor,
             );
         }
     }
@@ -166,12 +172,7 @@ impl ExtentNodeStore {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id) {
             if stream.with_extent(extent_id, |_| ()).is_none() {
-                stream.register_extent(
-                    extent_id,
-                    start_offset,
-                    epoch,
-                    extent_capacity,
-                );
+                stream.register_extent(extent_id, start_offset, epoch, extent_capacity);
             }
         }
     }
