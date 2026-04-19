@@ -7,6 +7,10 @@ edition = "2024"
 name = "store_append"
 harness = false
 
+[[bench]]
+name = "hasher"
+harness = false
+
 [dependencies]
 tokio = { workspace = true }
 bytes = { workspace = true }
