@@ -616,7 +616,7 @@ impl Stream {
     /// Register a new extent on this stream (called when SM sends RegisterExtent
     /// or when a secondary receives ForwardInitExtent).
     ///
-    /// `initial_capacity` is the arena size for this specific extent.
+    /// `extent_capacity` is the arena size for this specific extent.
     /// For primaries (SM path), this equals `min_extent_capacity` (first extent starts at min).
     /// For secondaries (ForwardInitExtent), this equals the primary's actual extent capacity.
     ///
@@ -627,7 +627,7 @@ impl Stream {
         id: ExtentId,
         start_offset: Offset,
         epoch: Epoch,
-        initial_capacity: u32,
+        extent_capacity: u32,
         min_extent_capacity: u32,
         max_extent_capacity: u32,
         growth_factor: u8,
@@ -637,13 +637,13 @@ impl Stream {
         inner.min_extent_capacity = min_extent_capacity;
         inner.max_extent_capacity = max_extent_capacity;
         inner.growth_factor = growth_factor;
-        inner.next_extent_capacity = initial_capacity;
+        inner.next_extent_capacity = extent_capacity;
         inner.next_extent_id = ExtentId(id.0 + 1);
         inner.active_extent_created_at = Some(Instant::now());
         inner.extents.push(Extent::with_capacity(
             id,
             start_offset,
-            initial_capacity,
+            extent_capacity,
             epoch,
         ));
         inner.evict_oldest_extents(self.id);
@@ -654,7 +654,7 @@ impl Stream {
             inner.extent_pool.push_back(Extent::with_capacity(
                 ExtentId(0), // placeholder — reset() overwrites on use
                 Offset(0),
-                initial_capacity,
+                extent_capacity,
                 Epoch(0),
             ));
         }
