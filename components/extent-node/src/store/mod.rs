@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use common::hasher::IdentityBuildHasher;
 use common::types::{Epoch, ErrorCode, ExtentId, Opcode, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use server::handler::RequestHandler;
@@ -42,12 +43,14 @@ use crate::stream::Stream;
 ///   within a stream, multiple appenders only synchronize on slot reservation.
 pub struct ExtentNodeStore {
     /// Per-stream data with fine-grained locking.
-    pub(crate) streams: papaya::HashMap<StreamId, Stream>,
+    /// Uses `IdentityBuildHasher` — StreamId is a server-assigned u32, so the
+    /// identity hash (no mixing) is safe and eliminates ~15 ns of SipHash per lookup.
+    pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
     /// Monotonic stream ID generator (atomic, no lock needed).
     pub(crate) next_stream_id: AtomicU32,
     /// Replication info per stream_id (registered via RegisterExtent).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
-    pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>>,
+    pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>, IdentityBuildHasher>,
     /// Direct TCP connection pool for broadcast replication (None for standalone/test mode).
     /// Initialized via `set_downstream()` after construction (OnceLock breaks circular dep).
     pub(crate) downstream: OnceLock<Arc<DownstreamPool>>,
@@ -59,7 +62,7 @@ pub struct ExtentNodeStore {
     pub(crate) update_tx: Option<Sender<ExtentUpdate>>,
     /// Per-stream ACK queues for the Primary (only used when this node is Primary for a stream).
     /// AckQueue has its own internal Mutex — no outer Mutex needed.
-    pub ack_queues: papaya::HashMap<StreamId, AckQueue>,
+    pub ack_queues: papaya::HashMap<StreamId, AckQueue, IdentityBuildHasher>,
     /// Configurable timeout for replication quorum ACK expiry.
     pub(crate) replication_timeout: Duration,
     // -- Metrics counters (reset on each heartbeat snapshot) --
@@ -76,13 +79,13 @@ impl ExtentNodeStore {
     /// Create a new store in standalone mode (no replication) with default arena capacity.
     pub fn new() -> Self {
         Self {
-            streams: papaya::HashMap::new(),
+            streams: papaya::HashMap::with_hasher(IdentityBuildHasher),
             next_stream_id: AtomicU32::new(1),
-            replicas: papaya::HashMap::new(),
+            replicas: papaya::HashMap::with_hasher(IdentityBuildHasher),
             downstream: OnceLock::new(),
             s3_client: OnceLock::new(),
             update_tx: None,
-            ack_queues: papaya::HashMap::new(),
+            ack_queues: papaya::HashMap::with_hasher(IdentityBuildHasher),
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
             append_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
