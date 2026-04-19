@@ -109,7 +109,7 @@ impl ExtentNodeStore {
     ///
     /// Always applies `cache_extents` (if > 0) and `storage_class` to the stream,
     /// whether existing or new. Returns `true` if the stream was just created.
-    pub(crate) fn get_or_create_stream(
+    pub(crate) fn try_create_stream(
         &self,
         stream_id: StreamId,
         cache_extents: u16,

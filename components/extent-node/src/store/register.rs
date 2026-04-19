@@ -91,7 +91,7 @@ impl ExtentNodeStore {
         // Create the stream locally if it doesn't exist, then register the new extent.
         // Skip extent creation if it already exists (idempotent — extent may have been
         // lazily created by a forwarded append that arrived before this RegisterExtent).
-        self.get_or_create_stream(stream_id, cache_extents, storage_class);
+        self.try_create_stream(stream_id, cache_extents, storage_class);
 
         // Register the extent (idempotent — skips if already exists).
         let streams_guard = self.streams.pin();

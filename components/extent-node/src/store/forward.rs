@@ -125,7 +125,7 @@ impl ExtentNodeStore {
             extent_growth_factor
         };
 
-        let is_new = self.get_or_create_stream(stream_id, cache_extents, storage_class);
+        let is_new = self.try_create_stream(stream_id, cache_extents, storage_class);
         self.try_register_extent(
             stream_id,
             extent_id,
