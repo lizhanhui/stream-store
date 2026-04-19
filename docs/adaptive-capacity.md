@@ -18,7 +18,7 @@ Start each stream at a small arena (configurable `min_extent_capacity`, default 
 
 ## Semantic Clarification
 
-**`extent_capacity`** always and only means: the associated extent's capacity (the arena size for that specific extent). It appears in `RegisterExtent`, `ForwardInitExtent`, and `Extent::capacity`. Stream-level bounds use distinct names: `min_extent_capacity` and `max_extent_capacity`.
+**`extent_capacity`** always and only means: the associated extent's capacity (the arena size for that specific extent). It appears in `ForwardInitExtent` and `Extent::capacity()`. It does **not** appear in `RegisterExtent` (which only carries stream-level bounds: `min_extent_capacity`, `max_extent_capacity`, `extent_growth_factor`). Stream-level bounds use distinct names: `min_extent_capacity` and `max_extent_capacity`.
 
 ## Capacity Scaling Model
 
@@ -108,13 +108,18 @@ try_append_active():
 - `min_extent_capacity: u32` (0 = default 8 MiB)
 - `max_extent_capacity: u32` (0 = default 256 MiB)
 
-**RegisterExtent** (0x15): Keep existing `extent_capacity` (this extent's capacity, SM-decided). Add:
+**RegisterExtent** (0x15): Carries stream-level capacity bounds only (no per-extent `extent_capacity`):
 - `min_extent_capacity: u32` -- stream's floor
 - `max_extent_capacity: u32` -- stream's ceiling
+- `extent_growth_factor: u8` -- adaptive growth multiplier
 
-SM sets `extent_capacity = min_extent_capacity` for initial and post-epoch-bump extents.
+SM sets the initial extent capacity to `min_extent_capacity` for new and post-epoch-bump extents.
 
-**ForwardInitExtent** (0x05 flag=0x01): Unchanged. `extent_capacity` carries the actual capacity.
+**ForwardInitExtent** (0x05 flag=0x01): Carries the primary's actual `extent_capacity` plus the full adaptive config:
+- `extent_capacity: u32` -- this extent's actual arena size
+- `min_extent_capacity: u32` -- stream's floor
+- `max_extent_capacity: u32` -- stream's ceiling
+- `extent_growth_factor: u8` -- adaptive growth multiplier
 
 **UpdateExtentSealed** (0x18 flag=0x00): Add `new_extent_capacity: u32`.
 

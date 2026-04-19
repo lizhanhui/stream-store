@@ -374,20 +374,25 @@ Payload:
   [payload      : bytes]  -- message body
 ```
 
-**flag=0x01 ForwardInitExtent** — Sent once by the Primary before the first Forward frame for a new extent. Carries extent metadata so the secondary can create the extent with the correct capacity. No payload, no response.
+**flag=0x01 ForwardInitExtent** — Sent once by the Primary before the first Forward frame for a new extent. Carries extent metadata so the secondary can create the extent with the correct capacity and adaptive sizing config. No payload, no response.
 
 ```
 Fixed Header (8B)    -- flags=0x01
-Variable Header (33B):
-  [stream_id        : u32]    -- target stream
-  [extent_id        : u32]    -- new extent
-  [epoch            : u32]    -- stream epoch
-  [start_offset     : u64]    -- extent base offset
-  [extent_capacity  : u32]    -- arena size in bytes
-  [cache_extents    : u16]    -- max extents to retain in memory
-  [storage_class   : u8]     -- 0 = S3, 1 = Memory
+Variable Header (36B):
+  [stream_id            : u32]    -- target stream
+  [extent_id            : u32]    -- new extent
+  [epoch                : u32]    -- stream epoch
+  [start_offset         : u64]    -- extent base offset
+  [extent_capacity      : u32]    -- arena size in bytes (primary's actual capacity)
+  [cache_extents        : u16]    -- max extents to retain in memory
+  [min_extent_capacity  : u32]    -- floor for adaptive shrink (0 = default 8 MiB)
+  [max_extent_capacity  : u32]    -- ceiling for adaptive growth (0 = default 256 MiB)
+  [extent_growth_factor : u8]     -- adaptive growth multiplier (0 = default 2)
+  [storage_class        : u8]     -- 0 = S3, 1 = Memory
 No Payload.
-```** — Sent by the Primary after sealing an extent so secondaries can verify data integrity. No response.
+```
+
+**flag=0x02 ForwardChecksum**
 
 ```
 Fixed Header (8B)    -- flags=0x02
@@ -717,12 +722,11 @@ Variable Header:
   [role                    : u8]     -- 0 = Primary, 1+ = Secondary
   [replication_factor      : u8]
   [epoch                   : u32]    -- stream epoch for this extent registration
-  [extent_capacity         : u32]    -- arena size in bytes for this extent
   [cache_extents           : u16]    -- max extents to retain in memory per stream
-  [min_extent_capacity     : u32]    -- floor for adaptive shrink (0 = default)
-  [max_extent_capacity     : u32]    -- ceiling for adaptive growth (0 = default)
-  [extent_growth_factor    : u8]    -- adaptive growth multiplier (0 = default 2)
-  [storage_class          : u8]    -- 0 = S3, 1 = Memory
+  [min_extent_capacity     : u32]    -- floor for adaptive shrink (0 = default 8 MiB)
+  [max_extent_capacity     : u32]    -- ceiling for adaptive growth (0 = default 256 MiB)
+  [extent_growth_factor    : u8]     -- adaptive growth multiplier (0 = default 2)
+  [storage_class           : u8]     -- 0 = S3, 1 = Memory
 Payload:
   [num_addrs    : u16]    -- number of secondary addresses (0 for Secondaries)
   per address:
@@ -1084,7 +1088,7 @@ stream-store/                          (Workspace root)
     │       │   └── tests.rs           -- Unit tests for store operations
     │       ├── stream_manager_client.rs -- StreamManagerClient: RAII connection + heartbeat lifecycle
     │       ├── downstream.rs          -- DownstreamManager: per-node-addr TCP for broadcast forwarding
-    │       ├── ack_queue.rs           -- AckQueue: per-stream quorum tracking, PendingAck, timeout expiry
+    │       ├── ack_queue.rs           -- AckQueue: per-stream quorum tracking (lives on Stream via OnceLock), PendingAck, timeout expiry
     │       ├── s3.rs                  -- S3Client: aws-sdk-s3 wrapper with namespace and compression config
     │       ├── s3_codec.rs            -- S3 extent file codec: chunk-compressed encode/decode with sparse index
     │       └── s3_flusher.rs          -- Background S3 flusher: uploads sealed extents, notifies SM on completion
@@ -1198,7 +1202,7 @@ Each stream on an Extent Node uses a **pipelined group commit** pattern to maxim
 
 #### Arena Layout
 
-Each active extent pre-allocates a contiguous buffer (configurable, default 64 MiB per stream via `extent_capacity`). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed extents.
+Each active extent pre-allocates a contiguous buffer (adaptive sizing: starts at `min_extent_capacity`, default 8 MiB, and grows by `extent_growth_factor` up to `max_extent_capacity`, default 256 MiB). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed extents.
 
 The arena has no internal index structure. Records are self-contained: a reader can walk forward from any byte position by reading the length prefix and advancing by `4 + len` bytes. Random access is provided by an **internal index** (see below).
 
@@ -1305,14 +1309,17 @@ Each extent maintains an **internal index** — a lock-free array mapping sequen
 - **Lock-free reads** — readers use atomic loads on `committed_bytes` and index entries, never blocking the writer.
 - **Single-struct ownership** — one `Extent` owns both data and index, simplifying lifecycle management.
 
-#### Configurable Extent Capacity
+#### Adaptive Extent Capacity
 
-The extent capacity is configurable per stream (default 64 MiB). Application users can tune this per workload:
+Extent capacity is adaptive per stream, controlled by three parameters set at stream creation time:
 
-- **Smaller extents**: More frequent seal-and-new, lower write amplification for small streams, faster S3 flush cycles.
-- **Larger extents**: Fewer seals, better for high-throughput streams that batch many messages per extent.
+- **`min_extent_capacity`** (default 8 MiB): Initial arena size and floor for shrink.
+- **`max_extent_capacity`** (default 256 MiB): Ceiling for growth.
+- **`extent_growth_factor`** (default 2): Multiplier applied on extent-full.
 
-The capacity is applied to all extents created for the stream, including new extents created during seal-and-new.
+The first extent starts at `min_extent_capacity`. On extent-full, the next extent's capacity is multiplied by `extent_growth_factor` (capped at `max_extent_capacity`). On idle-shrink (extent under-utilized for 5 minutes), capacity halves (floored at `min_extent_capacity`). This ensures hot streams quickly reach steady-state capacity while idle streams reclaim memory.
+
+See [adaptive-capacity.md](adaptive-capacity.md) for the full scaling model, decision flow, and implementation details.
 
 #### Seal
 
@@ -1438,12 +1445,11 @@ CREATE TABLE stream (
     stream_name          VARCHAR(512) NOT NULL UNIQUE,
     stream_type          VARCHAR(32) NOT NULL DEFAULT 'DATA',
     replication_factor   TINYINT UNSIGNED NOT NULL DEFAULT 2,
-    extent_capacity      INT NOT NULL DEFAULT 67108864,   -- initial arena size (default 64 MiB)
     min_extent_capacity  INT NOT NULL DEFAULT 8388608,    -- floor for adaptive shrink (8 MiB)
     max_extent_capacity  INT NOT NULL DEFAULT 268435456,  -- ceiling for adaptive growth (256 MiB)
     extent_growth_factor TINYINT UNSIGNED NOT NULL DEFAULT 2,          -- adaptive growth multiplier
     cache_extents        SMALLINT UNSIGNED NOT NULL DEFAULT 4,          -- max extents retained in memory
-    storage_class       TINYINT UNSIGNED NOT NULL DEFAULT 0,           -- 0 = S3, 1 = Memory
+    storage_class        TINYINT UNSIGNED NOT NULL DEFAULT 0,           -- 0 = S3, 1 = Memory
     epoch                INT NOT NULL DEFAULT 0,          -- current stream epoch
     created_at           DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3),
     updated_at           DATETIME(3) DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3)
