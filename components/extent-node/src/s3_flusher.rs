@@ -54,7 +54,11 @@ pub async fn run(
 /// Encode and upload a single sealed extent to S3 with retry.
 async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest) {
     // Encode the sealed extent into S3 file format.
-    let encoded = {
+    // Returns (encoded_bytes, actual_end_offset). When local data < requested
+    // end_offset, actual_end_offset < req.end_offset and the S3 key uses the
+    // actual range — a partial upload under a non-canonical key that won't
+    // overwrite the canonical object from a replica with full data.
+    let (encoded, actual_end_offset) = {
         let guard = store.streams.pin();
         let stream = match guard.get(&req.stream_id) {
             Some(s) => s,
@@ -74,7 +78,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
         match stream.with_extent(req.extent_id, |ext| {
             encode_extent_range(req.stream_id, ext, s3_client.compression(), req.end_offset)
         }) {
-            Some(data) => data,
+            Some(result) => result,
             None => {
                 warn!(
                     "flush: extent {} not found on stream {}, may have been evicted",
@@ -90,11 +94,12 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
         }
     };
 
+    // S3 key uses actual_end_offset: canonical if full data, distinct if partial.
     let key = s3_key(
         s3_client.namespace(),
         req.stream_id,
         req.start_offset,
-        req.end_offset,
+        actual_end_offset,
     );
     let data_len = encoded.len();
 
@@ -151,33 +156,47 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
         }
     }
 
-    // Success bookkeeping: notify SM, broadcast ForwardFlushed, mark locally.
-    let epoch = store
-        .streams
-        .pin()
-        .get(&req.stream_id)
-        .map(|s| s.epoch())
-        .unwrap_or(common::types::Epoch(0));
+    // Success bookkeeping. Only notify SM and mark flushed if the upload
+    // was canonical (actual_end_offset == requested end_offset). A partial
+    // upload preserves data in S3 but must not cause SM to transition the
+    // extent to Flushed — a replica with full data still needs to upload
+    // the canonical object.
+    let is_canonical = actual_end_offset == req.end_offset;
 
-    if let Some(ref tx) = store.update_tx {
-        let _ = tx.try_send(ExtentUpdate::Flushed {
-            stream_id: req.stream_id,
-            extent_id: req.extent_id,
-            epoch,
-        });
-    }
+    if is_canonical {
+        let epoch = store
+            .streams
+            .pin()
+            .get(&req.stream_id)
+            .map(|s| s.epoch())
+            .unwrap_or(common::types::Epoch(0));
 
-    let flushed_frame = Frame::new(
-        VariableHeader::ForwardFlushed {
-            stream_id: req.stream_id,
-            extent_id: req.extent_id,
-            epoch,
-        },
-        None,
-    );
-    if let Some(stream) = store.streams.pin().get(&req.stream_id) {
-        stream.with_extent(req.extent_id, |ext| ext.mark_flushed());
-        stream.send_forward(flushed_frame);
+        if let Some(ref tx) = store.update_tx {
+            let _ = tx.try_send(ExtentUpdate::Flushed {
+                stream_id: req.stream_id,
+                extent_id: req.extent_id,
+                epoch,
+            });
+        }
+
+        let flushed_frame = Frame::new(
+            VariableHeader::ForwardFlushed {
+                stream_id: req.stream_id,
+                extent_id: req.extent_id,
+                epoch,
+            },
+            None,
+        );
+        if let Some(stream) = store.streams.pin().get(&req.stream_id) {
+            stream.with_extent(req.extent_id, |ext| ext.mark_flushed());
+            stream.send_forward(flushed_frame);
+        }
+    } else {
+        info!(
+            "flush: partial upload for stream {} extent {} (actual_end={}, requested_end={}), \
+             not marking as flushed — waiting for canonical upload",
+            req.stream_id, req.extent_id, actual_end_offset, req.end_offset,
+        );
     }
 
     // Clear DR flush dedup tracker (no-op if this was a Primary flush).

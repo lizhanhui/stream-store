@@ -972,49 +972,48 @@ impl StreamManagerStore {
             .seal_allocate_register(stream_id, extent_id, end_offset, epoch)
             .await?;
 
+        // Look up replicas once for both phase 2 commit and DR flush.
+        let old_replicas = self
+            .store
+            .get_replicas(stream_id, extent_row.epoch)
+            .await
+            .unwrap_or_default();
+
         // Phase 2: broadcast seal commit to all replicas with the
         // authoritative committed offset. Fire-and-forget.
-        {
-            let replicas = self
-                .store
-                .get_replicas(stream_id, extent_row.epoch)
-                .await
-                .unwrap_or_default();
-
-            for replica in &replicas {
-                let addr = replica.node_addr.clone();
-                let sid = stream_id;
-                let eid = extent_id;
-                let ep = extent_row.epoch;
-                let so = extent_start_offset;
-                let eo = end_offset;
-                tokio::spawn(async move {
-                    match client::StreamClient::connect(&addr).await {
-                        Ok(c) => {
-                            let frame = rpc::frame::Frame::new(
-                                rpc::frame::VariableHeader::SealExtentNodeCommit {
-                                    stream_id: sid,
-                                    extent_id: eid,
-                                    epoch: ep,
-                                    start_offset: so,
-                                    end_offset: eo,
-                                },
-                                None,
-                            );
-                            if let Err(e) = c.send_frame_no_response(frame).await {
-                                tracing::warn!(
-                                    "seal phase 2 commit to {addr} failed: {e}"
-                                );
-                            }
-                        }
-                        Err(e) => {
+        for replica in &old_replicas {
+            let addr = replica.node_addr.clone();
+            let sid = stream_id;
+            let eid = extent_id;
+            let ep = extent_row.epoch;
+            let so = extent_start_offset;
+            let eo = end_offset;
+            tokio::spawn(async move {
+                match client::StreamClient::connect(&addr).await {
+                    Ok(c) => {
+                        let frame = rpc::frame::Frame::new(
+                            rpc::frame::VariableHeader::SealExtentNodeCommit {
+                                stream_id: sid,
+                                extent_id: eid,
+                                epoch: ep,
+                                start_offset: so,
+                                end_offset: eo,
+                            },
+                            None,
+                        );
+                        if let Err(e) = c.send_frame_no_response(frame).await {
                             tracing::warn!(
-                                "seal phase 2 commit connect to {addr} failed: {e}"
+                                "seal phase 2 commit to {addr} failed: {e}"
                             );
                         }
                     }
-                });
-            }
+                    Err(e) => {
+                        tracing::warn!(
+                            "seal phase 2 commit connect to {addr} failed: {e}"
+                        );
+                    }
+                }
+            });
         }
 
         // Immediate DR flush: if the old Primary is dead, the just-sealed extent
@@ -1023,11 +1022,6 @@ impl StreamManagerStore {
         if committed_offset.is_none() {
             // committed_offset was None → client-initiated seal with Primary
             // potentially unreachable. Check if the Primary is actually dead.
-            let old_replicas = self
-                .store
-                .get_replicas(stream_id, extent_row.epoch)
-                .await
-                .unwrap_or_default();
             let old_primary = old_replicas.iter().find(|r| r.role == 0);
 
             let primary_is_dead = match old_primary {
@@ -1956,7 +1950,7 @@ impl StreamManagerStore {
     /// Scan for sealed extents past the staleness threshold and delegate flush
     /// to ALL alive replicas. Called by the heartbeat checker (leader only).
     pub async fn flush_stale_extents(&self, threshold_ms: u32) {
-        let threshold_secs = (threshold_ms / 1000) as u64;
+        let threshold_secs = ((threshold_ms as u64) + 999) / 1000;
         let stale = match self.store.get_stale_sealed_extents(threshold_secs).await {
             Ok(s) => s,
             Err(e) => {
