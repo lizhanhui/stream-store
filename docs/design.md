@@ -42,12 +42,13 @@ For **client timeout or failure recovery**: the `SEAL_STREAM_MANAGER` opcode (0x
 4. Stream Manager reconciles metadata, bumps epoch, allocates a new replica set.
 5. Stream Manager responds to client with the new extent info and new epoch.
 
-**Client Seal (`FLAG_OFFSET_PRESENT = 0`, legacy extent-based)**:
+**Client Seal (`FLAG_OFFSET_PRESENT = 0`, legacy extent-based)** — uses the 2-phase Prepare/Commit protocol (`SEAL_EXTENT_NODE` 0x07):
 1. Client sends `Seal(stream_id, extent_id)` to Stream Manager.
-2. Stream Manager sends `Seal` RPC to **each Extent Node holding a replica** (Primary and all Secondaries). Each Extent Node stops accepting appends and responds with its local commit length.
-3. Stream Manager determines the committed offset: if the Primary responded, its quorum offset is used (most accurate). Otherwise, SM computes the committed offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
-4. Stream Manager updates extent metadata to SEALED with the committed end_offset.
-5. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtent` ack (flag=0x01)** before proceeding. `RegisterExtent` to Secondaries is fire-and-forget (see "Lazy Secondary Extent Creation" below).
+2. **Prepare**: Stream Manager sends `SealExtentNode` (flag=0x00) to **each Extent Node holding a replica** (Primary and all Secondaries). Each Extent Node seals its last mutable extent and responds with its local committed offset.
+3. Stream Manager determines the authoritative committed offset: if the Primary responded, its quorum offset is used (most accurate). Otherwise, SM computes the committed offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
+4. **Commit**: Stream Manager broadcasts `SealExtentNode` (flag=0x02) with the authoritative committed offset to all replicas so they correct their local seal point. Commit is fire-and-forget.
+5. Stream Manager updates extent metadata to SEALED with the committed end_offset.
+6. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtent` ack (flag=0x01)** before proceeding. `RegisterExtent` to Secondaries is fire-and-forget (see "Lazy Secondary Extent Creation" below).
 6. Stream Manager responds to client with the new extent info (Primary address). Writes resume immediately.
 
 **Extent-node Seal** (`FLAG_OFFSET_PRESENT = 1`):
@@ -194,7 +195,7 @@ A DB-based leadership lease (`stream_manager_leadership` table) ensures that onl
 | **Storage Service (stream-store)** | Rust | Dedicated process. Extent nodes, stream manager, broadcast replication, S3 flush/read. |
 | **Stream Manager** | Rust | Metadata coordinator within storage service. Manages stream->extent mappings, seal/allocate, offset translation. MySQL client for metadata persistence. |
 | **Extent Node** | Rust | Holds in-memory extent replicas. Participates in broadcast replication (Primary broadcasts, Secondaries ACK). |
-| **S3 Flusher** | Rust | Background task on Primary Extent Node. Encodes sealed extents with chunk compression and uploads to S3 via `aws-sdk-s3` (automatic multipart for large objects). Broadcasts ForwardFlushed to secondaries and notifies SM on completion. |
+| **S3 Flusher** | Rust | Background task on Primary Extent Node. Encodes sealed extents with chunk compression and uploads to S3 via `aws-sdk-s3` (automatic multipart for large objects). Retries indefinitely with exponential backoff capped at 30s (S3 HEAD check on retry to skip if a peer already uploaded). Also handles DR flush requests from SM (`FlushExtent` 0x1B) when the Primary is dead. Broadcasts ForwardFlushed to secondaries and notifies SM on completion. |
 | **S3 Reader** | Rust | Fetches flushed extents from S3 with local LRU read cache. |
 
 ### Custom TCP Wire Protocol
@@ -880,7 +881,7 @@ Payload:
 
 ##### 0x1B FLUSH_EXTENT (Stream Manager -> Extent Node)
 
-SM commands an EN to upload a sealed extent to S3 (disaster recovery). Fire-and-forget: no response. The EN queues the upload on its background S3 flusher and sends `UpdateExtentFlushed` (0x18, flag=0x02) back to SM on success.
+SM commands an EN to upload a sealed extent to S3 (disaster recovery). Fire-and-forget: no response. The EN queues the upload on its background S3 flusher and sends `UpdateExtentFlushed` (0x18, flag=0x02) back to SM on success. EN deduplicates concurrent FlushExtent requests via an in-progress tracking set (`dr_flush_in_progress`). SM may send this to ALL replicas concurrently — S3 PUT is idempotent.
 
 **Request (flag=0x00): SM -> EN**
 
@@ -1123,7 +1124,7 @@ stream-store/                          (Workspace root)
     │       ├── ack_queue.rs           -- AckQueue: per-stream quorum tracking (lives on Stream via OnceLock), PendingAck, timeout expiry
     │       ├── s3.rs                  -- S3Client: aws-sdk-s3 wrapper with namespace and compression config
     │       ├── s3_codec.rs            -- S3 extent file codec: chunk-compressed encode/decode with sparse index
-    │       └── s3_flusher.rs          -- Background S3 flusher: uploads sealed extents, notifies SM on completion
+    │       └── s3_flusher.rs          -- Background S3 flusher: uploads sealed extents (indefinite retry, S3 HEAD dedup on retry), handles DR flush from SM, notifies SM on completion
     │
     └── stream-manager/                -- Stream Manager library (depends: common, rpc, server, client)
         └── src/
@@ -1155,7 +1156,7 @@ src/bin/stream-manager.rs ──> stream-manager (lib) ──┬──> server �
 | **rpc** | lib | Custom TCP wire protocol: frame codec, payload helpers. |
 | **server** | lib | Server infrastructure: RequestHandler trait with deferred response support, connection accept loop. |
 | **client** | lib | Client for talking to Extent Node and Stream Manager: append/read messages, seal/create streams. Used by Extent Node (keepalive heartbeat to Stream Manager) and Stream Manager (seal commands to Extent Nodes). |
-| **extent-node** | lib | Extent Node logic. Holds in-memory extent replicas, participates in broadcast replication (Primary broadcasts to secondaries, receives watermark ACKs, computes quorum), serves APPEND/READ/SEAL requests. Primary runs background S3 flusher for sealed extents and broadcasts ForwardFlushed to secondaries. Uses client to heartbeat to Stream Manager. Built into a binary via `src/bin/extent-node.rs`. |
+| **extent-node** | lib | Extent Node logic. Holds in-memory extent replicas, participates in broadcast replication (Primary broadcasts to secondaries, receives watermark ACKs, computes quorum), serves APPEND/READ/SEAL requests. Primary runs background S3 flusher for sealed extents (indefinite retry, S3 HEAD dedup) and broadcasts ForwardFlushed to secondaries. Handles DR flush requests from SM when Primary is dead. Uses client to heartbeat to Stream Manager. Built into a binary via `src/bin/extent-node.rs`. |
 | **stream-manager** | lib | Stream Manager logic. Manages stream->extent mappings, orchestrates seal-and-new, allocates extents across Extent Nodes, persists metadata to MySQL. Uses client to issue seal/allocate to Extent Nodes. Built into a binary via `src/bin/stream-manager.rs`. |
 
 The `client` crate is used internally by both process types: Extent Node uses it to send keepalive heartbeats to Stream Manager, and Stream Manager uses it to issue seal/allocate commands to Extent Nodes. It is also the protocol interface for external consumers -- any client can re-implement the same wire format in their language of choice.
@@ -1425,6 +1426,10 @@ Extent data is stored in S3 using a chunk-compressed format designed for random-
 
 The key uses offset ranges (not extent IDs) to support future compaction of small extents into merged objects.
 
+**Canonical vs partial key**: The **canonical key** uses the SM-authoritative `(start_offset, end_offset)` from the extent metadata — this is the key that SM and readers expect. A **partial key** uses the replica's actual local `(start_offset, min(end_offset, local_count))` when the replica has fewer records than the canonical end_offset (e.g., a secondary that didn't receive all forwards before seal). Only canonical uploads (where local count >= SM end_offset) trigger `UpdateExtentFlushed` notification to SM. Partial uploads are stored for data recovery but do not transition the extent to Flushed.
+
+**`encode_extent_range`**: Encodes records in the range `[start, min(end_offset, local_count))` — the replica writes what it has, never padding or fabricating missing records.
+
 ```
 ┌─ Header (fixed 64 bytes) ──────────────────────────────┐
 │  magic              : u32  (0x53455854 "SEXT")          │
@@ -1456,7 +1461,7 @@ The key uses offset ranges (not extent IDs) to support future compaction of smal
 
 **Index interval = 64**: Chosen to ensure the header + chunk index fits within a 1 MiB initial S3 range read even for large extents (~1 GiB data, ~1 KiB avg record size → ~16K records → 256 chunks → 1 KiB index).
 
-**Flush role**: In the normal path, the Primary uploads sealed extents to S3 via a background flusher task. If the Primary dies before uploading, SM sends `FlushExtent` (0x1B) to **ALL** replicas — Primary outage is a data integrity emergency, so all secondaries upload concurrently (S3 PUT is idempotent). This happens immediately during fallback seal (when SM detects the Primary is dead) and as a catch-all via a periodic staleness scan (`flush_staleness_threshold_ms`, default 300 000 ms). After successful upload, the EN sends `UpdateExtentFlushed` to SM, which transitions the extent state from Sealed to Flushed in the database. SM then broadcasts `ForwardFlushed` to all replicas so they can mark the extent as eligible for memory eviction.
+**Flush role**: In the normal path, the Primary uploads sealed extents to S3 via a background flusher task. The flusher retries indefinitely with exponential backoff capped at 30s (on retry, an S3 HEAD check skips the upload if a peer already uploaded the canonical key). If the Primary dies before uploading, SM sends `FlushExtent` (0x1B) to **ALL** replicas — Primary outage is a data integrity emergency, so all secondaries upload concurrently (S3 PUT is idempotent). This happens immediately during fallback seal (when SM detects the Primary is dead) and as a catch-all via a periodic staleness scan (`flush_staleness_threshold_ms`, default 300 000 ms). After successful upload, the EN sends `UpdateExtentFlushed` to SM, which transitions the extent state from Sealed to Flushed in the database. SM then broadcasts `ForwardFlushed` to all replicas so they can mark the extent as eligible for memory eviction.
 
 **Compression config**: Global EN setting (`s3_compression` in config, default "none"). Valid values: "none", "zstd", "lz4". Per-stream compression may be added in the future.
 
@@ -1619,7 +1624,7 @@ read(stream, offset=1050, count=10)
 - Broadcast replication protocol: configurable RF (Primary broadcasts to all Secondaries in parallel)
 - Quorum-based ACK: Primary waits for RF/2 secondary cumulative watermark ACKs before ACKing clients
 - Deferred ACK mechanism: WatermarkHandler sends responses through per-connection channel when quorum advances
-- Stream Manager-driven seal: Stream Manager queries each Extent Node for commit length, takes min, allocates new replica set
+- Stream Manager-driven seal: 2-phase Prepare/Commit protocol — SM queries each Extent Node for committed offset (Prepare), computes quorum, broadcasts authoritative offset (Commit)
 - Stream Manager sends RegisterExtent to each Extent Node after extent allocation (Primary gets secondary addrs, Secondaries get empty addrs)
 - Stream Manager: extent allocation across nodes, seal orchestration
 - Failure detection (heartbeat) and seal-and-new recovery
@@ -1628,7 +1633,7 @@ read(stream, offset=1050, count=10)
 
 ### Phase 3: S3 Flush and Read
 - S3 extent codec: chunk-compressed binary format with 64-byte header, sparse chunk index, and independently compressible 64-record chunks (zstd/lz4/none)
-- S3 Flusher: background task on Primary encodes sealed extents and uploads via aws-sdk-s3 with retry
+- S3 Flusher: background task on Primary encodes sealed extents and uploads via aws-sdk-s3 with indefinite retry (exponential backoff capped at 30s, S3 HEAD check on retry to skip if peer already uploaded). Also handles DR flush from SM.
 - S3 multipart upload: objects above `s3_multipart_threshold` (default 64 MiB) are split into `s3_multipart_part_size` chunks (default 8 MiB) and uploaded concurrently (up to `s3_multipart_concurrency` parts in flight, default 8). Each part has independent retry with exponential backoff. On failure, uploaded parts are cleaned up via `abort_multipart_upload`.
 - ForwardFlushed broadcast: Primary → Secondaries after successful upload, enabling eviction across all replicas
 - UpdateExtentFlushed notification: Primary → SM after successful upload; SM transitions Sealed → Flushed in MySQL
@@ -1636,6 +1641,7 @@ read(stream, offset=1050, count=10)
 - S3 backpressure: when S3 flush is blocked (network/service issue), extent creation is refused and the client is redirected to seal via SM, which reallocates to different nodes
 - S3 Reader: range-read with local LRU cache (moka)
 - Flush triggers: size, time, node failure
+- DR flush: SM detects stale sealed extents (Primary dead) and delegates all replicas to upload concurrently; immediate on fallback seal + periodic staleness scan catch-all
 - Post-flush memory eviction
 - Integration tests with MinIO container
 

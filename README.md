@@ -97,7 +97,7 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
 
 ### Process Types
 
-- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Primary runs background S3 flusher for sealed extents (multipart upload for large objects) and broadcasts ForwardFlushed to secondaries for coordinated eviction. On Primary outage, SM sends `FlushExtent` to ALL secondaries for concurrent upload (S3 PUT idempotent), maximizing data durability. Per-stream StorageClass controls flush behavior (S3 vs Memory). S3 backpressure blocks new extent creation when flush is stalled, redirecting clients to healthy nodes via seal.
+- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Primary runs background S3 flusher for sealed extents (multipart upload for large objects, indefinite retry with exponential backoff capped at 30s, S3 HEAD check on retry to skip if peer already uploaded) and broadcasts ForwardFlushed to secondaries for coordinated eviction. On Primary outage, SM sends `FlushExtent` to ALL secondaries for concurrent upload (S3 PUT idempotent), maximizing data durability. Per-stream StorageClass controls flush behavior (S3 vs Memory). S3 backpressure blocks new extent creation when flush is stalled, redirecting clients to healthy nodes via seal.
 - **Stream Manager** -- Stateless metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Fully stateless design (no in-memory caches) allows multiple SM nodes to run against the same database for high availability. Includes load-aware extent placement, heartbeat-based failure detection, DB-based leadership lease for failover coordination, and disaster recovery flush delegation (detects stale sealed extents and commands all replicas to upload).
 
 ## Performance
@@ -137,7 +137,7 @@ stream-store/
 │   ├── server/                     # Server infrastructure (RequestHandler, ServerBuilder)
 │   ├── client/                     # StreamClient for Extent Node & Stream Manager
 │   ├── extent-node/                # Pipelined group commit arena, stream, replication,
-│   │                               # S3 codec (chunk-compressed), S3 flusher (multipart), watermark
+│   │                               # S3 codec (chunk-compressed), S3 flusher (multipart, DR flush), watermark
 │   └── stream-manager/             # Metadata store, allocator, heartbeat checker
 ├── conf/                           # Example TOML configuration files
 ├── tests/                          # Integration tests

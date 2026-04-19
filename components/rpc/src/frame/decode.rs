@@ -228,8 +228,28 @@ impl Frame {
                     ))
                 }
             }
-            // ── SealExtentNode: request (0x00), response (0x01), error (0x80) ──
+            // ── SealExtentNode: prepare (0x00), response (0x01), error (0x80), commit (0x02) ──
             Opcode::SealExtentNode => {
+                // Commit (phase 2) has a different wire layout: no request_id prefix.
+                // Check for it first before consuming shared fields.
+                if flags & FLAG_SEAL_COMMIT != 0 {
+                    let stream_id = StreamId(body.get_u32());
+                    let extent_id = ExtentId(body.get_u32());
+                    let epoch = Epoch(body.get_u32());
+                    let start_offset = body.get_u64();
+                    let end_offset = body.get_u64();
+                    return Ok((
+                        VariableHeader::SealExtentNodeCommit {
+                            stream_id,
+                            extent_id,
+                            epoch,
+                            start_offset,
+                            end_offset,
+                        },
+                        None,
+                    ));
+                }
+                // Prepare/Response/Error all start with request_id + stream_id.
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {

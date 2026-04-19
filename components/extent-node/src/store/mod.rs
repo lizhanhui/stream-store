@@ -72,6 +72,8 @@ pub struct ExtentNodeStore {
     pub(crate) flush_tx: Option<Sender<FlushRequest>>,
     /// Tracks extent IDs with an in-progress DR flush (SM-delegated upload).
     /// Used to deduplicate repeated FlushExtent commands from SM.
+    /// NOTE: std::sync::Mutex is intentional — critical sections are trivial
+    /// (HashSet insert/remove) and MUST NOT be held across .await points.
     pub(crate) dr_flush_in_progress: Mutex<HashSet<(StreamId, ExtentId)>>,
 }
 

@@ -2,8 +2,8 @@ use super::*;
 use bytes::{BufMut, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE, HEADER_LEN, MAGIC,
-    Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
+    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE, FLAG_SEAL_COMMIT,
+    HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
 };
 
 fn sample_append_frame() -> Frame {
@@ -568,5 +568,85 @@ fn describe_stream_by_name_round_trip() {
         }
         _ => panic!("expected DescribeStream"),
     }
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn seal_extent_node_commit_round_trip() {
+    let frame = Frame::new(
+        VariableHeader::SealExtentNodeCommit {
+            stream_id: StreamId(7),
+            extent_id: ExtentId(3),
+            epoch: Epoch(2),
+            start_offset: 100,
+            end_offset: 500,
+        },
+        None,
+    );
+
+    let mut buf = BytesMut::new();
+    frame.encode(&mut buf);
+
+    let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
+    assert_eq!(decoded.flags(), FLAG_SEAL_COMMIT);
+    assert_eq!(decoded.request_id(), 0); // fire-and-forget
+    match &decoded.variable_header {
+        VariableHeader::SealExtentNodeCommit {
+            stream_id,
+            extent_id,
+            epoch,
+            start_offset,
+            end_offset,
+        } => {
+            assert_eq!(*stream_id, StreamId(7));
+            assert_eq!(*extent_id, ExtentId(3));
+            assert_eq!(*epoch, Epoch(2));
+            assert_eq!(*start_offset, 100);
+            assert_eq!(*end_offset, 500);
+        }
+        _ => panic!("expected SealExtentNodeCommit"),
+    }
+    assert!(decoded.payload.is_none());
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn flush_extent_round_trip() {
+    let frame = Frame::new(
+        VariableHeader::FlushExtent {
+            stream_id: StreamId(12),
+            extent_id: ExtentId(5),
+            epoch: Epoch(3),
+            start_offset: 0,
+            end_offset: 1000,
+        },
+        None,
+    );
+
+    let mut buf = BytesMut::new();
+    frame.encode(&mut buf);
+
+    let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded.opcode(), Opcode::FlushExtent);
+    assert_eq!(decoded.flags(), 0x00);
+    assert_eq!(decoded.request_id(), 0);
+    match &decoded.variable_header {
+        VariableHeader::FlushExtent {
+            stream_id,
+            extent_id,
+            epoch,
+            start_offset,
+            end_offset,
+        } => {
+            assert_eq!(*stream_id, StreamId(12));
+            assert_eq!(*extent_id, ExtentId(5));
+            assert_eq!(*epoch, Epoch(3));
+            assert_eq!(*start_offset, 0);
+            assert_eq!(*end_offset, 1000);
+        }
+        _ => panic!("expected FlushExtent"),
+    }
+    assert!(decoded.payload.is_none());
     assert!(buf.is_empty());
 }

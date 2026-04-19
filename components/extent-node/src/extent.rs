@@ -707,9 +707,20 @@ impl Extent {
     /// the extent is not sealed or the limit is already at or below the target.
     pub fn correct_seal_offset(&self, end_offset: u64) {
         let count = end_offset.saturating_sub(self.start_offset.0);
-        let current = self.limit.load(Ordering::Acquire);
-        if current != LIMIT_OPEN && current > count {
-            self.limit.store(count, Ordering::Release);
+        loop {
+            let current = self.limit.load(Ordering::Acquire);
+            if current == LIMIT_OPEN || current <= count {
+                return; // not sealed or already at/below target
+            }
+            match self.limit.compare_exchange(
+                current,
+                count,
+                Ordering::Release,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(_) => continue, // concurrent modification, retry
+            }
         }
     }
 

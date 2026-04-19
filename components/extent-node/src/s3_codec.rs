@@ -330,22 +330,39 @@ pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compress
 
 /// Encode a sealed extent for S3 upload, respecting an authoritative end_offset.
 ///
-/// During DR flush, a secondary may hold more data than the quorum-committed
-/// point. This function encodes only records in `[extent.start_offset, end_offset)`,
-/// using the caller-supplied `end_offset` for both the S3 header and record
-/// truncation. The S3 key must also use this `end_offset`.
+/// During DR flush, a secondary may hold more or fewer records than the
+/// quorum-committed point:
+/// - **More data**: encodes only `[start_offset, end_offset)`, trimming excess.
+/// - **Less data**: encodes all local data `[start_offset, local_end)` under a
+///   different S3 key so it doesn't overwrite the canonical object. The canonical
+///   key is reserved for replicas with full data.
+///
+/// Returns `(encoded_bytes, actual_end_offset)`. The caller must use
+/// `actual_end_offset` (not the requested `end_offset`) to build the S3 key.
+/// When `actual_end_offset == end_offset`, the upload uses the canonical key.
 pub fn encode_extent_range(
     stream_id: StreamId,
     extent: &Extent,
     compression: Compression,
     end_offset: u64,
-) -> Vec<u8> {
+) -> (Vec<u8>, u64) {
     let start_offset = extent.start_offset.0;
-    let record_count = if end_offset > start_offset {
+    let local_count = extent.message_count() as u32;
+    let requested_count = if end_offset > start_offset {
         (end_offset - start_offset) as u32
     } else {
         0
     };
+    // Use min(requested, local) — encode what we have, up to what's requested.
+    let record_count = std::cmp::min(requested_count, local_count);
+    if record_count < requested_count {
+        tracing::warn!(
+            "encode_extent_range: local count ({local_count}) < requested ({requested_count}) \
+             for stream {stream_id} at [{start_offset}, {end_offset}), \
+             encoding {record_count} records under partial key",
+        );
+    }
+    let actual_end_offset = start_offset + record_count as u64;
 
     // Determine the byte range for the requested records.
     let data: Bytes = if record_count == 0 {
@@ -415,7 +432,7 @@ pub fn encode_extent_range(
         flags: 0,
         stream_id: stream_id.0 as u64,
         start_offset,
-        end_offset,
+        end_offset: actual_end_offset,
         record_count,
         index_interval: S3_INDEX_INTERVAL,
         chunk_count,
@@ -429,7 +446,7 @@ pub fn encode_extent_range(
     out.extend_from_slice(&header.encode());
     out.extend_from_slice(&index_bytes);
     out.extend_from_slice(&compressed_data);
-    out
+    (out, actual_end_offset)
 }
 
 // ── Errors ──────────────────────────────────────────────────────────────────
