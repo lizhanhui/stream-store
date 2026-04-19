@@ -1081,7 +1081,7 @@ async fn secondary_accepts_forwarded_append_after_seal() {
     let seal_resp = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodeRequest {
+                VariableHeader::SealExtentNodePrepare {
                     request_id: 20,
                     stream_id: StreamId(10),
                     epoch: Epoch(0),
@@ -1172,7 +1172,7 @@ async fn handle_seal_is_idempotent() {
     let seal1 = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodeRequest {
+                VariableHeader::SealExtentNodePrepare {
                     request_id: 20,
                     stream_id: sid,
                     epoch: Epoch(0),
@@ -1196,7 +1196,7 @@ async fn handle_seal_is_idempotent() {
     let seal2 = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodeRequest {
+                VariableHeader::SealExtentNodePrepare {
                     request_id: 21,
                     stream_id: sid,
                     epoch: Epoch(0),

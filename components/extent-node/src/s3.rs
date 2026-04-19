@@ -171,6 +171,17 @@ impl S3Client {
         Ok(())
     }
 
+    /// Check if an object exists in S3 (HEAD request, no body download).
+    pub async fn exists(&self, key: &str) -> bool {
+        self.client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(key)
+            .send()
+            .await
+            .is_ok()
+    }
+
     /// The configured S3 bucket name.
     pub fn bucket(&self) -> &str {
         &self.bucket

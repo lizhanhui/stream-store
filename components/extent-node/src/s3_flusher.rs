@@ -10,16 +10,19 @@ use std::time::Duration;
 use common::types::{ExtentId, StreamId};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
 
 use crate::s3::S3Client;
-use crate::s3_codec::{encode_extent, s3_key};
+use crate::s3_codec::{encode_extent_range, s3_key};
 use crate::store::{ExtentNodeStore, ExtentUpdate};
 
 use rpc::frame::{Frame, VariableHeader};
 
-/// Maximum number of upload retries before giving up on a flush request.
-const MAX_RETRIES: u32 = 3;
+/// Maximum backoff delay between S3 upload retries (30 seconds).
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+/// Initial backoff delay for S3 upload retries (200 milliseconds).
+const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(200);
 
 /// A request to flush a sealed extent to S3.
 #[derive(Debug, Clone)]
@@ -60,11 +63,16 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     "flush: stream {} not found, skipping extent {}",
                     req.stream_id, req.extent_id,
                 );
+                store
+                    .dr_flush_in_progress
+                    .lock()
+                    .unwrap()
+                    .remove(&(req.stream_id, req.extent_id));
                 return;
             }
         };
         match stream.with_extent(req.extent_id, |ext| {
-            encode_extent(req.stream_id, ext, s3_client.compression())
+            encode_extent_range(req.stream_id, ext, s3_client.compression(), req.end_offset)
         }) {
             Some(data) => data,
             None => {
@@ -72,6 +80,11 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     "flush: extent {} not found on stream {}, may have been evicted",
                     req.extent_id, req.stream_id,
                 );
+                store
+                    .dr_flush_in_progress
+                    .lock()
+                    .unwrap()
+                    .remove(&(req.stream_id, req.extent_id));
                 return;
             }
         }
@@ -85,71 +98,92 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
     );
     let data_len = encoded.len();
 
-    // Upload with retry.
+    // Upload with indefinite retry. S3 is the durability layer — giving up
+    // means accepting data loss. Backoff exponentially up to MAX_RETRY_DELAY.
+    // On retry, check if a peer replica already uploaded (S3 HEAD) to avoid
+    // redundant work during concurrent DR flush.
     let mut attempt = 0u32;
+    let mut delay = INITIAL_RETRY_DELAY;
     loop {
         attempt += 1;
+
+        // On retries, check if another replica already uploaded this extent.
+        if attempt > 1 && s3_client.exists(&key).await {
+            info!(
+                "flush: extent {} for stream {} already exists at s3://{}/{}, skipping upload",
+                req.extent_id, req.stream_id, s3_client.bucket(), key,
+            );
+            break;
+        }
+
         match s3_client.upload(&key, encoded.clone()).await {
             Ok(()) => {
-                info!(
-                    "flushed extent {} for stream {} to s3://{}/{} ({} bytes)",
-                    req.extent_id,
-                    req.stream_id,
-                    s3_client.bucket(),
-                    key,
-                    data_len,
-                );
-
-                // Look up epoch once for both SM notification and ForwardFlushed.
-                let epoch = store
-                    .streams
-                    .pin()
-                    .get(&req.stream_id)
-                    .map(|s| s.epoch())
-                    .unwrap_or(common::types::Epoch(0));
-
-                // Notify SM that this extent is now flushed to S3.
-                if let Some(ref tx) = store.update_tx {
-                    let _ = tx.try_send(ExtentUpdate::Flushed {
-                        stream_id: req.stream_id,
-                        extent_id: req.extent_id,
-                        epoch,
-                    });
+                if attempt > 1 {
+                    info!(
+                        "flushed extent {} for stream {} to s3://{}/{} ({} bytes, after {} attempts)",
+                        req.extent_id,
+                        req.stream_id,
+                        s3_client.bucket(),
+                        key,
+                        data_len,
+                        attempt,
+                    );
+                } else {
+                    info!(
+                        "flushed extent {} for stream {} to s3://{}/{} ({} bytes)",
+                        req.extent_id,
+                        req.stream_id,
+                        s3_client.bucket(),
+                        key,
+                        data_len,
+                    );
                 }
-
-                // Broadcast ForwardFlushed to secondaries so they can mark
-                // the extent as eligible for eviction.
-                let flushed_frame = Frame::new(
-                    VariableHeader::ForwardFlushed {
-                        stream_id: req.stream_id,
-                        extent_id: req.extent_id,
-                        epoch,
-                    },
-                    None,
-                );
-                if let Some(stream) = store.streams.pin().get(&req.stream_id) {
-                    // Mark locally on Primary as well.
-                    stream.with_extent(req.extent_id, |ext| ext.mark_flushed());
-                    stream.send_forward(flushed_frame);
-                }
-
-                return;
+                break;
             }
             Err(e) => {
-                if attempt >= MAX_RETRIES {
-                    error!(
-                        "flush failed after {} attempts for stream {} extent {}: {}",
-                        MAX_RETRIES, req.stream_id, req.extent_id, e,
-                    );
-                    return;
-                }
-                let delay_ms = 100 * (1 << attempt); // 200ms, 400ms
                 warn!(
-                    "flush attempt {}/{} failed for stream {} extent {}: {}, retrying in {}ms",
-                    attempt, MAX_RETRIES, req.stream_id, req.extent_id, e, delay_ms,
+                    "flush attempt {} failed for stream {} extent {}: {}, retrying in {:?}",
+                    attempt, req.stream_id, req.extent_id, e, delay,
                 );
-                sleep(Duration::from_millis(delay_ms)).await;
+                sleep(delay).await;
+                delay = (delay * 2).min(MAX_RETRY_DELAY);
             }
         }
     }
+
+    // Success bookkeeping: notify SM, broadcast ForwardFlushed, mark locally.
+    let epoch = store
+        .streams
+        .pin()
+        .get(&req.stream_id)
+        .map(|s| s.epoch())
+        .unwrap_or(common::types::Epoch(0));
+
+    if let Some(ref tx) = store.update_tx {
+        let _ = tx.try_send(ExtentUpdate::Flushed {
+            stream_id: req.stream_id,
+            extent_id: req.extent_id,
+            epoch,
+        });
+    }
+
+    let flushed_frame = Frame::new(
+        VariableHeader::ForwardFlushed {
+            stream_id: req.stream_id,
+            extent_id: req.extent_id,
+            epoch,
+        },
+        None,
+    );
+    if let Some(stream) = store.streams.pin().get(&req.stream_id) {
+        stream.with_extent(req.extent_id, |ext| ext.mark_flushed());
+        stream.send_forward(flushed_frame);
+    }
+
+    // Clear DR flush dedup tracker (no-op if this was a Primary flush).
+    store
+        .dr_flush_in_progress
+        .lock()
+        .unwrap()
+        .remove(&(req.stream_id, req.extent_id));
 }

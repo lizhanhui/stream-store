@@ -461,9 +461,9 @@ Payload:
 
 ##### 0x07 SEAL_EXTENT_NODE (Stream Manager <-> Extent Node)
 
-SM seals the last mutable extent at the given epoch on an EN. The EN returns the sealed extent info in the header and any predecessor extents (unknown to SM) in the payload, enabling one-RPC reconciliation.
+Two-phase seal protocol. **Phase 1 (Prepare)**: SM queries each EN to seal its last mutable extent and report the committed offset. SM collects responses and computes the quorum-committed offset. **Phase 2 (Commit)**: SM broadcasts the authoritative committed offset to all replicas so they correct their local seal point. Phase 2 is fire-and-forget.
 
-**Request (flag=0x00): SM -> EN**
+**Prepare (flag=0x00): SM -> EN**
 
 `extent_id_from` is SM's last known extent — the EN returns all extents with `extent_id >= extent_id_from` in the response payload.
 
@@ -511,6 +511,21 @@ Variable Header:
 Payload:
   [payload_len : u32]
   [payload     : bytes]  -- human-readable error message
+```
+
+**Commit (flag=0x02): SM -> EN**
+
+Fire-and-forget. SM broadcasts the authoritative quorum-committed offset after computing it from Prepare responses. ENs correct their local seal point (which may differ if they sealed at their own local offset during Prepare).
+
+```
+Fixed Header (8B)    -- flags=0x02
+Variable Header (28B):
+  [stream_id     : u32]    -- stream whose extent was sealed
+  [extent_id     : u32]    -- sealed extent
+  [epoch         : u32]    -- stream epoch
+  [start_offset  : u64]    -- extent start offset
+  [end_offset    : u64]    -- authoritative committed end offset
+No Payload.
 ```
 
 ##### 0x08 QUERY_OFFSET (Client <-> Extent Node / Stream Manager)
@@ -804,7 +819,7 @@ Variable Header (24B):
 No Payload.
 ```
 
-**flag=0x02 UpdateExtentFlushed** — Sent by Secondary-1 (flush role) after a sealed extent is successfully uploaded to S3. SM transitions extent state from Sealed to Flushed.
+**flag=0x02 UpdateExtentFlushed** — Sent by the EN that uploaded a sealed extent to S3. Normally the Primary; in disaster recovery, a secondary delegated by SM. SM transitions extent state from Sealed to Flushed.
 
 ```
 Fixed Header (8B)    -- flags=0x02
@@ -861,6 +876,23 @@ Variable Header:
 Payload:
   [payload_len : u32]
   [payload     : bytes]  -- human-readable error message
+```
+
+##### 0x1B FLUSH_EXTENT (Stream Manager -> Extent Node)
+
+SM commands an EN to upload a sealed extent to S3 (disaster recovery). Fire-and-forget: no response. The EN queues the upload on its background S3 flusher and sends `UpdateExtentFlushed` (0x18, flag=0x02) back to SM on success.
+
+**Request (flag=0x00): SM -> EN**
+
+```
+Fixed Header (8B)
+Variable Header (28B):
+  [stream_id     : u32]    -- stream whose extent should be flushed
+  [extent_id     : u32]    -- sealed extent to upload
+  [epoch         : u32]    -- stream epoch
+  [start_offset  : u64]    -- extent start offset (for S3 key)
+  [end_offset    : u64]    -- extent end offset (for S3 key)
+No Payload.
 ```
 
 **Cluster management (0x20-0x2F) -- Stream Manager -> Extent Node/Client**
@@ -1333,7 +1365,7 @@ Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (lea
 | No overlap | Single writer advances `write_cursor` — each record occupies a disjoint region |
 | Read consistency | `committed_bytes` advances in-order; readers see a gap-free prefix |
 | Zero-copy reads | `Bytes::slice` into the arena buffer; no allocation or copy |
-| S3 flush | Sealed extent records encoded into chunk-compressed S3 format; uploaded by Secondary-1 |
+| S3 flush | Sealed extent records encoded into chunk-compressed S3 format; uploaded by Primary (normal) or SM-delegated secondary (DR) |
 | No mutex on hot path | Leader election uses a single `fetch_add`; followers push to unbounded channel |
 | O(1) random read | Internal extent index resolves offset→byte_pos; no sequential walk needed |
 | Scalable under contention | Followers delegate to leader, eliminating cache-line bouncing |
@@ -1341,9 +1373,11 @@ Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (lea
 ### Failure Handling
 
 1. Stream Manager detects node failure (heartbeat timeout = 1.5x declared interval).
-2. Stream Manager seals the current extent with the end_offset from metadata (the dead node cannot report).
+2. Stream Manager seals the current extent using the two-phase seal protocol: **Prepare** (query replicas for committed offsets, compute quorum), then **Commit** (broadcast authoritative committed offset to all replicas for correction).
 3. Stream Manager allocates new extent with new replica set on healthy nodes.
 4. Writes resume immediately. Failed replica is lazily re-replicated.
+5. **Immediate DR flush on fallback seal**: When SM performs a fallback seal (Primary unreachable, offset resolved from secondary quorum) and the old Primary is dead, SM immediately sends `FlushExtent` (0x1B) to **ALL** replicas (including the dead Primary, best-effort). Primary outage is a data integrity emergency — all secondaries upload concurrently to maximize the chance at least one succeeds before further failures. S3 PUT is idempotent so concurrent uploads to the same key are safe. EN deduplicates via an in-progress tracking set.
+6. **Staleness scan (catch-all)**: SM leader periodically scans for sealed extents older than a configurable threshold (`flush_staleness_threshold_ms`, default 300 000 ms) that have not been flushed to S3. For each stale extent, SM sends `FlushExtent` (0x1B) to **ALL** replicas. This catches cases missed by the immediate path (e.g., SM crash between seal and flush delegation, or Primary died after EN-initiated seal). The EN uploads the extent using its existing S3 flusher and sends `UpdateExtentFlushed` back to SM. SM then transitions the extent to Flushed in MySQL and broadcasts `ForwardFlushed` to all replicas.
 
 ## Multi-Dispatch: Shared Data Stream + Index
 
@@ -1422,7 +1456,7 @@ The key uses offset ranges (not extent IDs) to support future compaction of smal
 
 **Index interval = 64**: Chosen to ensure the header + chunk index fits within a 1 MiB initial S3 range read even for large extents (~1 GiB data, ~1 KiB avg record size → ~16K records → 256 chunks → 1 KiB index).
 
-**Flush role**: The Primary uploads sealed extents to S3 via a background flusher task. After successful upload, the Primary broadcasts `ForwardFlushed` (Forward opcode 0x05, flag=0x03) to all secondaries so they can mark the extent as eligible for memory eviction. The Primary also sends `UpdateExtentFlushed` to SM, which transitions the extent state from Sealed to Flushed in the database. This reuses the existing broadcast replication channels — no additional infrastructure is needed for eviction notification.
+**Flush role**: In the normal path, the Primary uploads sealed extents to S3 via a background flusher task. If the Primary dies before uploading, SM sends `FlushExtent` (0x1B) to **ALL** replicas — Primary outage is a data integrity emergency, so all secondaries upload concurrently (S3 PUT is idempotent). This happens immediately during fallback seal (when SM detects the Primary is dead) and as a catch-all via a periodic staleness scan (`flush_staleness_threshold_ms`, default 300 000 ms). After successful upload, the EN sends `UpdateExtentFlushed` to SM, which transitions the extent state from Sealed to Flushed in the database. SM then broadcasts `ForwardFlushed` to all replicas so they can mark the extent as eligible for memory eviction.
 
 **Compression config**: Global EN setting (`s3_compression` in config, default "none"). Valid values: "none", "zstd", "lz4". Per-stream compression may be added in the future.
 

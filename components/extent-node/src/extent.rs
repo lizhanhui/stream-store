@@ -697,6 +697,22 @@ impl Extent {
         self.limit.load(Ordering::Acquire) != LIMIT_OPEN
     }
 
+    /// Correct the seal point to an authoritative committed offset (DR path).
+    ///
+    /// During fallback seal, a secondary may have sealed at its own local offset
+    /// which can be higher than the quorum-committed offset determined by SM.
+    /// This method forces the limit down to match SM's authoritative end_offset.
+    /// Only takes effect if the extent is already sealed and the current limit
+    /// exceeds the requested count (i.e., a downward correction). No-op if
+    /// the extent is not sealed or the limit is already at or below the target.
+    pub fn correct_seal_offset(&self, end_offset: u64) {
+        let count = end_offset.saturating_sub(self.start_offset.0);
+        let current = self.limit.load(Ordering::Acquire);
+        if current != LIMIT_OPEN && current > count {
+            self.limit.store(count, Ordering::Release);
+        }
+    }
+
     /// Returns the finalized CRC32 checksum computed incrementally during primary
     /// appends, or `None` if this extent has not been sealed on the primary path.
     pub fn finalized_crc32(&self) -> Option<u32> {

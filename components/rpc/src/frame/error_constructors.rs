@@ -271,7 +271,7 @@ impl Frame {
                 stream_id,
                 ..
             } => Self::seal_stream_manager_resp_error(*request_id, *stream_id, error_code, message),
-            VariableHeader::SealExtentNodeRequest {
+            VariableHeader::SealExtentNodePrepare {
                 request_id,
                 stream_id,
                 ..

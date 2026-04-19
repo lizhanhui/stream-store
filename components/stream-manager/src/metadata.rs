@@ -40,6 +40,16 @@ pub struct ExtentRow {
     pub epoch: Epoch,
 }
 
+/// A sealed extent that has been stuck past the staleness threshold.
+#[derive(Debug, Clone)]
+pub struct StaleExtentRow {
+    pub stream_id: StreamId,
+    pub extent_id: ExtentId,
+    pub epoch: Epoch,
+    pub start_offset: u64,
+    pub end_offset: u64,
+}
+
 /// A row from the `stream_replica` table (keyed by stream_id + epoch).
 #[derive(Debug, Clone)]
 pub struct StreamReplicaRow {
@@ -1105,6 +1115,57 @@ impl MetadataStore {
             .collect())
     }
 
+    /// Check if a node is alive by its address.
+    pub async fn is_node_alive_by_addr(&self, addr: &str) -> Result<bool, StorageError> {
+        let row = sqlx::query("SELECT state FROM node WHERE addr = ?")
+            .bind(addr)
+            .fetch_optional(&self.pool)
+            .await
+            .context(DatabaseSnafu {
+                message: "is_node_alive_by_addr",
+            })?;
+        Ok(row
+            .map(|r| r.get::<i8, _>("state") as u8 == NodeState::Alive.as_u8())
+            .unwrap_or(false))
+    }
+
+    /// Query sealed extents that have been stuck past the given threshold.
+    /// Returns only S3-class streams with RF > 1 (must have secondaries).
+    pub async fn get_stale_sealed_extents(
+        &self,
+        threshold_secs: u64,
+    ) -> Result<Vec<StaleExtentRow>, StorageError> {
+        let rows = sqlx::query(
+            "SELECT e.stream_id, e.extent_id, e.epoch, e.start_offset, e.end_offset \
+             FROM extent e \
+             JOIN stream s ON e.stream_id = s.stream_id \
+             WHERE e.state = ? \
+               AND e.sealed_at IS NOT NULL \
+               AND e.sealed_at < NOW() - INTERVAL ? SECOND \
+               AND s.storage_class = 0 \
+               AND s.replication_factor > 1 \
+             ORDER BY e.sealed_at ASC",
+        )
+        .bind(ExtentState::Sealed.as_u8())
+        .bind(threshold_secs as i64)
+        .fetch_all(&self.pool)
+        .await
+        .context(DatabaseSnafu {
+            message: "get_stale_sealed_extents",
+        })?;
+
+        Ok(rows
+            .iter()
+            .map(|row| StaleExtentRow {
+                stream_id: StreamId(row.get::<u32, _>("stream_id")),
+                extent_id: ExtentId(row.get::<i64, _>("extent_id") as u32),
+                epoch: Epoch(row.get::<i32, _>("epoch") as u32),
+                start_offset: row.get::<i64, _>("start_offset") as u64,
+                end_offset: row.get::<i64, _>("end_offset") as u64,
+            })
+            .collect())
+    }
+
     /// Map a sqlx Row to a NodeRow.
     fn map_node_row(r: sqlx::mysql::MySqlRow) -> NodeRow {
         let state_val = r.get::<i8, _>("state") as u8;
@@ -1436,7 +1497,7 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Record that an extent was flushed to S3 (Secondary-1 confirms upload).
+    /// Record that an extent was flushed to S3 (EN confirms upload via UpdateExtentFlushed).
     ///
     /// Transitions the extent state from Sealed to Flushed. Idempotent: no-op if
     /// already Flushed or if the extent is still Active. Epoch-validated.

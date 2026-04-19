@@ -97,8 +97,8 @@ A binary protocol with an 8-byte fixed header (Magic | Version | Opcode | Flags 
 
 ### Process Types
 
-- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Primary runs background S3 flusher for sealed extents (multipart upload for large objects) and broadcasts ForwardFlushed to secondaries for coordinated eviction. Per-stream StorageClass controls flush behavior (S3 vs Memory). S3 backpressure blocks new extent creation when flush is stalled, redirecting clients to healthy nodes via seal.
-- **Stream Manager** -- Stateless metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Fully stateless design (no in-memory caches) allows multiple SM nodes to run against the same database for high availability. Includes load-aware extent placement, heartbeat-based failure detection, and DB-based leadership lease for failover coordination.
+- **Extent Node** -- Holds in-memory extent replicas, participates in broadcast replication, serves APPEND/READ requests. Primary runs background S3 flusher for sealed extents (multipart upload for large objects) and broadcasts ForwardFlushed to secondaries for coordinated eviction. On Primary outage, SM sends `FlushExtent` to ALL secondaries for concurrent upload (S3 PUT idempotent), maximizing data durability. Per-stream StorageClass controls flush behavior (S3 vs Memory). S3 backpressure blocks new extent creation when flush is stalled, redirecting clients to healthy nodes via seal.
+- **Stream Manager** -- Stateless metadata coordinator managing stream-to-extent mappings, orchestrating seal-and-new, persisting metadata to MySQL. Fully stateless design (no in-memory caches) allows multiple SM nodes to run against the same database for high availability. Includes load-aware extent placement, heartbeat-based failure detection, DB-based leadership lease for failover coordination, and disaster recovery flush delegation (detects stale sealed extents and commands all replicas to upload).
 
 ## Performance
 
@@ -196,7 +196,7 @@ cargo bench
 | 2 | Broadcast replication, quorum ACK, Stream Manager (MySQL), seal-and-new | Done |
 | 2.5 | Stateless multi-active SM with DB-based leader lease, CAS-fenced failover | Done |
 | 2b | Lock-free hot-path: papaya HashMap, AckQueue producer/consumer split, Arc\<ReplicaInfo\> | Done |
-| 3 | S3 flush: chunk-compressed codec (zstd/lz4), background flusher on Primary, ForwardFlushed broadcast, UpdateExtentFlushed notification, per-stream StorageClass (S3/Memory), S3 backpressure, multipart upload | Done |
+| 3 | S3 flush: chunk-compressed codec (zstd/lz4), background flusher on Primary, ForwardFlushed broadcast, UpdateExtentFlushed notification, per-stream StorageClass (S3/Memory), S3 backpressure, multipart upload, DR flush (SM delegates all secondaries on Primary outage) | Done |
 | 4 | Multi-Dispatch (data + index streams) | Planned |
 
 ## Contributing

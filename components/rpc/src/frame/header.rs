@@ -77,7 +77,7 @@ pub enum VariableHeader {
         stream_id: StreamId,
         error_code: ErrorCode,
     },
-    SealExtentNodeRequest {
+    SealExtentNodePrepare {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
@@ -96,6 +96,16 @@ pub enum VariableHeader {
         request_id: u32,
         stream_id: StreamId,
         error_code: ErrorCode,
+    },
+    /// Phase 2 seal commit (SealExtentNode, flag=0x02).
+    /// SM broadcasts the authoritative committed offset so replicas commit
+    /// their local seal point. Fire-and-forget: no request_id, no response.
+    SealExtentNodeCommit {
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        epoch: Epoch,
+        start_offset: u64,
+        end_offset: u64,
     },
     CreateStream {
         request_id: u32,
@@ -220,7 +230,7 @@ pub enum VariableHeader {
         current_offset: Offset,
     },
     /// Extent flushed to S3 (UpdateExtent, flag=0x02).
-    /// Fire-and-forget: Secondary-1 notifies SM after successful S3 upload.
+    /// Fire-and-forget: EN notifies SM after successful S3 upload.
     UpdateExtentFlushed {
         stream_id: StreamId,
         epoch: Epoch,
@@ -293,6 +303,15 @@ pub enum VariableHeader {
         extent_id: ExtentId,
         epoch: Epoch,
     },
+    /// SM commands EN to flush a sealed extent to S3 (disaster recovery, 0x1B).
+    /// Fire-and-forget: no request_id, no response.
+    FlushExtent {
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        epoch: Epoch,
+        start_offset: u64,
+        end_offset: u64,
+    },
     StreamManagerMembershipChange,
     DescribeStream {
         request_id: u32,
@@ -359,9 +378,10 @@ impl VariableHeader {
             VariableHeader::SealStreamManagerRequest { .. }
             | VariableHeader::SealStreamManagerResp { .. }
             | VariableHeader::SealStreamManagerRespError { .. } => Opcode::SealStreamManager,
-            VariableHeader::SealExtentNodeRequest { .. }
+            VariableHeader::SealExtentNodePrepare { .. }
             | VariableHeader::SealExtentNodeResp { .. }
-            | VariableHeader::SealExtentNodeRespError { .. } => Opcode::SealExtentNode,
+            | VariableHeader::SealExtentNodeRespError { .. }
+            | VariableHeader::SealExtentNodeCommit { .. } => Opcode::SealExtentNode,
             VariableHeader::CreateStream { .. }
             | VariableHeader::CreateStreamResp { .. }
             | VariableHeader::CreateStreamRespError { .. } => Opcode::CreateStream,
@@ -391,6 +411,7 @@ impl VariableHeader {
             | VariableHeader::ForwardInitExtent { .. }
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::ForwardFlushed { .. } => Opcode::Forward,
+            VariableHeader::FlushExtent { .. } => Opcode::FlushExtent,
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
             VariableHeader::DescribeStream { .. }
             | VariableHeader::DescribeStreamResp { .. }
