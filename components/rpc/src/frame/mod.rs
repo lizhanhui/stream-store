@@ -11,7 +11,8 @@ use bytes::Bytes;
 use common::types::{
     Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
     FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
-    FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SYSTEM_TICK, Offset, Opcode,
+    FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT, FLAG_SYSTEM_TICK,
+    Offset, Opcode,
     PROTOCOL_VERSION, StreamId,
 };
 
@@ -106,7 +107,7 @@ impl Frame {
             | VariableHeader::SealStreamManagerRequest { request_id, .. }
             | VariableHeader::SealStreamManagerResp { request_id, .. }
             | VariableHeader::SealStreamManagerRespError { request_id, .. }
-            | VariableHeader::SealExtentNodeRequest { request_id, .. }
+            | VariableHeader::SealExtentNodePrepare { request_id, .. }
             | VariableHeader::SealExtentNodeResp { request_id, .. }
             | VariableHeader::SealExtentNodeRespError { request_id, .. }
             | VariableHeader::CreateStream { request_id, .. }
@@ -143,6 +144,8 @@ impl Frame {
             | VariableHeader::ForwardInitExtent { .. }
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::ForwardFlushed { .. }
+            | VariableHeader::FlushExtent { .. }
+            | VariableHeader::SealExtentNodeCommit { .. }
             | VariableHeader::UpdateExtentSealed { .. }
             | VariableHeader::UpdateExtentProgress { .. }
             | VariableHeader::UpdateExtentFlushed { .. }
@@ -162,7 +165,7 @@ impl Frame {
             | VariableHeader::SealStreamManagerRequest { stream_id, .. }
             | VariableHeader::SealStreamManagerResp { stream_id, .. }
             | VariableHeader::SealStreamManagerRespError { stream_id, .. }
-            | VariableHeader::SealExtentNodeRequest { stream_id, .. }
+            | VariableHeader::SealExtentNodePrepare { stream_id, .. }
             | VariableHeader::SealExtentNodeResp { stream_id, .. }
             | VariableHeader::SealExtentNodeRespError { stream_id, .. }
             | VariableHeader::CreateStreamResp { stream_id, .. }
@@ -176,6 +179,8 @@ impl Frame {
             | VariableHeader::Forward { stream_id, .. }
             | VariableHeader::ForwardInitExtent { stream_id, .. }
             | VariableHeader::ForwardChecksum { stream_id, .. }
+            | VariableHeader::FlushExtent { stream_id, .. }
+            | VariableHeader::SealExtentNodeCommit { stream_id, .. }
             | VariableHeader::UpdateExtentSealed { stream_id, .. }
             | VariableHeader::UpdateExtentProgress { stream_id, .. }
             | VariableHeader::ReportExtents { stream_id, .. }
@@ -227,10 +232,12 @@ impl Frame {
             | VariableHeader::Forward { extent_id, .. }
             | VariableHeader::ForwardInitExtent { extent_id, .. }
             | VariableHeader::ForwardChecksum { extent_id, .. }
+            | VariableHeader::FlushExtent { extent_id, .. }
+            | VariableHeader::SealExtentNodeCommit { extent_id, .. }
             | VariableHeader::Watermark { extent_id, .. }
             | VariableHeader::DescribeExtent { extent_id, .. }
             | VariableHeader::DescribeExtentRespError { extent_id, .. } => *extent_id,
-            VariableHeader::SealExtentNodeRequest { extent_id_from, .. } => *extent_id_from,
+            VariableHeader::SealExtentNodePrepare { extent_id_from, .. } => *extent_id_from,
             _ => ExtentId(0),
         }
     }
@@ -243,14 +250,16 @@ impl Frame {
             | VariableHeader::AppendAckError { epoch, .. }
             | VariableHeader::CreateStreamResp { epoch, .. } => *epoch,
             VariableHeader::SealStreamManagerRequest { epoch, .. }
-            | VariableHeader::SealExtentNodeRequest { epoch, .. }
-            | VariableHeader::SealExtentNodeResp { epoch, .. } => *epoch,
+            | VariableHeader::SealExtentNodePrepare { epoch, .. }
+            | VariableHeader::SealExtentNodeResp { epoch, .. }
+            | VariableHeader::SealExtentNodeCommit { epoch, .. } => *epoch,
             VariableHeader::SealStreamManagerResp { new_epoch, .. } => *new_epoch,
             VariableHeader::RegisterExtent { epoch, .. } => *epoch,
             VariableHeader::UpdateExtentSealed { epoch, .. }
             | VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
             VariableHeader::Forward { epoch, .. }
-            | VariableHeader::ForwardInitExtent { epoch, .. } => *epoch,
+            | VariableHeader::ForwardInitExtent { epoch, .. }
+            | VariableHeader::FlushExtent { epoch, .. } => *epoch,
             VariableHeader::ReportExtents { epoch, .. }
             | VariableHeader::ReportExtentsResp { epoch, .. }
             | VariableHeader::ReportExtentsRespError { epoch, .. } => *epoch,
@@ -343,6 +352,7 @@ impl Frame {
                     0
                 }
             }
+            VariableHeader::SealExtentNodeCommit { .. } => FLAG_SEAL_COMMIT,
             // ── Requests and fire-and-forget: 0x00 ──
             _ => 0,
         };

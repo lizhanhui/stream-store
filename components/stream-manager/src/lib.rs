@@ -83,6 +83,7 @@ impl StreamManager {
         let heartbeat_check_interval =
             Duration::from_millis(config.heartbeat_check_interval_ms as u64);
         let lease_duration_secs = config.leadership_lease_duration_secs;
+        let flush_staleness_threshold_ms = config.flush_staleness_threshold_ms;
         let heartbeat_shutdown = shutdown_tx.subscribe();
         task_handles.push(tokio::spawn(async move {
             run_heartbeat_checker(
@@ -90,6 +91,7 @@ impl StreamManager {
                 node_id,
                 heartbeat_check_interval,
                 lease_duration_secs,
+                flush_staleness_threshold_ms,
                 heartbeat_shutdown,
             )
             .await;

@@ -22,7 +22,7 @@ use tracing::{error, info, warn};
 
 /// Seal an ExtentNode's extent and return the sealed extent info.
 ///
-/// Sends SealExtentNodeRequest to the EN and parses SealExtentNodeResp.
+/// Sends SealExtentNodePrepare to the EN and parses SealExtentNodeResp.
 /// Returns (sealed_extent_id, start_offset, end_offset, optional payload with predecessor extents).
 async fn seal_extent_node_static(
     addr: &str,
@@ -40,7 +40,7 @@ async fn seal_extent_node_static(
 
     let resp = client
         .send_frame(Frame::new(
-            VariableHeader::SealExtentNodeRequest {
+            VariableHeader::SealExtentNodePrepare {
                 request_id: 0,
                 stream_id,
                 epoch,
@@ -912,7 +912,7 @@ impl StreamManagerStore {
 
     /// Seal an extent and allocate a new one.
     ///
-    /// The new seal protocol sends SealExtentNodeRequest to ENs, which seal the
+    /// The new seal protocol sends SealExtentNodePrepare to ENs, which seal the
     /// last mutable extent and return SealExtentNodeResp with extent info.
     ///
     /// **Phase 1 — Seal primary, obtain committed offset.**
@@ -972,33 +972,96 @@ impl StreamManagerStore {
             .seal_allocate_register(stream_id, extent_id, end_offset, epoch)
             .await?;
 
-        // Fire-and-forget seal to all replicas (safety net).
-        // Look up replicas using the extent's epoch (not the new bumped epoch).
+        // Phase 2: broadcast seal commit to all replicas with the
+        // authoritative committed offset. Fire-and-forget.
         {
             let replicas = self
                 .store
                 .get_replicas(stream_id, extent_row.epoch)
                 .await
                 .unwrap_or_default();
-            let addrs: Vec<String> = replicas.into_iter().map(|r| r.node_addr).collect();
 
-            if !addrs.is_empty() {
+            for replica in &replicas {
+                let addr = replica.node_addr.clone();
                 let sid = stream_id;
                 let eid = extent_id;
                 let ep = extent_row.epoch;
                 let so = extent_start_offset;
+                let eo = end_offset;
                 tokio::spawn(async move {
-                    for addr in addrs {
-                        match seal_extent_node_static(&addr, sid, ep, eid, so).await {
-                            Ok((_sealed_eid, _start, end, _payload)) => {
-                                info!("fire-and-forget seal to {addr}: end_offset={end}");
+                    match client::StreamClient::connect(&addr).await {
+                        Ok(c) => {
+                            let frame = rpc::frame::Frame::new(
+                                rpc::frame::VariableHeader::SealExtentNodeCommit {
+                                    stream_id: sid,
+                                    extent_id: eid,
+                                    epoch: ep,
+                                    start_offset: so,
+                                    end_offset: eo,
+                                },
+                                None,
+                            );
+                            if let Err(e) = c.send_frame_no_response(frame).await {
+                                tracing::warn!(
+                                    "seal phase 2 commit to {addr} failed: {e}"
+                                );
                             }
-                            Err(e) => {
-                                warn!("fire-and-forget seal to {addr} failed: {e}");
-                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "seal phase 2 commit connect to {addr} failed: {e}"
+                            );
                         }
                     }
                 });
+            }
+        }
+
+        // Immediate DR flush: if the old Primary is dead, the just-sealed extent
+        // will never be uploaded by the Primary. Send FlushExtent to ALL alive
+        // secondaries — Primary outage is a data integrity emergency.
+        if committed_offset.is_none() {
+            // committed_offset was None → client-initiated seal with Primary
+            // potentially unreachable. Check if the Primary is actually dead.
+            let old_replicas = self
+                .store
+                .get_replicas(stream_id, extent_row.epoch)
+                .await
+                .unwrap_or_default();
+            let old_primary = old_replicas.iter().find(|r| r.role == 0);
+
+            let primary_is_dead = match old_primary {
+                Some(p) => !self
+                    .store
+                    .is_node_alive_by_addr(&p.node_addr)
+                    .await
+                    .unwrap_or(true),
+                None => true,
+            };
+
+            if primary_is_dead {
+                // Check storage class: only S3 streams need flush.
+                let needs_flush = self
+                    .store
+                    .get_stream(stream_id)
+                    .await
+                    .ok()
+                    .flatten()
+                    .map(|s| s.storage_class == StorageClass::S3)
+                    .unwrap_or(false);
+
+                if needs_flush {
+                    self.send_flush_extent_to_all_replicas(
+                        &old_replicas,
+                        stream_id,
+                        extent_id,
+                        extent_row.epoch,
+                        extent_start_offset,
+                        end_offset,
+                        "seal_extent",
+                    )
+                    .await;
+                }
             }
         }
 
@@ -1478,7 +1541,7 @@ impl StreamManagerStore {
     ///
     /// Flow:
     /// 1. Look up the Primary EN for the active extent at this epoch.
-    /// 2. Forward SealExtentNodeRequest to the Primary — it knows the ground truth.
+    /// 2. Forward SealExtentNodePrepare to the Primary — it knows the ground truth.
     /// 3. Primary seals its active extent and responds with SealExtentNodeResp.
     /// 4. SM reconciles metadata, bumps epoch, allocates new extent on new replica set.
     /// 5. SM responds to client with SealStreamManagerResp (new epoch/extent info).
@@ -1755,7 +1818,7 @@ impl StreamManagerStore {
     /// Dispatches on variant:
     /// - Sealed: extent was sealed, insert new extent (autonomous extent creation).
     /// - Progress: periodic offset update for an active extent (observability).
-    /// - Flushed: extent was flushed to S3 (Secondary-1 confirms upload).
+    /// - Flushed: extent was flushed to S3 (EN confirms upload). SM broadcasts ForwardFlushed to all replicas.
     async fn handle_extent_update(&self, frame: Frame) {
         match &frame.variable_header {
             VariableHeader::UpdateExtentSealed {
@@ -1822,6 +1885,12 @@ impl StreamManagerStore {
                         "Failed to record extent flushed for stream {:?}: {e}",
                         stream_id
                     );
+                } else {
+                    // Broadcast ForwardFlushed to all replicas so they can mark the
+                    // extent eligible for eviction. Idempotent — safe even if the
+                    // Primary already broadcast this notification.
+                    self.broadcast_forward_flushed(*stream_id, *epoch, *extent_id)
+                        .await;
                 }
             }
             _ => {
@@ -1830,6 +1899,178 @@ impl StreamManagerStore {
                     frame.opcode()
                 );
             }
+        }
+    }
+
+    /// Send ForwardFlushed to all replicas for an extent (best-effort, fire-and-forget).
+    async fn broadcast_forward_flushed(
+        &self,
+        stream_id: StreamId,
+        epoch: Epoch,
+        extent_id: ExtentId,
+    ) {
+        let replicas = match self.store.get_replicas(stream_id, epoch).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(
+                    "broadcast_forward_flushed: failed to get replicas for stream={} epoch={}: {e}",
+                    stream_id, epoch
+                );
+                return;
+            }
+        };
+        for replica in &replicas {
+            let addr = replica.node_addr.clone();
+            let sid = stream_id;
+            let eid = extent_id;
+            let ep = epoch;
+            tokio::spawn(async move {
+                match client::StreamClient::connect(&addr).await {
+                    Ok(c) => {
+                        let frame = Frame::new(
+                            VariableHeader::ForwardFlushed {
+                                stream_id: sid,
+                                extent_id: eid,
+                                epoch: ep,
+                            },
+                            None,
+                        );
+                        if let Err(e) = c.send_frame_no_response(frame).await {
+                            tracing::warn!(
+                                "broadcast_forward_flushed: failed to send to {}: {e}",
+                                addr
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "broadcast_forward_flushed: failed to connect to {}: {e}",
+                            addr
+                        );
+                    }
+                }
+            });
+        }
+    }
+
+    /// Scan for sealed extents past the staleness threshold and delegate flush
+    /// to ALL alive replicas. Called by the heartbeat checker (leader only).
+    pub async fn flush_stale_extents(&self, threshold_ms: u32) {
+        let threshold_secs = (threshold_ms / 1000) as u64;
+        let stale = match self.store.get_stale_sealed_extents(threshold_secs).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("flush_stale_extents: query failed: {e}");
+                return;
+            }
+        };
+        if stale.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "flush_stale_extents: found {} stale sealed extent(s)",
+            stale.len()
+        );
+
+        for extent in &stale {
+            let replicas = match self
+                .store
+                .get_replicas(extent.stream_id, extent.epoch)
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!(
+                        "flush_stale_extents: failed to get replicas for stream={} epoch={}: {e}",
+                        extent.stream_id,
+                        extent.epoch
+                    );
+                    continue;
+                }
+            };
+
+            self.send_flush_extent_to_all_replicas(
+                &replicas,
+                extent.stream_id,
+                extent.extent_id,
+                extent.epoch,
+                extent.start_offset,
+                extent.end_offset,
+                "flush_stale_extents",
+            )
+            .await;
+        }
+    }
+
+    /// Send FlushExtent to ALL alive replicas for a sealed extent.
+    ///
+    /// Primary outage is a data integrity emergency — all secondaries upload
+    /// concurrently to maximize the chance that at least one completes before
+    /// further failures. S3 PUT is idempotent so concurrent uploads to the
+    /// same key are safe. Includes the dead Primary (best-effort, in case it
+    /// recovered). Each send is fire-and-forget via `tokio::spawn`.
+    async fn send_flush_extent_to_all_replicas(
+        &self,
+        replicas: &[crate::metadata::StreamReplicaRow],
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        epoch: Epoch,
+        start_offset: u64,
+        end_offset: u64,
+        caller: &str,
+    ) {
+        let mut sent_count = 0u32;
+        for replica in replicas {
+            let addr = replica.node_addr.clone();
+            let sid = stream_id;
+            let eid = extent_id;
+            let ep = epoch;
+            let so = start_offset;
+            let eo = end_offset;
+            let tag = caller.to_string();
+            tokio::spawn(async move {
+                match client::StreamClient::connect(&addr).await {
+                    Ok(c) => {
+                        let frame = rpc::frame::Frame::new(
+                            rpc::frame::VariableHeader::FlushExtent {
+                                stream_id: sid,
+                                extent_id: eid,
+                                epoch: ep,
+                                start_offset: so,
+                                end_offset: eo,
+                            },
+                            None,
+                        );
+                        match c.send_frame_no_response(frame).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "{tag}: sent FlushExtent to {addr} for stream={sid} extent={eid}",
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "{tag}: FlushExtent send to {addr} failed: {e}",
+                                );
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "{tag}: FlushExtent connect to {addr} failed: {e}",
+                        );
+                    }
+                }
+            });
+            sent_count += 1;
+        }
+        if sent_count > 0 {
+            tracing::info!(
+                "{caller}: dispatched FlushExtent to {sent_count} replica(s) for stream={stream_id} extent={extent_id}",
+            );
+        } else {
+            tracing::warn!(
+                "{caller}: no replicas available for stream={stream_id} extent={extent_id}",
+            );
         }
     }
 

@@ -25,7 +25,7 @@ pub enum ExtentUpdate {
         current_offset: u64,
         epoch: Epoch,
     },
-    /// Extent was flushed to S3 (Secondary-1 notifies SM after successful upload).
+    /// Extent was flushed to S3 (EN notifies SM after successful upload).
     Flushed {
         stream_id: StreamId,
         extent_id: ExtentId,

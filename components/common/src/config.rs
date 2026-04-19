@@ -209,6 +209,10 @@ pub struct StreamManagerConfig {
     /// Leadership lease duration in seconds. Only the lease holder runs the heartbeat
     /// checker and failover. Defaults to 10s (renewed every heartbeat_check_interval).
     pub leadership_lease_duration_secs: u32,
+    /// Threshold in milliseconds before SM considers a sealed extent "stale" and
+    /// delegates S3 upload to a secondary (disaster recovery). Default: 300 000 ms (5 min).
+    #[serde(default = "default_flush_staleness_threshold_ms")]
+    pub flush_staleness_threshold_ms: u32,
 }
 
 impl Default for StreamManagerConfig {
@@ -227,6 +231,7 @@ impl Default for StreamManagerConfig {
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
             leadership_lease_duration_secs: 10,
+            flush_staleness_threshold_ms: default_flush_staleness_threshold_ms(),
         }
     }
 }
@@ -260,6 +265,10 @@ impl StreamManagerConfig {
             self.mysql_database
         )
     }
+}
+
+fn default_flush_staleness_threshold_ms() -> u32 {
+    300_000
 }
 
 /// Load a config from a TOML file, falling back to defaults for missing fields.

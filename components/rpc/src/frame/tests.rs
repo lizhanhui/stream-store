@@ -302,7 +302,7 @@ fn seal_stream_manager_resp_error_round_trip() {
 #[test]
 fn seal_extent_node_request_round_trip() {
     let frame = Frame::new(
-        VariableHeader::SealExtentNodeRequest {
+        VariableHeader::SealExtentNodePrepare {
             request_id: 4,
             stream_id: StreamId(20),
             epoch: Epoch(3),
@@ -326,7 +326,7 @@ fn seal_extent_node_request_round_trip() {
     assert_eq!(decoded.extent_id(), ExtentId(7));
     assert!(!decoded.is_error_response());
     match &decoded.variable_header {
-        VariableHeader::SealExtentNodeRequest {
+        VariableHeader::SealExtentNodePrepare {
             extent_id_from,
             start_offset,
             ..
@@ -334,7 +334,7 @@ fn seal_extent_node_request_round_trip() {
             assert_eq!(*extent_id_from, ExtentId(7));
             assert_eq!(*start_offset, 100);
         }
-        _ => panic!("expected SealExtentNodeRequest"),
+        _ => panic!("expected SealExtentNodePrepare"),
     }
     assert!(buf.is_empty());
 }

@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use bytes::{BufMut, Bytes, BytesMut};
 use common::types::{ErrorCode, ExtentId};
 use rpc::frame::{Frame, VariableHeader};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::ExtentNodeStore;
 use crate::s3_flusher::FlushRequest;
@@ -64,10 +64,10 @@ impl ExtentNodeStore {
     }
 
     pub(crate) fn handle_seal(&self, frame: Frame) -> Frame {
-        // Parse SealExtentNodeRequest fields.
+        // Parse SealExtentNodePrepare fields.
         let (request_id, stream_id, epoch, extent_id_from, req_start_offset) =
             match &frame.variable_header {
-                VariableHeader::SealExtentNodeRequest {
+                VariableHeader::SealExtentNodePrepare {
                     request_id,
                     stream_id,
                     epoch,
@@ -85,7 +85,7 @@ impl ExtentNodeStore {
                         frame.request_id(),
                         frame.stream_id(),
                         ErrorCode::InternalError,
-                        "invalid SealExtentNodeRequest frame",
+                        "invalid SealExtentNodePrepare frame",
                     );
                 }
             };
@@ -285,5 +285,153 @@ impl ExtentNodeStore {
             buf.put_u64(*end);
         }
         Some(buf.freeze())
+    }
+
+    /// Handle FLUSH_EXTENT (0x1B): SM commands this EN to upload a sealed extent
+    /// to S3 on behalf of a dead Primary (disaster recovery).
+    ///
+    /// Fire-and-forget: no response. The EN pushes a FlushRequest onto the
+    /// existing S3 flusher channel. On success the flusher sends
+    /// `UpdateExtentFlushed` back to SM via the normal `update_tx` path.
+    pub(crate) fn handle_flush_extent(&self, frame: Frame) {
+        let (stream_id, extent_id, _epoch, start_offset, end_offset) =
+            match &frame.variable_header {
+                VariableHeader::FlushExtent {
+                    stream_id,
+                    extent_id,
+                    epoch,
+                    start_offset,
+                    end_offset,
+                } => (*stream_id, *extent_id, *epoch, *start_offset, *end_offset),
+                _ => return,
+            };
+
+        // Guard: S3 must be configured.
+        let flush_tx = match self.flush_tx {
+            Some(ref tx) => tx,
+            None => {
+                warn!(
+                    "FlushExtent: no S3 configured, ignoring stream={} extent={}",
+                    stream_id, extent_id,
+                );
+                return;
+            }
+        };
+
+        // Guard: extent must exist, be sealed, and not already flushed.
+        // Phase 2 (SealExtentNodeCommit) should have already sealed and
+        // committed the offset. Warn if the extent is Active (unexpected)
+        // or if local offset differs from SM's authoritative offset.
+        let ready = self
+            .streams
+            .pin()
+            .get(&stream_id)
+            .and_then(|s| {
+                s.with_extent(extent_id, |ext| {
+                    if ext.is_flushed() {
+                        return false;
+                    }
+                    if !ext.is_sealed() {
+                        warn!(
+                            "FlushExtent: extent is not sealed (unexpected), sealing now: stream={} extent={} end_offset={}",
+                            stream_id, extent_id, end_offset,
+                        );
+                        ext.seal(Some(end_offset));
+                    } else {
+                        // Defense-in-depth: verify local seal matches SM's offset.
+                        let local_end = ext.start_offset.0 + ext.message_count();
+                        if local_end != end_offset {
+                            warn!(
+                                "FlushExtent: local seal offset {} differs from SM offset {}, correcting: stream={} extent={}",
+                                local_end, end_offset, stream_id, extent_id,
+                            );
+                            ext.correct_seal_offset(end_offset);
+                        }
+                    }
+                    true
+                })
+            })
+            .unwrap_or(false);
+
+        if !ready {
+            info!(
+                "FlushExtent: skipping stream={} extent={} (not found or already flushed)",
+                stream_id, extent_id,
+            );
+            return;
+        }
+
+        // Deduplicate: skip if already in progress.
+        {
+            let mut in_progress = self.dr_flush_in_progress.lock().unwrap();
+            if !in_progress.insert((stream_id, extent_id)) {
+                info!(
+                    "FlushExtent: already in progress for stream={} extent={}, skipping",
+                    stream_id, extent_id,
+                );
+                return;
+            }
+        }
+
+        // Enqueue onto the existing flusher. If the channel is full, remove
+        // from the dedup set so SM can retry on the next scan.
+        if flush_tx
+            .try_send(FlushRequest {
+                stream_id,
+                extent_id,
+                start_offset,
+                end_offset,
+            })
+            .is_err()
+        {
+            warn!(
+                "FlushExtent: flush channel full for stream={} extent={}",
+                stream_id, extent_id,
+            );
+            self.dr_flush_in_progress
+                .lock()
+                .unwrap()
+                .remove(&(stream_id, extent_id));
+        } else {
+            info!(
+                "FlushExtent: queued DR flush for stream={} extent={}",
+                stream_id, extent_id,
+            );
+        }
+    }
+
+    /// Handle SealExtentNode phase 2: commit local seal point to SM's
+    /// authoritative committed offset. Fire-and-forget, no response.
+    pub(crate) fn handle_seal_commit(&self, frame: Frame) {
+        let (stream_id, extent_id, _epoch, _start_offset, end_offset) =
+            match &frame.variable_header {
+                VariableHeader::SealExtentNodeCommit {
+                    stream_id,
+                    extent_id,
+                    epoch,
+                    start_offset,
+                    end_offset,
+                } => (*stream_id, *extent_id, *epoch, *start_offset, *end_offset),
+                _ => return,
+            };
+
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
+            Some(s) => s,
+            None => return,
+        };
+
+        stream.with_extent(extent_id, |ext| {
+            if !ext.is_sealed() {
+                // Not yet sealed — seal with SM's authoritative offset.
+                ext.seal(Some(end_offset));
+                info!(
+                    "SealCommit: sealed extent {} for stream {} at end_offset={}",
+                    extent_id, stream_id, end_offset,
+                );
+            } else {
+                ext.correct_seal_offset(end_offset);
+            }
+        });
     }
 }

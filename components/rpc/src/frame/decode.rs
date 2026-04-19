@@ -3,7 +3,8 @@ use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpco
 use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
     FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
-    FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, HEADER_LEN,
+    FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
+    FLAG_SEAL_COMMIT, HEADER_LEN,
     MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
 };
 
@@ -264,12 +265,29 @@ impl Frame {
                         },
                         payload,
                     ))
+                } else if flags & FLAG_SEAL_COMMIT != 0 {
+                    // Phase 2: commit broadcast (fire-and-forget).
+                    let stream_id = StreamId(body.get_u32());
+                    let extent_id = ExtentId(body.get_u32());
+                    let epoch = Epoch(body.get_u32());
+                    let start_offset = body.get_u64();
+                    let end_offset = body.get_u64();
+                    Ok((
+                        VariableHeader::SealExtentNodeCommit {
+                            stream_id,
+                            extent_id,
+                            epoch,
+                            start_offset,
+                            end_offset,
+                        },
+                        None,
+                    ))
                 } else {
                     let epoch = Epoch(body.get_u32());
                     let extent_id_from = ExtentId(body.get_u32());
                     let start_offset = body.get_u64();
                     Ok((
-                        VariableHeader::SealExtentNodeRequest {
+                        VariableHeader::SealExtentNodePrepare {
                             request_id,
                             stream_id,
                             epoch,
@@ -848,6 +866,24 @@ impl Frame {
                         None,
                     ))
                 }
+            }
+            // ── FlushExtent: fire-and-forget (0x00 only) ──
+            Opcode::FlushExtent => {
+                let stream_id = StreamId(body.get_u32());
+                let extent_id = ExtentId(body.get_u32());
+                let epoch = Epoch(body.get_u32());
+                let start_offset = body.get_u64();
+                let end_offset = body.get_u64();
+                Ok((
+                    VariableHeader::FlushExtent {
+                        stream_id,
+                        extent_id,
+                        epoch,
+                        start_offset,
+                        end_offset,
+                    },
+                    None,
+                ))
             }
         }
     }

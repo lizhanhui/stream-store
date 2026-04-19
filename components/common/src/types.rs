@@ -46,6 +46,12 @@ pub const FLAG_RESPONSE_ERROR: u8 = 0x80;
 /// Uses 0x02 (not 0x01) to avoid conflict with FLAG_RESPONSE.
 pub const FLAG_SYSTEM_TICK: u8 = 0x02;
 
+/// Flag on SEAL_EXTENT_NODE: phase 2 commit with authoritative committed offset.
+/// SM broadcasts after computing quorum offset so replicas correct their local
+/// seal point. Fire-and-forget (no response).
+/// Uses 0x02 (not 0x01) to avoid conflict with FLAG_RESPONSE.
+pub const FLAG_SEAL_COMMIT: u8 = 0x02;
+
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct StreamId(pub u32);
@@ -141,6 +147,9 @@ pub enum Opcode {
     /// SM queries an EN for all extents it holds for a stream (recovery path).
     /// Flags: 0x00=request, 0x01=response, 0x80=error.
     ReportExtents = 0x19,
+    /// SM commands EN to flush a sealed extent to S3 (disaster recovery).
+    /// Fire-and-forget: no response.
+    FlushExtent = 0x1B,
 
     // -- Cluster management (0x20-0x2F): StreamManager -> ExtentNode/Client --
     StreamManagerMembershipChange = 0x20,
@@ -174,6 +183,7 @@ impl Opcode {
             0x17 => Some(Opcode::Watermark),
             0x18 => Some(Opcode::UpdateExtent),
             0x19 => Some(Opcode::ReportExtents),
+            0x1B => Some(Opcode::FlushExtent),
             // Cluster management
             0x20 => Some(Opcode::StreamManagerMembershipChange),
             // Management

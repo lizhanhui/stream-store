@@ -328,6 +328,110 @@ pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compress
     out
 }
 
+/// Encode a sealed extent for S3 upload, respecting an authoritative end_offset.
+///
+/// During DR flush, a secondary may hold more data than the quorum-committed
+/// point. This function encodes only records in `[extent.start_offset, end_offset)`,
+/// using the caller-supplied `end_offset` for both the S3 header and record
+/// truncation. The S3 key must also use this `end_offset`.
+pub fn encode_extent_range(
+    stream_id: StreamId,
+    extent: &Extent,
+    compression: Compression,
+    end_offset: u64,
+) -> Vec<u8> {
+    let start_offset = extent.start_offset.0;
+    let record_count = if end_offset > start_offset {
+        (end_offset - start_offset) as u32
+    } else {
+        0
+    };
+
+    // Determine the byte range for the requested records.
+    let data: Bytes = if record_count == 0 {
+        Bytes::new()
+    } else {
+        let full_data = extent.committed_data();
+        let local_end_seq = record_count as u64;
+        let byte_end = extent
+            .index_lookup(local_end_seq)
+            .map(|bp| bp as usize)
+            .unwrap_or(full_data.len());
+        full_data.slice(0..byte_end)
+    };
+
+    // Number of chunks: ceil(record_count / interval).
+    let chunk_count = if record_count == 0 {
+        0
+    } else {
+        (record_count + S3_INDEX_INTERVAL - 1) / S3_INDEX_INTERVAL
+    };
+
+    // Build chunks: split data into groups of 64 records, compress each.
+    let mut chunk_offsets: Vec<u32> = Vec::with_capacity(chunk_count as usize);
+    let mut compressed_data: Vec<u8> = Vec::new();
+
+    for i in 0..chunk_count {
+        let chunk_start_seq = (i * S3_INDEX_INTERVAL) as u64;
+        let chunk_end_seq =
+            std::cmp::min(((i + 1) * S3_INDEX_INTERVAL) as u64, record_count as u64);
+
+        let byte_start = if chunk_start_seq == 0 {
+            0usize
+        } else {
+            extent.index_lookup(chunk_start_seq).unwrap_or(0) as usize
+        };
+
+        let byte_end = if chunk_end_seq >= record_count as u64 {
+            data.len()
+        } else {
+            extent
+                .index_lookup(chunk_end_seq)
+                .unwrap_or(data.len() as u64) as usize
+        };
+
+        let raw_chunk = &data[byte_start..byte_end];
+        chunk_offsets.push(compressed_data.len() as u32);
+        let compressed_chunk = compression.compress(raw_chunk);
+        compressed_data.extend_from_slice(&compressed_chunk);
+    }
+
+    let data_size = compressed_data.len() as u32;
+
+    let index_size = chunk_count as usize * 4;
+    let mut index_bytes = Vec::with_capacity(index_size);
+    for offset in &chunk_offsets {
+        index_bytes.extend_from_slice(&offset.to_be_bytes());
+    }
+
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(&index_bytes);
+    hasher.update(&compressed_data);
+    let crc32 = hasher.finalize();
+
+    let header = S3ExtentHeader {
+        magic: S3_EXTENT_MAGIC,
+        version: S3_EXTENT_VERSION,
+        flags: 0,
+        stream_id: stream_id.0 as u64,
+        start_offset,
+        end_offset,
+        record_count,
+        index_interval: S3_INDEX_INTERVAL,
+        chunk_count,
+        data_size,
+        crc32,
+        compression,
+    };
+
+    let total_size = S3_EXTENT_HEADER_SIZE + index_size + compressed_data.len();
+    let mut out = Vec::with_capacity(total_size);
+    out.extend_from_slice(&header.encode());
+    out.extend_from_slice(&index_bytes);
+    out.extend_from_slice(&compressed_data);
+    out
+}
+
 // ── Errors ──────────────────────────────────────────────────────────────────
 
 /// Errors from S3 extent codec operations.

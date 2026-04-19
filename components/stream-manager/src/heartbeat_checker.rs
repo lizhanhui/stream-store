@@ -20,6 +20,7 @@ pub async fn run_heartbeat_checker(
     node_id: String,
     check_interval: Duration,
     lease_duration_secs: u32,
+    flush_staleness_threshold_ms: u32,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
     info!("heartbeat checker started, interval={check_interval:?}");
@@ -68,6 +69,9 @@ pub async fn run_heartbeat_checker(
                     error!("heartbeat checker error: {e}");
                 }
             }
+
+            // Scan for stale sealed extents and delegate flush to secondaries.
+            sm_store.flush_stale_extents(flush_staleness_threshold_ms).await;
         }
 
         // Wait for next check interval or shutdown signal.
