@@ -980,7 +980,7 @@ impl StreamManagerStore {
             .unwrap_or_default();
 
         // Phase 2: broadcast seal commit to all replicas with the
-        // authoritative committed offset. Fire-and-forget.
+        // authoritative committed offset. Request-response.
         for replica in &old_replicas {
             let addr = replica.node_addr.clone();
             let sid = stream_id;
@@ -993,6 +993,7 @@ impl StreamManagerStore {
                     Ok(c) => {
                         let frame = rpc::frame::Frame::new(
                             rpc::frame::VariableHeader::SealExtentNodeCommit {
+                                request_id: 0,
                                 stream_id: sid,
                                 extent_id: eid,
                                 epoch: ep,
@@ -1001,13 +1002,19 @@ impl StreamManagerStore {
                             },
                             None,
                         );
-                        if let Err(e) = c.send_frame_no_response(frame).await {
-                            tracing::warn!(
-                                "seal phase 2 commit to {addr} failed: {e}"
-                            );
+                        match c.send_frame(frame).await {
+                            Ok(resp) => {
+                                tracing::debug!(
+                                    "seal phase 2 commit to {addr} succeeded: {:?}",
+                                    resp.opcode()
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "seal phase 2 commit to {addr} failed: {e}"
+                                );
+                            }
                         }
-                        // Brief sleep to let the writer flush before drop.
-                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -2006,7 +2013,7 @@ impl StreamManagerStore {
     /// concurrently to maximize the chance that at least one completes before
     /// further failures. S3 PUT is idempotent so concurrent uploads to the
     /// same key are safe. Includes the dead Primary (best-effort, in case it
-    /// recovered). Each send is fire-and-forget via `tokio::spawn`.
+    /// recovered). Each send is request-response via `tokio::spawn`.
     async fn send_flush_extent_to_all_replicas(
         &self,
         replicas: &[crate::metadata::StreamReplicaRow],
@@ -2031,6 +2038,7 @@ impl StreamManagerStore {
                     Ok(c) => {
                         let frame = rpc::frame::Frame::new(
                             rpc::frame::VariableHeader::FlushExtent {
+                                request_id: 0,
                                 stream_id: sid,
                                 extent_id: eid,
                                 epoch: ep,
@@ -2039,13 +2047,11 @@ impl StreamManagerStore {
                             },
                             None,
                         );
-                        match c.send_frame_no_response(frame).await {
-                            Ok(()) => {
-                                // Brief sleep to let the writer task flush the frame
-                                // to TCP before the client drops and closes the socket.
-                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        match c.send_frame(frame).await {
+                            Ok(resp) => {
                                 tracing::info!(
-                                    "{tag}: sent FlushExtent to {addr} for stream={sid} extent={eid}",
+                                    "{tag}: FlushExtent to {addr} for stream={sid} extent={eid} responded: {:?}",
+                                    resp.opcode(),
                                 );
                             }
                             Err(e) => {

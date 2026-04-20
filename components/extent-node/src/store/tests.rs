@@ -1386,6 +1386,7 @@ async fn flush_extent_seals_active_extent() {
         .handle_frame(
             Frame::new(
                 VariableHeader::FlushExtent {
+                    request_id: 50,
                     stream_id: sid,
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1397,7 +1398,9 @@ async fn flush_extent_seals_active_extent() {
             None,
         )
         .await;
-    assert!(result.is_none(), "FlushExtent is fire-and-forget");
+    let resp = result.expect("FlushExtent should return a response");
+    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert!(!resp.is_error_response());
 
     // Verify extent is now sealed.
     {
@@ -1436,6 +1439,7 @@ async fn flush_extent_corrects_sealed_extent() {
         .handle_frame(
             Frame::new(
                 VariableHeader::FlushExtent {
+                    request_id: 51,
                     stream_id: sid,
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1447,7 +1451,9 @@ async fn flush_extent_corrects_sealed_extent() {
             None,
         )
         .await;
-    assert!(result.is_none());
+    let resp = result.expect("FlushExtent should return a response");
+    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert!(!resp.is_error_response());
 
     // Verify extent is still sealed and the FlushRequest carries the corrected offset.
     {
@@ -1487,6 +1493,7 @@ async fn flush_extent_skips_flushed() {
         .handle_frame(
             Frame::new(
                 VariableHeader::FlushExtent {
+                    request_id: 52,
                     stream_id: sid,
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1498,7 +1505,9 @@ async fn flush_extent_skips_flushed() {
             None,
         )
         .await;
-    assert!(result.is_none());
+    let resp = result.expect("FlushExtent should return a response");
+    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert!(!resp.is_error_response());
     assert!(
         flush_rx.try_recv().is_err(),
         "no FlushRequest should be sent for already-flushed extent"
@@ -1518,6 +1527,7 @@ async fn flush_extent_skips_missing_extent() {
         .handle_frame(
             Frame::new(
                 VariableHeader::FlushExtent {
+                    request_id: 53,
                     stream_id: StreamId(1),
                     extent_id: ExtentId(99),
                     epoch: Epoch(0),
@@ -1529,7 +1539,9 @@ async fn flush_extent_skips_missing_extent() {
             None,
         )
         .await;
-    assert!(result.is_none());
+    let resp = result.expect("FlushExtent should return a response");
+    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert!(!resp.is_error_response());
     assert!(
         flush_rx.try_recv().is_err(),
         "no FlushRequest for missing extent"
@@ -1547,6 +1559,7 @@ async fn flush_extent_skips_missing_stream() {
         .handle_frame(
             Frame::new(
                 VariableHeader::FlushExtent {
+                    request_id: 54,
                     stream_id: StreamId(999),
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1558,7 +1571,9 @@ async fn flush_extent_skips_missing_stream() {
             None,
         )
         .await;
-    assert!(result.is_none());
+    let resp = result.expect("FlushExtent should return a response");
+    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert!(!resp.is_error_response());
     assert!(
         flush_rx.try_recv().is_err(),
         "no FlushRequest for missing stream"
@@ -1581,6 +1596,7 @@ async fn flush_extent_dedup() {
 
     let flush_frame = Frame::new(
         VariableHeader::FlushExtent {
+            request_id: 55,
             stream_id: sid,
             extent_id: ExtentId(1),
             epoch: Epoch(0),
@@ -1591,12 +1607,14 @@ async fn flush_extent_dedup() {
     );
 
     // First FlushExtent → should enqueue.
-    store.handle_frame(flush_frame.clone(), None).await;
+    let resp1 = store.handle_frame(flush_frame.clone(), None).await;
+    assert!(resp1.is_some());
     let req = flush_rx.try_recv().expect("first FlushExtent should enqueue");
     assert_eq!(req.stream_id, sid);
 
     // Second FlushExtent → deduplicated, no new FlushRequest.
-    store.handle_frame(flush_frame, None).await;
+    let resp2 = store.handle_frame(flush_frame, None).await;
+    assert!(resp2.is_some());
     assert!(
         flush_rx.try_recv().is_err(),
         "second FlushExtent should be deduplicated"
@@ -1611,11 +1629,12 @@ async fn flush_extent_no_s3_configured() {
     append_n(&store, sid, 2).await;
     seal_via_rpc(&store, sid, ExtentId(1)).await;
 
-    // flush_tx is None — should just return without panicking.
+    // flush_tx is None — should return error response without panicking.
     let result = store
         .handle_frame(
             Frame::new(
                 VariableHeader::FlushExtent {
+                    request_id: 56,
                     stream_id: sid,
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1627,7 +1646,9 @@ async fn flush_extent_no_s3_configured() {
             None,
         )
         .await;
-    assert!(result.is_none());
+    let resp = result.expect("FlushExtent should return a response");
+    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert!(resp.is_error_response());
 }
 
 // ── C. handle_seal_commit tests ──────────────────────────────────────────
@@ -1647,6 +1668,7 @@ async fn seal_commit_corrects_higher_offset() {
         .handle_frame(
             Frame::new(
                 VariableHeader::SealExtentNodeCommit {
+                    request_id: 60,
                     stream_id: sid,
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1658,7 +1680,9 @@ async fn seal_commit_corrects_higher_offset() {
             None,
         )
         .await;
-    assert!(result.is_none(), "SealExtentNodeCommit is fire-and-forget");
+    let resp = result.expect("SealExtentNodeCommit should return a response");
+    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    assert!(!resp.is_error_response());
 
     // Verify extent is still sealed. The limit was corrected to 3 internally
     // (correct_seal_offset), but message_count() returns committed_offset - start_offset
@@ -1688,6 +1712,7 @@ async fn seal_commit_seals_active_extent() {
         .handle_frame(
             Frame::new(
                 VariableHeader::SealExtentNodeCommit {
+                    request_id: 61,
                     stream_id: sid,
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1699,7 +1724,9 @@ async fn seal_commit_seals_active_extent() {
             None,
         )
         .await;
-    assert!(result.is_none());
+    let resp = result.expect("SealExtentNodeCommit should return a response");
+    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    assert!(!resp.is_error_response());
 
     // Verify extent is now sealed.
     {
@@ -1729,6 +1756,7 @@ async fn seal_commit_noop_lower_offset() {
         .handle_frame(
             Frame::new(
                 VariableHeader::SealExtentNodeCommit {
+                    request_id: 62,
                     stream_id: sid,
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1740,7 +1768,9 @@ async fn seal_commit_noop_lower_offset() {
             None,
         )
         .await;
-    assert!(result.is_none());
+    let resp = result.expect("SealExtentNodeCommit should return a response");
+    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    assert!(!resp.is_error_response());
 
     // Verify limit stays at 3 (not 5).
     {
@@ -1765,6 +1795,7 @@ async fn seal_commit_unknown_stream() {
         .handle_frame(
             Frame::new(
                 VariableHeader::SealExtentNodeCommit {
+                    request_id: 63,
                     stream_id: StreamId(999),
                     extent_id: ExtentId(1),
                     epoch: Epoch(0),
@@ -1776,5 +1807,7 @@ async fn seal_commit_unknown_stream() {
             None,
         )
         .await;
-    assert!(result.is_none(), "should return None for unknown stream");
+    let resp = result.expect("SealExtentNodeCommit should return a response");
+    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    assert!(!resp.is_error_response(), "should return success for unknown stream");
 }

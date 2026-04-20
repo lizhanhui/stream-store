@@ -48,9 +48,12 @@ pub const FLAG_SYSTEM_TICK: u8 = 0x02;
 
 /// Flag on SEAL_EXTENT_NODE: phase 2 commit with authoritative committed offset.
 /// SM broadcasts after computing quorum offset so replicas correct their local
-/// seal point. Fire-and-forget (no response).
-/// Uses 0x02 (not 0x01) to avoid conflict with FLAG_RESPONSE.
+/// seal point. Uses 0x02 (not 0x01) to avoid conflict with FLAG_RESPONSE.
 pub const FLAG_SEAL_COMMIT: u8 = 0x02;
+
+/// Flag on SEAL_EXTENT_NODE: phase 2 commit acknowledgement.
+/// Sent by EN back to SM after processing SealExtentNodeCommit.
+pub const FLAG_SEAL_COMMIT_RESP: u8 = 0x03;
 
 /// Unique identifier for a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

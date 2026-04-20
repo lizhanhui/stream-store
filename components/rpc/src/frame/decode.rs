@@ -4,7 +4,7 @@ use common::types::{
     Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
     FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
     FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
-    FLAG_SEAL_COMMIT, HEADER_LEN,
+    FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, HEADER_LEN,
     MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
 };
 
@@ -228,11 +228,25 @@ impl Frame {
                     ))
                 }
             }
-            // ── SealExtentNode: prepare (0x00), response (0x01), error (0x80), commit (0x02) ──
+            // ── SealExtentNode: prepare (0x00), response (0x01), error (0x80), commit (0x02), commit_resp (0x03) ──
             Opcode::SealExtentNode => {
-                // Commit (phase 2) has a different wire layout: no request_id prefix.
-                // Check for it first before consuming shared fields.
+                // Commit (phase 2) and commit_resp have a different wire layout.
+                // Check for them first before consuming shared fields.
+                if flags == FLAG_SEAL_COMMIT_RESP {
+                    let request_id = body.get_u32();
+                    let stream_id = StreamId(body.get_u32());
+                    let extent_id = ExtentId(body.get_u32());
+                    return Ok((
+                        VariableHeader::SealExtentNodeCommitResp {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                        },
+                        None,
+                    ));
+                }
                 if flags & FLAG_SEAL_COMMIT != 0 {
+                    let request_id = body.get_u32();
                     let stream_id = StreamId(body.get_u32());
                     let extent_id = ExtentId(body.get_u32());
                     let epoch = Epoch(body.get_u32());
@@ -240,6 +254,7 @@ impl Frame {
                     let end_offset = body.get_u64();
                     return Ok((
                         VariableHeader::SealExtentNodeCommit {
+                            request_id,
                             stream_id,
                             extent_id,
                             epoch,
@@ -286,22 +301,11 @@ impl Frame {
                         payload,
                     ))
                 } else if flags & FLAG_SEAL_COMMIT != 0 {
-                    // Phase 2: commit broadcast (fire-and-forget).
-                    let stream_id = StreamId(body.get_u32());
-                    let extent_id = ExtentId(body.get_u32());
-                    let epoch = Epoch(body.get_u32());
-                    let start_offset = body.get_u64();
-                    let end_offset = body.get_u64();
-                    Ok((
-                        VariableHeader::SealExtentNodeCommit {
-                            stream_id,
-                            extent_id,
-                            epoch,
-                            start_offset,
-                            end_offset,
-                        },
-                        None,
-                    ))
+                    // unreachable — handled above, but keep for safety.
+                    return Err(InternalSnafu {
+                        message: "duplicate FLAG_SEAL_COMMIT branch",
+                    }
+                    .build());
                 } else {
                     let epoch = Epoch(body.get_u32());
                     let extent_id_from = ExtentId(body.get_u32());
@@ -887,23 +891,53 @@ impl Frame {
                     ))
                 }
             }
-            // ── FlushExtent: fire-and-forget (0x00 only) ──
+            // ── FlushExtent: request (0x00), response (0x01), error (0x80) ──
             Opcode::FlushExtent => {
+                let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
                 let extent_id = ExtentId(body.get_u32());
-                let epoch = Epoch(body.get_u32());
-                let start_offset = body.get_u64();
-                let end_offset = body.get_u64();
-                Ok((
-                    VariableHeader::FlushExtent {
-                        stream_id,
-                        extent_id,
-                        epoch,
-                        start_offset,
-                        end_offset,
-                    },
-                    None,
-                ))
+                if flags & FLAG_RESPONSE_ERROR != 0 {
+                    let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
+                        InvalidFrameSnafu {
+                            message: "unknown FlushExtent error code",
+                        }
+                        .build()
+                    })?;
+                    let payload = Self::read_payload(body);
+                    Ok((
+                        VariableHeader::FlushExtentRespError {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            error_code,
+                        },
+                        payload,
+                    ))
+                } else if flags & FLAG_RESPONSE != 0 {
+                    Ok((
+                        VariableHeader::FlushExtentResp {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                        },
+                        None,
+                    ))
+                } else {
+                    let epoch = Epoch(body.get_u32());
+                    let start_offset = body.get_u64();
+                    let end_offset = body.get_u64();
+                    Ok((
+                        VariableHeader::FlushExtent {
+                            request_id,
+                            stream_id,
+                            extent_id,
+                            epoch,
+                            start_offset,
+                            end_offset,
+                        },
+                        None,
+                    ))
+                }
             }
         }
     }
