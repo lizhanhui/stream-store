@@ -881,7 +881,7 @@ Payload:
 
 ##### 0x1B FLUSH_EXTENT (Stream Manager -> Extent Node)
 
-SM commands an EN to upload a sealed extent to S3 (disaster recovery). Fire-and-forget: no response. The EN queues the upload on its background S3 flusher and sends `UpdateExtentFlushed` (0x18, flag=0x02) back to SM on success. EN deduplicates concurrent FlushExtent requests via an in-progress tracking set (`dr_flush_in_progress`). SM may send this to ALL replicas concurrently — S3 PUT is idempotent.
+SM commands an EN to upload a sealed extent to S3 (disaster recovery). Fire-and-forget: no response. The EN queues the upload on its background S3 flusher and sends `UpdateExtentFlushed` (0x18, flag=0x02) back to SM on success. EN deduplicates concurrent FlushExtent requests via a per-stream in-progress tracking set (`Stream::flush_in_progress`), checked via `start_flush`/`finish_flush`. SM may send this to ALL replicas concurrently — S3 PUT is idempotent.
 
 **Request (flag=0x00): SM -> EN**
 
