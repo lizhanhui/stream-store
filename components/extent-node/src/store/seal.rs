@@ -301,7 +301,14 @@ impl ExtentNodeStore {
                     epoch,
                     start_offset,
                     end_offset,
-                } => (*request_id, *stream_id, *extent_id, *epoch, *start_offset, *end_offset),
+                } => (
+                    *request_id,
+                    *stream_id,
+                    *extent_id,
+                    *epoch,
+                    *start_offset,
+                    *end_offset,
+                ),
                 _ => {
                     return Frame::error_from_request(
                         &frame,
@@ -380,10 +387,15 @@ impl ExtentNodeStore {
             );
         }
 
-        // Deduplicate: skip if already in progress.
+        // Deduplicate: skip if already in progress (covers both Primary and DR paths).
         {
-            let guard = self.dr_flush_in_progress.pin();
-            if guard.contains_key(&(stream_id, extent_id)) {
+            let started = self
+                .streams
+                .pin()
+                .get(&stream_id)
+                .map(|s| s.start_flush(extent_id))
+                .unwrap_or(false);
+            if !started {
                 info!(
                     "FlushExtent: already in progress for stream={} extent={}, skipping",
                     stream_id, extent_id,
@@ -397,11 +409,10 @@ impl ExtentNodeStore {
                     None,
                 );
             }
-            guard.insert((stream_id, extent_id), ());
         }
 
-        // Enqueue onto the existing flusher. If the channel is full, remove
-        // from the dedup set so SM can retry on the next scan.
+        // Enqueue onto the existing flusher. If the channel is full, clear
+        // the flush marker so SM can retry on the next scan.
         if flush_tx
             .try_send(FlushRequest {
                 stream_id,
@@ -415,9 +426,9 @@ impl ExtentNodeStore {
                 "FlushExtent: flush channel full for stream={} extent={}",
                 stream_id, extent_id,
             );
-            self.dr_flush_in_progress
-                .pin()
-                .remove(&(stream_id, extent_id));
+            if let Some(s) = self.streams.pin().get(&stream_id) {
+                s.finish_flush(extent_id);
+            }
             return Frame::flush_extent_resp_error(
                 request_id,
                 stream_id,
@@ -453,7 +464,14 @@ impl ExtentNodeStore {
                     epoch,
                     start_offset,
                     end_offset,
-                } => (*request_id, *stream_id, *extent_id, *epoch, *start_offset, *end_offset),
+                } => (
+                    *request_id,
+                    *stream_id,
+                    *extent_id,
+                    *epoch,
+                    *start_offset,
+                    *end_offset,
+                ),
                 _ => {
                     return Frame::error_from_request(
                         &frame,

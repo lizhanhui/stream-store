@@ -67,10 +67,6 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     "flush: stream {} not found, skipping extent {}",
                     req.stream_id, req.extent_id,
                 );
-                store
-                    .dr_flush_in_progress
-                    .pin()
-                    .remove(&(req.stream_id, req.extent_id));
                 return;
             }
         };
@@ -83,10 +79,9 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     "flush: extent {} not found on stream {}, may have been evicted",
                     req.extent_id, req.stream_id,
                 );
-                store
-                    .dr_flush_in_progress
-                    .pin()
-                    .remove(&(req.stream_id, req.extent_id));
+                if let Some(s) = store.streams.pin().get(&req.stream_id) {
+                    s.finish_flush(req.extent_id);
+                }
                 return;
             }
         }
@@ -114,7 +109,10 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
         if attempt > 1 && s3_client.exists(&key).await {
             info!(
                 "flush: extent {} for stream {} already exists at s3://{}/{}, skipping upload",
-                req.extent_id, req.stream_id, s3_client.bucket(), key,
+                req.extent_id,
+                req.stream_id,
+                s3_client.bucket(),
+                key,
             );
             break;
         }
@@ -198,8 +196,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
     }
 
     // Clear DR flush dedup tracker (no-op if this was a Primary flush).
-    store
-        .dr_flush_in_progress
-        .pin()
-        .remove(&(req.stream_id, req.extent_id));
+    if let Some(s) = store.streams.pin().get(&req.stream_id) {
+        s.finish_flush(req.extent_id);
+    }
 }
