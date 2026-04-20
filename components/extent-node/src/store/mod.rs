@@ -68,10 +68,6 @@ pub struct ExtentNodeStore {
     /// Channel to send sealed extent flush requests to the S3 flusher task.
     /// None when S3 is not configured.
     pub(crate) flush_tx: Option<Sender<FlushRequest>>,
-    /// Tracks extent IDs with an in-progress DR flush (SM-delegated upload).
-    /// Used to deduplicate repeated FlushExtent commands from SM.
-    /// Lock-free via papaya::HashMap — no Mutex contention.
-    pub(crate) dr_flush_in_progress: papaya::HashMap<(StreamId, ExtentId), ()>,
 }
 
 impl ExtentNodeStore {
@@ -88,7 +84,6 @@ impl ExtentNodeStore {
             append_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             flush_tx: None,
-            dr_flush_in_progress: papaya::HashMap::new(),
         }
     }
 
@@ -288,14 +283,10 @@ impl RequestHandler for ExtentNodeStore {
             }
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
-            Opcode::SealExtentNode => {
-                match &frame.variable_header {
-                    VariableHeader::SealExtentNodeCommit { .. } => {
-                        Some(self.handle_seal_commit(frame))
-                    }
-                    _ => Some(self.handle_seal(frame)),
-                }
-            }
+            Opcode::SealExtentNode => match &frame.variable_header {
+                VariableHeader::SealExtentNodeCommit { .. } => Some(self.handle_seal_commit(frame)),
+                _ => Some(self.handle_seal(frame)),
+            },
             Opcode::RegisterExtent => Some(self.handle_register_extent(frame)),
             Opcode::Connect => Some(Frame::new(
                 VariableHeader::ConnectAck {
@@ -310,9 +301,7 @@ impl RequestHandler for ExtentNodeStore {
                 None,
             )),
             Opcode::ReportExtents => Some(self.handle_report_extents(frame)),
-            Opcode::FlushExtent => {
-                Some(self.handle_flush_extent(frame))
-            }
+            Opcode::FlushExtent => Some(self.handle_flush_extent(frame)),
             Opcode::UpdateExtent
             | Opcode::Watermark
             | Opcode::SealStreamManager

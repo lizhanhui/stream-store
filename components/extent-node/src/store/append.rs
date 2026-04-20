@@ -647,12 +647,32 @@ impl ExtentNodeStore {
             .get(&stream_id)
             .and_then(|s| s.with_extent(notification.sealed_extent_id, |e| e.start_offset.0))
             .unwrap_or(0);
-        let _ = tx.try_send(crate::s3_flusher::FlushRequest {
-            stream_id,
-            extent_id: notification.sealed_extent_id,
-            start_offset,
-            end_offset: notification.end_offset,
-        });
+
+        // Deduplicate: mark flush-in-progress before enqueuing.
+        let started = self
+            .streams
+            .pin()
+            .get(&stream_id)
+            .map(|s| s.start_flush(notification.sealed_extent_id))
+            .unwrap_or(false);
+        if !started {
+            return; // Another path already enqueued a flush for this extent.
+        }
+
+        if tx
+            .try_send(crate::s3_flusher::FlushRequest {
+                stream_id,
+                extent_id: notification.sealed_extent_id,
+                start_offset,
+                end_offset: notification.end_offset,
+            })
+            .is_err()
+        {
+            // Channel full — clear the marker so it can be retried.
+            if let Some(s) = self.streams.pin().get(&stream_id) {
+                s.finish_flush(notification.sealed_extent_id);
+            }
+        }
     }
 
     /// Send a ForwardChecksum for a sealed extent inline via per-stream channels.

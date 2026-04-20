@@ -252,6 +252,11 @@ pub struct Stream {
     /// forcing the append hot path into a write lock.
     ack_queue: OnceLock<AckQueue>,
 
+    /// Tracks extents with an in-progress S3 flush (both Primary and DR paths).
+    /// Used to deduplicate concurrent flush requests for the same extent.
+    /// Lock-free via papaya::HashMap.
+    flush_in_progress: papaya::HashMap<ExtentId, ()>,
+
     /// Mutable state protected by RwLock.
     inner: RwLock<StreamInner>,
 }
@@ -279,6 +284,7 @@ impl Stream {
             job_tx,
             job_rx,
             ack_queue: OnceLock::new(),
+            flush_in_progress: papaya::HashMap::new(),
             inner: RwLock::new(StreamInner {
                 extents: Vec::new(),
                 next_extent_id: ExtentId(0),
@@ -623,6 +629,23 @@ impl Stream {
     /// Return the storage class for this stream.
     pub fn storage_class(&self) -> StorageClass {
         self.inner.read().storage_class
+    }
+
+    /// Try to mark an extent as flush-in-progress. Returns `true` if inserted
+    /// (caller should proceed with flush), `false` if already in progress (dedup).
+    pub fn start_flush(&self, extent_id: ExtentId) -> bool {
+        let guard = self.flush_in_progress.pin();
+        if guard.contains_key(&extent_id) {
+            false
+        } else {
+            guard.insert(extent_id, ());
+            true
+        }
+    }
+
+    /// Clear the flush-in-progress marker for an extent (flush completed or failed).
+    pub fn finish_flush(&self, extent_id: ExtentId) {
+        self.flush_in_progress.pin().remove(&extent_id);
     }
 
     // ── Write-lock methods ─────────────────────────────────────────────
