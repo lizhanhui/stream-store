@@ -1341,11 +1341,7 @@ async fn append_n(store: &ExtentNodeStore, sid: StreamId, n: u32) -> Offset {
 
 /// Seal an extent via SealExtentNodePrepare (the production RPC path).
 /// Returns the end_offset from the SealExtentNodeResp.
-async fn seal_via_rpc(
-    store: &ExtentNodeStore,
-    sid: StreamId,
-    extent_id: ExtentId,
-) -> u64 {
+async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, extent_id: ExtentId) -> u64 {
     let resp = store
         .handle_frame(
             Frame::new(
@@ -1406,7 +1402,9 @@ async fn flush_extent_seals_active_extent() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        let sealed = stream.with_extent(ExtentId(1), |ext| ext.is_sealed()).unwrap();
+        let sealed = stream
+            .with_extent(ExtentId(1), |ext| ext.is_sealed())
+            .unwrap();
         assert!(sealed, "extent should be sealed after FlushExtent");
     }
 
@@ -1431,7 +1429,9 @@ async fn flush_extent_corrects_sealed_extent() {
     assert_eq!(end, 5);
 
     // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
-    let seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
+    let seal_req = flush_rx
+        .try_recv()
+        .expect("seal should have enqueued FlushRequest");
     assert_eq!(seal_req.end_offset, 5);
 
     // Simulate s3_flusher completing: clear the flush-in-progress marker.
@@ -1466,13 +1466,20 @@ async fn flush_extent_corrects_sealed_extent() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        let sealed = stream.with_extent(ExtentId(1), |ext| ext.is_sealed()).unwrap();
+        let sealed = stream
+            .with_extent(ExtentId(1), |ext| ext.is_sealed())
+            .unwrap();
         assert!(sealed, "extent should still be sealed after FlushExtent");
     }
 
-    let req = flush_rx.try_recv().expect("FlushExtent should enqueue FlushRequest");
+    let req = flush_rx
+        .try_recv()
+        .expect("FlushExtent should enqueue FlushRequest");
     assert_eq!(req.stream_id, sid);
-    assert_eq!(req.end_offset, 3, "FlushRequest should carry SM's corrected offset");
+    assert_eq!(
+        req.end_offset, 3,
+        "FlushRequest should carry SM's corrected offset"
+    );
 }
 
 #[tokio::test]
@@ -1487,7 +1494,9 @@ async fn flush_extent_skips_flushed() {
     seal_via_rpc(&store, sid, ExtentId(1)).await;
 
     // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
-    let _seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
+    let _seal_req = flush_rx
+        .try_recv()
+        .expect("seal should have enqueued FlushRequest");
 
     // Simulate s3_flusher completing: clear the flush-in-progress marker.
     {
@@ -1606,7 +1615,9 @@ async fn flush_extent_dedup() {
     seal_via_rpc(&store, sid, ExtentId(1)).await;
 
     // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
-    let _seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
+    let _seal_req = flush_rx
+        .try_recv()
+        .expect("seal should have enqueued FlushRequest");
 
     // Simulate s3_flusher completing: clear the flush-in-progress marker.
     {
@@ -1630,7 +1641,9 @@ async fn flush_extent_dedup() {
     // First FlushExtent → should enqueue.
     let resp1 = store.handle_frame(flush_frame.clone(), None).await;
     assert!(resp1.is_some());
-    let req = flush_rx.try_recv().expect("first FlushExtent should enqueue");
+    let req = flush_rx
+        .try_recv()
+        .expect("first FlushExtent should enqueue");
     assert_eq!(req.stream_id, sid);
 
     // Second FlushExtent → deduplicated, no new FlushRequest.
@@ -1712,13 +1725,18 @@ async fn seal_commit_corrects_higher_offset() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        let sealed = stream.with_extent(ExtentId(1), |ext| ext.is_sealed()).unwrap();
+        let sealed = stream
+            .with_extent(ExtentId(1), |ext| ext.is_sealed())
+            .unwrap();
         assert!(sealed, "extent should still be sealed after SealCommit");
         // committed_offset is unchanged (5 records were written).
         let count = stream
             .with_extent(ExtentId(1), |ext| ext.message_count())
             .unwrap();
-        assert_eq!(count, 5, "committed data is unchanged; limit correction is internal");
+        assert_eq!(
+            count, 5,
+            "committed data is unchanged; limit correction is internal"
+        );
     }
 }
 
@@ -1753,7 +1771,9 @@ async fn seal_commit_seals_active_extent() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        let sealed = stream.with_extent(ExtentId(1), |ext| ext.is_sealed()).unwrap();
+        let sealed = stream
+            .with_extent(ExtentId(1), |ext| ext.is_sealed())
+            .unwrap();
         assert!(sealed, "extent should be sealed after SealExtentNodeCommit");
         let count = stream
             .with_extent(ExtentId(1), |ext| ext.message_count())
@@ -1830,5 +1850,8 @@ async fn seal_commit_unknown_stream() {
         .await;
     let resp = result.expect("SealExtentNodeCommit should return a response");
     assert_eq!(resp.opcode(), Opcode::SealExtentNode);
-    assert!(!resp.is_error_response(), "should return success for unknown stream");
+    assert!(
+        !resp.is_error_response(),
+        "should return success for unknown stream"
+    );
 }

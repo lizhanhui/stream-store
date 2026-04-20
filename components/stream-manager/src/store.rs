@@ -1010,16 +1010,12 @@ impl StreamManagerStore {
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "seal phase 2 commit to {addr} failed: {e}"
-                                );
+                                tracing::warn!("seal phase 2 commit to {addr} failed: {e}");
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "seal phase 2 commit connect to {addr} failed: {e}"
-                        );
+                        tracing::warn!("seal phase 2 commit connect to {addr} failed: {e}");
                     }
                 }
             });
@@ -1938,16 +1934,16 @@ impl StreamManagerStore {
                             },
                             None,
                         );
-                    if let Err(e) = c.send_frame_no_response(frame).await {
-                        tracing::warn!(
-                            "broadcast_forward_flushed: failed to send to {}: {e}",
-                            addr
-                        );
+                        if let Err(e) = c.send_frame_no_response(frame).await {
+                            tracing::warn!(
+                                "broadcast_forward_flushed: failed to send to {}: {e}",
+                                addr
+                            );
+                        }
+                        // Brief sleep to let the writer flush before drop.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
-                    // Brief sleep to let the writer flush before drop.
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                }
-                Err(e) => {
+                    Err(e) => {
                         tracing::warn!(
                             "broadcast_forward_flushed: failed to connect to {}: {e}",
                             addr
@@ -2055,16 +2051,12 @@ impl StreamManagerStore {
                                 );
                             }
                             Err(e) => {
-                                tracing::warn!(
-                                    "{tag}: FlushExtent send to {addr} failed: {e}",
-                                );
+                                tracing::warn!("{tag}: FlushExtent send to {addr} failed: {e}",);
                             }
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(
-                            "{tag}: FlushExtent connect to {addr} failed: {e}",
-                        );
+                        tracing::warn!("{tag}: FlushExtent connect to {addr} failed: {e}",);
                     }
                 }
             });

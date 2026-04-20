@@ -712,12 +712,10 @@ impl Extent {
             if current == LIMIT_OPEN || current <= count {
                 return; // not sealed or already at/below target
             }
-            match self.limit.compare_exchange(
-                current,
-                count,
-                Ordering::Release,
-                Ordering::Acquire,
-            ) {
+            match self
+                .limit
+                .compare_exchange(current, count, Ordering::Release, Ordering::Acquire)
+            {
                 Ok(_) => return,
                 Err(_) => continue, // concurrent modification, retry
             }
