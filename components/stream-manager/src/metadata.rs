@@ -1500,7 +1500,11 @@ impl MetadataStore {
     /// Record that an extent was flushed to S3 (EN confirms upload via UpdateExtentFlushed).
     ///
     /// Transitions the extent state from Sealed to Flushed. Idempotent: no-op if
-    /// already Flushed or if the extent is still Active. Epoch-validated.
+    /// already Flushed or if the extent is still Active.
+    ///
+    /// Validates by (stream_id, extent_id, epoch): the epoch must match the extent's
+    /// creation epoch stored in the DB. This is the per-extent epoch (immutable after
+    /// creation), NOT the stream's current epoch (which may be higher after a seal).
     pub async fn record_extent_flushed(
         &self,
         stream_id: StreamId,
@@ -1514,34 +1518,101 @@ impl MetadataStore {
             message: "begin transaction",
         })?;
 
-        // Validate epoch matches current stream epoch.
-        let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
-            .bind(stream_id.0)
-            .fetch_optional(&mut *tx)
-            .await
-            .context(DatabaseSnafu {
-                message: "lock stream",
-            })?;
+        // Lock the extent row and read its current state + epoch for validation.
+        let row = sqlx::query(
+            "SELECT epoch, state FROM extent WHERE stream_id = ? AND extent_id = ? FOR UPDATE",
+        )
+        .bind(stream_id.0)
+        .bind(extent_id.0 as i64)
+        .fetch_optional(&mut *tx)
+        .await
+        .context(DatabaseSnafu {
+            message: "lock extent",
+        })?;
 
-        if let Some(row) = row {
-            let current_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
-            if epoch != current_epoch {
-                // Stale notification from an old epoch — skip.
+        let Some(row) = row else {
+            tracing::warn!(
+                "record_extent_flushed: stream {} extent {} not found, skipping",
+                stream_id,
+                extent_id,
+            );
+            tx.commit()
+                .await
+                .context(DatabaseSnafu { message: "commit" })?;
+            return Ok(());
+        };
+
+        let extent_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
+        let state_raw = row.get::<i8, _>("state") as u8;
+        let extent_state = ExtentState::from_u8(state_raw).unwrap_or_else(|| {
+            tracing::error!(
+                "record_extent_flushed: unknown extent state {} for stream {} extent {}, treating as Active",
+                state_raw, stream_id, extent_id,
+            );
+            ExtentState::Active
+        });
+
+        // Validate the extent's creation epoch matches the reported epoch.
+        // The EN reports the extent's own epoch (immutable), which should match
+        // what we stored when the extent was allocated.
+        if epoch != extent_epoch {
+            tracing::warn!(
+                "record_extent_flushed: epoch mismatch for stream {} extent {}: \
+                 reported epoch={}, DB epoch={}, current state={:?} — skipping",
+                stream_id,
+                extent_id,
+                epoch.0,
+                extent_epoch.0,
+                extent_state,
+            );
+            tx.commit()
+                .await
+                .context(DatabaseSnafu { message: "commit" })?;
+            return Ok(());
+        }
+
+        match extent_state {
+            ExtentState::Sealed => {
+                tracing::info!(
+                    "record_extent_flushed: stream {} extent {} Sealed→Flushed \
+                     (epoch={})",
+                    stream_id,
+                    extent_id,
+                    epoch.0,
+                );
+            }
+            ExtentState::Flushed => {
+                tracing::debug!(
+                    "record_extent_flushed: stream {} extent {} already Flushed \
+                     (epoch={}), idempotent skip",
+                    stream_id,
+                    extent_id,
+                    epoch.0,
+                );
                 tx.commit()
                     .await
                     .context(DatabaseSnafu { message: "commit" })?;
                 return Ok(());
             }
-        } else {
-            return InternalSnafu {
-                message: format!("stream {:?} not found", stream_id),
+            other => {
+                tracing::warn!(
+                    "record_extent_flushed: stream {} extent {} in unexpected state {:?} \
+                     (epoch={}), cannot transition to Flushed",
+                    stream_id,
+                    extent_id,
+                    other,
+                    epoch.0,
+                );
+                tx.commit()
+                    .await
+                    .context(DatabaseSnafu { message: "commit" })?;
+                return Ok(());
             }
-            .fail();
         }
 
         // Transition Sealed → Flushed (idempotent: no-op if already Flushed).
-        sqlx::query(
-            "UPDATE extent SET state = ? \
+        let result = sqlx::query(
+            "UPDATE extent SET state = ?, flushed_at = NOW(3) \
              WHERE stream_id = ? AND extent_id = ? AND state = ?",
         )
         .bind(ExtentState::Flushed.as_u8())
@@ -1557,6 +1628,16 @@ impl MetadataStore {
         tx.commit()
             .await
             .context(DatabaseSnafu { message: "commit" })?;
+
+        let rows_affected = result.rows_affected();
+        if rows_affected == 0 {
+            tracing::warn!(
+                "record_extent_flushed: stream {} extent {} UPDATE matched 0 rows \
+                 (concurrent state change?)",
+                stream_id,
+                extent_id,
+            );
+        }
 
         Ok(())
     }
