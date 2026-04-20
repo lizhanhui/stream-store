@@ -7,7 +7,12 @@ on:
     branches: [ "master", "develop" ]
 
 env:
-  CARGO_TERM_COLOR: always
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_ACCESS_SECRET }}
+  AWS_DEFAULT_REGION: ap-guangzhou
+  AWS_ENDPOINT_URL: https://cos.ap-guangzhou.myqcloud.com
+  AWS_S3_ADDRESSING_STYLE: virtual
+  CARGO_TERM_COLOR: always    
 
 jobs:
   build:
