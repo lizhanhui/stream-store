@@ -39,7 +39,7 @@ use aws_sdk_s3 as s3;
 async fn main() {
     env_logger::init();
     // endpoint_url, region, and addressing_style come from ~/.aws/config.
-    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "dev".to_string());
+    let profile = std::env::var("AWS_PROFILE").unwrap_or_else(|_| "default".to_string());
     let config = aws_config::from_env().profile_name(&profile).load().await;
     let mut config_builder = s3::config::Builder::from(&config);
     config_builder.set_force_path_style(Some(false));
@@ -48,7 +48,7 @@ async fn main() {
     let client = s3::Client::from_conf(config);
 
     let bucket_name =
-        std::env::var("COS_BUCKET").unwrap_or_else(|_| "stream-storage-1366919849".to_string());
+        std::env::var("S3_BUCKET_NAME").unwrap_or_else(|_| "stream-storage-1366919849".to_string());
     let key = "s3-example-test/hello.txt";
 
     // Put object
