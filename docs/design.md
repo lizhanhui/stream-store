@@ -1295,7 +1295,7 @@ Detailed steps:
 
 2. **Single-writer append** (`try_append_active` → `append_inner`): The leader uses plain `load`/`store` on `write_cursor` and `record_count` (no `fetch_add`). Same memcpy as before. Direct `store` of `committed_bytes`, index entry, and `committed_seq` — no spin-wait needed since there's only one writer.
 
-3. **Extent-full transition** (inline, within leader's turn): If `append_inner` returns `ExtentFull`, the leader drops the shared DashMap ref, acquires an exclusive ref, calls `seal_and_create_next()`, re-acquires shared ref, retries. All within the same leader turn — no re-election, no race. Followers queued during the transition are processed on the new extent.
+3. **Extent-full transition** (inline, within leader's turn): If `append_inner` returns `ExtentFull`, the leader drops the shared RwLock ref, acquires an exclusive ref, calls `seal_and_create_next()`, re-acquires shared ref, retries. All within the same leader turn — no re-election, no race. Followers queued during the transition are processed on the new extent.
 
 4. **Replication / ACK**: After append, the leader checks `ReplicaInfo`:
    - **RF=1 / standalone / no replica**: Send immediate `AppendAck` via `response_tx`.
