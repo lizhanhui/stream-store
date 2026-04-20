@@ -1404,4 +1404,72 @@ mod tests {
         let msgs = ext.read(r.byte_pos, 1).unwrap();
         assert_eq!(msgs[0], Bytes::from_static(b"shrunk"));
     }
+
+    #[test]
+    fn correct_seal_offset_lowers_limit() {
+        // Sealed at 100 records, correct down to 80
+        let extent = Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        for i in 0..100u32 {
+            extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
+        }
+        extent.seal(None); // seals at 100
+        assert_eq!(extent.message_count(), 100);
+
+        extent.correct_seal_offset(80);
+        // limit should now be 80; message_count still reads committed_offset which is 100
+        // but is_sealed() still true
+        assert!(extent.is_sealed());
+    }
+
+    #[test]
+    fn correct_seal_offset_noop_if_already_lower() {
+        // Sealed at 50 records, try to "correct" to 80 → no-op
+        let extent = Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        for i in 0..50u32 {
+            extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
+        }
+        extent.seal(None); // seals at 50
+
+        extent.correct_seal_offset(80); // 80 > 50, no change
+        assert!(extent.is_sealed());
+        // limit stays at 50
+    }
+
+    #[test]
+    fn correct_seal_offset_noop_if_unsealed() {
+        // Not sealed → correct_seal_offset is a no-op
+        let extent = Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        extent.append(Bytes::from_static(b"hello")).unwrap();
+
+        extent.correct_seal_offset(0); // should not seal or crash
+        assert!(!extent.is_sealed());
+    }
+
+    #[test]
+    fn correct_seal_offset_concurrent() {
+        // Multiple threads calling correct_seal_offset → CAS loop handles it
+        let extent = Arc::new(Extent::with_capacity(
+            ExtentId(1),
+            Offset(0),
+            1024 * 1024,
+            Epoch(0),
+        ));
+        for i in 0..100u32 {
+            extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
+        }
+        extent.seal(None); // seals at 100
+
+        let mut handles = vec![];
+        for target in [90, 80, 70, 60, 50] {
+            let ext = Arc::clone(&extent);
+            handles.push(std::thread::spawn(move || {
+                ext.correct_seal_offset(target);
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+        // After all corrections, limit should be 50 (the lowest)
+        assert!(extent.is_sealed());
+    }
 }

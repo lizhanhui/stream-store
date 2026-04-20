@@ -874,4 +874,82 @@ mod tests {
         assert!(Compression::from_u8(3).is_err());
         assert!(Compression::from_u8(255).is_err());
     }
+
+    // ── encode_extent_range tests ────────────────────────────────────────────
+
+    #[test]
+    fn encode_extent_range_full_data() {
+        // Extent has exactly end_offset - start_offset records → canonical
+        let extent = sealed_extent(&[b"aaa", b"bbb", b"ccc"]);
+        let (encoded, actual_end) = encode_extent_range(StreamId(1), &extent, Compression::None, 3);
+        assert_eq!(actual_end, 3); // canonical
+        let header = S3ExtentHeader::decode(&encoded).unwrap();
+        assert_eq!(header.start_offset, 0);
+        assert_eq!(header.end_offset, 3);
+        assert_eq!(header.record_count, 3);
+        verify_crc32(&encoded, &header);
+    }
+
+    #[test]
+    fn encode_extent_range_more_local_data() {
+        // Extent has 5 records, request only 3 → trims, canonical
+        let extent = sealed_extent(&[b"a", b"b", b"c", b"d", b"e"]);
+        let (encoded, actual_end) = encode_extent_range(StreamId(1), &extent, Compression::None, 3);
+        assert_eq!(actual_end, 3);
+        let header = S3ExtentHeader::decode(&encoded).unwrap();
+        assert_eq!(header.record_count, 3);
+        assert_eq!(header.end_offset, 3);
+        verify_crc32(&encoded, &header);
+    }
+
+    #[test]
+    fn encode_extent_range_less_local_data() {
+        // Extent has 3 records, request 5 → partial, actual_end < requested
+        let extent = sealed_extent(&[b"a", b"b", b"c"]);
+        let (encoded, actual_end) = encode_extent_range(StreamId(1), &extent, Compression::None, 5);
+        assert_eq!(actual_end, 3); // partial: only 3 records available
+        let header = S3ExtentHeader::decode(&encoded).unwrap();
+        assert_eq!(header.record_count, 3);
+        assert_eq!(header.end_offset, 3);
+        verify_crc32(&encoded, &header);
+    }
+
+    #[test]
+    fn encode_extent_range_zero_records() {
+        // end_offset == start_offset → empty
+        let extent = sealed_extent(&[b"a", b"b"]);
+        let (encoded, actual_end) = encode_extent_range(StreamId(1), &extent, Compression::None, 0);
+        assert_eq!(actual_end, 0);
+        let header = S3ExtentHeader::decode(&encoded).unwrap();
+        assert_eq!(header.record_count, 0);
+        assert_eq!(header.end_offset, 0);
+    }
+
+    #[test]
+    fn encode_extent_range_nonzero_start() {
+        // start_offset=100, 3 records, request end_offset=103 → canonical
+        let extent = sealed_extent_at(100, &[b"x", b"y", b"z"]);
+        let (encoded, actual_end) =
+            encode_extent_range(StreamId(5), &extent, Compression::None, 103);
+        assert_eq!(actual_end, 103);
+        let header = S3ExtentHeader::decode(&encoded).unwrap();
+        assert_eq!(header.start_offset, 100);
+        assert_eq!(header.end_offset, 103);
+        assert_eq!(header.record_count, 3);
+        verify_crc32(&encoded, &header);
+    }
+
+    #[test]
+    fn encode_extent_range_partial_key_differs() {
+        // When local < requested, S3 key uses actual_end (partial key)
+        // which differs from the canonical key using requested end
+        let extent = sealed_extent(&[b"a", b"b"]);
+        let (_, actual_end) = encode_extent_range(StreamId(42), &extent, Compression::None, 5);
+        let canonical_key = s3_key("ns", StreamId(42), 0, 5);
+        let partial_key = s3_key("ns", StreamId(42), 0, actual_end);
+        assert_ne!(canonical_key, partial_key);
+        assert_eq!(actual_end, 2);
+        assert!(canonical_key.contains("0_5.dat"));
+        assert!(partial_key.contains("0_2.dat"));
+    }
 }
