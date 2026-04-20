@@ -1006,6 +1006,8 @@ impl StreamManagerStore {
                                 "seal phase 2 commit to {addr} failed: {e}"
                             );
                         }
+                        // Brief sleep to let the writer flush before drop.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     Err(e) => {
                         tracing::warn!(
@@ -1929,14 +1931,16 @@ impl StreamManagerStore {
                             },
                             None,
                         );
-                        if let Err(e) = c.send_frame_no_response(frame).await {
-                            tracing::warn!(
-                                "broadcast_forward_flushed: failed to send to {}: {e}",
-                                addr
-                            );
-                        }
+                    if let Err(e) = c.send_frame_no_response(frame).await {
+                        tracing::warn!(
+                            "broadcast_forward_flushed: failed to send to {}: {e}",
+                            addr
+                        );
                     }
-                    Err(e) => {
+                    // Brief sleep to let the writer flush before drop.
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => {
                         tracing::warn!(
                             "broadcast_forward_flushed: failed to connect to {}: {e}",
                             addr
@@ -2037,6 +2041,9 @@ impl StreamManagerStore {
                         );
                         match c.send_frame_no_response(frame).await {
                             Ok(()) => {
+                                // Brief sleep to let the writer task flush the frame
+                                // to TCP before the client drops and closes the socket.
+                                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                                 tracing::info!(
                                     "{tag}: sent FlushExtent to {addr} for stream={sid} extent={eid}",
                                 );
