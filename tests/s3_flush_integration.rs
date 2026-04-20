@@ -24,7 +24,7 @@ use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::{Epoch, ExtentState, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use extent_node::s3::S3Client;
-use extent_node::s3_codec::{s3_key, S3ExtentHeader};
+use extent_node::s3_codec::{S3ExtentHeader, s3_key};
 use stream_manager::StreamManager;
 use stream_manager::metadata::MetadataStore;
 use tokio::time::sleep;
@@ -183,8 +183,7 @@ async fn setup_cluster_with_s3(
     let sm_addrs = vec![sm_addr.clone()];
     let mut en_map = HashMap::new();
     for i in 0..en_count {
-        let en =
-            ExtentNode::start(en_config_with_s3(&sm_addrs, profile, bucket, namespace)).await;
+        let en = ExtentNode::start(en_config_with_s3(&sm_addrs, profile, bucket, namespace)).await;
         let addr = en.addr().to_string();
         info!("[setup] EN {i} started on {addr}");
         en_map.insert(addr, en);
@@ -384,7 +383,15 @@ async fn staleness_scan_triggers_dr_flush() {
     // Create stream RF=2 with tiny extent capacity to trigger extent-full quickly.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
     let (stream_id, _eid, _epoch, primary_addr) = sm_client
-        .create_stream("test-staleness-flush", 2, 1024, 1024, 0, 0, StorageClass::S3)
+        .create_stream(
+            "test-staleness-flush",
+            2,
+            1024,
+            1024,
+            0,
+            0,
+            StorageClass::S3,
+        )
         .await
         .expect("create_stream");
     info!("[test] Stream {stream_id}, RF=2, primary={primary_addr}, capacity=1024");
@@ -394,11 +401,7 @@ async fn staleness_scan_triggers_dr_flush() {
     let mut total = 0;
     for i in 0..200u32 {
         match client
-            .append(
-                stream_id,
-                Epoch(0),
-                Bytes::from(format!("payload-{i:04}")),
-            )
+            .append(stream_id, Epoch(0), Bytes::from(format!("payload-{i:04}")))
             .await
         {
             Ok(_) => total += 1,

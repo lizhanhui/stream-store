@@ -71,7 +71,9 @@ pub async fn run_heartbeat_checker(
             }
 
             // Scan for stale sealed extents and delegate flush to secondaries.
-            sm_store.flush_stale_extents(flush_staleness_threshold_ms).await;
+            sm_store
+                .flush_stale_extents(flush_staleness_threshold_ms)
+                .await;
         }
 
         // Wait for next check interval or shutdown signal.
