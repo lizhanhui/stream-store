@@ -11,10 +11,8 @@ mod tests;
 pub(crate) use types::AppendJob;
 pub use types::{ExtentUpdate, ReplicaInfo};
 
-use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 
 use common::hasher::IdentityBuildHasher;
@@ -72,9 +70,8 @@ pub struct ExtentNodeStore {
     pub(crate) flush_tx: Option<Sender<FlushRequest>>,
     /// Tracks extent IDs with an in-progress DR flush (SM-delegated upload).
     /// Used to deduplicate repeated FlushExtent commands from SM.
-    /// NOTE: std::sync::Mutex is intentional — critical sections are trivial
-    /// (HashSet insert/remove) and MUST NOT be held across .await points.
-    pub(crate) dr_flush_in_progress: Mutex<HashSet<(StreamId, ExtentId)>>,
+    /// Lock-free via papaya::HashMap — no Mutex contention.
+    pub(crate) dr_flush_in_progress: papaya::HashMap<(StreamId, ExtentId), ()>,
 }
 
 impl ExtentNodeStore {
@@ -91,7 +88,7 @@ impl ExtentNodeStore {
             append_count: AtomicU64::new(0),
             bytes_written: AtomicU64::new(0),
             flush_tx: None,
-            dr_flush_in_progress: Mutex::new(HashSet::new()),
+            dr_flush_in_progress: papaya::HashMap::new(),
         }
     }
 

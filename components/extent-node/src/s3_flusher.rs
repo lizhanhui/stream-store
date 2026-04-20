@@ -69,8 +69,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                 );
                 store
                     .dr_flush_in_progress
-                    .lock()
-                    .unwrap()
+                    .pin()
                     .remove(&(req.stream_id, req.extent_id));
                 return;
             }
@@ -86,8 +85,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                 );
                 store
                     .dr_flush_in_progress
-                    .lock()
-                    .unwrap()
+                    .pin()
                     .remove(&(req.stream_id, req.extent_id));
                 return;
             }
@@ -202,7 +200,6 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
     // Clear DR flush dedup tracker (no-op if this was a Primary flush).
     store
         .dr_flush_in_progress
-        .lock()
-        .unwrap()
+        .pin()
         .remove(&(req.stream_id, req.extent_id));
 }

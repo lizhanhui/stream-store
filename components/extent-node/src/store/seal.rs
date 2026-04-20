@@ -382,8 +382,8 @@ impl ExtentNodeStore {
 
         // Deduplicate: skip if already in progress.
         {
-            let mut in_progress = self.dr_flush_in_progress.lock().unwrap();
-            if !in_progress.insert((stream_id, extent_id)) {
+            let guard = self.dr_flush_in_progress.pin();
+            if guard.contains_key(&(stream_id, extent_id)) {
                 info!(
                     "FlushExtent: already in progress for stream={} extent={}, skipping",
                     stream_id, extent_id,
@@ -397,6 +397,7 @@ impl ExtentNodeStore {
                     None,
                 );
             }
+            guard.insert((stream_id, extent_id), ());
         }
 
         // Enqueue onto the existing flusher. If the channel is full, remove
@@ -415,8 +416,7 @@ impl ExtentNodeStore {
                 stream_id, extent_id,
             );
             self.dr_flush_in_progress
-                .lock()
-                .unwrap()
+                .pin()
                 .remove(&(stream_id, extent_id));
             return Frame::flush_extent_resp_error(
                 request_id,
