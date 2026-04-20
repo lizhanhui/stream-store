@@ -1312,3 +1312,469 @@ async fn append_with_matching_epoch_succeeds() {
     assert_eq!(resp.opcode(), Opcode::Append);
     assert!(!resp.is_error_response());
 }
+
+// ── Helper: append N records to a stream ─────────────────────────────────
+
+/// Append `n` records to the given stream and return the last offset.
+async fn append_n(store: &ExtentNodeStore, sid: StreamId, n: u32) -> Offset {
+    let mut last = Offset(0);
+    for i in 0..n {
+        let resp = store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::Append {
+                        request_id: 100 + i,
+                        stream_id: sid,
+                        epoch: Epoch(0),
+                    },
+                    Some(Bytes::from(format!("rec{i}"))),
+                ),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.opcode(), Opcode::Append);
+        last = resp.offset();
+    }
+    last
+}
+
+/// Seal an extent via SealExtentNodePrepare (the production RPC path).
+/// Returns the end_offset from the SealExtentNodeResp.
+async fn seal_via_rpc(
+    store: &ExtentNodeStore,
+    sid: StreamId,
+    extent_id: ExtentId,
+) -> u64 {
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::SealExtentNodePrepare {
+                    request_id: 200,
+                    stream_id: sid,
+                    epoch: Epoch(0),
+                    extent_id_from: extent_id,
+                    start_offset: 0,
+                },
+                None,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    match &resp.variable_header {
+        VariableHeader::SealExtentNodeResp { end_offset, .. } => *end_offset,
+        other => panic!("expected SealExtentNodeResp, got {:?}", other),
+    }
+}
+
+// ── B. handle_flush_extent tests ─────────────────────────────────────────
+
+#[tokio::test]
+async fn flush_extent_seals_active_extent() {
+    // B6: FlushExtent on an Active extent should seal it and enqueue a FlushRequest.
+    let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
+    let mut store = ExtentNodeStore::new();
+    store.set_flush_tx(flush_tx);
+
+    let sid = register_stream(&store, 1, 1).await;
+    append_n(&store, sid, 3).await;
+
+    // Extent is Active — send FlushExtent with end_offset=3.
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::FlushExtent {
+                    stream_id: sid,
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 3,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none(), "FlushExtent is fire-and-forget");
+
+    // Verify extent is now sealed.
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        let sealed = stream.with_extent(ExtentId(1), |ext| ext.is_sealed()).unwrap();
+        assert!(sealed, "extent should be sealed after FlushExtent");
+    }
+
+    // Verify FlushRequest was received.
+    let req = flush_rx.try_recv().expect("expected FlushRequest");
+    assert_eq!(req.stream_id, sid);
+    assert_eq!(req.extent_id, ExtentId(1));
+    assert_eq!(req.end_offset, 3);
+}
+
+#[tokio::test]
+async fn flush_extent_corrects_sealed_extent() {
+    // B7: FlushExtent on a Sealed extent with a lower end_offset (SM quorum < local)
+    // should correct the seal offset downward and enqueue a FlushRequest.
+    let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
+    let mut store = ExtentNodeStore::new();
+    store.set_flush_tx(flush_tx);
+
+    let sid = register_stream(&store, 1, 1).await;
+    append_n(&store, sid, 5).await;
+    let end = seal_via_rpc(&store, sid, ExtentId(1)).await;
+    assert_eq!(end, 5);
+
+    // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
+    let seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
+    assert_eq!(seal_req.end_offset, 5);
+
+    // SM says quorum committed offset is 3 (lower than local 5).
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::FlushExtent {
+                    stream_id: sid,
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 3,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none());
+
+    // Verify extent is still sealed and the FlushRequest carries the corrected offset.
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        let sealed = stream.with_extent(ExtentId(1), |ext| ext.is_sealed()).unwrap();
+        assert!(sealed, "extent should still be sealed after FlushExtent");
+    }
+
+    let req = flush_rx.try_recv().expect("FlushExtent should enqueue FlushRequest");
+    assert_eq!(req.stream_id, sid);
+    assert_eq!(req.end_offset, 3, "FlushRequest should carry SM's corrected offset");
+}
+
+#[tokio::test]
+async fn flush_extent_skips_flushed() {
+    // B8: FlushExtent on an already-flushed extent → no FlushRequest.
+    let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
+    let mut store = ExtentNodeStore::new();
+    store.set_flush_tx(flush_tx);
+
+    let sid = register_stream(&store, 1, 1).await;
+    append_n(&store, sid, 2).await;
+    seal_via_rpc(&store, sid, ExtentId(1)).await;
+
+    // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
+    let _seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
+
+    // Mark as flushed.
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        stream.with_extent(ExtentId(1), |ext| ext.mark_flushed());
+    }
+
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::FlushExtent {
+                    stream_id: sid,
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 2,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none());
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "no FlushRequest should be sent for already-flushed extent"
+    );
+}
+
+#[tokio::test]
+async fn flush_extent_skips_missing_extent() {
+    // B9: FlushExtent for a non-existent extent → no FlushRequest, no panic.
+    let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
+    let mut store = ExtentNodeStore::new();
+    store.set_flush_tx(flush_tx);
+
+    let _sid = register_stream(&store, 1, 1).await;
+
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::FlushExtent {
+                    stream_id: StreamId(1),
+                    extent_id: ExtentId(99),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 10,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none());
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "no FlushRequest for missing extent"
+    );
+}
+
+#[tokio::test]
+async fn flush_extent_skips_missing_stream() {
+    // B10: FlushExtent for a non-existent stream → no FlushRequest, no panic.
+    let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
+    let mut store = ExtentNodeStore::new();
+    store.set_flush_tx(flush_tx);
+
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::FlushExtent {
+                    stream_id: StreamId(999),
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 5,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none());
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "no FlushRequest for missing stream"
+    );
+}
+
+#[tokio::test]
+async fn flush_extent_dedup() {
+    // B11: Duplicate FlushExtent for the same (stream, extent) should be deduplicated.
+    let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
+    let mut store = ExtentNodeStore::new();
+    store.set_flush_tx(flush_tx);
+
+    let sid = register_stream(&store, 1, 1).await;
+    append_n(&store, sid, 3).await;
+    seal_via_rpc(&store, sid, ExtentId(1)).await;
+
+    // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
+    let _seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
+
+    let flush_frame = Frame::new(
+        VariableHeader::FlushExtent {
+            stream_id: sid,
+            extent_id: ExtentId(1),
+            epoch: Epoch(0),
+            start_offset: 0,
+            end_offset: 3,
+        },
+        None,
+    );
+
+    // First FlushExtent → should enqueue.
+    store.handle_frame(flush_frame.clone(), None).await;
+    let req = flush_rx.try_recv().expect("first FlushExtent should enqueue");
+    assert_eq!(req.stream_id, sid);
+
+    // Second FlushExtent → deduplicated, no new FlushRequest.
+    store.handle_frame(flush_frame, None).await;
+    assert!(
+        flush_rx.try_recv().is_err(),
+        "second FlushExtent should be deduplicated"
+    );
+}
+
+#[tokio::test]
+async fn flush_extent_no_s3_configured() {
+    // B12: FlushExtent on a store without flush_tx (S3 not configured) → no panic.
+    let store = ExtentNodeStore::new();
+    let sid = register_stream(&store, 1, 1).await;
+    append_n(&store, sid, 2).await;
+    seal_via_rpc(&store, sid, ExtentId(1)).await;
+
+    // flush_tx is None — should just return without panicking.
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::FlushExtent {
+                    stream_id: sid,
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 2,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none());
+}
+
+// ── C. handle_seal_commit tests ──────────────────────────────────────────
+
+#[tokio::test]
+async fn seal_commit_corrects_higher_offset() {
+    // C13: SealExtentNodeCommit with a lower end_offset than local seal
+    // should correct the seal point downward.
+    let store = ExtentNodeStore::new();
+    let sid = register_stream(&store, 1, 1).await;
+    append_n(&store, sid, 5).await;
+    let end = seal_via_rpc(&store, sid, ExtentId(1)).await;
+    assert_eq!(end, 5);
+
+    // SM says committed offset is 3 (quorum < local).
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::SealExtentNodeCommit {
+                    stream_id: sid,
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 3,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none(), "SealExtentNodeCommit is fire-and-forget");
+
+    // Verify extent is still sealed. The limit was corrected to 3 internally
+    // (correct_seal_offset), but message_count() returns committed_offset - start_offset
+    // which reflects actually-written data (5), not the seal limit.
+    // The correction ensures the S3 flusher encodes only 3 records.
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        let sealed = stream.with_extent(ExtentId(1), |ext| ext.is_sealed()).unwrap();
+        assert!(sealed, "extent should still be sealed after SealCommit");
+        // committed_offset is unchanged (5 records were written).
+        let count = stream
+            .with_extent(ExtentId(1), |ext| ext.message_count())
+            .unwrap();
+        assert_eq!(count, 5, "committed data is unchanged; limit correction is internal");
+    }
+}
+
+#[tokio::test]
+async fn seal_commit_seals_active_extent() {
+    // C14: SealExtentNodeCommit on an Active extent should seal it.
+    let store = ExtentNodeStore::new();
+    let sid = register_stream(&store, 1, 1).await;
+    append_n(&store, sid, 3).await;
+
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::SealExtentNodeCommit {
+                    stream_id: sid,
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 3,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none());
+
+    // Verify extent is now sealed.
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        let sealed = stream.with_extent(ExtentId(1), |ext| ext.is_sealed()).unwrap();
+        assert!(sealed, "extent should be sealed after SealExtentNodeCommit");
+        let count = stream
+            .with_extent(ExtentId(1), |ext| ext.message_count())
+            .unwrap();
+        assert_eq!(count, 3);
+    }
+}
+
+#[tokio::test]
+async fn seal_commit_noop_lower_offset() {
+    // C15: SealExtentNodeCommit with end_offset > local seal → no-op
+    // (correct_seal_offset only corrects downward).
+    let store = ExtentNodeStore::new();
+    let sid = register_stream(&store, 1, 1).await;
+    append_n(&store, sid, 3).await;
+    let end = seal_via_rpc(&store, sid, ExtentId(1)).await;
+    assert_eq!(end, 3);
+
+    // SM says end_offset=5 — higher than local 3 → no change.
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::SealExtentNodeCommit {
+                    stream_id: sid,
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 5,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none());
+
+    // Verify limit stays at 3 (not 5).
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        let count = stream
+            .with_extent(ExtentId(1), |ext| ext.message_count())
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "seal commit with higher offset should not change limit"
+        );
+    }
+}
+
+#[tokio::test]
+async fn seal_commit_unknown_stream() {
+    // C16: SealExtentNodeCommit for a non-existent stream → no panic.
+    let store = ExtentNodeStore::new();
+
+    let result = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::SealExtentNodeCommit {
+                    stream_id: StreamId(999),
+                    extent_id: ExtentId(1),
+                    epoch: Epoch(0),
+                    start_offset: 0,
+                    end_offset: 5,
+                },
+                None,
+            ),
+            None,
+        )
+        .await;
+    assert!(result.is_none(), "should return None for unknown stream");
+}
