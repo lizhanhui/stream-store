@@ -185,12 +185,28 @@ impl ExtentNodeStore {
                         .map(|ri| ri.is_primary())
                         .unwrap_or(false);
                     if is_primary {
-                        let _ = tx.try_send(FlushRequest {
-                            stream_id,
-                            extent_id: sealed_extent_id,
-                            start_offset: start_offset as u64,
-                            end_offset: end_offset as u64,
-                        });
+                        // Deduplicate: mark flush-in-progress before enqueuing.
+                        let started = self
+                            .streams
+                            .pin()
+                            .get(&stream_id)
+                            .map(|s| s.start_flush(sealed_extent_id))
+                            .unwrap_or(false);
+                        if started {
+                            if tx
+                                .try_send(FlushRequest {
+                                    stream_id,
+                                    extent_id: sealed_extent_id,
+                                    start_offset: start_offset as u64,
+                                    end_offset: end_offset as u64,
+                                })
+                                .is_err()
+                            {
+                                if let Some(s) = self.streams.pin().get(&stream_id) {
+                                    s.finish_flush(sealed_extent_id);
+                                }
+                            }
+                        }
                     }
                 }
 

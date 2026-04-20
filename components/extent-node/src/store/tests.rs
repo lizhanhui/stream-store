@@ -1434,6 +1434,13 @@ async fn flush_extent_corrects_sealed_extent() {
     let seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
     assert_eq!(seal_req.end_offset, 5);
 
+    // Simulate s3_flusher completing: clear the flush-in-progress marker.
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        stream.finish_flush(ExtentId(1));
+    }
+
     // SM says quorum committed offset is 3 (lower than local 5).
     let result = store
         .handle_frame(
@@ -1481,6 +1488,13 @@ async fn flush_extent_skips_flushed() {
 
     // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
     let _seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
+
+    // Simulate s3_flusher completing: clear the flush-in-progress marker.
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        stream.finish_flush(ExtentId(1));
+    }
 
     // Mark as flushed.
     {
@@ -1593,6 +1607,13 @@ async fn flush_extent_dedup() {
 
     // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
     let _seal_req = flush_rx.try_recv().expect("seal should have enqueued FlushRequest");
+
+    // Simulate s3_flusher completing: clear the flush-in-progress marker.
+    {
+        let guard = store.streams.pin();
+        let stream = guard.get(&sid).unwrap();
+        stream.finish_flush(ExtentId(1));
+    }
 
     let flush_frame = Frame::new(
         VariableHeader::FlushExtent {
