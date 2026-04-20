@@ -224,6 +224,24 @@ impl Frame {
         )
     }
 
+    pub fn flush_extent_resp_error(
+        request_id: u32,
+        stream_id: StreamId,
+        extent_id: ExtentId,
+        error_code: ErrorCode,
+        message: &str,
+    ) -> Frame {
+        Frame::new(
+            VariableHeader::FlushExtentRespError {
+                request_id,
+                stream_id,
+                extent_id,
+                error_code,
+            },
+            Some(Bytes::copy_from_slice(message.as_bytes())),
+        )
+    }
+
     pub fn error_from_request(
         request: &Frame,
         error_code: ErrorCode,
@@ -344,6 +362,18 @@ impl Frame {
                 stream_id,
                 offset,
             } => Self::seek_resp_error(*request_id, *stream_id, *offset, error_code, message),
+            VariableHeader::FlushExtent {
+                request_id,
+                stream_id,
+                extent_id,
+                ..
+            } => Self::flush_extent_resp_error(
+                *request_id,
+                *stream_id,
+                *extent_id,
+                error_code,
+                message,
+            ),
             _ => panic!(
                 "no error response mapping for opcode {:?}",
                 request.opcode()

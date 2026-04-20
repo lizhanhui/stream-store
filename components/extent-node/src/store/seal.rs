@@ -290,20 +290,26 @@ impl ExtentNodeStore {
     /// Handle FLUSH_EXTENT (0x1B): SM commands this EN to upload a sealed extent
     /// to S3 on behalf of a dead Primary (disaster recovery).
     ///
-    /// Fire-and-forget: no response. The EN pushes a FlushRequest onto the
-    /// existing S3 flusher channel. On success the flusher sends
-    /// `UpdateExtentFlushed` back to SM via the normal `update_tx` path.
-    pub(crate) fn handle_flush_extent(&self, frame: Frame) {
-        let (stream_id, extent_id, _epoch, start_offset, end_offset) =
+    /// Returns FlushExtentResp on success (accepted), FlushExtentRespError on skip/error.
+    pub(crate) fn handle_flush_extent(&self, frame: Frame) -> Frame {
+        let (request_id, stream_id, extent_id, _epoch, start_offset, end_offset) =
             match &frame.variable_header {
                 VariableHeader::FlushExtent {
+                    request_id,
                     stream_id,
                     extent_id,
                     epoch,
                     start_offset,
                     end_offset,
-                } => (*stream_id, *extent_id, *epoch, *start_offset, *end_offset),
-                _ => return,
+                } => (*request_id, *stream_id, *extent_id, *epoch, *start_offset, *end_offset),
+                _ => {
+                    return Frame::error_from_request(
+                        &frame,
+                        ErrorCode::InternalError,
+                        "invalid FlushExtent frame",
+                        ExtentId(0),
+                    );
+                }
             };
 
         // Guard: S3 must be configured.
@@ -314,7 +320,13 @@ impl ExtentNodeStore {
                     "FlushExtent: no S3 configured, ignoring stream={} extent={}",
                     stream_id, extent_id,
                 );
-                return;
+                return Frame::flush_extent_resp_error(
+                    request_id,
+                    stream_id,
+                    extent_id,
+                    ErrorCode::InternalError,
+                    "no S3 configured",
+                );
             }
         };
 
@@ -358,7 +370,14 @@ impl ExtentNodeStore {
                 "FlushExtent: skipping stream={} extent={} (not found or already flushed)",
                 stream_id, extent_id,
             );
-            return;
+            return Frame::new(
+                VariableHeader::FlushExtentResp {
+                    request_id,
+                    stream_id,
+                    extent_id,
+                },
+                None,
+            );
         }
 
         // Deduplicate: skip if already in progress.
@@ -369,7 +388,14 @@ impl ExtentNodeStore {
                     "FlushExtent: already in progress for stream={} extent={}, skipping",
                     stream_id, extent_id,
                 );
-                return;
+                return Frame::new(
+                    VariableHeader::FlushExtentResp {
+                        request_id,
+                        stream_id,
+                        extent_id,
+                    },
+                    None,
+                );
             }
         }
 
@@ -392,33 +418,65 @@ impl ExtentNodeStore {
                 .lock()
                 .unwrap()
                 .remove(&(stream_id, extent_id));
-        } else {
-            info!(
-                "FlushExtent: queued DR flush for stream={} extent={}",
-                stream_id, extent_id,
+            return Frame::flush_extent_resp_error(
+                request_id,
+                stream_id,
+                extent_id,
+                ErrorCode::InternalError,
+                "flush channel full",
             );
         }
+
+        info!(
+            "FlushExtent: queued DR flush for stream={} extent={}",
+            stream_id, extent_id,
+        );
+        Frame::new(
+            VariableHeader::FlushExtentResp {
+                request_id,
+                stream_id,
+                extent_id,
+            },
+            None,
+        )
     }
 
     /// Handle SealExtentNode phase 2: commit local seal point to SM's
-    /// authoritative committed offset. Fire-and-forget, no response.
-    pub(crate) fn handle_seal_commit(&self, frame: Frame) {
-        let (stream_id, extent_id, _epoch, _start_offset, end_offset) =
+    /// authoritative committed offset. Returns SealExtentNodeCommitResp.
+    pub(crate) fn handle_seal_commit(&self, frame: Frame) -> Frame {
+        let (request_id, stream_id, extent_id, _epoch, _start_offset, end_offset) =
             match &frame.variable_header {
                 VariableHeader::SealExtentNodeCommit {
+                    request_id,
                     stream_id,
                     extent_id,
                     epoch,
                     start_offset,
                     end_offset,
-                } => (*stream_id, *extent_id, *epoch, *start_offset, *end_offset),
-                _ => return,
+                } => (*request_id, *stream_id, *extent_id, *epoch, *start_offset, *end_offset),
+                _ => {
+                    return Frame::error_from_request(
+                        &frame,
+                        ErrorCode::InternalError,
+                        "invalid SealExtentNodeCommit frame",
+                        ExtentId(0),
+                    );
+                }
             };
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
             Some(s) => s,
-            None => return,
+            None => {
+                return Frame::new(
+                    VariableHeader::SealExtentNodeCommitResp {
+                        request_id,
+                        stream_id,
+                        extent_id,
+                    },
+                    None,
+                );
+            }
         };
 
         stream.with_extent(extent_id, |ext| {
@@ -433,5 +491,14 @@ impl ExtentNodeStore {
                 ext.correct_seal_offset(end_offset);
             }
         });
+
+        Frame::new(
+            VariableHeader::SealExtentNodeCommitResp {
+                request_id,
+                stream_id,
+                extent_id,
+            },
+            None,
+        )
     }
 }

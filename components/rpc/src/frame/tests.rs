@@ -575,6 +575,7 @@ fn describe_stream_by_name_round_trip() {
 fn seal_extent_node_commit_round_trip() {
     let frame = Frame::new(
         VariableHeader::SealExtentNodeCommit {
+            request_id: 77,
             stream_id: StreamId(7),
             extent_id: ExtentId(3),
             epoch: Epoch(2),
@@ -590,15 +591,17 @@ fn seal_extent_node_commit_round_trip() {
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
     assert_eq!(decoded.flags(), FLAG_SEAL_COMMIT);
-    assert_eq!(decoded.request_id(), 0); // fire-and-forget
+    assert_eq!(decoded.request_id(), 77);
     match &decoded.variable_header {
         VariableHeader::SealExtentNodeCommit {
+            request_id,
             stream_id,
             extent_id,
             epoch,
             start_offset,
             end_offset,
         } => {
+            assert_eq!(*request_id, 77);
             assert_eq!(*stream_id, StreamId(7));
             assert_eq!(*extent_id, ExtentId(3));
             assert_eq!(*epoch, Epoch(2));
@@ -615,6 +618,7 @@ fn seal_extent_node_commit_round_trip() {
 fn flush_extent_round_trip() {
     let frame = Frame::new(
         VariableHeader::FlushExtent {
+            request_id: 88,
             stream_id: StreamId(12),
             extent_id: ExtentId(5),
             epoch: Epoch(3),
@@ -630,15 +634,17 @@ fn flush_extent_round_trip() {
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::FlushExtent);
     assert_eq!(decoded.flags(), 0x00);
-    assert_eq!(decoded.request_id(), 0);
+    assert_eq!(decoded.request_id(), 88);
     match &decoded.variable_header {
         VariableHeader::FlushExtent {
+            request_id,
             stream_id,
             extent_id,
             epoch,
             start_offset,
             end_offset,
         } => {
+            assert_eq!(*request_id, 88);
             assert_eq!(*stream_id, StreamId(12));
             assert_eq!(*extent_id, ExtentId(5));
             assert_eq!(*epoch, Epoch(3));

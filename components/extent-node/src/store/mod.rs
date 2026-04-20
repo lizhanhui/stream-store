@@ -294,8 +294,7 @@ impl RequestHandler for ExtentNodeStore {
             Opcode::SealExtentNode => {
                 match &frame.variable_header {
                     VariableHeader::SealExtentNodeCommit { .. } => {
-                        self.handle_seal_commit(frame);
-                        None // fire-and-forget
+                        Some(self.handle_seal_commit(frame))
                     }
                     _ => Some(self.handle_seal(frame)),
                 }
@@ -315,8 +314,7 @@ impl RequestHandler for ExtentNodeStore {
             )),
             Opcode::ReportExtents => Some(self.handle_report_extents(frame)),
             Opcode::FlushExtent => {
-                self.handle_flush_extent(frame);
-                None // fire-and-forget
+                Some(self.handle_flush_extent(frame))
             }
             Opcode::UpdateExtent
             | Opcode::Watermark

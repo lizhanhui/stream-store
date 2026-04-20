@@ -45,7 +45,9 @@ impl Frame {
             // request_id(4) + stream_id(4) + error_code(2)
             VariableHeader::SealExtentNodeRespError { .. } => 4 + 4 + 2,
             // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + end_offset(8)
-            VariableHeader::SealExtentNodeCommit { .. } => 4 + 4 + 4 + 8 + 8,
+            VariableHeader::SealExtentNodeCommit { .. } => 4 + 4 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(4) + extent_id(4)
+            VariableHeader::SealExtentNodeCommitResp { .. } => 4 + 4 + 4,
             // request_id(4) + name_len(2) + name(N) + replication_factor(1) + min_extent_capacity(4) + max_extent_capacity(4) + cache_extents(2) + extent_growth_factor(1) + storage_class(1)
             VariableHeader::CreateStream { stream_name, .. } => {
                 4 + 2 + stream_name.len() + 1 + 4 + 4 + 2 + 1 + 1
@@ -100,8 +102,12 @@ impl Frame {
             VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 4 + 8,
             // stream_id(4) + extent_id(4) + epoch(4)
             VariableHeader::ForwardFlushed { .. } => 4 + 4 + 4,
-            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + end_offset(8)
-            VariableHeader::FlushExtent { .. } => 4 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + end_offset(8)
+            VariableHeader::FlushExtent { .. } => 4 + 4 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(4) + extent_id(4)
+            VariableHeader::FlushExtentResp { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
+            VariableHeader::FlushExtentRespError { .. } => 4 + 4 + 4 + 2,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
             // request_id(4) + stream_id(4) + count(4) [+ name_len(2) + name(N) if FLAG_DESCRIBE_STREAM_BY_NAME]
@@ -155,7 +161,8 @@ impl Frame {
             | VariableHeader::QueryOffsetRespError { .. }
             | VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
-            | VariableHeader::RegisterExtentAckError { .. } => true,
+            | VariableHeader::RegisterExtentAckError { .. }
+            | VariableHeader::FlushExtentRespError { .. } => true,
             _ => false,
         }
     }
@@ -327,17 +334,28 @@ impl Frame {
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::SealExtentNodeCommit {
+                request_id,
                 stream_id,
                 extent_id,
                 epoch,
                 start_offset,
                 end_offset,
             } => {
+                dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(*start_offset);
                 dst.put_u64(*end_offset);
+            }
+            VariableHeader::SealExtentNodeCommitResp {
+                request_id,
+                stream_id,
+                extent_id,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u32(stream_id.0);
+                dst.put_u32(extent_id.0);
             }
             VariableHeader::CreateStream {
                 request_id,
@@ -544,17 +562,39 @@ impl Frame {
                 dst.put_u32(epoch.0);
             }
             VariableHeader::FlushExtent {
+                request_id,
                 stream_id,
                 extent_id,
                 epoch,
                 start_offset,
                 end_offset,
             } => {
+                dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(*start_offset);
                 dst.put_u64(*end_offset);
+            }
+            VariableHeader::FlushExtentResp {
+                request_id,
+                stream_id,
+                extent_id,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u32(stream_id.0);
+                dst.put_u32(extent_id.0);
+            }
+            VariableHeader::FlushExtentRespError {
+                request_id,
+                stream_id,
+                extent_id,
+                error_code,
+            } => {
+                dst.put_u32(*request_id);
+                dst.put_u32(stream_id.0);
+                dst.put_u32(extent_id.0);
+                dst.put_u16(*error_code as u16);
             }
             VariableHeader::StreamManagerMembershipChange => {
                 // no variable header fields, just payload
