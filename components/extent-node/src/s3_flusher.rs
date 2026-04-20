@@ -160,11 +160,14 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
     let is_canonical = actual_end_offset == req.end_offset;
 
     if is_canonical {
+        // Read the extent's own epoch — the immutable epoch assigned at extent
+        // creation time. This is distinct from the stream's current epoch which
+        // may have been bumped by RegisterExtent for a successor extent.
         let epoch = store
             .streams
             .pin()
             .get(&req.stream_id)
-            .map(|s| s.epoch())
+            .and_then(|s| s.with_extent(req.extent_id, |ext| ext.epoch))
             .unwrap_or(common::types::Epoch(0));
 
         if let Some(ref tx) = store.update_tx {
