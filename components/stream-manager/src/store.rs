@@ -1870,14 +1870,22 @@ impl StreamManagerStore {
                 stream_id,
                 epoch,
                 extent_id,
+                start_offset,
+                end_offset,
             } => {
                 info!(
-                    "UpdateExtentFlushed: stream={}, epoch={}, extent={}",
-                    stream_id, epoch, extent_id
+                    "UpdateExtentFlushed: stream={}, epoch={}, extent={}, start_offset={}, end_offset={}",
+                    stream_id, epoch, extent_id, start_offset.0, end_offset.0
                 );
                 if let Err(e) = self
                     .store
-                    .record_extent_flushed(*stream_id, *epoch, *extent_id)
+                    .record_extent_flushed(
+                        *stream_id,
+                        *epoch,
+                        *extent_id,
+                        start_offset.0,
+                        end_offset.0,
+                    )
                     .await
                 {
                     warn!(

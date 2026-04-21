@@ -238,10 +238,18 @@ pub enum VariableHeader {
     },
     /// Extent flushed to S3 (UpdateExtent, flag=0x02).
     /// Fire-and-forget: EN notifies SM after successful S3 upload.
+    ///
+    /// Carries `start_offset` and `end_offset` so SM can materialize a
+    /// `Flushed` row even when the preceding `UpdateExtentSealed` has not yet
+    /// arrived (the two notifications are independent fire-and-forget frames
+    /// whose ordering is not guaranteed end-to-end — see
+    /// `record_extent_flushed` in stream-manager/metadata.rs).
     UpdateExtentFlushed {
         stream_id: StreamId,
         epoch: Epoch,
         extent_id: ExtentId,
+        start_offset: Offset,
+        end_offset: Offset,
     },
     /// SM queries an EN for all extents it holds for a stream at a given epoch (0x19).
     ReportExtents {

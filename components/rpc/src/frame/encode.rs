@@ -87,7 +87,7 @@ impl Frame {
             // stream_id(4) + epoch(4) + extent_id(4) + current_offset(8)
             VariableHeader::UpdateExtentProgress { .. } => 4 + 4 + 4 + 8,
             // stream_id(4) + epoch(4) + extent_id(4)
-            VariableHeader::UpdateExtentFlushed { .. } => 4 + 4 + 4,
+            VariableHeader::UpdateExtentFlushed { .. } => 4 + 4 + 4 + 8 + 8,
             // request_id(4) + stream_id(4) + epoch(4)
             VariableHeader::ReportExtents { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + epoch(4)
@@ -712,10 +712,14 @@ impl Frame {
                 stream_id,
                 epoch,
                 extent_id,
+                start_offset,
+                end_offset,
             } => {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(extent_id.0);
+                dst.put_u64(start_offset.0);
+                dst.put_u64(end_offset.0);
             }
             VariableHeader::ReportExtents {
                 request_id,

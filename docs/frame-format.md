@@ -618,14 +618,16 @@ Variable Header (24B):
 No Payload.
 ```
 
-**flag=0x02 UpdateExtentFlushed** — Sent by the EN that uploaded a sealed extent to S3. Normally the Primary; in disaster recovery, a secondary delegated by SM. SM transitions extent state from Sealed to Flushed.
+**flag=0x02 UpdateExtentFlushed** — Sent by the EN that uploaded a sealed extent to S3. Normally the Primary; in disaster recovery, a secondary delegated by SM. SM transitions extent state from Sealed to Flushed. Carries `start_offset` / `end_offset` so SM can materialize a `Flushed` row even when the preceding `UpdateExtentSealed` has not yet arrived — the two notifications are independent fire-and-forget frames whose relative ordering is not guaranteed (channel backpressure `try_send` drops, SM reconnect between frames, SM failover splitting the pair across instances).
 
 ```
 Fixed Header (8B)    -- flags=0x02
-Variable Header (16B):
+Variable Header (28B):
   [stream_id    : u32]    -- stream whose extent was flushed
-  [epoch        : u32]    -- epoch at time of flush
+  [epoch        : u32]    -- extent's creation epoch (immutable)
   [extent_id    : u32]    -- flushed extent
+  [start_offset : u64]    -- extent start offset
+  [end_offset   : u64]    -- committed end offset (canonical: actual_end_offset)
 No Payload.
 ```
 
