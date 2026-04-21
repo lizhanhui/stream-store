@@ -175,6 +175,8 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                 stream_id: req.stream_id,
                 extent_id: req.extent_id,
                 epoch,
+                start_offset: req.start_offset,
+                end_offset: req.end_offset,
             });
         }
 

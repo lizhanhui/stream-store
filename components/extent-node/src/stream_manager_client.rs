@@ -543,12 +543,16 @@ impl StreamManagerClient {
                 stream_id,
                 extent_id,
                 epoch,
+                start_offset,
+                end_offset,
             } => (
                 Frame::new(
                     VariableHeader::UpdateExtentFlushed {
                         stream_id,
                         epoch,
                         extent_id,
+                        start_offset: Offset(start_offset),
+                        end_offset: Offset(end_offset),
                     },
                     None,
                 ),

@@ -656,3 +656,42 @@ fn flush_extent_round_trip() {
     assert!(decoded.payload.is_none());
     assert!(buf.is_empty());
 }
+
+#[test]
+fn update_extent_flushed_round_trip() {
+    let frame = Frame::new(
+        VariableHeader::UpdateExtentFlushed {
+            stream_id: StreamId(91),
+            epoch: Epoch(5),
+            extent_id: ExtentId(17),
+            start_offset: Offset(1_234),
+            end_offset: Offset(9_999),
+        },
+        None,
+    );
+
+    let mut buf = BytesMut::new();
+    frame.encode(&mut buf);
+
+    let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded.opcode(), Opcode::UpdateExtent);
+    assert_eq!(decoded.flags(), 0x02); // FLAG_EXTENT_FLUSHED
+    match &decoded.variable_header {
+        VariableHeader::UpdateExtentFlushed {
+            stream_id,
+            epoch,
+            extent_id,
+            start_offset,
+            end_offset,
+        } => {
+            assert_eq!(*stream_id, StreamId(91));
+            assert_eq!(*epoch, Epoch(5));
+            assert_eq!(*extent_id, ExtentId(17));
+            assert_eq!(*start_offset, Offset(1_234));
+            assert_eq!(*end_offset, Offset(9_999));
+        }
+        _ => panic!("expected UpdateExtentFlushed"),
+    }
+    assert!(decoded.payload.is_none());
+    assert!(buf.is_empty());
+}

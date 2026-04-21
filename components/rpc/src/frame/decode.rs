@@ -833,11 +833,15 @@ impl Frame {
                     }
                     FLAG_EXTENT_FLUSHED => {
                         let extent_id = ExtentId(body.get_u32());
+                        let start_offset = Offset(body.get_u64());
+                        let end_offset = Offset(body.get_u64());
                         Ok((
                             VariableHeader::UpdateExtentFlushed {
                                 stream_id,
                                 epoch,
                                 extent_id,
+                                start_offset,
+                                end_offset,
                             },
                             None,
                         ))
