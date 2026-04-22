@@ -83,7 +83,7 @@ async fn setup_stream_with_active_extent(
     name: &str,
 ) -> (StreamId, ExtentId, Epoch) {
     let stream_id = store
-        .create_stream(name, "DATA", 1, 0, 0, 0, 0, StorageClass::S3)
+        .create_stream(name, 1, 0, 0, 0, 0, StorageClass::S3)
         .await
         .expect("create_stream");
 
