@@ -369,7 +369,7 @@ fn print_interval(
         0.0
     };
 
-    let (avg, p99, p999, max) = if hist.len() > 0 {
+    let (avg, p99, p999, max) = if !hist.is_empty() {
         (
             format_us(hist.mean() as u64),
             format_us(hist.value_at_quantile(0.99)),
@@ -410,7 +410,7 @@ fn format_us(us: u64) -> String {
 // -- Deadline helper ----------------------------------------------------------
 
 fn past_deadline(deadline: Option<Instant>) -> bool {
-    deadline.map_or(false, |d| Instant::now() >= d)
+    deadline.is_some_and(|d| Instant::now() >= d)
 }
 
 // -- Sender -------------------------------------------------------------------

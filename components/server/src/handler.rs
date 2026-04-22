@@ -199,11 +199,11 @@ async fn serve_connection<H: RequestHandler>(stream: TcpStream, handler: Arc<H>)
             match result {
                 Ok(frame) => {
                     let response = handler.handle_frame(frame, None).await;
-                    if let Some(response) = response {
-                        if let Err(e) = framed.send(response).await {
-                            error!("failed to send response: {e}");
-                            return;
-                        }
+                    if let Some(response) = response
+                        && let Err(e) = framed.send(response).await
+                    {
+                        error!("failed to send response: {e}");
+                        return;
                     }
                 }
                 Err(e) => {
@@ -334,11 +334,11 @@ async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, ha
                 }
             } else {
                 // Non-append: process individually.
-                if let Some(resp) = handler.handle_frame(frame, Some(&response_tx)).await {
-                    if response_tx.send(resp).await.is_err() {
-                        error!("response channel closed");
-                        break;
-                    }
+                if let Some(resp) = handler.handle_frame(frame, Some(&response_tx)).await
+                    && response_tx.send(resp).await.is_err()
+                {
+                    error!("response channel closed");
+                    break;
                 }
             }
         }

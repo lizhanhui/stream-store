@@ -143,10 +143,10 @@ async fn wait_for_flushed(
 ) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(extents) = sm_client.describe_stream(stream_id, 0).await {
-            if extents.iter().any(|e| e.state == ExtentState::Flushed) {
-                return true;
-            }
+        if let Ok(extents) = sm_client.describe_stream(stream_id, 0).await
+            && extents.iter().any(|e| e.state == ExtentState::Flushed)
+        {
+            return true;
         }
         if tokio::time::Instant::now() >= deadline {
             return false;

@@ -170,10 +170,10 @@ impl ExtentNodeStore {
         extent_capacity: u32,
     ) {
         let guard = self.streams.pin();
-        if let Some(stream) = guard.get(&stream_id) {
-            if stream.with_extent(extent_id, |_| ()).is_none() {
-                stream.register_extent(extent_id, start_offset, epoch, extent_capacity);
-            }
+        if let Some(stream) = guard.get(&stream_id)
+            && stream.with_extent(extent_id, |_| ()).is_none()
+        {
+            stream.register_extent(extent_id, start_offset, epoch, extent_capacity);
         }
     }
 

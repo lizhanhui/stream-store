@@ -275,6 +275,7 @@ impl StreamClient {
     /// If max_extent_capacity=0, the StreamManager uses its default (256 MiB).
     /// If cache_extents=0, the StreamManager uses its default (4).
     /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
+    #[allow(clippy::too_many_arguments)]
     pub async fn create_stream(
         &self,
         name: &str,
@@ -689,6 +690,7 @@ impl StreamClient {
     /// The creation path exposes the same per-stream settings as `create_stream`.
     /// Returns the `StreamId`. The primary address is cached internally and
     /// can be retrieved via `cached_primary`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         &self,
         stream_name: &str,
@@ -747,10 +749,10 @@ impl StreamClient {
             .iter()
             .find(|e| e.state == ExtentState::Active)
             .or_else(|| extents.first());
-        if let Some(ext) = target {
-            if let Some(primary) = ext.replicas.iter().find(|r| r.role == 0) {
-                self.cache_primary(stream_id, &primary.node_addr).await;
-            }
+        if let Some(ext) = target
+            && let Some(primary) = ext.replicas.iter().find(|r| r.role == 0)
+        {
+            self.cache_primary(stream_id, &primary.node_addr).await;
         }
     }
 }

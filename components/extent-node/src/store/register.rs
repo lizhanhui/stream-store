@@ -141,16 +141,16 @@ impl ExtentNodeStore {
 
             // Cache per-secondary Sender handles in the Stream so the
             // hot append path can push Forward frames with zero lookup overhead.
-            if !ri.replica_addrs.is_empty() {
-                if let Some(pool) = self.downstream.get() {
-                    let txs: Vec<_> = ri
-                        .replica_addrs
-                        .iter()
-                        .map(|addr| pool.get_or_create_sender(addr))
-                        .collect();
-                    if let Some(stream) = streams_guard.get(&stream_id) {
-                        stream.set_downstream_txs(txs);
-                    }
+            if !ri.replica_addrs.is_empty()
+                && let Some(pool) = self.downstream.get()
+            {
+                let txs: Vec<_> = ri
+                    .replica_addrs
+                    .iter()
+                    .map(|addr| pool.get_or_create_sender(addr))
+                    .collect();
+                if let Some(stream) = streams_guard.get(&stream_id) {
+                    stream.set_downstream_txs(txs);
                 }
             }
         }

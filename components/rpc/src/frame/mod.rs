@@ -356,13 +356,10 @@ impl Frame {
             VariableHeader::ForwardInitExtent { .. } => FLAG_FORWARD_INIT_EXTENT,
             VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,
             VariableHeader::ForwardFlushed { .. } => FLAG_FORWARD_FLUSHED,
-            VariableHeader::DescribeStream { stream_name, .. } => {
-                if stream_name.is_some() {
-                    FLAG_DESCRIBE_STREAM_BY_NAME
-                } else {
-                    0
-                }
-            }
+            VariableHeader::DescribeStream {
+                stream_name: Some(_),
+                ..
+            } => FLAG_DESCRIBE_STREAM_BY_NAME,
             VariableHeader::SealExtentNodeCommit { .. } => FLAG_SEAL_COMMIT,
             VariableHeader::SealExtentNodeCommitResp { .. } => FLAG_SEAL_COMMIT_RESP,
             // ── Requests and fire-and-forget: 0x00 ──

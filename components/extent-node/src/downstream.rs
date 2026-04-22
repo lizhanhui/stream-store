@@ -97,12 +97,12 @@ impl DownstreamPool {
         let mut map = self.writers.lock().unwrap();
 
         // Return existing sender if alive.
-        if let Some(handle) = map.get(addr) {
-            if !handle.tx.is_closed() {
-                return handle.tx.clone();
-            }
-            // Channel closed (shouldn't happen unless shutdown) — recreate.
+        if let Some(handle) = map.get(addr)
+            && !handle.tx.is_closed()
+        {
+            return handle.tx.clone();
         }
+        // Channel closed (shouldn't happen unless shutdown) — recreate.
 
         // Create bounded channel + spawn writer task.
         let (tx, rx) = mpsc::channel::<Frame>(DEFAULT_DOWNSTREAM_CHANNEL_CAPACITY);
@@ -223,16 +223,11 @@ async fn downstream_writer_task(
 
             // Drain all immediately available frames (batch for single flush).
             let mut feed_err = false;
-            loop {
-                match rx.try_recv() {
-                    Ok(frame) => {
-                        if let Err(e) = writer.feed(frame).await {
-                            warn!("writer to {addr} feed error: {e}");
-                            feed_err = true;
-                            break;
-                        }
-                    }
-                    Err(_) => break, // channel empty, proceed to flush
+            while let Ok(frame) = rx.try_recv() {
+                if let Err(e) = writer.feed(frame).await {
+                    warn!("writer to {addr} feed error: {e}");
+                    feed_err = true;
+                    break;
                 }
             }
             if feed_err {

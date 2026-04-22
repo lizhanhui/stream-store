@@ -144,21 +144,20 @@ impl ExtentNodeStore {
                     self.send_flush_request(stream_id, notification);
                 }
             }
-            if should_shrink {
-                if let Some(ref notification) =
+            if should_shrink
+                && let Some(ref notification) =
                     self.seal_and_create(stream_id, SealReason::IdleShrink)
-                {
-                    self.send_extent_update(stream_id, notification);
-                    self.send_forward_checksum(stream_id, notification.sealed_extent_id);
-                    self.send_flush_request(stream_id, notification);
-                    info!(
-                        "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
-                        stream_id,
-                        notification.sealed_extent_id,
-                        notification.new_extent_id,
-                        notification.new_extent_capacity,
-                    );
-                }
+            {
+                self.send_extent_update(stream_id, notification);
+                self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                self.send_flush_request(stream_id, notification);
+                info!(
+                    "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
+                    stream_id,
+                    notification.sealed_extent_id,
+                    notification.new_extent_id,
+                    notification.new_extent_capacity,
+                );
             }
             return None;
         }
@@ -195,7 +194,7 @@ impl ExtentNodeStore {
                     ErrorCode::ExtentSealed,
                     "extent full: eviction blocked, seal required",
                 );
-                if let Some(ref tx) = response_tx {
+                if let Some(tx) = response_tx {
                     let _ = tx.try_send(err);
                     return None;
                 }
@@ -287,7 +286,7 @@ impl ExtentNodeStore {
                     ErrorCode::ExtentSealed,
                     "extent is sealed",
                 );
-                if let Some(ref tx) = response_tx {
+                if let Some(tx) = response_tx {
                     let _ = tx.try_send(err);
                     return (None, false);
                 }
@@ -307,7 +306,7 @@ impl ExtentNodeStore {
                     ErrorCode::InternalError,
                     &e.to_string(),
                 );
-                if let Some(ref tx) = response_tx {
+                if let Some(tx) = response_tx {
                     let _ = tx.try_send(err);
                     return (None, false);
                 }
@@ -341,7 +340,7 @@ impl ExtentNodeStore {
                     },
                     None,
                 );
-                if let Some(ref tx) = response_tx {
+                if let Some(tx) = response_tx {
                     let _ = tx.try_send(ack);
                     (None, false)
                 } else {
@@ -361,7 +360,7 @@ impl ExtentNodeStore {
                         },
                         None,
                     );
-                    if let Some(ref tx) = response_tx {
+                    if let Some(tx) = response_tx {
                         let _ = tx.try_send(ack);
                         (None, false)
                     } else {
@@ -417,7 +416,7 @@ impl ExtentNodeStore {
                     },
                     None,
                 );
-                if let Some(ref tx) = response_tx {
+                if let Some(tx) = response_tx {
                     let _ = tx.try_send(ack);
                     (None, false)
                 } else {
