@@ -103,10 +103,10 @@ async fn poll_leader(store: &MetadataStore, timeout: Duration) -> String {
 async fn poll_leader_is(store: &MetadataStore, expected: &str, timeout: Duration) {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if let Ok(Some(leader)) = store.get_leader().await {
-            if leader == expected {
-                return;
-            }
+        if let Ok(Some(leader)) = store.get_leader().await
+            && leader == expected
+        {
+            return;
         }
         if tokio::time::Instant::now() >= deadline {
             panic!("timed out waiting for {expected} to become leader");

@@ -81,10 +81,10 @@ pub async fn run_heartbeat_checker(
             _ = tokio::time::sleep(check_interval) => {}
             _ = shutdown_rx.recv() => {
                 info!("heartbeat checker received shutdown signal");
-                if is_leader {
-                    if let Err(e) = sm_store.store().release_leadership(&node_id).await {
-                        warn!("failed to release leadership on shutdown: {e}");
-                    }
+                if is_leader
+                    && let Err(e) = sm_store.store().release_leadership(&node_id).await
+                {
+                    warn!("failed to release leadership on shutdown: {e}");
                 }
                 break;
             }

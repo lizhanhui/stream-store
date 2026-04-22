@@ -192,20 +192,18 @@ impl ExtentNodeStore {
                             .get(&stream_id)
                             .map(|s| s.start_flush(sealed_extent_id))
                             .unwrap_or(false);
-                        if started {
-                            if tx
+                        if started
+                            && tx
                                 .try_send(FlushRequest {
                                     stream_id,
                                     extent_id: sealed_extent_id,
-                                    start_offset: start_offset as u64,
-                                    end_offset: end_offset as u64,
+                                    start_offset,
+                                    end_offset,
                                 })
                                 .is_err()
-                            {
-                                if let Some(s) = self.streams.pin().get(&stream_id) {
-                                    s.finish_flush(sealed_extent_id);
-                                }
-                            }
+                            && let Some(s) = self.streams.pin().get(&stream_id)
+                        {
+                            s.finish_flush(sealed_extent_id);
                         }
                     }
                 }
@@ -270,10 +268,7 @@ impl ExtentNodeStore {
         sealed_extent_id: ExtentId,
     ) -> Option<Bytes> {
         let guard = self.streams.pin();
-        let stream = match guard.get(&stream_id) {
-            Some(s) => s,
-            None => return None,
-        };
+        let stream = guard.get(&stream_id)?;
 
         let mut predecessors: Vec<(ExtentId, u64, u64)> = Vec::new();
         // Iterate over all known extents to find predecessors.

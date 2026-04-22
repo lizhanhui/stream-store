@@ -129,7 +129,7 @@ impl StreamInner {
         if self.max_extents > 0
             && self.extents.len() >= self.max_extents
             && self.storage_class == StorageClass::S3
-            && self.extents.first().map_or(false, |e| !e.is_flushed())
+            && self.extents.first().is_some_and(|e| !e.is_flushed())
         {
             return None;
         }

@@ -302,10 +302,10 @@ impl Frame {
                     ))
                 } else if flags & FLAG_SEAL_COMMIT != 0 {
                     // unreachable — handled above, but keep for safety.
-                    return Err(InternalSnafu {
+                    Err(InternalSnafu {
                         message: "duplicate FLAG_SEAL_COMMIT branch",
                     }
-                    .build());
+                    .build())
                 } else {
                     let epoch = Epoch(body.get_u32());
                     let extent_id_from = ExtentId(body.get_u32());

@@ -134,37 +134,37 @@ impl Frame {
 
     /// Whether this opcode has a payload section (u32 length prefix + bytes).
     pub(super) fn has_payload_section(&self) -> bool {
-        match &self.variable_header {
+        matches!(
+            &self.variable_header,
             VariableHeader::Append { .. }
-            | VariableHeader::ReadResp { .. }
-            | VariableHeader::ReadRespError { .. }
-            | VariableHeader::Connect { .. }
-            | VariableHeader::Disconnect { .. }
-            | VariableHeader::Heartbeat { .. }
-            | VariableHeader::HeartbeatError { .. }
-            | VariableHeader::RegisterExtent { .. }
-            | VariableHeader::Forward { .. }
-            | VariableHeader::StreamManagerMembershipChange
-            | VariableHeader::ReportExtentsResp { .. }
-            | VariableHeader::ReportExtentsRespError { .. }
-            | VariableHeader::DescribeStreamResp { .. }
-            | VariableHeader::DescribeStreamRespError { .. }
-            | VariableHeader::DescribeExtentResp { .. }
-            | VariableHeader::DescribeExtentRespError { .. }
-            | VariableHeader::SeekResp { .. }
-            | VariableHeader::SeekRespError { .. }
-            | VariableHeader::AppendAckError { .. }
-            | VariableHeader::SealStreamManagerRespError { .. }
-            | VariableHeader::SealExtentNodeResp { .. }
-            | VariableHeader::SealExtentNodeRespError { .. }
-            | VariableHeader::CreateStreamRespError { .. }
-            | VariableHeader::QueryOffsetRespError { .. }
-            | VariableHeader::ConnectAckError { .. }
-            | VariableHeader::DisconnectAckError { .. }
-            | VariableHeader::RegisterExtentAckError { .. }
-            | VariableHeader::FlushExtentRespError { .. } => true,
-            _ => false,
-        }
+                | VariableHeader::ReadResp { .. }
+                | VariableHeader::ReadRespError { .. }
+                | VariableHeader::Connect { .. }
+                | VariableHeader::Disconnect { .. }
+                | VariableHeader::Heartbeat { .. }
+                | VariableHeader::HeartbeatError { .. }
+                | VariableHeader::RegisterExtent { .. }
+                | VariableHeader::Forward { .. }
+                | VariableHeader::StreamManagerMembershipChange
+                | VariableHeader::ReportExtentsResp { .. }
+                | VariableHeader::ReportExtentsRespError { .. }
+                | VariableHeader::DescribeStreamResp { .. }
+                | VariableHeader::DescribeStreamRespError { .. }
+                | VariableHeader::DescribeExtentResp { .. }
+                | VariableHeader::DescribeExtentRespError { .. }
+                | VariableHeader::SeekResp { .. }
+                | VariableHeader::SeekRespError { .. }
+                | VariableHeader::AppendAckError { .. }
+                | VariableHeader::SealStreamManagerRespError { .. }
+                | VariableHeader::SealExtentNodeResp { .. }
+                | VariableHeader::SealExtentNodeRespError { .. }
+                | VariableHeader::CreateStreamRespError { .. }
+                | VariableHeader::QueryOffsetRespError { .. }
+                | VariableHeader::ConnectAckError { .. }
+                | VariableHeader::DisconnectAckError { .. }
+                | VariableHeader::RegisterExtentAckError { .. }
+                | VariableHeader::FlushExtentRespError { .. }
+        )
     }
 
     /// Encode this frame into the destination buffer.

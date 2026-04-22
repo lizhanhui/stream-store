@@ -156,8 +156,8 @@ async fn broadcast_replication_rf2() {
         .await
         .unwrap();
     assert_eq!(msgs.len(), 5);
-    for i in 0..5 {
-        assert_eq!(msgs[i], Bytes::from(format!("msg-{i}")));
+    for (i, msg) in msgs.iter().enumerate().take(5) {
+        assert_eq!(*msg, Bytes::from(format!("msg-{i}")));
     }
 
     // Also verify data is on the Secondary.
@@ -175,8 +175,8 @@ async fn broadcast_replication_rf2() {
         .await
         .unwrap();
     assert_eq!(secondary_msgs.len(), 5);
-    for i in 0..5 {
-        assert_eq!(secondary_msgs[i], Bytes::from(format!("msg-{i}")));
+    for (i, msg) in secondary_msgs.iter().enumerate().take(5) {
+        assert_eq!(*msg, Bytes::from(format!("msg-{i}")));
     }
 }
 
@@ -241,9 +241,9 @@ async fn broadcast_replication_rf3() {
             .await
             .unwrap();
         assert_eq!(msgs.len(), 3, "{label} should have 3 messages");
-        for i in 0..3 {
+        for (i, msg) in msgs.iter().enumerate().take(3) {
             assert_eq!(
-                msgs[i],
+                *msg,
                 Bytes::from(format!("rf3-msg-{i}")),
                 "{label} message {i} mismatch"
             );

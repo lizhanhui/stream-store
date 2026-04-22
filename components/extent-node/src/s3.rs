@@ -237,7 +237,7 @@ async fn multipart_upload(
         .to_string();
 
     // 2. Build part descriptors (zero-copy slices of the Bytes buffer).
-    let num_parts = (data_len + part_size - 1) / part_size;
+    let num_parts = data_len.div_ceil(part_size);
     let parts: Vec<(i32, Bytes)> = (0..num_parts)
         .map(|i| {
             let start = i * part_size;
@@ -352,7 +352,7 @@ async fn upload_part_with_retry(
                 if attempt >= PART_MAX_RETRIES {
                     return Err(UploadPartFailedSnafu {
                         key: key.to_string(),
-                        part_number: part_number,
+                        part_number,
                     }
                     .into_error(e.into()));
                 }

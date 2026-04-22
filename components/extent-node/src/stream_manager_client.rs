@@ -54,6 +54,7 @@ impl StreamManagerClient {
     ///
     /// The heartbeat task manages the heartbeat connection exclusively.
     /// The update task manages a separate connection for extent updates.
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         store: Arc<ExtentNodeStore>,
         node_id: String,
@@ -137,6 +138,7 @@ impl StreamManagerClient {
     // ── Heartbeat connection ────────────────────────────────────────────
 
     /// Reconnection loop for the heartbeat connection.
+    #[allow(clippy::too_many_arguments)]
     async fn heartbeat_loop(
         store: Arc<ExtentNodeStore>,
         node_id: String,
@@ -185,6 +187,7 @@ impl StreamManagerClient {
     }
 
     /// Single heartbeat session: Connect, heartbeat loop, Disconnect on shutdown.
+    #[allow(clippy::too_many_arguments)]
     async fn heartbeat_session(
         store: &Arc<ExtentNodeStore>,
         node_id: &str,
@@ -314,6 +317,7 @@ impl StreamManagerClient {
     // ── Update connection ───────────────────────────────────────────────
 
     /// Reconnection loop for the extent update connection.
+    #[allow(clippy::too_many_arguments)]
     async fn update_loop(
         store: Arc<ExtentNodeStore>,
         node_id: String,
@@ -361,6 +365,7 @@ impl StreamManagerClient {
     }
 
     /// Single update session: Connect, drain extent updates, send progress.
+    #[allow(clippy::too_many_arguments)]
     async fn update_session(
         store: &Arc<ExtentNodeStore>,
         node_id: &str,

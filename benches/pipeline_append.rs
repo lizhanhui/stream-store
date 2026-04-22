@@ -360,7 +360,7 @@ fn print_interval(
         0.0
     };
 
-    let (avg, p99, p999, max) = if hist.len() > 0 {
+    let (avg, p99, p999, max) = if !hist.is_empty() {
         (
             format_us(hist.mean() as u64),
             format_us(hist.value_at_quantile(0.99)),

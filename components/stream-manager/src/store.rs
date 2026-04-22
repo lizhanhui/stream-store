@@ -361,6 +361,7 @@ impl StreamManagerStore {
     /// `primary_addr`: the Primary's listen address.
     /// `secondary_addrs`: addresses of all Secondaries (passed to Primary so it
     /// can broadcast Forward frames).
+    #[allow(clippy::too_many_arguments)]
     async fn register_primary(
         &self,
         stream_id: StreamId,
@@ -458,6 +459,7 @@ impl StreamManagerStore {
     /// Secondaries create extents lazily on the first Forward frame, so these
     /// RPCs are hints for pre-allocation, not required for correctness.
     /// Each is spawned as an independent task to avoid blocking the caller.
+    #[allow(clippy::too_many_arguments)]
     fn notify_secondaries(
         &self,
         stream_id: StreamId,
@@ -545,6 +547,7 @@ impl StreamManagerStore {
     /// `replication_factor` specifies how many replicas to create for this extent.
     /// The stream_replica table stores node *addresses* (not node IDs) so that the StreamManager
     /// can connect to ExtentNodes for seal and RegisterExtent operations.
+    #[allow(clippy::too_many_arguments)]
     async fn allocate_and_notify_replica_set(
         &self,
         stream_id: StreamId,
@@ -1180,19 +1183,18 @@ impl StreamManagerStore {
                         secondary_offsets.push(*end_offset);
                     }
                     // Reconcile predecessor extents from the SealExtentNodeResp payload.
-                    if let Some(payload) = payload {
-                        if let Some(extents) = parse_seal_predecessor_payload(payload) {
-                            if !extents.is_empty() {
-                                info!(
-                                    "Reconciling {} predecessor extents from {addr} for stream {stream_id}",
-                                    extents.len()
-                                );
-                                let _ = self
-                                    .store
-                                    .reconcile_extents(stream_id, epoch, &extents)
-                                    .await;
-                            }
-                        }
+                    if let Some(payload) = payload
+                        && let Some(extents) = parse_seal_predecessor_payload(payload)
+                        && !extents.is_empty()
+                    {
+                        info!(
+                            "Reconciling {} predecessor extents from {addr} for stream {stream_id}",
+                            extents.len()
+                        );
+                        let _ = self
+                            .store
+                            .reconcile_extents(stream_id, epoch, &extents)
+                            .await;
                     }
                 }
                 Err(e) => {
@@ -1655,20 +1657,19 @@ impl StreamManagerStore {
         {
             Ok((_sealed_eid, _start, end, payload)) => {
                 // Reconcile predecessor extents from the primary's SealExtentNodeResp.
-                if let Some(ref payload) = payload {
-                    if let Some(extents) = parse_seal_predecessor_payload(payload) {
-                        if !extents.is_empty() {
-                            info!(
-                                "Epoch seal: reconciling {} predecessor extents from primary for stream {}",
-                                extents.len(),
-                                stream_id
-                            );
-                            let _ = self
-                                .store
-                                .reconcile_extents(stream_id, active.epoch, &extents)
-                                .await;
-                        }
-                    }
+                if let Some(ref payload) = payload
+                    && let Some(extents) = parse_seal_predecessor_payload(payload)
+                    && !extents.is_empty()
+                {
+                    info!(
+                        "Epoch seal: reconciling {} predecessor extents from primary for stream {}",
+                        extents.len(),
+                        stream_id
+                    );
+                    let _ = self
+                        .store
+                        .reconcile_extents(stream_id, active.epoch, &extents)
+                        .await;
                 }
                 end
             }
@@ -1965,7 +1966,7 @@ impl StreamManagerStore {
     /// Scan for sealed extents past the staleness threshold and delegate flush
     /// to ALL alive replicas. Called by the heartbeat checker (leader only).
     pub async fn flush_stale_extents(&self, threshold_ms: u32) {
-        let threshold_secs = ((threshold_ms as u64) + 999) / 1000;
+        let threshold_secs = (threshold_ms as u64).div_ceil(1000);
         let stale = match self.store.get_stale_sealed_extents(threshold_secs).await {
             Ok(s) => s,
             Err(e) => {
@@ -2018,6 +2019,7 @@ impl StreamManagerStore {
     /// further failures. S3 PUT is idempotent so concurrent uploads to the
     /// same key are safe. Includes the dead Primary (best-effort, in case it
     /// recovered). Each send is request-response via `tokio::spawn`.
+    #[allow(clippy::too_many_arguments)]
     async fn send_flush_extent_to_all_replicas(
         &self,
         replicas: &[crate::metadata::StreamReplicaRow],

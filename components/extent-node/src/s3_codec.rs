@@ -175,11 +175,11 @@ impl S3ExtentHeader {
         }
         let magic = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]);
         if magic != S3_EXTENT_MAGIC {
-            return Err(BadMagicSnafu { magic: magic }.build());
+            return Err(BadMagicSnafu { magic }.build());
         }
         let version = u16::from_be_bytes([buf[4], buf[5]]);
         if version != S3_EXTENT_VERSION {
-            return Err(UnsupportedVersionSnafu { version: version }.build());
+            return Err(UnsupportedVersionSnafu { version }.build());
         }
         let flags = u16::from_be_bytes([buf[6], buf[7]]);
         let stream_id = u64::from_be_bytes(buf[8..16].try_into().unwrap());
@@ -252,7 +252,7 @@ pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compress
     let chunk_count = if record_count == 0 {
         0
     } else {
-        (record_count + S3_INDEX_INTERVAL - 1) / S3_INDEX_INTERVAL
+        record_count.div_ceil(S3_INDEX_INTERVAL)
     };
 
     // Build chunks: split committed data into groups of 64 records, compress each.
@@ -381,7 +381,7 @@ pub fn encode_extent_range(
     let chunk_count = if record_count == 0 {
         0
     } else {
-        (record_count + S3_INDEX_INTERVAL - 1) / S3_INDEX_INTERVAL
+        record_count.div_ceil(S3_INDEX_INTERVAL)
     };
 
     // Build chunks: split data into groups of 64 records, compress each.
