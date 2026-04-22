@@ -1,7 +1,6 @@
 CREATE TABLE stream (
     stream_id           INT UNSIGNED PRIMARY KEY AUTO_INCREMENT,
     stream_name         VARCHAR(512) NOT NULL UNIQUE,
-    stream_type         VARCHAR(32) NOT NULL DEFAULT 'DATA',
     replication_factor  TINYINT UNSIGNED NOT NULL DEFAULT 2,
     min_extent_capacity INT NOT NULL DEFAULT 8388608,
     max_extent_capacity INT NOT NULL DEFAULT 268435456,

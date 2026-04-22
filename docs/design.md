@@ -8,12 +8,7 @@ Replace cloud block-based disk storage with object storage (S3-compatible) to re
 
 ### Stream
 
-An ordered, append-only sequence of messages/records. 
-
-Stream has two types:
-
-- **Data Stream**: Stores sequence of messages/records data. Each extent maintains an internal index (compressed `AtomicU32` pointers) mapping sequence numbers to byte positions.
-- **Index Stream**: Stores lightweight pointers into data streams (used for multi-dispatch fan-out).
+An ordered, append-only sequence of messages/records. Each extent maintains an internal index (compressed `AtomicU32` pointers) mapping sequence numbers to byte positions.
 
 ### Extent
 
