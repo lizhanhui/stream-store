@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StorageClass, StreamId};
+use common::types::{
+    Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+};
 
 /// Fixed header fields present in every frame on the wire.
 ///
@@ -118,16 +120,10 @@ pub enum VariableHeader {
         request_id: u32,
         stream_name: Bytes,
         replication_factor: u8,
-        /// Minimum extent capacity for new extents (0 = use default min).
-        min_extent_capacity: u32,
-        /// Maximum extent capacity for new extents (0 = use default max).
-        max_extent_capacity: u32,
-        cache_extents: u16,
-        /// Growth factor for adaptive capacity scaling (0 = use default).
-        /// On extent-full, next_capacity = min(current * growth_factor, max).
-        extent_growth_factor: u8,
         /// Storage class for sealed extents: S3 (0) or Memory (1).
         storage_class: StorageClass,
+        /// Extent sizing/caching policy.
+        policy: ExtentPolicy,
     },
     CreateStreamResp {
         request_id: u32,
@@ -183,22 +179,11 @@ pub enum VariableHeader {
     },
     RegisterExtent {
         request_id: u32,
-        stream_id: StreamId,
         extent_id: ExtentId,
+        /// 0 = Primary, 1+ = Secondary.
         role: u8,
-        replication_factor: u8,
-        /// Stream epoch for this extent registration.
-        epoch: Epoch,
-        /// Maximum extents to retain in memory for this stream. 0 = no limit.
-        cache_extents: u16,
-        /// Minimum extent capacity for this stream (0 = use default min).
-        min_extent_capacity: u32,
-        /// Maximum extent capacity for this stream (0 = use default max).
-        max_extent_capacity: u32,
-        /// Growth factor for adaptive capacity scaling (0 = use default).
-        extent_growth_factor: u8,
-        /// Storage class for sealed extents: S3 (0) or Memory (1).
-        storage_class: StorageClass,
+        /// Stream identity, replication, epoch, durability, and sizing policy.
+        config: StreamConfig,
     },
     RegisterExtentAck {
         request_id: u32,

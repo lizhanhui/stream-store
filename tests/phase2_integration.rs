@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, ExtentId, ExtentState, NodeMetrics, Offset, StorageClass};
+use common::types::{Epoch, ExtentId, ExtentPolicy, ExtentState, NodeMetrics, Offset, StorageClass};
 
 use serial_test::serial;
 
@@ -156,11 +156,13 @@ async fn stream_manager_integration() {
             .create_stream(
                 &stream_name,
                 1,
-                8 * 1024 * 1024,
-                256 * 1024 * 1024,
-                4,
-                0,
                 StorageClass::S3,
+                ExtentPolicy {
+                    min_capacity: 8 * 1024 * 1024,
+                    max_capacity: 256 * 1024 * 1024,
+                    cache: 4,
+                    scale_factor: 0,
+                },
             )
             .await
             .unwrap();

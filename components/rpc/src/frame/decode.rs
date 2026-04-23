@@ -1,11 +1,11 @@
 use bytes::{Buf, Bytes, BytesMut};
 use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpcodeSnafu};
 use common::types::{
-    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
+    Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
     FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
     FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
     FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
-    StorageClass, StreamId,
+    StorageClass, StreamConfig, StreamId,
 };
 
 use super::{FixedHeader, Frame, VariableHeader};
@@ -360,10 +360,10 @@ impl Frame {
                     let name_len = body.get_u16() as usize;
                     let stream_name = body.split_to(name_len).freeze();
                     let replication_factor = body.get_u8();
-                    let min_extent_capacity = body.get_u32();
-                    let max_extent_capacity = body.get_u32();
-                    let cache_extents = body.get_u16();
-                    let extent_growth_factor = body.get_u8();
+                    let min_capacity = body.get_u32();
+                    let max_capacity = body.get_u32();
+                    let cache = body.get_u16();
+                    let scale_factor = body.get_u8();
                     let storage_class = StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
                         InvalidFrameSnafu {
                             message: "unknown storage class",
@@ -375,11 +375,13 @@ impl Frame {
                             request_id,
                             stream_name,
                             replication_factor,
-                            min_extent_capacity,
-                            max_extent_capacity,
-                            cache_extents,
-                            extent_growth_factor,
                             storage_class,
+                            policy: ExtentPolicy {
+                                cache,
+                                min_capacity,
+                                max_capacity,
+                                scale_factor,
+                            },
                         },
                         None,
                     ))
@@ -533,10 +535,10 @@ impl Frame {
                     let role = body.get_u8();
                     let replication_factor = body.get_u8();
                     let epoch = Epoch(body.get_u32());
-                    let cache_extents = body.get_u16();
-                    let min_extent_capacity = body.get_u32();
-                    let max_extent_capacity = body.get_u32();
-                    let extent_growth_factor = body.get_u8();
+                    let cache = body.get_u16();
+                    let min_capacity = body.get_u32();
+                    let max_capacity = body.get_u32();
+                    let scale_factor = body.get_u8();
                     let storage_class = StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
                         InvalidFrameSnafu {
                             message: "unknown storage class",
@@ -547,16 +549,20 @@ impl Frame {
                     Ok((
                         VariableHeader::RegisterExtent {
                             request_id,
-                            stream_id,
                             extent_id,
                             role,
-                            replication_factor,
-                            epoch,
-                            cache_extents,
-                            min_extent_capacity,
-                            max_extent_capacity,
-                            extent_growth_factor,
-                            storage_class,
+                            config: StreamConfig {
+                                stream_id,
+                                replication_factor,
+                                epoch,
+                                storage_class,
+                                policy: ExtentPolicy {
+                                    cache,
+                                    min_capacity,
+                                    max_capacity,
+                                    scale_factor,
+                                },
+                            },
                         },
                         payload,
                     ))

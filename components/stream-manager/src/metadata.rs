@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use common::errors::{DatabaseSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
-    Epoch, ExtentId, ExtentInfo, ExtentState, NodeMetrics, NodeState, ReplicaDetail, StorageClass,
-    StreamId,
+    Epoch, ExtentId, ExtentInfo, ExtentPolicy, ExtentState, NodeMetrics, NodeState, ReplicaDetail,
+    StorageClass, StreamId,
 };
 use snafu::ResultExt;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
@@ -159,26 +159,22 @@ impl MetadataStore {
 
     /// Create a new stream with a per-stream replication factor. Returns the assigned StreamId.
     /// Also initializes the stream_sequence row for per-stream extent_id generation.
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_stream(
         &self,
         name: &str,
         replication_factor: u8,
-        min_extent_capacity: u32,
-        max_extent_capacity: u32,
-        cache_extents: u16,
-        extent_growth_factor: u8,
         storage_class: StorageClass,
+        policy: ExtentPolicy,
     ) -> Result<StreamId, StorageError> {
         let result = sqlx::query(
             "INSERT INTO stream (stream_name, replication_factor, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class) VALUES (?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(name)
         .bind(replication_factor)
-        .bind(min_extent_capacity as i32)
-        .bind(max_extent_capacity as i32)
-        .bind(cache_extents)
-        .bind(extent_growth_factor)
+        .bind(policy.min_capacity as i32)
+        .bind(policy.max_capacity as i32)
+        .bind(policy.cache)
+        .bind(policy.scale_factor)
         .bind(storage_class.as_u8())
         .execute(&self.pool)
         .await

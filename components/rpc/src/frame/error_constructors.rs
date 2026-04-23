@@ -312,12 +312,12 @@ impl Frame {
             }
             VariableHeader::RegisterExtent {
                 request_id,
-                stream_id,
                 extent_id,
+                config,
                 ..
             } => Self::register_extent_ack_error(
                 *request_id,
-                *stream_id,
+                config.stream_id,
                 if effective_extent_id != ExtentId(0) {
                     effective_extent_id
                 } else {

@@ -40,7 +40,7 @@ use bytes::Bytes;
 use client::StreamClient;
 use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR};
 use common::errors::{InternalSnafu, StorageError};
-use common::types::{Epoch, StorageClass, StreamId};
+use common::types::{Epoch, ExtentPolicy, StorageClass, StreamId};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use hdrhistogram::Histogram;
@@ -182,11 +182,13 @@ async fn main() {
         .open(
             "bench-pipeline-cluster",
             REPLICATION_FACTOR,
-            MIN_EXTENT_CAPACITY,
-            MAX_EXTENT_CAPACITY,
-            DEFAULT_CACHE_EXTENTS,
-            DEFAULT_EXTENT_GROWTH_FACTOR,
             StorageClass::S3,
+            ExtentPolicy {
+                min_capacity: MIN_EXTENT_CAPACITY,
+                max_capacity: MAX_EXTENT_CAPACITY,
+                cache: DEFAULT_CACHE_EXTENTS,
+                scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            },
         )
         .await
         .expect("open stream");

@@ -223,6 +223,33 @@ impl StorageClass {
     }
 }
 
+/// Capacity-scaling policy for extents within a stream. Describes only
+/// sizing/caching — no durability or identity semantics.
+///
+/// A zero on any field means "use the server default".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ExtentPolicy {
+    /// Maximum extents to retain in memory for the stream (0 = default).
+    pub cache: u16,
+    /// Minimum extent capacity in bytes (0 = default).
+    pub min_capacity: u32,
+    /// Maximum extent capacity in bytes (0 = default).
+    pub max_capacity: u32,
+    /// Adaptive-growth multiplier on extent-full (0 = default).
+    pub scale_factor: u8,
+}
+
+/// Full per-stream configuration threaded through replica registration,
+/// seal-and-new allocation, and forwarded extent init.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamConfig {
+    pub stream_id: StreamId,
+    pub replication_factor: u8,
+    pub epoch: Epoch,
+    pub storage_class: StorageClass,
+    pub policy: ExtentPolicy,
+}
+
 /// State of an extent in metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

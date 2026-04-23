@@ -11,7 +11,7 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
     DEFAULT_MIN_EXTENT_CAPACITY, StreamManagerConfig,
 };
-use common::types::{Epoch, ExtentState, NodeMetrics, StorageClass};
+use common::types::{Epoch, ExtentPolicy, ExtentState, NodeMetrics, StorageClass};
 use serial_test::serial;
 
 /// Initialize tracing for tests.
@@ -119,11 +119,13 @@ async fn stream_client_open_integration() {
         .open(
             "test-stream",
             1,
-            DEFAULT_MIN_EXTENT_CAPACITY,
-            DEFAULT_MAX_EXTENT_CAPACITY,
-            DEFAULT_CACHE_EXTENTS,
-            DEFAULT_EXTENT_GROWTH_FACTOR,
             StorageClass::S3,
+            ExtentPolicy {
+                min_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                max_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                cache: DEFAULT_CACHE_EXTENTS,
+                scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            },
         )
         .await
         .unwrap();
@@ -146,11 +148,13 @@ async fn stream_client_open_integration() {
         .open(
             "test-stream",
             1,
-            DEFAULT_MIN_EXTENT_CAPACITY,
-            DEFAULT_MAX_EXTENT_CAPACITY,
-            DEFAULT_CACHE_EXTENTS,
-            DEFAULT_EXTENT_GROWTH_FACTOR,
             StorageClass::S3,
+            ExtentPolicy {
+                min_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                max_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                cache: DEFAULT_CACHE_EXTENTS,
+                scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            },
         )
         .await
         .unwrap();
@@ -168,11 +172,13 @@ async fn stream_client_open_integration() {
         .open(
             "another-stream",
             1,
-            DEFAULT_MIN_EXTENT_CAPACITY,
-            DEFAULT_MAX_EXTENT_CAPACITY,
-            DEFAULT_CACHE_EXTENTS,
-            DEFAULT_EXTENT_GROWTH_FACTOR,
             StorageClass::S3,
+            ExtentPolicy {
+                min_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                max_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                cache: DEFAULT_CACHE_EXTENTS,
+                scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            },
         )
         .await
         .unwrap();

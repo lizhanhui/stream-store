@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use common::config::{DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY};
-use common::types::{ErrorCode, ExtentId};
+use common::types::{ErrorCode, ExtentId, ExtentPolicy};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use tracing::info;
@@ -13,43 +13,13 @@ impl ExtentNodeStore {
     ///
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
     pub(crate) fn handle_register_extent(&self, frame: Frame) -> Frame {
-        // Extract stream_id, extent_id, role, replication_factor from the variable header.
-        let (
-            stream_id,
-            extent_id,
-            role,
-            replication_factor,
-            epoch,
-            cache_extents,
-            min_extent_capacity,
-            max_extent_capacity,
-            extent_growth_factor,
-            storage_class,
-        ) = match &frame.variable_header {
+        let (extent_id, role, config) = match &frame.variable_header {
             VariableHeader::RegisterExtent {
-                stream_id,
                 extent_id,
                 role,
-                replication_factor,
-                epoch,
-                cache_extents,
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
-                storage_class,
+                config,
                 ..
-            } => (
-                *stream_id,
-                *extent_id,
-                *role,
-                *replication_factor,
-                *epoch,
-                *cache_extents,
-                *min_extent_capacity,
-                *max_extent_capacity,
-                *extent_growth_factor,
-                *storage_class,
-            ),
+            } => (*extent_id, *role, *config),
             _ => {
                 return Frame::error_from_request(
                     &frame,
@@ -60,16 +30,24 @@ impl ExtentNodeStore {
             }
         };
 
+        let stream_id = config.stream_id;
+        let epoch = config.epoch;
+        let replication_factor = config.replication_factor;
+
         // Normalize capacity bounds: 0 means use default.
-        let min_extent_capacity = if min_extent_capacity == 0 {
-            DEFAULT_MIN_EXTENT_CAPACITY
-        } else {
-            min_extent_capacity
-        };
-        let max_extent_capacity = if max_extent_capacity == 0 {
-            DEFAULT_MAX_EXTENT_CAPACITY
-        } else {
-            max_extent_capacity
+        let policy = ExtentPolicy {
+            cache: config.policy.cache,
+            min_capacity: if config.policy.min_capacity == 0 {
+                DEFAULT_MIN_EXTENT_CAPACITY
+            } else {
+                config.policy.min_capacity
+            },
+            max_capacity: if config.policy.max_capacity == 0 {
+                DEFAULT_MAX_EXTENT_CAPACITY
+            } else {
+                config.policy.max_capacity
+            },
+            scale_factor: config.policy.scale_factor,
         };
 
         // Parse replica addresses from the payload.
@@ -89,20 +67,13 @@ impl ExtentNodeStore {
         // Create the stream locally if it doesn't exist, then register the new extent.
         // Skip extent creation if it already exists (idempotent — extent may have been
         // lazily created by a forwarded append that arrived before this RegisterExtent).
-        self.try_create_stream(
-            stream_id,
-            cache_extents,
-            storage_class,
-            min_extent_capacity,
-            max_extent_capacity,
-            extent_growth_factor,
-        );
+        self.try_create_stream(stream_id, config.storage_class, &policy);
 
         // Register the extent (idempotent — skips if already exists).
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
             if stream.with_extent(extent_id, |_| ()).is_none() {
-                stream.register_extent(extent_id, stream.max_offset(), epoch, min_extent_capacity);
+                stream.register_extent(extent_id, stream.max_offset(), epoch, policy.min_capacity);
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
                 // from authoritative source (RegisterExtent carries the real epoch).

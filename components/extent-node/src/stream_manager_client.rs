@@ -27,7 +27,7 @@ use rpc::codec::FrameCodec;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{build_connect_payload, build_disconnect_payload, build_heartbeat_payload};
 use tokio::net::TcpStream;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::codec::Framed;
 use tracing::{error, info, warn};
@@ -42,8 +42,8 @@ use crate::store::{ExtentNodeStore, ExtentUpdate};
 /// tasks are signaled to shut down.
 pub struct StreamManagerClient {
     /// Dropping these senders signals the background tasks to shut down.
-    _heartbeat_shutdown_tx: tokio::sync::oneshot::Sender<()>,
-    _update_shutdown_tx: tokio::sync::oneshot::Sender<()>,
+    _heartbeat_shutdown_tx: oneshot::Sender<()>,
+    _update_shutdown_tx: oneshot::Sender<()>,
     /// Handles to the background tasks for explicit join-on-stop.
     heartbeat_handle: JoinHandle<()>,
     update_handle: JoinHandle<()>,
@@ -65,8 +65,8 @@ impl StreamManagerClient {
         rpc_request_timeout: Duration,
         update_rx: mpsc::Receiver<ExtentUpdate>,
     ) -> Self {
-        let (hb_shutdown_tx, hb_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let (upd_shutdown_tx, upd_shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let (hb_shutdown_tx, hb_shutdown_rx) = oneshot::channel::<()>();
+        let (upd_shutdown_tx, upd_shutdown_rx) = oneshot::channel::<()>();
 
         // Heartbeat task — dedicated connection, no extent updates.
         let hb_store = Arc::clone(&store);
@@ -145,7 +145,7 @@ impl StreamManagerClient {
         advertise_addr: String,
         stream_manager_addrs: Vec<String>,
         heartbeat_interval_ms: u32,
-        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        mut shutdown_rx: oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
     ) {
@@ -194,7 +194,7 @@ impl StreamManagerClient {
         advertise_addr: &str,
         stream_manager_addr: &str,
         heartbeat_interval_ms: u32,
-        shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
+        shutdown_rx: &mut oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
     ) -> Result<bool, StorageError> {
@@ -324,7 +324,7 @@ impl StreamManagerClient {
         advertise_addr: String,
         stream_manager_addrs: Vec<String>,
         heartbeat_interval_ms: u32,
-        mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+        mut shutdown_rx: oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
         mut update_rx: mpsc::Receiver<ExtentUpdate>,
@@ -372,7 +372,7 @@ impl StreamManagerClient {
         advertise_addr: &str,
         stream_manager_addr: &str,
         heartbeat_interval_ms: u32,
-        shutdown_rx: &mut tokio::sync::oneshot::Receiver<()>,
+        shutdown_rx: &mut oneshot::Receiver<()>,
         rpc_connect_timeout: Duration,
         rpc_request_timeout: Duration,
         update_rx: &mut mpsc::Receiver<ExtentUpdate>,
