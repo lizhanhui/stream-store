@@ -29,10 +29,7 @@ async fn start_stream_manager_server() -> String {
     use stream_manager::metadata::MetadataStore;
     use stream_manager::store::StreamManagerStore;
 
-    let config = StreamManagerConfig {
-        default_replication_factor: 1,
-        ..StreamManagerConfig::default()
-    };
+    let config = StreamManagerConfig::default();
 
     let pool = sqlx::mysql::MySqlPoolOptions::new()
         .max_connections(1)
@@ -61,7 +58,7 @@ async fn start_stream_manager_server() -> String {
         .expect("failed to connect to MySQL");
     store.migrate().await.expect("failed to migrate");
 
-    let stream_manager_store = StreamManagerStore::new(store, config.default_replication_factor);
+    let stream_manager_store = StreamManagerStore::new(store);
     let handler = Arc::new(stream_manager_store);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

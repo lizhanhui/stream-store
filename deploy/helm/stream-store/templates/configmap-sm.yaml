@@ -14,5 +14,4 @@ data:
     mysql_username = {{ .Values.mysql.username | quote }}
     mysql_password = {{ .Values.mysql.password | quote }}
     mysql_database = {{ .Values.mysql.database | quote }}
-    default_replication_factor = {{ .Values.streamManager.replicationFactor }}
     heartbeat_check_interval_ms = {{ .Values.streamManager.heartbeatCheckIntervalMs }}

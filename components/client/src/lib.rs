@@ -270,7 +270,7 @@ impl StreamClient {
     /// Create a new stream on the StreamManager.
     /// Variable header carries stream name, per-stream replication factor, storage class,
     /// and the stream's extent-sizing policy.
-    /// If `replication_factor=0`, the StreamManager uses its default.
+    /// `replication_factor` must be >= 1; the server rejects `replication_factor = 0`.
     /// If any `policy` field is 0, the StreamManager substitutes its default.
     /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
     pub async fn create_stream(

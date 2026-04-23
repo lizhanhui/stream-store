@@ -196,23 +196,12 @@ async fn report_extents_from_node_static(
 pub struct StreamManagerStore {
     store: MetadataStore,
     allocator: Allocator,
-    /// Default replication factor used when a client sends replication_factor=0
-    /// (meaning "use server default"). Per-stream replication factor is stored in the stream table.
-    default_replication_factor: usize,
 }
 
 impl StreamManagerStore {
-    pub fn new(store: MetadataStore, default_replication_factor: usize) -> Self {
-        assert!(
-            default_replication_factor >= 1,
-            "default_replication_factor must be >= 1"
-        );
+    pub fn new(store: MetadataStore) -> Self {
         let allocator = Allocator::new(store.clone());
-        Self {
-            store,
-            allocator,
-            default_replication_factor,
-        }
+        Self { store, allocator }
     }
 
     /// Access the underlying MetadataStore (e.g., for heartbeat checker).
@@ -717,7 +706,7 @@ impl StreamManagerStore {
     /// CreateStream: create stream in metadata, allocate initial extent replica set, notify ExtentNodes.
     ///
     /// Variable header carries stream_name, replication_factor, and extent_capacity.
-    /// If replication_factor=0, the server's default_replication_factor is used.
+    /// `replication_factor` must be >= 1; a value of 0 is rejected with an error.
     /// If min_extent_capacity=0, the default of 8 MiB is used.
     /// If max_extent_capacity=0, the default of 256 MiB is used.
     ///
@@ -747,12 +736,17 @@ impl StreamManagerStore {
             }
         };
 
-        // Use server default if client sends replication_factor=0.
-        let replication_factor = if replication_factor == 0 {
-            self.default_replication_factor as u8
-        } else {
-            replication_factor
-        };
+        // Streams must be created with a concrete replication factor. The
+        // wire protocol reserves 0 as an error sentinel now that the server
+        // no longer carries a default RF.
+        if replication_factor == 0 {
+            return Frame::error_from_request(
+                &frame,
+                ErrorCode::InternalError,
+                "replication_factor must be >= 1",
+                ExtentId(0),
+            );
+        }
 
         // Use defaults if client sends 0 values.
         let policy = ExtentPolicy {
