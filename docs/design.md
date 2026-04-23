@@ -14,7 +14,7 @@ An ordered, append-only sequence of messages/records. Each extent maintains an i
 
 The unit of replication and the unit of S3 flush. A stream is composed of an ordered list of extents.
 
-- **Active (unsealed, mutable)**: At most one per stream. Accept appends. Replicated via broadcast replication across a configurable number of nodes (replication factor, default 2).
+- **Active (unsealed, mutable)**: At most one per stream. Accept appends. Replicated via broadcast replication across a configurable number of nodes (replication factor, per-stream, typically 2).
 - **Sealed**: Immutable. Eligible for S3 flush. Once flushed to S3, they can be evicted from memory. 
 - **Flushed**: Sealed + uploaded to S3.  Served from S3 (with read cache) on demand. Flushed extents are supposed to be evicted from memory to free up space for active extents and new appends. They are subject to TTL-based policy in memory and S3.
 
@@ -120,14 +120,14 @@ The storage layer runs as a **dedicated Rust process** (`stream-store`). This la
 
 ### Broadcast Replication Topology
 
-The replication factor (RF) is configurable (default 2, supports 1-N). Each active extent is replicated across RF nodes. Following WAS paper terminology, the first node is the **Primary** and subsequent nodes are **Secondaries**.
+The replication factor (RF) is a per-stream setting supplied at `CreateStream` time (supports 1-N, typically 2; the server requires RF >= 1 and rejects 0). Each active extent is replicated across RF nodes. Following WAS paper terminology, the first node is the **Primary** and subsequent nodes are **Secondaries**.
 
 - **Primary**: Sole append acceptor. Assigns monotonic sequence numbers. Broadcasts writes to all Secondaries in parallel (O(1) hop latency).
 - **Secondary**: Receives forwarded writes directly from Primary. Returns cumulative watermark ACKs to Primary.
 - **Quorum ACK**: Primary waits for ACKs from a quorum of replicas (itself + `RF/2` secondaries) before ACKing clients. This tolerates minority failures without blocking.
 
 ```
-RF=2 (default):  Primary broadcasts to Secondary
+RF=2 (typical):  Primary broadcasts to Secondary
 
                           +------------------+
                           | Stream Manager   |
@@ -313,7 +313,7 @@ The `client` crate is used internally by both process types: Extent Node uses it
 
 ## Replication: Broadcast Replication
 
-Each active extent has an N-node replica set determined by the configurable replication factor (RF). Default RF=2: Primary + one Secondary. RF=1: single node (no forwarding). RF=N: Primary + (N-1) Secondaries.
+Each active extent has an N-node replica set determined by the per-stream replication factor (RF). RF=2 (typical): Primary + one Secondary. RF=1: single node (no forwarding). RF=N: Primary + (N-1) Secondaries.
 
 Unlike chain replication where writes flow sequentially through the chain (O(N) hops), broadcast replication has the Primary fan out appends to **all Secondaries in parallel** (O(1) hop latency). Quorum-based ACKs allow the system to tolerate minority replica failures without blocking.
 
@@ -713,7 +713,7 @@ read(stream, offset=1050, count=10)
 | RPC protocol | Custom TCP with fixed header + variable header + payload | Minimal overhead, zero-copy broadcast forwarding, per-opcode wire layout, full control over batching and framing |
 | Object storage API | S3-compatible | Widest ecosystem (AWS, MinIO, Ceph, Alibaba OSS S3-compat) |
 | Replication protocol | Broadcast replication with quorum ACK | O(1) hop latency (vs O(N) for chain), tolerates minority failures, simple parallel fan-out |
-| Durability before S3 | Pure in-memory N-way (default 2-way) | Low latency; single-node failure tolerated; S3 flush bounds risk |
+| Durability before S3 | Pure in-memory N-way (typically 2-way) | Low latency; single-node failure tolerated; S3 flush bounds risk |
 | Stream concurrency | Stream-level pipelined group commit with leader election, lock-free arena with internal compressed index for O(1) reads | Single active writer per stream eliminates cache-line bouncing; extent-full transition is inline (no re-election); followers delegate via channel; batch drain amortizes cost; no mutex on hot path |
 | Multi-dispatch | Shared data + index streams | Storage efficient; avoids body duplication across subscribers |
 | Stream Manager metadata store | MySQL (sqlx) | Reuses existing infra; metadata ops are infrequent (per-extent, not per-message) |
