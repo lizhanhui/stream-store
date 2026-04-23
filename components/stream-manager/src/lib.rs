@@ -61,10 +61,7 @@ impl StreamManager {
         info!("StreamManager server bound on {local_addr}");
 
         // 3. Create StreamManagerStore (stateless — all state lives in MySQL).
-        let stream_manager_store = Arc::new(StreamManagerStore::new(
-            store,
-            config.default_replication_factor,
-        ));
+        let stream_manager_store = Arc::new(StreamManagerStore::new(store));
 
         // 4. Reconcile metadata with EN state (catch up on missed UPDATE_EXTENT
         //    notifications from any prior SM downtime).

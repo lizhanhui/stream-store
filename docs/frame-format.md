@@ -60,7 +60,7 @@ Lower flag bits (0x02, 0x04) are available for per-opcode request-side semantics
 
 ##### 0x01 CREATE_STREAM (Client <-> Stream Manager)
 
-Create a new stream. If `replication_factor = 0`, Stream Manager uses its default. If `min/max_extent_capacity = 0`, defaults apply (8 MiB / 256 MiB). If `cache_extents = 0`, Stream Manager uses 4. If `extent_growth_factor = 0`, default 2 is used.
+Create a new stream. `replication_factor` must be >= 1; the server rejects `replication_factor = 0`. If `min/max_extent_capacity = 0`, defaults apply (8 MiB / 256 MiB). If `cache_extents = 0`, Stream Manager uses 4. If `extent_growth_factor = 0`, default 2 is used.
 
 **Request (flag=0x00): Client -> SM**
 

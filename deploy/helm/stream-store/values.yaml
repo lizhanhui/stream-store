@@ -13,7 +13,6 @@ mysql:
 streamManager:
   replicas: 1
   port: 9800
-  replicationFactor: 2
   heartbeatCheckIntervalMs: 3000
   resources:
     requests:

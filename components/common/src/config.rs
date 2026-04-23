@@ -198,8 +198,6 @@ pub struct StreamManagerConfig {
     pub mysql_password: String,
     /// MySQL database name.
     pub mysql_database: String,
-    /// Default replication factor: number of nodes per extent replica set.
-    pub default_replication_factor: usize,
     /// How often the heartbeat checker polls for expired nodes, in milliseconds.
     pub heartbeat_check_interval_ms: u32,
     /// Timeout (ms) for establishing an RPC TCP connection to ExtentNodes. Defaults to 500ms.
@@ -226,7 +224,6 @@ impl Default for StreamManagerConfig {
             mysql_username: "root".to_string(),
             mysql_password: "password".to_string(),
             mysql_database: "stream_store".to_string(),
-            default_replication_factor: 2,
             heartbeat_check_interval_ms: 3000,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,

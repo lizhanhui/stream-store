@@ -14,9 +14,6 @@ mysql_username = "root"
 mysql_password = "password"
 mysql_database = "stream_store"
 
-# Replication
-default_replication_factor = 2
-
 # Heartbeat checker interval (ms)
 heartbeat_check_interval_ms = 3000
 
