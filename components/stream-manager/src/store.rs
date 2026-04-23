@@ -10,7 +10,9 @@ use common::config::{
     DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::errors::{InternalSnafu, StorageError};
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StorageClass, StreamId};
+use common::types::{
+    Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+};
 use futures_util::future;
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{
@@ -361,32 +363,16 @@ impl StreamManagerStore {
     /// `primary_addr`: the Primary's listen address.
     /// `secondary_addrs`: addresses of all Secondaries (passed to Primary so it
     /// can broadcast Forward frames).
-    #[allow(clippy::too_many_arguments)]
     async fn register_primary(
         &self,
-        stream_id: StreamId,
+        config: StreamConfig,
         extent_id: ExtentId,
         primary_addr: &str,
         secondary_addrs: &[&str],
-        replication_factor: u8,
-        epoch: Epoch,
-        min_extent_capacity: u32,
-        max_extent_capacity: u32,
-        cache_extents: u16,
-        extent_growth_factor: u8,
-        storage_class: StorageClass,
     ) -> Result<(), StorageError> {
         let payload = build_register_extent_payload(secondary_addrs);
         let addr = primary_addr.to_string();
-        let sid = stream_id;
         let eid = extent_id;
-        let rf = replication_factor;
-        let ep = epoch;
-        let minc = min_extent_capacity;
-        let maxc = max_extent_capacity;
-        let ce = cache_extents;
-        let gf = extent_growth_factor;
-        let sm = storage_class;
 
         let result = tokio::time::timeout(Duration::from_millis(500), async {
             let client = client::StreamClient::connect(&addr).await.map_err(|e| {
@@ -402,16 +388,9 @@ impl StreamManagerStore {
                 .send_frame(Frame::new(
                     VariableHeader::RegisterExtent {
                         request_id: 0,
-                        stream_id: sid,
                         extent_id: eid,
                         role: 0, // Primary
-                        replication_factor: rf,
-                        epoch: ep,
-                        min_extent_capacity: minc,
-                        max_extent_capacity: maxc,
-                        cache_extents: ce,
-                        extent_growth_factor: gf,
-                        storage_class: sm,
+                        config,
                     },
                     Some(payload),
                 ))
@@ -439,9 +418,10 @@ impl StreamManagerStore {
         match result {
             Ok(Ok(())) => {
                 info!(
-                    "RegisterExtent ACK from Primary {primary_addr}: stream={}, extent={}, rf={replication_factor}, secondaries={}",
-                    stream_id,
+                    "RegisterExtent ACK from Primary {primary_addr}: stream={}, extent={}, rf={}, secondaries={}",
+                    config.stream_id,
                     extent_id,
+                    config.replication_factor,
                     secondary_addrs.join(", ")
                 );
                 Ok(())
@@ -459,32 +439,17 @@ impl StreamManagerStore {
     /// Secondaries create extents lazily on the first Forward frame, so these
     /// RPCs are hints for pre-allocation, not required for correctness.
     /// Each is spawned as an independent task to avoid blocking the caller.
-    #[allow(clippy::too_many_arguments)]
     fn notify_secondaries(
         &self,
-        stream_id: StreamId,
+        config: StreamConfig,
         extent_id: ExtentId,
         secondary_addrs: &[String],
-        replication_factor: u8,
-        epoch: Epoch,
-        min_extent_capacity: u32,
-        max_extent_capacity: u32,
-        cache_extents: u16,
-        extent_growth_factor: u8,
-        storage_class: StorageClass,
     ) {
         for (i, addr) in secondary_addrs.iter().enumerate() {
             let role = (i + 1) as u8; // 1, 2, ...
             let addr = addr.clone();
-            let sid = stream_id;
             let eid = extent_id;
-            let rf = replication_factor;
-            let ep = epoch;
-            let minc = min_extent_capacity;
-            let maxc = max_extent_capacity;
-            let ce = cache_extents;
-            let gf = extent_growth_factor;
-            let sm = storage_class;
+            let sid = config.stream_id;
 
             tokio::spawn(async move {
                 let payload = build_register_extent_payload(&[]); // secondaries get no downstream addrs
@@ -494,16 +459,9 @@ impl StreamManagerStore {
                             .send_frame(Frame::new(
                                 VariableHeader::RegisterExtent {
                                     request_id: 0,
-                                    stream_id: sid,
                                     extent_id: eid,
                                     role,
-                                    replication_factor: rf,
-                                    epoch: ep,
-                                    min_extent_capacity: minc,
-                                    max_extent_capacity: maxc,
-                                    cache_extents: ce,
-                                    extent_growth_factor: gf,
-                                    storage_class: sm,
+                                    config,
                                 },
                                 Some(payload),
                             ))
@@ -547,19 +505,12 @@ impl StreamManagerStore {
     /// `replication_factor` specifies how many replicas to create for this extent.
     /// The stream_replica table stores node *addresses* (not node IDs) so that the StreamManager
     /// can connect to ExtentNodes for seal and RegisterExtent operations.
-    #[allow(clippy::too_many_arguments)]
     async fn allocate_and_notify_replica_set(
         &self,
-        stream_id: StreamId,
+        config: StreamConfig,
         start_offset: u64,
-        replication_factor: usize,
-        epoch: Epoch,
-        min_extent_capacity: u32,
-        max_extent_capacity: u32,
-        cache_extents: u16,
-        extent_growth_factor: u8,
-        storage_class: StorageClass,
     ) -> Result<(ExtentId, String), StorageError> {
+        let replication_factor = config.replication_factor as usize;
         // Initial allocation: require full RF.
         let nodes = self
             .allocator
@@ -575,12 +526,12 @@ impl StreamManagerStore {
 
         let extent_id = self
             .store
-            .allocate_extent(stream_id, start_offset, &replicas, epoch)
+            .allocate_extent(config.stream_id, start_offset, &replicas, config.epoch)
             .await?;
 
         info!(
             "extent {} allocated for stream {}: replicas={:?}",
-            extent_id, stream_id, node_addrs
+            extent_id, config.stream_id, node_addrs
         );
 
         // Notify ExtentNodes of their replication roles.
@@ -588,25 +539,19 @@ impl StreamManagerStore {
         // the StreamManager-assigned stream_id and extent_id (required for seal coordination).
         let primary_addr = &node_addrs[0];
         let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
-        let rf = node_addrs.len() as u8;
+        // Effective RF may be degraded below the requested count during failover
+        // allocation; reflect that in the config we broadcast so replicas match reality.
+        let effective_config = StreamConfig {
+            replication_factor: node_addrs.len() as u8,
+            ..config
+        };
 
-        self.register_primary(stream_id, extent_id, primary_addr, &secondary_addrs, rf, epoch, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class)
+        self.register_primary(effective_config, extent_id, primary_addr, &secondary_addrs)
             .await
             .unwrap_or_else(|e| {
                 warn!("register_primary failed for initial extent {}: {e}; client will discover on first append", extent_id);
             });
-        self.notify_secondaries(
-            stream_id,
-            extent_id,
-            &node_addrs[1..],
-            rf,
-            epoch,
-            min_extent_capacity,
-            max_extent_capacity,
-            cache_extents,
-            extent_growth_factor,
-            storage_class,
-        );
+        self.notify_secondaries(effective_config, extent_id, &node_addrs[1..]);
 
         Ok((extent_id, node_addrs[0].clone()))
     }
@@ -778,32 +723,19 @@ impl StreamManagerStore {
     ///
     /// Response variable header carries primary_addr.
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
-        let (
-            stream_name,
-            replication_factor,
-            min_extent_capacity,
-            max_extent_capacity,
-            cache_extents,
-            extent_growth_factor,
-            storage_class,
-        ) = match &frame.variable_header {
+        let (stream_name, replication_factor, storage_class, policy) = match &frame.variable_header
+        {
             VariableHeader::CreateStream {
                 stream_name,
                 replication_factor,
-                min_extent_capacity,
-                max_extent_capacity,
-                cache_extents,
-                extent_growth_factor,
                 storage_class,
+                policy,
                 ..
             } => (
                 String::from_utf8_lossy(stream_name).to_string(),
                 *replication_factor,
-                *min_extent_capacity,
-                *max_extent_capacity,
-                *cache_extents,
-                *extent_growth_factor,
                 *storage_class,
+                *policy,
             ),
             _ => {
                 return Frame::error_from_request(
@@ -817,49 +749,56 @@ impl StreamManagerStore {
 
         // Use server default if client sends replication_factor=0.
         let replication_factor = if replication_factor == 0 {
-            self.default_replication_factor
+            self.default_replication_factor as u8
         } else {
-            replication_factor as usize
+            replication_factor
         };
 
         // Use defaults if client sends 0 values.
-        let min_extent_capacity = if min_extent_capacity == 0 {
-            DEFAULT_MIN_EXTENT_CAPACITY
-        } else {
-            min_extent_capacity
-        };
-
-        let max_extent_capacity = if max_extent_capacity == 0 {
-            DEFAULT_MAX_EXTENT_CAPACITY
-        } else {
-            max_extent_capacity
-        };
-
-        // Use default 4 if client sends cache_extents=0.
-        let cache_extents = if cache_extents == 0 {
-            DEFAULT_CACHE_EXTENTS
-        } else {
-            cache_extents
-        };
-
-        // Use default growth factor if client sends 0.
-        let extent_growth_factor = if extent_growth_factor == 0 {
-            DEFAULT_EXTENT_GROWTH_FACTOR
-        } else {
-            extent_growth_factor
+        let policy = ExtentPolicy {
+            cache: if policy.cache == 0 {
+                DEFAULT_CACHE_EXTENTS
+            } else {
+                policy.cache
+            },
+            min_capacity: if policy.min_capacity == 0 {
+                DEFAULT_MIN_EXTENT_CAPACITY
+            } else {
+                policy.min_capacity
+            },
+            max_capacity: if policy.max_capacity == 0 {
+                DEFAULT_MAX_EXTENT_CAPACITY
+            } else {
+                policy.max_capacity
+            },
+            scale_factor: if policy.scale_factor == 0 {
+                DEFAULT_EXTENT_GROWTH_FACTOR
+            } else {
+                policy.scale_factor
+            },
         };
 
         let result = async {
             // 1. Create stream in metadata with per-stream replication factor and extent capacity.
-            let stream_id = self.store.create_stream(&stream_name, replication_factor as u8, min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class).await?;
+            let stream_id = self
+                .store
+                .create_stream(&stream_name, replication_factor, storage_class, policy)
+                .await?;
 
             // 2. Allocate first extent replica set and notify ExtentNodes.
+            let config = StreamConfig {
+                stream_id,
+                replication_factor,
+                epoch: Epoch(0),
+                storage_class,
+                policy,
+            };
             let (extent_id, primary_addr) =
-                self.allocate_and_notify_replica_set(stream_id, 0, replication_factor, Epoch(0), min_extent_capacity, max_extent_capacity, cache_extents, extent_growth_factor, storage_class).await?;
+                self.allocate_and_notify_replica_set(config, 0).await?;
 
             info!(
-                "stream {stream_name} created: stream_id={}, extent_id={}, primary={primary_addr}, min_extent_capacity={min_extent_capacity}, max_extent_capacity={max_extent_capacity}, cache_extents={cache_extents}, extent_growth_factor={extent_growth_factor}",
-                stream_id, extent_id
+                "stream {stream_name} created: stream_id={}, extent_id={}, primary={primary_addr}, min_capacity={}, max_capacity={}, cache={}, scale_factor={}",
+                stream_id, extent_id, policy.min_capacity, policy.max_capacity, policy.cache, policy.scale_factor
             );
 
             Ok::<(StreamId, ExtentId, String), StorageError>((stream_id, extent_id, primary_addr))
@@ -1294,7 +1233,20 @@ impl StreamManagerStore {
                 let node_addrs: Vec<String> = new_replicas.iter().map(|(a, _)| a.clone()).collect();
                 let secondary_addrs: Vec<&str> =
                     node_addrs[1..].iter().map(|s| s.as_str()).collect();
-                let rf = node_addrs.len() as u8;
+                // Effective RF may be degraded below the requested count during failover
+                // allocation; use the actual replica count we just picked.
+                let config = StreamConfig {
+                    stream_id,
+                    replication_factor: node_addrs.len() as u8,
+                    epoch,
+                    storage_class,
+                    policy: ExtentPolicy {
+                        cache: cache_extents,
+                        min_capacity: min_extent_capacity,
+                        max_capacity: max_extent_capacity,
+                        scale_factor: extent_growth_factor,
+                    },
+                };
 
                 info!(
                     "new extent {} allocated for stream {}, primary={primary_addr}",
@@ -1304,19 +1256,7 @@ impl StreamManagerStore {
                 // Register new extent: best-effort. If Primary is dead/slow,
                 // client will discover on first append and trigger another seal-and-new.
                 if let Err(e) = self
-                    .register_primary(
-                        stream_id,
-                        new_extent_id,
-                        &primary_addr,
-                        &secondary_addrs,
-                        rf,
-                        epoch,
-                        min_extent_capacity,
-                        max_extent_capacity,
-                        cache_extents,
-                        extent_growth_factor,
-                        storage_class,
-                    )
+                    .register_primary(config, new_extent_id, &primary_addr, &secondary_addrs)
                     .await
                 {
                     warn!(
@@ -1326,18 +1266,7 @@ impl StreamManagerStore {
                 }
 
                 // notify extent secondary nodes in fire-and-forget way
-                self.notify_secondaries(
-                    stream_id,
-                    new_extent_id,
-                    &node_addrs[1..],
-                    rf,
-                    epoch,
-                    min_extent_capacity,
-                    max_extent_capacity,
-                    cache_extents,
-                    extent_growth_factor,
-                    storage_class,
-                );
+                self.notify_secondaries(config, new_extent_id, &node_addrs[1..]);
 
                 (new_extent_id, primary_addr)
             }

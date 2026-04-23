@@ -31,7 +31,7 @@ use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::errors::{InternalSnafu, StorageError};
-use common::types::{Epoch, StorageClass, StreamId};
+use common::types::{Epoch, ExtentPolicy, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -229,11 +229,13 @@ async fn main() {
             .open(
                 &format!("bench-multi-{i}"),
                 REPLICATION_FACTOR,
-                MIN_EXTENT_CAPACITY,
-                MAX_EXTENT_CAPACITY,
-                CACHE_EXTENTS,
-                EXTENT_GROWTH_FACTOR,
                 StorageClass::Memory,
+                ExtentPolicy {
+                    min_capacity: MIN_EXTENT_CAPACITY,
+                    max_capacity: MAX_EXTENT_CAPACITY,
+                    cache: CACHE_EXTENTS,
+                    scale_factor: EXTENT_GROWTH_FACTOR,
+                },
             )
             .await
             .unwrap_or_else(|e| panic!("open stream {i}: {e}"));

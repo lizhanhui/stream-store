@@ -361,20 +361,17 @@ impl Frame {
                 request_id,
                 stream_name,
                 replication_factor,
-                min_extent_capacity,
-                max_extent_capacity,
-                cache_extents,
-                extent_growth_factor,
                 storage_class,
+                policy,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u16(stream_name.len() as u16);
                 dst.extend_from_slice(stream_name);
                 dst.put_u8(*replication_factor);
-                dst.put_u32(*min_extent_capacity);
-                dst.put_u32(*max_extent_capacity);
-                dst.put_u16(*cache_extents);
-                dst.put_u8(*extent_growth_factor);
+                dst.put_u32(policy.min_capacity);
+                dst.put_u32(policy.max_capacity);
+                dst.put_u16(policy.cache);
+                dst.put_u8(policy.scale_factor);
                 dst.put_u8(storage_class.as_u8());
             }
             VariableHeader::CreateStreamResp {
@@ -430,28 +427,21 @@ impl Frame {
             }
             VariableHeader::RegisterExtent {
                 request_id,
-                stream_id,
                 extent_id,
                 role,
-                replication_factor,
-                epoch,
-                cache_extents,
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
-                storage_class,
+                config,
             } => {
                 dst.put_u32(*request_id);
-                dst.put_u32(stream_id.0);
+                dst.put_u32(config.stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u8(*role);
-                dst.put_u8(*replication_factor);
-                dst.put_u32(epoch.0);
-                dst.put_u16(*cache_extents);
-                dst.put_u32(*min_extent_capacity);
-                dst.put_u32(*max_extent_capacity);
-                dst.put_u8(*extent_growth_factor);
-                dst.put_u8(storage_class.as_u8());
+                dst.put_u8(config.replication_factor);
+                dst.put_u32(config.epoch.0);
+                dst.put_u16(config.policy.cache);
+                dst.put_u32(config.policy.min_capacity);
+                dst.put_u32(config.policy.max_capacity);
+                dst.put_u8(config.policy.scale_factor);
+                dst.put_u8(config.storage_class.as_u8());
             }
             VariableHeader::ConnectAck { request_id }
             | VariableHeader::DisconnectAck { request_id } => {

@@ -4,7 +4,7 @@ use common::config::{
     DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
 };
 use common::errors::StorageError;
-use common::types::{Epoch, ExtentId, Offset, StreamId};
+use common::types::{Epoch, ExtentId, ExtentPolicy, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
@@ -127,11 +127,13 @@ impl ExtentNodeStore {
 
         let is_new = self.try_create_stream(
             stream_id,
-            cache_extents,
             storage_class,
-            min_extent_capacity,
-            max_extent_capacity,
-            extent_growth_factor,
+            &ExtentPolicy {
+                cache: cache_extents,
+                min_capacity: min_extent_capacity,
+                max_capacity: max_extent_capacity,
+                scale_factor: extent_growth_factor,
+            },
         );
         self.try_register_extent(stream_id, extent_id, start_offset, epoch, extent_capacity);
 

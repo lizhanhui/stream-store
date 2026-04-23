@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::hasher::IdentityBuildHasher;
-use common::types::{Epoch, ErrorCode, ExtentId, Opcode, StorageClass, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, ExtentPolicy, Opcode, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use server::handler::RequestHandler;
 use std::sync::Arc;
@@ -101,41 +101,30 @@ impl ExtentNodeStore {
 
     /// Ensure a stream exists, creating it if needed.
     ///
-    /// Always applies all stream-level configs (cache_extents, storage_class,
-    /// capacity bounds) to the stream, whether existing or new.
+    /// Always applies all stream-level configs (cache, storage_class, capacity
+    /// bounds) to the stream, whether existing or new.
     /// Returns `true` if the stream was just created.
     pub(crate) fn try_create_stream(
         &self,
         stream_id: StreamId,
-        cache_extents: u16,
         storage_class: StorageClass,
-        min_extent_capacity: u32,
-        max_extent_capacity: u32,
-        extent_growth_factor: u8,
+        policy: &ExtentPolicy,
     ) -> bool {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id) {
-            if cache_extents > 0 {
-                stream.set_max_extents(cache_extents as usize);
+            if policy.cache > 0 {
+                stream.set_max_extents(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
-            stream.set_capacity_bounds(
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
-            );
+            stream.set_capacity_bounds(policy.min_capacity, policy.max_capacity, policy.scale_factor);
             false
         } else {
             let stream = Stream::new(stream_id);
-            if cache_extents > 0 {
-                stream.set_max_extents(cache_extents as usize);
+            if policy.cache > 0 {
+                stream.set_max_extents(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
-            stream.set_capacity_bounds(
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
-            );
+            stream.set_capacity_bounds(policy.min_capacity, policy.max_capacity, policy.scale_factor);
             guard.insert(stream_id, stream);
             true
         }

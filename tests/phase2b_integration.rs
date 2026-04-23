@@ -7,7 +7,9 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::types::{Epoch, ExtentId, Offset, Opcode, StorageClass, StreamId};
+use common::types::{
+    Epoch, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::build_register_extent_payload;
 
@@ -75,16 +77,20 @@ async fn register_extent(
         .send(Frame::new(
             VariableHeader::RegisterExtent {
                 request_id: 0,
-                stream_id: StreamId(stream_id),
                 extent_id: ExtentId(extent_id),
                 role,
-                replication_factor,
-                epoch: Epoch(0),
-                cache_extents: 4,
-                min_extent_capacity: 8 * 1024 * 1024,
-                max_extent_capacity: 256 * 1024 * 1024,
-                extent_growth_factor: 2,
-                storage_class: StorageClass::S3,
+                config: StreamConfig {
+                    stream_id: StreamId(stream_id),
+                    replication_factor,
+                    epoch: Epoch(0),
+                    storage_class: StorageClass::S3,
+                    policy: ExtentPolicy {
+                        cache: 4,
+                        min_capacity: 8 * 1024 * 1024,
+                        max_capacity: 256 * 1024 * 1024,
+                        scale_factor: 2,
+                    },
+                },
             },
             Some(payload),
         ))

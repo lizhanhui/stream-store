@@ -7,12 +7,30 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
     DEFAULT_MIN_EXTENT_CAPACITY,
 };
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, Opcode, StorageClass, StreamId};
+use common::types::{
+    Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+};
 use rpc::frame::{Frame, VariableHeader};
 use server::handler::RequestHandler;
 use tokio::sync::mpsc;
 
 use crate::ack_queue::{AckQueue, DEFAULT_REPLICATION_TIMEOUT, PendingAck};
+
+/// Build a default `StreamConfig` for tests.
+fn test_config(stream_id: u32, replication_factor: u8) -> StreamConfig {
+    StreamConfig {
+        stream_id: StreamId(stream_id),
+        replication_factor,
+        epoch: Epoch(0),
+        storage_class: StorageClass::S3,
+        policy: ExtentPolicy {
+            cache: DEFAULT_CACHE_EXTENTS,
+            min_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+        },
+    }
+}
 
 /// Register a stream on the ExtentNode via RegisterExtent (RF=1, Primary, no secondaries).
 /// This is the production path: StreamManager assigns a stream_id and sends RegisterExtent.
@@ -26,16 +44,9 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: req_id,
-                    stream_id: sid,
                     extent_id: ExtentId(1),
                     role: 0,
-                    replication_factor: 1,
-                    epoch: Epoch(0),
-                    min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                    max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                    extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
-                    cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_class: StorageClass::S3,
+                    config: test_config(stream_id, 1),
                 },
                 Some(payload),
             ),
@@ -237,16 +248,9 @@ async fn register_extent_creates_stream() {
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: 1,
-                    stream_id: StreamId(42),
                     extent_id: ExtentId(100),
                     role: 0,
-                    replication_factor: 2,
-                    epoch: Epoch(0),
-                    min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                    max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                    extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
-                    cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_class: StorageClass::S3,
+                    config: test_config(42, 2),
                 },
                 Some(payload),
             ),
@@ -292,16 +296,9 @@ async fn register_extent_secondary() {
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: 1,
-                    stream_id: StreamId(42),
                     extent_id: ExtentId(100),
                     role: 1,
-                    replication_factor: 2,
-                    epoch: Epoch(0),
-                    min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                    max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                    extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
-                    cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_class: StorageClass::S3,
+                    config: test_config(42, 2),
                 },
                 Some(payload),
             ),
@@ -339,16 +336,9 @@ async fn register_extent_then_append_rf1() {
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: 1,
-                    stream_id: StreamId(10),
                     extent_id: ExtentId(50),
                     role: 0,
-                    replication_factor: 1,
-                    epoch: Epoch(0),
-                    min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                    max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                    extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
-                    cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_class: StorageClass::S3,
+                    config: test_config(10, 1),
                 },
                 Some(payload),
             ),
@@ -403,16 +393,9 @@ async fn primary_append_defers_and_broadcasts() {
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: 1,
-                    stream_id: StreamId(10),
                     extent_id: ExtentId(50),
                     role: 0,
-                    replication_factor: 3,
-                    epoch: Epoch(0),
-                    min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                    max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                    extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
-                    cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_class: StorageClass::S3,
+                    config: test_config(10, 3),
                 },
                 Some(payload),
             ),
@@ -497,16 +480,9 @@ async fn secondary_returns_watermark() {
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: 1,
-                    stream_id: StreamId(10),
                     extent_id: ExtentId(50),
                     role: 1,
-                    replication_factor: 2,
-                    epoch: Epoch(0),
-                    min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                    max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                    extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
-                    cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_class: StorageClass::S3,
+                    config: test_config(10, 2),
                 },
                 Some(payload),
             ),
@@ -1039,16 +1015,9 @@ async fn secondary_accepts_forwarded_append_after_seal() {
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: 1,
-                    stream_id: StreamId(10),
                     extent_id: ExtentId(50),
                     role: 1,
-                    replication_factor: 2,
-                    epoch: Epoch(0),
-                    min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                    max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                    extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
-                    cache_extents: DEFAULT_CACHE_EXTENTS,
-                    storage_class: StorageClass::S3,
+                    config: test_config(10, 2),
                 },
                 Some(payload),
             ),

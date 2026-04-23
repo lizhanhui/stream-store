@@ -2,8 +2,8 @@ use super::*;
 use bytes::{BufMut, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE, FLAG_SEAL_COMMIT,
-    HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
+    Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE,
+    FLAG_SEAL_COMMIT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
 };
 
 fn sample_append_frame() -> Frame {
@@ -471,11 +471,13 @@ fn create_stream_round_trip() {
             request_id: 5,
             stream_name: Bytes::from_static(b"my-stream"),
             replication_factor: 3,
-            min_extent_capacity: 8_388_608,
-            max_extent_capacity: 268_435_456,
-            cache_extents: 4,
-            extent_growth_factor: 8,
             storage_class: StorageClass::S3,
+            policy: ExtentPolicy {
+                cache: 4,
+                min_capacity: 8_388_608,
+                max_capacity: 268_435_456,
+                scale_factor: 8,
+            },
         },
         None,
     );
@@ -490,18 +492,15 @@ fn create_stream_round_trip() {
         VariableHeader::CreateStream {
             stream_name,
             replication_factor,
-            min_extent_capacity,
-            max_extent_capacity,
-            cache_extents,
-            extent_growth_factor,
+            policy,
             ..
         } => {
             assert_eq!(stream_name, &Bytes::from_static(b"my-stream"));
             assert_eq!(*replication_factor, 3);
-            assert_eq!(*min_extent_capacity, 8_388_608);
-            assert_eq!(*max_extent_capacity, 268_435_456);
-            assert_eq!(*cache_extents, 4);
-            assert_eq!(*extent_growth_factor, 8);
+            assert_eq!(policy.min_capacity, 8_388_608);
+            assert_eq!(policy.max_capacity, 268_435_456);
+            assert_eq!(policy.cache, 4);
+            assert_eq!(policy.scale_factor, 8);
         }
         _ => panic!("expected CreateStream"),
     }

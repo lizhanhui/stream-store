@@ -10,8 +10,8 @@ use common::errors::{
     UnknownStreamSnafu,
 };
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentInfo, ExtentState, NodeMetrics, Offset, Opcode, StorageClass,
-    StreamId,
+    Epoch, ErrorCode, ExtentId, ExtentInfo, ExtentPolicy, ExtentState, NodeMetrics, Offset, Opcode,
+    StorageClass, StreamId,
 };
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
@@ -268,34 +268,25 @@ impl StreamClient {
     }
 
     /// Create a new stream on the StreamManager.
-    /// Variable header carries stream name, per-stream replication factor, per-stream extent capacity bounds,
-    /// and per-stream cache_extents (max extents to retain in memory).
-    /// If replication_factor=0, the StreamManager uses its default.
-    /// If min_extent_capacity=0, the StreamManager uses its default (8 MiB).
-    /// If max_extent_capacity=0, the StreamManager uses its default (256 MiB).
-    /// If cache_extents=0, the StreamManager uses its default (4).
+    /// Variable header carries stream name, per-stream replication factor, storage class,
+    /// and the stream's extent-sizing policy.
+    /// If `replication_factor=0`, the StreamManager uses its default.
+    /// If any `policy` field is 0, the StreamManager substitutes its default.
     /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
-    #[allow(clippy::too_many_arguments)]
     pub async fn create_stream(
         &self,
         name: &str,
         replication_factor: u8,
-        min_extent_capacity: u32,
-        max_extent_capacity: u32,
-        cache_extents: u16,
-        extent_growth_factor: u8,
         storage_class: StorageClass,
+        policy: ExtentPolicy,
     ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
                 request_id: self.alloc_request_id(),
                 stream_name: Bytes::from(name.to_owned()),
                 replication_factor,
-                min_extent_capacity,
-                max_extent_capacity,
-                cache_extents,
-                extent_growth_factor,
                 storage_class,
+                policy,
             },
             None,
         );
@@ -690,16 +681,12 @@ impl StreamClient {
     /// The creation path exposes the same per-stream settings as `create_stream`.
     /// Returns the `StreamId`. The primary address is cached internally and
     /// can be retrieved via `cached_primary`.
-    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         &self,
         stream_name: &str,
         replication_factor: u8,
-        min_extent_capacity: u32,
-        max_extent_capacity: u32,
-        cache_extents: u16,
-        extent_growth_factor: u8,
         storage_class: StorageClass,
+        policy: ExtentPolicy,
     ) -> Result<StreamId, StorageError> {
         match self.describe_stream_by_name(stream_name, 1).await {
             Ok((stream_id, extents)) => {
@@ -711,15 +698,7 @@ impl StreamClient {
             }
             Err(StorageError::UnknownStream { .. }) => {
                 let (stream_id, _, _, _) = self
-                    .create_stream(
-                        stream_name,
-                        replication_factor,
-                        min_extent_capacity,
-                        max_extent_capacity,
-                        cache_extents,
-                        extent_growth_factor,
-                        storage_class,
-                    )
+                    .create_stream(stream_name, replication_factor, storage_class, policy)
                     .await?;
                 Ok(stream_id)
             }

@@ -176,7 +176,6 @@ impl Frame {
             | VariableHeader::QueryOffsetRespError { stream_id, .. }
             | VariableHeader::RegisterExtentAck { stream_id, .. }
             | VariableHeader::RegisterExtentAckError { stream_id, .. }
-            | VariableHeader::RegisterExtent { stream_id, .. }
             | VariableHeader::Watermark { stream_id, .. }
             | VariableHeader::Forward { stream_id, .. }
             | VariableHeader::ForwardInitExtent { stream_id, .. }
@@ -200,6 +199,7 @@ impl Frame {
             | VariableHeader::Seek { stream_id, .. }
             | VariableHeader::SeekResp { stream_id, .. }
             | VariableHeader::SeekRespError { stream_id, .. } => *stream_id,
+            VariableHeader::RegisterExtent { config, .. } => config.stream_id,
             _ => StreamId(0),
         }
     }
@@ -262,7 +262,7 @@ impl Frame {
             | VariableHeader::SealExtentNodeResp { epoch, .. }
             | VariableHeader::SealExtentNodeCommit { epoch, .. } => *epoch,
             VariableHeader::SealStreamManagerResp { new_epoch, .. } => *new_epoch,
-            VariableHeader::RegisterExtent { epoch, .. } => *epoch,
+            VariableHeader::RegisterExtent { config, .. } => config.epoch,
             VariableHeader::UpdateExtentSealed { epoch, .. }
             | VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
             VariableHeader::Forward { epoch, .. }
