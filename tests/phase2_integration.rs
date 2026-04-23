@@ -409,3 +409,40 @@ async fn stream_manager_integration() {
         assert_eq!(s.state, ExtentState::Active);
     }
 }
+
+/// CreateStream with replication_factor=0 must be rejected now that the
+/// server no longer carries a default RF. The client is expected to always
+/// pass a sane replication_factor (>= 1).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn test_create_stream_rejects_rf_zero() {
+    init_tracing();
+    let stream_manager_addr = start_stream_manager_server().await;
+
+    let client = client::StreamClient::connect(&stream_manager_addr)
+        .await
+        .expect("connect to SM");
+
+    let err = client
+        .create_stream(
+            &format!(
+                "test-rf-zero-{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+            ),
+            0, // <-- must be rejected
+            StorageClass::S3,
+            ExtentPolicy::default(),
+        )
+        .await
+        .expect_err("CreateStream with replication_factor=0 must fail");
+
+    let msg = format!("{err}");
+    assert!(
+        msg.to_lowercase().contains("replication_factor")
+            || msg.to_lowercase().contains("replication factor"),
+        "error should mention replication_factor; got: {msg}"
+    );
+}
