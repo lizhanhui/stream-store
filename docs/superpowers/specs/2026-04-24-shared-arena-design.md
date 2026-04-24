@@ -1,106 +1,136 @@
-# Shared Arena for Extent Memory
+# Shared Arena for Multi-Stream Memory, and Collapsing Extent into Epoch
 
 ## Motivation
 
-Today each active extent owns a dedicated arena: `Arc<ArenaBuffer>` allocated via
-`std::alloc::alloc_zeroed` plus a `Box<[AtomicU32]>` index sized `capacity / 5`.
-Defaults are `min_extent_capacity = 8 MiB` and index capacity `~6.7 MiB` per
-minimum-sized extent, so a freshly registered stream with one active extent and
-one recycled spare in its extent pool costs roughly **30 MiB of RAM**.
+Two independent observations drive this change.
 
-This is fine for Kafka-style workloads — a handful of high-throughput streams —
-but unusable for MQTT-style workloads where an ExtentNode may host on the order
-of **one million low-traffic queues**. At 30 MiB × 1M = 30 TiB, the per-stream
-memory floor dominates any cluster design.
+**(1) Per-stream memory floor.** Today each active extent owns a dedicated
+arena: `Arc<ArenaBuffer>` allocated via `std::alloc::alloc_zeroed` plus a
+`Box<[AtomicU32]>` index sized `capacity / 5`. At `min_extent_capacity = 8
+MiB` that's ~8 MiB data + ~6.7 MiB index per minimum extent, and with one
+recycled spare in the stream's extent pool a freshly registered stream costs
+roughly **30 MiB of RAM**. For MQTT-scale workloads with ~1M low-traffic
+queues per ExtentNode, that's ~30 TiB — unusable. We need memory to scale
+with bytes-in-flight, not stream count.
 
-The goal is to support both workloads in one system:
+**(2) Extent is redundant with Epoch.** The replica set for a stream is
+stable within one epoch; it only changes when SM bumps the epoch on failure
+or rebalance. Seal is only meaningful on epoch bump. Once arena lifetime is
+decoupled from the record-span lifetime (Observation 1 forces a shared arena
+to flush independently of any one stream's record span), every role played
+by `Extent` is played by either **epoch** (replication target, replica set,
+quorum tracking, seal) or **arena** (memory, S3 upload). The intermediate
+`Extent` concept carries no information that `(stream_id, epoch)` does not
+already carry.
 
-- **Shared class**: many low-traffic streams share a pool of arenas, so memory
-  scales with total bytes in flight, not with stream count. Target per idle
-  stream: **< 4 KiB**.
-- **Dedicated class**: a small number of high-throughput streams keep the
-  current single-writer-per-stream fast path with zero cross-stream coordination.
+This spec does two things at once:
 
-Per-stream class is declared at `CreateStream` time and may be overridden at
-runtime when observed throughput crosses configured thresholds.
+- Introduces a per-stream `ArenaClass` (Shared vs Dedicated) so low-traffic
+  streams multiplex onto shared arenas while high-throughput streams keep a
+  private arena.
+- Collapses the `Extent` concept into `Epoch` across the wire protocol, SM
+  metadata, and EN code. A stream's record-span is identified by
+  `(stream_id, epoch)`; there is no separate `extent_id`.
 
 ## Scope
 
 This spec is implemented **in place**. The store is pre-production; schemas,
 wire protocol, and internal interfaces are modified directly. There is no
-dual-run, no feature-flagged rollout, and no backwards-compatibility layer.
+dual-run, no feature flag, and no backwards-compatibility layer.
+
+## Terminology
+
+- **Epoch**: a (stream_id, epoch_number, replica_set) triple. Immutable
+  replica set. Monotonically increasing epoch numbers within a stream. One
+  epoch → one Primary + (RF-1) Secondaries.
+- **Arena**: a contiguous in-memory buffer and the unit of S3 upload.
+  Shared or Dedicated per the stream's `ArenaClass`.
+- **ArenaClass** (per stream):
+  - `Dedicated`: the stream has its own arena; one writer per stream
+    (today's fast path).
+  - `Shared`: records land in arenas from an EN-wide pool; one writer per
+    arena, multiplexing records from many streams.
+- **Seal**: the SM-driven 2-phase Prepare/Commit protocol, invoked **only
+  on epoch bump** (failure / rebalance). There is no EN-initiated seal in
+  either class.
+- **Arena roll**: the Primary (for Shared) or the stream's writer (for
+  Dedicated) finishes the current arena and starts a new one. Epoch is
+  unaffected.
+
+## What Changes vs Today
+
+| Concept today | New model |
+|---|---|
+| `extent_id` on the wire, in DB, in code | Replaced by `epoch`. `(stream_id, epoch)` is the identity. |
+| `extents` table | Renamed `stream_epochs`. Columns: `stream_id`, `epoch`, `start_offset`, `state`, replica metadata. |
+| `extent_s3_objects` (proposed in earlier draft) | Replaced by `epoch_arenas`, keyed by `(stream_id, epoch, sequence)`, one row per arena this epoch wrote to. |
+| `RegisterExtent` opcode | Renamed `RegisterEpoch`. Carries `arena_class`. |
+| `ForwardInitExtent` opcode | Renamed `ForwardInitEpoch`. Carries `arena_class`. |
+| `SealExtentNode`, `SealStreamManager` opcodes | Renamed `SealEpoch`. Same 2-phase Prepare/Commit protocol. Invoked only on epoch bump. |
+| `NOTIFY_SEALED_EXTENT`, autonomous extent creation | **Removed.** Arena-full never triggers an epoch bump or SM round-trip. |
+| `Forward` carrying `byte_pos` | Removed. Secondaries compute byte_pos locally from strict append order. |
+| Per-extent arena + per-extent u32 index (Dedicated) | Per-epoch arena pool (Dedicated): one writer per stream, rolls arenas within an epoch. Per-arena directory (same as Shared). |
+| S3 key `{ns}/data/{stream}/{start}_{end}.dat` | Per-arena key: `{ns}/arenas/{arena_id:016x}.dat` for both classes. |
 
 ## Core Abstractions
 
 ### ArenaClass
 
-A new per-stream property, orthogonal to the existing `StorageClass`:
-
 ```rust
 enum ArenaClass {
-    Dedicated = 0,  // per-stream arena + per-extent u32 index (existing fast path)
-    Shared    = 1,  // records land in an ExtentNode-wide shared arena pool
+    Dedicated = 0,  // one arena at a time belongs exclusively to this stream
+    Shared    = 1,  // arenas multiplex records from many streams
 }
 ```
 
-Stored in the `streams` MySQL row. Propagated from SM to ExtentNodes via
-`RegisterExtent` (per-extent allocation); the Primary further propagates it
-to secondaries on the first forwarded append via `ForwardInitExtent`.
+Stored in the `streams` MySQL row. Propagated from SM to Primary via
+`RegisterEpoch` (at epoch allocation). Primary propagates to Secondaries on
+the first forwarded append for a new epoch via `ForwardInitEpoch`.
 
-### Extent Storage
+### Epoch (replaces Extent)
 
-The existing `Extent` struct keeps its identity fields (`state`, `start_offset`,
-`limit`, `committed_seq`, `committed_bytes`, `record_count`, `epoch`,
-`replica_info`, seal/flush flags). Only its backing storage becomes class-aware:
+A `StreamEpoch` is a per-stream, per-epoch runtime object on every replica.
+It owns what `Extent` owned, minus the arena:
 
 ```rust
-enum ExtentStorage {
-    Dedicated(DedicatedStorage),   // Arc<ArenaBuffer> + Box<[AtomicU32]> (today)
-    Shared(SharedRef),
+struct StreamEpoch {
+    stream_id:       StreamId,
+    epoch:           u64,
+    start_offset:    u64,                     // first offset this epoch will write
+    replica_info:    ReplicaInfo,             // fixed for epoch lifetime
+    state:           AtomicU8,                // Open | Sealing | Sealed
+    limit:           AtomicU64,               // set at seal time
+    record_count:    AtomicU64,
+    committed_seq:   AtomicU64,
+    committed_bytes: AtomicU64,               // extent-relative cumulative bytes
+
+    // Memory accounting (both classes) — which arenas this epoch has touched.
+    // In append order. Entries drop off when an arena is evicted from the pool;
+    // historical arenas are reachable via `epoch_arenas` table.
+    resident_arenas: Mutex<SmallVec<[ArenaId; 4]>>,
+
+    // Class-specific state:
+    class:           ArenaClass,
+    dedicated_state: Option<DedicatedState>,  // Some iff class == Dedicated
 }
 
-struct SharedRef {
-    // Arenas this extent has touched, in append order. Small (1–3 typical).
-    // Appended under the stream's group-commit leader lock; frozen at seal.
-    arenas: SmallVec<[ArenaId; 2]>,
+struct DedicatedState {
+    // The single-writer pipelined group commit state (previously on Stream).
+    in_flight: AtomicU64,
+    job_tx:    crossbeam::channel::Sender<AppendJob>,
+    job_rx:    crossbeam::channel::Receiver<AppendJob>,
 }
 ```
 
-Extent identity, replication, quorum tracking, and seal are identical across
-classes. Only the memcpy target and the read resolution differ.
-
-### Stream
-
-`Stream` is unchanged in shape:
-
-- Stream-level pipelined group commit (`in_flight` + `job_tx/job_rx`) still
-  elects a single active writer per stream.
-- On the leader's turn:
-  - **Dedicated**: memcpy directly into the per-extent arena (today's code).
-  - **Shared**: submit an `AppendJob` to the current shared arena's writer
-    channel and await the ack.
-
-### Runtime Promotion and Demotion
-
-Each stream maintains a rolling EWMA of write bytes/s and records/s. At every
-extent boundary (seal-and-create-next) the stream evaluates:
-
-- If `class == Shared` and observed rate exceeds
-  `promote_to_dedicated_bytes_per_sec`, the next extent is created as
-  Dedicated.
-- If `class == Dedicated` and rate is below
-  `demote_to_shared_bytes_per_sec`, the next extent is created as Shared.
-- Both are gated by `class_transition_min_dwell_ms` (hysteresis).
-
-Class transitions only happen at extent boundaries. No data migration: the
-sealed extent retains the class it was created under; only the new extent
-changes class. Stream Manager is notified via `NotifyArenaClass`; MySQL
-`streams.arena_class` is updated. Clients continue talking to the same
-Primary.
+`Stream` becomes a thin map from `stream_id → Arc<StreamEpoch>` (the active
+epoch) plus metadata like `arena_class`, `storage_class`, EWMA for runtime
+class transitions. No pipelined-group-commit state lives on `Stream` anymore
+— it moved to `DedicatedState`, because Shared streams drive their writes
+through the pool's per-arena writer rather than a stream-level leader.
 
 ## SharedArenaPool
 
-One pool per ExtentNode, owning all shared-class arenas:
+One pool per ExtentNode, owning all Shared arenas:
 
 ```rust
 struct SharedArenaPool {
@@ -124,7 +154,7 @@ struct SharedArenaConfig {
 ```rust
 struct SharedArena {
     id:         ArenaId,                  // (node_id << 48) | local_counter
-    buf:        Arc<ArenaBuffer>,         // same type the Dedicated path uses
+    buf:        Arc<ArenaBuffer>,
     state:      AtomicU8,                 // Open | Sealed | Uploaded | Evicted
     created_at: Instant,
     directory:  Mutex<ArenaDirectory>,
@@ -133,21 +163,23 @@ struct SharedArena {
 }
 
 struct ArenaDirectory {
-    entries: HashMap<StreamId, StreamArenaEntry>,
+    // Keyed by (stream_id, epoch) — an arena can contain records for multiple
+    // epochs of the same stream if a cross-arena epoch bump happened to land
+    // on this arena (rare but legal).
+    entries: HashMap<(StreamId, u64), EpochArenaEntry>,
 }
 
-struct StreamArenaEntry {
-    extent_id:         ExtentId,
-    start_offset:      u64,
-    end_offset:        u64,        // exclusive
-    byte_positions:    Vec<u32>,   // per record, within this arena
-    arena_start_byte:  u32,
-    arena_end_byte:    u32,
+struct EpochArenaEntry {
+    start_offset:     u64,
+    end_offset:       u64,        // exclusive, running while arena open
+    byte_positions:   Vec<u32>,   // per record, within this arena
+    arena_start_byte: u32,
+    arena_end_byte:   u32,
 }
 
 struct SharedAppendJob {
     stream_id: StreamId,
-    extent_id: ExtentId,
+    epoch:     u64,
     seq:       u64,
     payload:   Bytes,
     reply:     oneshot::Sender<SharedAppendAck>,
@@ -155,7 +187,7 @@ struct SharedAppendJob {
 
 struct SharedAppendAck {
     arena_id:  ArenaId,
-    byte_pos:  u32,                // debug / metrics; reads use the directory
+    byte_pos:  u32,                // debug / metrics; reads use directory
     rolled_to: Option<ArenaId>,    // Some(new_id) if this append caused a roll
 }
 ```
@@ -163,204 +195,209 @@ struct SharedAppendAck {
 ### ArenaId
 
 `ArenaId = u64 = (node_id << 48) | local_counter`. Globally unique by
-construction, so the S3 key `{namespace}/shared/{arena_id:016x}.dat` does not
-collide across ENs. The node_id field is 16 bits (65,535 ENs per cluster) and
-the counter is 48 bits — effectively inexhaustible.
+construction. S3 key `{namespace}/arenas/{arena_id:016x}.dat` does not
+collide across ENs. 16 bits of node_id (65,535 ENs) and 48 bits of counter.
 
 ### Writer Task
 
-One task per arena, not per pool:
+One task per arena, not per pool. Behavior is identical for Shared and
+Dedicated arenas (they differ only in who populates the MPSC — see Write
+Path):
 
 ```
 loop:
     batch = drain_up_to(job_rx, max_batch_jobs or max_batch_time)
-    group batch by stream_id
-    for (stream_id, jobs) in grouped:
+    group batch by (stream_id, epoch)
+    for ((stream_id, epoch), jobs) in grouped:
         ensure sufficient arena space; if not:
             pool.roll()   // pool seals current arena (state ← Sealed),
                           // moves it into `resident`, allocates a new arena
                           // and a new writer task, installs as `active`.
-                          // This writer finishes the current batch; replies
-                          // for jobs that did not fit carry rolled_to=Some(new_id)
-                          // so the stream leader retries on the new arena.
-            break   // drain any unreplied jobs into the new arena's channel
+                          // Remaining jobs are requeued to the new arena's
+                          // channel; their eventual reply carries
+                          // rolled_to=Some(new_id).
+            break
         for job in jobs:
             memcpy job.payload into buf at cursor, prefixed with u32 BE len
-            directory.entries[stream_id].append(byte_pos, len, seq)
+            directory.entries[(stream_id, epoch)].append(byte_pos, len, seq)
             cursor += 4 + len
             job.reply.send(Ack{ arena_id, byte_pos, rolled_to: None })
 ```
 
-Per-stream gather inside the writer ensures that, within one arena, records
-belonging to the same stream are laid down contiguously. Jobs for a given
-stream arrive in-order through the MPSC (single leader per stream), so this
-preserves sequence order within the stream. The resulting physical layout is
-the same one that will be written to S3 on flush — no re-sorting or
-re-grouping.
+Per-(stream, epoch) grouping inside the writer keeps each epoch's records
+contiguous within one arena, so the resulting S3 object layout is produced
+with no re-sorting on seal.
 
 ## Write Path
 
 ### Shared-Class Append (Primary)
 
-Inside the stream's group-commit leader turn:
-
 ```
-ext = stream.active_extent
-seq = ext.record_count.load()
+ep = stream.active_epoch               // StreamEpoch, class = Shared
+seq = ep.record_count.fetch_add(1, AcqRel)
 
-if ext is sealed or extent-full by record/age cap:
-    seal_and_create_next_extent()   // may flip class
-    ext  = stream.active_extent
-
-if ext.storage is Dedicated:
-    take existing Dedicated code path and return
-
-// Shared branch
-arena = pool.active.load()
-job   = SharedAppendJob { stream_id, extent_id: ext.id, seq, payload, reply: tx }
+arena = pool.active.load()             // ArcSwap — cheap read
+job   = SharedAppendJob {
+    stream_id, epoch: ep.epoch, seq, payload, reply: tx
+}
 arena.job_tx.send(job).await
-ack   = rx.await
+ack = rx.await
 
-ext.record_count.store(seq + 1)
-ext.committed_bytes.store(ext.committed_bytes.load() + 4 + payload.len())
-ext.storage.shared.register_arena(ack.arena_id)  // idempotent; appends to SmallVec
-ext.committed_seq.store(seq + 1, Release)        // record becomes readable
+ep.committed_bytes.fetch_add(4 + payload.len(), Release)
+ep.resident_arenas.register(ack.arena_id)      // idempotent push to SmallVec
+ep.committed_seq.store(seq + 1, Release)
 
-if ext.replica_info.rf >= 2:
-    forward(stream_id, extent_id, seq, payload)  // no byte_pos field
+if ep.replica_info.rf >= 2:
+    forward(stream_id, epoch, seq, payload)    // no byte_pos field
     ack_queue.push(PendingAck { seq, client_reply_tx })
 else:
-    client_reply_tx.send(AppendAck { offset: ext.start_offset + seq })
+    client_reply_tx.send(AppendAck { offset: ep.start_offset + seq })
 ```
+
+Note: the stream-level group-commit leader election **is not used in Shared
+class** — the pool's per-arena writer already serializes concurrent stream
+writers. Shared-class Primaries call `record_count.fetch_add` directly; the
+race with other appenders is resolved at the pool's MPSC (FIFO preserves
+stream-level order because each stream has only one Primary per epoch, and
+that Primary's handler is single-threaded per connection for a given
+stream).
+
+### Dedicated-Class Append (Primary)
+
+Unchanged from today's fast path, except:
+
+- The pipelined-group-commit leader writes into a **Dedicated arena**
+  obtained from a small per-stream arena slot (one active + one pooled
+  spare), not into a per-extent arena.
+- When the Dedicated arena fills, the writer calls `pool_for_this_stream.roll()`
+  (a thin per-stream variant of the same pool mechanism), sealing the old
+  arena and installing a new one. **This does not bump the epoch.** The
+  running extent-level state (`record_count`, `committed_seq`,
+  `committed_bytes`) continues uninterrupted; only the arena changes
+  underneath.
+- The `NOTIFY_SEALED_EXTENT` opcode is deleted. The Primary no longer
+  notifies SM on arena roll; SM learns about the new arena only when the
+  flush task sends `UpdateArenaFlushed` after upload.
+- `resident_arenas` on the epoch records the sequence of arenas this epoch
+  has written to.
 
 ### Forward Protocol
 
-`byte_pos` is **removed** from the `Forward` frame. Secondaries replay Forwards
-in strict order per extent; their own byte_pos is computed locally. This
-change applies to both Dedicated and Shared — the Forward wire format is
-unified.
+- `Forward` carries `(stream_id, epoch, seq, payload)`. No `byte_pos`.
+  Secondaries replay in strict order per epoch and compute their own
+  byte_pos.
+- `RegisterEpoch` (SM → Primary): allocates a new epoch. Carries `epoch`,
+  `start_offset`, `replica_set`, `arena_class`.
+- `ForwardInitEpoch` (Primary → Secondary): sent before the first `Forward`
+  for a new epoch. Carries `epoch`, `start_offset`, `arena_class`.
+  Secondaries use `arena_class` to decide whether to open a Dedicated arena
+  for this epoch or route appends into the shared pool.
+- `ForwardInitArena` (new, Primary → Secondary, fire-and-forget): sent on
+  arena roll. Carries `arena_id` and `arena_capacity`. Secondaries
+  allocate an arena tagged with the same `arena_id` so replicas agree on
+  arena identity for DR flush.
+- `SealEpoch` (SM ↔ EN): 2-phase Prepare/Commit as today's
+  `SealExtentNode`/`SealStreamManager`, but keyed by `(stream_id, epoch)`.
+  Only invoked on epoch bump.
+- `NotifyArenaClass` (new, EN → SM): reports a runtime class transition so
+  SM persists the change in `streams.arena_class`.
 
-Three additions:
+### Seal (Epoch Bump Only)
 
-- `RegisterExtent` (SM → Primary) gains an `arena_class: u8` field. The SM
-  reads `streams.arena_class` during extent allocation and carries it to the
-  Primary.
-- `ForwardInitExtent` (Primary → Secondaries) gains an `arena_class: u8`
-  field (consuming a previously reserved byte). Secondaries use it to decide
-  whether to open a per-extent arena (Dedicated) or route appends into their
-  own `SharedArenaPool`.
-- `ForwardInitArena` is a new fire-and-forget opcode sent by a Primary when
-  it rolls its active shared arena. It carries `arena_id: u64` and
-  `arena_capacity: u32`. Secondaries allocate a shared arena tagged with the
-  same `arena_id` and install it as their active arena for subsequent
-  Forwards.
+`SealEpoch` runs the existing 2-phase protocol:
 
-### Secondary Path
+1. **Prepare**: SM queries each replica of the current epoch for its
+   committed offset.
+2. **Quorum**: SM computes the authoritative committed offset.
+3. **Commit**: SM broadcasts the committed offset so replicas correct
+   their local seal point.
+4. **Allocate**: SM picks a new replica set (for failure/rebalance),
+   bumps the epoch, calls `RegisterEpoch` on the new Primary, waits for
+   the ack.
 
-On receiving a Forward for a Shared-class extent, the secondary submits a
-`SharedAppendJob` to its own pool's active arena with the Primary's
-`arena_id`. If the secondary has not seen `ForwardInitArena` for that id yet
-(race or lost hint), it lazily allocates the arena on first Forward, keyed by
-the Primary-assigned id. This is analogous to Lazy Secondary Extent Creation.
+The sealed epoch's `limit` is recorded in `stream_epochs`. Its arenas are
+still resident in whichever pool they live in, flushed and evicted
+independently.
 
-### Extent-Full Criteria (Shared)
+### Arena Roll
 
-A Shared extent seals when any holds:
+Identical mechanism in both classes:
 
-- `record_count >= max_records_per_shared_extent` (default 65,536)
-- `now - extent.created_at >= shared_extent_max_age_ms` (default 300,000 ms)
-- Explicit seal (client or SM failover)
-
-Arena-full is **not** an extent-full trigger. Extents may span multiple
-arenas.
+1. Writer detects insufficient space for the next batch.
+2. Old arena: `state = Sealed`, moved from `active` to `resident`.
+3. New arena allocated (`ArenaBuffer` via `alloc_zeroed`). New writer task
+   started. Installed as `active`.
+4. `ForwardInitArena` broadcast to secondaries (fire-and-forget).
+5. Sealed arena handed to S3 flush task.
+6. In-flight jobs not yet appended are requeued to the new arena's channel;
+   their acks carry `rolled_to = Some(new_id)` so the caller's epoch-level
+   `resident_arenas` is updated.
 
 ### Backpressure
 
-The writer MPSC is bounded by `writer_channel_capacity`. Full → stream leader
-awaits up to `shared_append_timeout_ms`; on timeout, returns `Busy` to the
-client. Sustained backpressure is the signal that drives runtime promotion to
-Dedicated.
+Shared writer MPSC bounded by `writer_channel_capacity`. Dedicated writers
+use the same per-arena MPSC. Full → caller awaits up to
+`arena_append_timeout_ms`; on timeout, returns `Busy` to the client.
 
-### Hot-Path Cost (Shared vs Dedicated)
+### Runtime Promotion / Demotion
 
-Per append, Shared adds:
+Each stream tracks a rolling EWMA of write bytes/s. Evaluated on arena roll
+boundaries (not epoch bumps — they are too rare):
 
-- 1 `ArcSwap.load()` (Relaxed)
-- 1 bounded MPSC send
-- 1 oneshot await
+- `class == Shared` and rate > `promote_to_dedicated_bytes_per_sec`: the
+  **next arena** allocated for this stream is Dedicated. The stream's
+  `arena_class` flips. Current epoch is unaffected; future arenas go to the
+  new class.
+- `class == Dedicated` and rate < `demote_to_shared_bytes_per_sec`: next
+  arena is Shared.
+- Hysteresis: `class_transition_min_dwell_ms`.
 
-The memcpy itself moves from leader to writer task — same total work,
-different thread. Dedicated streams are unaffected.
+SM is notified via `NotifyArenaClass`; MySQL `streams.arena_class` updated.
+
+This means a single epoch can have arenas of both classes in its
+`resident_arenas` list. That's fine — arena state is self-describing
+(`SharedArena` vs dedicated-pool arena), and reads route through the pool
+that owns the target arena regardless.
 
 ## Read Path
 
-Two tiers, checked in order.
+Two tiers.
 
 ### Tier 1: Per-Arena Directory (Warm, In-Memory)
 
 ```
-for arena_id in ext.storage.shared.arenas:
-    arena = pool.resident.read().get(&arena_id)
+for arena_id in ep.resident_arenas:
+    arena = lookup(arena_id)               // shared pool or dedicated pool
     if arena is None or arena.state == Evicted:
         continue
-    entry = arena.directory.lock().entries.get(&stream_id)
+    entry = arena.directory.lock().entries.get(&(stream_id, epoch))
     if entry.start_offset <= offset < entry.end_offset:
-        idx       = (offset - entry.start_offset) as usize
-        byte_pos  = entry.byte_positions[idx]
+        idx      = (offset - entry.start_offset) as usize
+        byte_pos = entry.byte_positions[idx]
         return bytes_from_arena(arena, byte_pos, count)
 ```
 
-`ext.storage.shared.arenas` is typically 1–3 entries. The directory lookup is
-O(1). `Bytes::slice` returns zero-copy references backed by `Arc<ArenaBuffer>`
-via `Bytes::from_owner(OwnedArenaSlice{...})`, keeping the arena alive for the
-reader even if eviction races.
+`resident_arenas` is typically 1–3 entries for live epochs. Zero-copy reads
+via `Bytes::from_owner(OwnedArenaSlice)` keep the arena alive against
+concurrent eviction.
 
-Lock granularity: `directory` is `Mutex<>` during the writer's active phase;
-once the arena is `Sealed` it is effectively read-only and the lock never
-contends. If contention on still-open arenas is observed, the implementation
-may switch to `RwLock<>` or to `DashMap` for `entries`.
+Lock granularity: `directory` is `Mutex<>` during write; once the arena is
+`Sealed`, it is read-only and the lock never contends.
 
 ### Tier 2: S3 Cold Read
 
-If no resident arena has the record, SM metadata resolves which S3 object
-holds the offset:
+If no resident arena has the record:
 
-1. Look up `extent_s3_objects` (below) by `(stream_id, extent_id)`,
-   binary-search by offset.
-2. Fetch the object through `S3Reader` + moka LRU. The object's header names
-   the per-stream block index; fetch the target block (single S3 range read);
+1. Look up `epoch_arenas` by `(stream_id, epoch)`, binary-search by offset
+   to find the arena S3 object.
+2. Fetch through `S3Reader` + moka LRU. The object's directory locates the
+   `(stream_id, epoch)` block; fetch the target block via range read;
    decompress; sparse index resolves `offset → byte_pos_in_block`;
-   `Bytes::slice` over the decompressed block.
+   `Bytes::slice`.
 
-The S3 block is the unit of decompression and of the moka cache. Existing
-`S3Reader` machinery is reused; the new code is the multi-stream S3 object
-parser described below.
+## S3 Object Format (All Arenas)
 
-### Unified S3 Metadata
-
-Dedicated and Shared extents both resolve cold reads through
-`extent_s3_objects`. Dedicated extents always have exactly one row with
-`sequence = 0`; Shared extents have one row per arena touched. The legacy
-per-extent `s3_key` column on `extents` is removed.
-
-## Seal, S3 Format, Replication
-
-### Seal Triggers
-
-| Trigger | Applies To | Default |
-|---|---|---|
-| `record_count >= max_records_per_shared_extent` | Shared extent | 65,536 |
-| `now - extent.created_at >= shared_extent_max_age_ms` | Shared extent | 300,000 ms |
-| Arena full | Arena only | `shared_arena_size` (64 MiB) |
-| Arena idle | Arena only | `shared_arena_max_age_ms` (60,000 ms) |
-| Client seal / SM failover | Any extent | as today |
-
-Arena seal and extent seal are independent events.
-
-### S3 Object Format (Shared Arena)
-
-One S3 object per shared arena. Key:
-`{namespace}/shared/{arena_id:016x}.dat`.
+One S3 object per arena. Key: `{namespace}/arenas/{arena_id:016x}.dat`.
 
 ```
 ┌─ Header (fixed 32 bytes) ────────────────────────────────────┐
@@ -368,15 +405,15 @@ One S3 object per shared arena. Key:
 │  version            : u16  (1)                               │
 │  flags              : u16                                    │
 │  arena_id           : u64                                    │
-│  stream_count       : u32                                    │
+│  entry_count        : u32   (number of (stream, epoch) entries)│
 │  data_section_start : u32                                    │
 │  crc32              : u32  (over directory + data sections)  │
 │  compression        : u8   (0=none, 1=zstd, 2=lz4)          │
 │  _reserved          : [u8; 3]                                │
-├─ Stream Directory (variable) ────────────────────────────────┤
-│  For each stream (stream_count entries):                     │
+├─ Entry Directory (variable) ─────────────────────────────────┤
+│  For each entry (entry_count):                               │
 │    stream_id         : u64                                   │
-│    extent_id         : u64                                   │
+│    epoch             : u64                                   │
 │    start_offset      : u64                                   │
 │    end_offset        : u64                                   │
 │    record_count      : u32                                   │
@@ -384,148 +421,132 @@ One S3 object per shared arena. Key:
 │    block_index_start : u32                                   │
 │    data_start        : u32                                   │
 │    data_size         : u32                                   │
-├─ Per-Stream Block Index (variable) ──────────────────────────┤
-│  For each stream, at block_index_start:                      │
+├─ Per-Entry Block Index (variable) ───────────────────────────┤
+│  For each entry, at block_index_start:                       │
 │    [block_count × u32]  byte offset of compressed block i    │
 │    [block_count × u32]  record count in block i              │
-├─ Per-Stream Data (variable) ─────────────────────────────────┤
-│  Stream A: compressed(records[0..64]), compressed([64..128]) │
-│  Stream B: compressed(records[0..64]), ...                   │
+├─ Per-Entry Data (variable) ──────────────────────────────────┤
+│  Entry A: compressed(records[0..64]), compressed([64..128])  │
+│  Entry B: compressed(records[0..64]), ...                    │
 └──────────────────────────────────────────────────────────────┘
 ```
 
-Block size is `s3_index_step` records (default 64). Each block is
-independently compressible via the configured codec, enabling random-access
-reads via single-block range fetches.
+A Dedicated arena is usually a single entry (one stream, one epoch). A
+Shared arena typically has many entries. The same format supports both
+classes so the S3 read path is uniform.
 
-The writer has already laid each stream's records contiguously in the arena
-buffer, so building the S3 object at seal time is a linear walk of the
-directory: compress block-sized slices from the arena into a staging buffer
-and emit the layout above.
+Block size = `s3_index_step` records (default 64). Independently
+compressible. Each block is the unit of decompression and of the moka
+cache.
 
-### Dedicated Extent S3 Format
+## Stream Manager Metadata
 
-Dedicated extents continue to use today's single-stream chunk-compressed
-format. The unified difference is only in where the key is recorded
-(`extent_s3_objects` instead of an inline `s3_key` column on `extents`).
-
-### Stream Manager Metadata
-
-The `streams` table gains:
+`streams` (existing table) gains:
 
 ```sql
 ALTER TABLE streams
   ADD COLUMN arena_class TINYINT NOT NULL DEFAULT 0;  -- 0=Dedicated, 1=Shared
 ```
 
-The `extents` table **drops** its `s3_key` column.
-
-A new table tracks the S3 object list for every extent:
+`extents` table is **replaced by** `stream_epochs`:
 
 ```sql
-CREATE TABLE extent_s3_objects (
-    stream_id    BIGINT NOT NULL,
-    extent_id    BIGINT NOT NULL,
-    sequence     INT    NOT NULL,   -- 0..N-1 in offset order
-    arena_id     BIGINT NOT NULL,   -- 0 for Dedicated
-    s3_key       VARCHAR(512) NOT NULL,
-    start_offset BIGINT NOT NULL,
-    end_offset   BIGINT NOT NULL,   -- exclusive
-    PRIMARY KEY (stream_id, extent_id, sequence),
-    INDEX (stream_id, extent_id, start_offset)
+CREATE TABLE stream_epochs (
+    stream_id     BIGINT  NOT NULL,
+    epoch         BIGINT  NOT NULL,
+    start_offset  BIGINT  NOT NULL,
+    end_offset    BIGINT  NULL,        -- set on seal (epoch bump)
+    state         TINYINT NOT NULL,    -- Open | Sealed
+    replica_set   TEXT    NOT NULL,    -- JSON array of node_ids
+    arena_class   TINYINT NOT NULL,    -- snapshot at epoch allocation
+    created_at    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    sealed_at     TIMESTAMP NULL,
+    PRIMARY KEY (stream_id, epoch),
+    INDEX (stream_id, start_offset)
 );
 ```
 
-Dedicated extents write exactly one row on flush (with `arena_id = 0` as a
-sentinel). Shared extents write one row per arena they touched, in offset
-order.
+`extent_s3_objects` is replaced by `epoch_arenas`:
 
-An operational `arenas` table tracks per-arena state across the cluster for
-visibility. It is not on any hot path.
+```sql
+CREATE TABLE epoch_arenas (
+    stream_id    BIGINT NOT NULL,
+    epoch        BIGINT NOT NULL,
+    sequence     INT    NOT NULL,   -- 0..N-1 in offset order within epoch
+    arena_id     BIGINT NOT NULL,
+    s3_key       VARCHAR(512) NOT NULL,
+    start_offset BIGINT NOT NULL,
+    end_offset   BIGINT NOT NULL,   -- exclusive
+    PRIMARY KEY (stream_id, epoch, sequence),
+    INDEX (stream_id, epoch, start_offset)
+);
+```
 
-### Flush Lifecycle (Shared Arena)
+A separate operational `arenas` table tracks per-arena state across the
+cluster (resident node, flush status). Not on any hot path.
+
+## Flush Lifecycle
+
+Identical for Shared and Dedicated arenas:
 
 1. Arena rolls → `state = Sealed` → S3 flush task notified.
-2. Flush task walks the `ArenaDirectory`, compresses per-stream blocks,
-   uploads via `aws-sdk-s3` (multipart for objects above
-   `s3_multipart_threshold`). Retry policy matches the existing Dedicated
-   flusher.
-3. On success the task sends `UpdateArenaFlushed(arena_id, s3_key, pairs)` to
-   SM. `pairs = Vec<(stream_id, extent_id, start_offset, end_offset)>` for
-   every `(stream, extent)` this arena touched.
-4. SM writes one `extent_s3_objects` row per pair in a single transaction.
-5. Primary broadcasts `ForwardFlushed(arena_id)` to all peer replicas of
-   streams in the arena (fire-and-forget). Secondaries transition their copy
-   of the arena to `Uploaded`.
-6. Arena becomes eligible for eviction (next section).
+2. Flush task walks the directory, compresses per-entry blocks, uploads
+   via `aws-sdk-s3` (multipart above `s3_multipart_threshold`). Retry
+   policy matches today's flusher.
+3. On success: `UpdateArenaFlushed(arena_id, s3_key, entries)` to SM where
+   `entries = Vec<(stream_id, epoch, start_offset, end_offset)>`.
+4. SM writes one `epoch_arenas` row per entry in a single transaction.
+5. Primary broadcasts `ForwardFlushed(arena_id)` to peers (fire-and-forget).
+6. Arena becomes LRU-eligible.
 
 ### DR Flush
 
-Extends the existing `FlushExtent (0x1B)` opcode with a variant flag meaning
-"flush arena, not extent." SM's staleness scan also searches for
-sealed-but-unflushed arenas (beyond `flush_staleness_threshold_ms`) and
-delegates upload to any live replica that still holds the arena in memory. S3
-PUT is idempotent and all replicas agree on the arena_id and therefore on the
-key, so concurrent uploads produce identical objects safely.
-
-### Replication — What Changes
-
-- `Forward` loses `byte_pos`.
-- `RegisterExtent` gains `arena_class` (SM → Primary, on extent allocation).
-- `ForwardInitExtent` gains `arena_class` (Primary → Secondaries, on first
-  forwarded append for a new extent).
-- `ForwardInitArena` is new, fire-and-forget (Primary → secondaries on arena
-  roll).
-- `NotifyArenaClass` is new, EN → SM, sent when a stream's runtime class
-  transitions at an extent boundary.
-
-Quorum tracking, watermark handling, 2-phase seal, extent-level checksum — all
-unchanged. Extent state (`committed_seq`, `committed_bytes`, `record_count`,
-`limit`, `replica_info`) is class-independent, so the shared-path append
-updates it exactly as the dedicated path does.
+`FlushExtent (0x1B)` is renamed `FlushArena` with the same opcode number.
+SM's staleness scan looks for sealed-but-unflushed arenas beyond
+`flush_staleness_threshold_ms` and delegates upload to any live replica
+that still holds the arena in memory. S3 PUT is idempotent; all replicas
+agree on `arena_id` and therefore on the key.
 
 ## Eviction
 
-Global LRU over shared arenas in the pool:
+Global LRU over the SharedArenaPool (Shared class) plus a small cap
+(`cache_arenas` per stream, default 4) over each Dedicated stream's own
+arena list.
 
-- An arena becomes LRU-eligible once `state == Uploaded` (or, for Memory
-  StorageClass streams, immediately on `Sealed` since there is no S3 upload).
-- `Sealed` but not-yet-`Uploaded` arenas are pinned; if too many accumulate
-  relative to `max_resident_shared_arenas`, the writer channel applies
-  backpressure to new appends.
-- `resident.len() > max_resident_shared_arenas` drains the LRU head until
-  under budget.
+- Arena becomes LRU-eligible once `state = Uploaded` (or, for Memory
+  `StorageClass`, immediately on `Sealed`).
+- Sealed-but-not-yet-Uploaded arenas are pinned; if too many accumulate,
+  writer backpressure kicks in.
 - Eviction drops the `Arc<SharedArena>` from `resident`. In-flight readers
-  retain the underlying `ArenaBuffer` via their own `Arc` clone through
-  `Bytes::from_owner(OwnedArenaSlice)`; the allocation is freed when the last
-  reader releases it.
-
-`cache_extents` is retained as a per-stream upper bound on **Dedicated**
-extents kept in memory. For Shared extents the concept is subsumed by the
-global arena LRU; the field has no effect.
+  keep the underlying buffer alive via their own `Arc` clone in the
+  `OwnedArenaSlice` that backs `Bytes::from_owner`.
 
 ## Configuration
 
-New fields in `ExtentNodeConfig`:
+New `ExtentNodeConfig` fields:
 
 | Field | Default | Notes |
 |---|---|---|
 | `shared_arena_size` | 64 MiB | Per-arena buffer size |
-| `max_resident_shared_arenas` | 64 | → 4 GiB shared memory budget |
-| `shared_writer_channel_capacity` | 4096 | MPSC bound per arena |
-| `shared_append_timeout_ms` | 1000 | Backpressure timeout |
-| `max_records_per_shared_extent` | 65,536 | Extent record cap |
-| `shared_extent_max_age_ms` | 300,000 | Extent time cap |
-| `shared_arena_max_age_ms` | 60,000 | Idle arena roll |
-| `promote_to_dedicated_bytes_per_sec` | 10 MiB/s | Runtime promotion threshold |
-| `demote_to_shared_bytes_per_sec` | 100 KiB/s | Runtime demotion threshold |
+| `max_resident_shared_arenas` | 64 | → 4 GiB shared budget |
+| `shared_writer_channel_capacity` | 4096 | MPSC bound |
+| `arena_append_timeout_ms` | 1000 | Backpressure timeout |
+| `arena_max_age_ms` | 60,000 | Idle arena roll |
+| `cache_arenas` | 4 | Per-Dedicated-stream arena memory cap |
+| `promote_to_dedicated_bytes_per_sec` | 10 MiB/s | Runtime promotion |
+| `demote_to_shared_bytes_per_sec` | 100 KiB/s | Runtime demotion |
 | `class_transition_min_dwell_ms` | 300,000 | Hysteresis |
 
-New per-stream setting on `CreateStream`:
+New per-stream `CreateStream` field:
 
-| Field | Default | Notes |
-|---|---|---|
-| `arena_class` | `Dedicated` | Declared class; runtime can override |
+| Field | Default |
+|---|---|
+| `arena_class` | `Dedicated` |
+
+Removed: `min_extent_capacity`, `max_extent_capacity`, `extent_growth_factor`,
+`cache_extents`, `max_records_per_shared_extent`, `shared_extent_max_age_ms`.
+These either become `shared_arena_size` / `cache_arenas` (different unit) or
+disappear (no per-extent record/age caps in the new model).
 
 ## Metrics
 
@@ -533,52 +554,57 @@ Per pool:
 
 - `shared_arena_resident_count`, `shared_arena_bytes_resident`
 - `shared_arena_rolls_total`, `shared_arena_evictions_total`
-- `shared_arena_writer_channel_depth` (gauge, per active arena)
-- `shared_arena_flush_pending` (sealed, not-yet-uploaded)
+- `shared_arena_writer_channel_depth` (per active arena)
+- `shared_arena_flush_pending`
 
 Per stream class:
 
-- `streams_by_class{class="shared|dedicated"}` (gauge)
+- `streams_by_class{class="shared|dedicated"}` gauge
 - `class_promotions_total`, `class_demotions_total`
 - `shared_append_latency_seconds`, `dedicated_append_latency_seconds`
-  (histograms)
+  histograms
 
-Per arena (debug):
+Per epoch (debug):
 
-- `arena_stream_count`, `arena_utilization`, `arena_age_seconds`
+- `epoch_record_count`, `epoch_age_seconds`, `epoch_resident_arenas`
 
 ## Error Handling
 
 | Failure | Behavior |
 |---|---|
-| Shared writer task panics | Arena state → `Failed`; new appends route to a freshly rolled arena. In-flight replies return `AppendError::WriterFailed`; stream leader propagates to client. SM seal-and-new recovers the extent. |
-| MPSC channel full | Stream leader awaits up to `shared_append_timeout_ms`; on timeout returns `Busy`. Sustained busy → runtime promotion. |
-| Arena allocation OOM | EN refuses new Shared-class writes; reports via `node_metrics`; SM avoids placing new Shared extents there. |
-| S3 upload fails indefinitely | Existing retry policy. Arena pinned in memory; shared append backpressure applies. |
-| Secondary missed `ForwardInitArena` | Secondary lazily allocates the arena on the first Forward that references its id. |
-| Reader finds arena `Evicted` mid-lookup | Falls through to Tier 2 (S3 cold read). |
-| Cross-class mismatch between Primary and Secondary | Impossible by construction: `arena_class` is a stream property carried on `RegisterExtent` (SM → Primary) and on `ForwardInitExtent` (Primary → Secondaries). |
+| Writer task panics | Arena state → `Failed`; new appends route to a freshly rolled arena. In-flight replies return `AppendError::WriterFailed`; caller propagates to client. SM epoch bump recovers. |
+| MPSC channel full | Caller awaits up to `arena_append_timeout_ms`; on timeout returns `Busy`. Sustained busy → runtime promotion for Shared-class streams. |
+| Arena allocation OOM | EN refuses new Shared writes; reports via `node_metrics`; SM avoids placing new Shared epochs there. |
+| S3 upload fails indefinitely | Existing retry policy. Arena pinned; writer backpressure applies. |
+| Secondary missed `ForwardInitArena` | Secondary lazily allocates arena on first Forward referencing its id (analogous to Lazy Secondary Extent Creation). |
+| Reader finds arena `Evicted` mid-lookup | Falls through to Tier 2. |
+| Cross-class mismatch Primary vs Secondary | Impossible: `arena_class` carried on `RegisterEpoch` (SM → Primary) and `ForwardInitEpoch` (Primary → Secondary); any mismatch fails epoch registration. |
 
 ## Testing
 
-### Unit Tests (`components/extent-node/src/shared_arena/tests.rs`)
+### Unit Tests
 
 - `SharedArenaPool`: allocate, append, roll, evict.
-- `ArenaDirectory`: build, lookup, frozen-at-seal.
+- `ArenaDirectory`: build, lookup by `(stream, epoch)`, frozen-at-seal.
 - `ArenaId`: uniqueness from `(node_id, counter)`; wire round-trip.
-- `Extent` with `ExtentStorage::Shared`: record and age caps, seal.
+- `StreamEpoch`: state machine, `resident_arenas` tracking, seal on epoch
+  bump.
+- Writer-task roll: in-flight jobs requeue correctly, replies carry
+  `rolled_to`.
 
-### Integration Tests (`tests/shared_arena.rs`)
+### Integration Tests
 
-- End-to-end append + read on one EN at RF=1.
+- End-to-end append + read on one EN, RF=1, both classes.
 - RF=2: Primary + Secondary agree on `arena_id`; DR flush from secondary
-  produces identical S3 key and bytes.
-- Extent spanning 2–3 arenas: reads succeed across arena boundaries.
-- Cold read after eviction: `extent_s3_objects` directs to the right S3
-  object and block.
-- Runtime promotion: stream starts Shared, rate exceeds threshold, next
-  extent is Dedicated, no data loss at the boundary.
-- Demotion: hot stream goes idle, next extent is Shared.
+  produces identical S3 key + bytes.
+- Epoch spanning 2–3 arenas in both classes: reads work across arena
+  boundaries.
+- Cold read after eviction: `epoch_arenas` directs to the right object /
+  block.
+- Runtime promotion mid-epoch: stream starts Shared, rate exceeds
+  threshold, subsequent arenas in the same epoch are Dedicated, reads
+  work across class boundary.
+- Demotion: symmetric.
 - 100K Shared streams: memory budget respected; evictions behave.
 
 ### Stress Tests
@@ -590,15 +616,20 @@ Per arena (debug):
 
 ### Crash / Recovery
 
-- Primary of Shared stream dies mid-arena: SM DR flush from secondary
-  produces the canonical S3 object.
-- Writer task panic: pool recovers; new appends succeed on the next arena.
+- Primary dies mid-arena: SM epoch bump, new Primary takes over. DR flush
+  from surviving replica for the old epoch's unflushed arenas.
+- Writer task panic: pool recovers; next append succeeds on the next
+  arena.
 
 ## Open Questions
 
 - Whether to shard the shared pool's writer into N parallel writers if
-  single-writer throughput becomes limiting in production. The design allows
-  this to be added later without changing `ExtentStorage`, `ArenaDirectory`,
-  or the S3 format.
-- Whether to switch `ArenaDirectory.entries` to `DashMap` based on measured
-  hotness of the read-tier-2 path.
+  single-writer throughput becomes limiting. The design allows this to be
+  added later without changing public schemas.
+- Whether `resident_arenas` on `StreamEpoch` should be a `DashMap` instead
+  of `Mutex<SmallVec<>>` if read-path contention is observed in practice.
+- `NOTIFY_SEALED_EXTENT` is gone; the current code's
+  `autonomous-extent-creation` path is deleted with it. The failover
+  design relies on SM's periodic staleness scan to flush arenas whose
+  Primary died before upload; confirming this is sufficient for the MTTR
+  target is deferred to the implementation plan.
