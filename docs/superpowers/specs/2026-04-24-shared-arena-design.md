@@ -66,7 +66,9 @@ dual-run, no feature flag, and no backwards-compatibility layer.
 | `extent_s3_objects` (proposed in earlier draft) | Replaced by `epoch_arenas`, keyed by `(stream_id, epoch, sequence)`, one row per arena this epoch wrote to. |
 | `RegisterExtent` opcode | Renamed `RegisterEpoch`. Carries `arena_class`. |
 | `ForwardInitExtent` opcode | Renamed `ForwardInitEpoch`. Carries `arena_class`. |
-| `SealExtentNode`, `SealStreamManager` opcodes | Renamed `SealEpoch`. Same 2-phase Prepare/Commit protocol. Invoked only on epoch bump. |
+| `SealStreamManager` opcode (client → SM) | Renamed `SealStream`. Keyed by `(stream_id, current_epoch)`. Triggers the epoch bump + new replica set; replies with the new epoch and new Primary. |
+| `SealExtentNode` opcode (SM → EN internal 2-phase) | Renamed `SealEpoch`. Same 2-phase Prepare/Commit against each replica of the sealing epoch. Invoked by SM while processing `SealStream` or during failover. |
+| EN-initiated seal (`FLAG_OFFSET_PRESENT = 1`) | **Removed.** Arena-full never bumps the epoch; no EN-initiated seal path. |
 | `NOTIFY_SEALED_EXTENT`, autonomous extent creation | **Removed.** Arena-full never triggers an epoch bump or SM round-trip. |
 | `Forward` carrying `byte_pos` | Removed. Secondaries compute byte_pos locally from strict append order. |
 | Per-extent arena + per-extent u32 index (Dedicated) | Per-epoch arena pool (Dedicated): one writer per stream, rolls arenas within an epoch. Per-arena directory (same as Shared). |
@@ -296,28 +298,62 @@ Unchanged from today's fast path, except:
   arena roll. Carries `arena_id` and `arena_capacity`. Secondaries
   allocate an arena tagged with the same `arena_id` so replicas agree on
   arena identity for DR flush.
-- `SealEpoch` (SM ↔ EN): 2-phase Prepare/Commit as today's
-  `SealExtentNode`/`SealStreamManager`, but keyed by `(stream_id, epoch)`.
-  Only invoked on epoch bump.
+- `SealStream` (client → SM): **user-facing** stream-writer API. Request
+  carries `(stream_id, current_epoch)`. SM verifies the epoch matches
+  MySQL (stale client → SM responds with the newer epoch + redirect
+  hint, no seal performed), runs `SealEpoch` against the current
+  replica set, records the sealed epoch's `end_offset` in
+  `stream_epochs`, allocates a new epoch with a new replica set,
+  issues `RegisterEpoch` to the new Primary and waits for ack, then
+  responds to the client with the new epoch and Primary address.
+- `SealEpoch` (SM → EN): **internal 2-phase sub-protocol** used by SM
+  while processing `SealStream` and during failover-driven seal. Keyed
+  by `(stream_id, epoch)`. Phase 1 Prepare (flag=0x00): replica
+  responds with its local committed offset. Phase 2 Commit (flag=0x02):
+  SM broadcasts the authoritative committed offset; replica corrects
+  its local seal point and transitions the epoch to Sealed. Broadcast
+  to every replica in the epoch's replica_set.
 - `NotifyArenaClass` (new, EN → SM): reports a runtime class transition so
   SM persists the change in `streams.arena_class`.
 
 ### Seal (Epoch Bump Only)
 
-`SealEpoch` runs the existing 2-phase protocol:
+An epoch bump is the **only** event that seals an epoch. Two things can
+trigger it:
 
-1. **Prepare**: SM queries each replica of the current epoch for its
-   committed offset.
-2. **Quorum**: SM computes the authoritative committed offset.
-3. **Commit**: SM broadcasts the committed offset so replicas correct
-   their local seal point.
-4. **Allocate**: SM picks a new replica set (for failure/rebalance),
-   bumps the epoch, calls `RegisterEpoch` on the new Primary, waits for
-   the ack.
+- **Client-initiated**: a stream writer sends `SealStream(stream_id,
+  current_epoch)` to SM (e.g., to recover after a timeout or to force a
+  consistency checkpoint).
+- **Failover-initiated**: SM's leader detects a dead node in the current
+  replica set via the heartbeat checker.
 
-The sealed epoch's `limit` is recorded in `stream_epochs`. Its arenas are
-still resident in whichever pool they live in, flushed and evicted
-independently.
+In both cases SM runs the same sub-protocol against the current epoch's
+replicas via `SealEpoch`:
+
+1. **Prepare** (`SealEpoch` flag=0x00): SM queries each replica for its
+   local committed offset on the current epoch.
+2. **Quorum**: SM sorts the offsets descending and takes the k-th value
+   where `k = RF/2`. (If the Primary is reachable, its offset is
+   authoritative.)
+3. **Commit** (`SealEpoch` flag=0x02): SM broadcasts the authoritative
+   committed offset to all replicas; each corrects its local seal point
+   and transitions the epoch to Sealed.
+4. **Allocate**: SM picks a new replica set, bumps the epoch, calls
+   `RegisterEpoch` on the new Primary, waits for its ack.
+5. **Respond**:
+   - For client-initiated: SM responds to the `SealStream` request with
+     the new epoch and new Primary address. Writes resume immediately on
+     the new epoch.
+   - For failover-initiated: no upstream response; new clients discover
+     the new epoch on their next `DescribeStream` or when their Primary
+     connection fails over.
+
+The sealed epoch's `limit` and `end_offset` are recorded in
+`stream_epochs`. Its arenas are unaffected: they stay resident in
+whichever pool owns them, get flushed by the normal path, and evict by
+the normal LRU. The sealed epoch remains readable from memory until its
+arenas are uploaded and evicted, after which reads go through
+`epoch_arenas` + S3.
 
 ### Arena Roll
 
