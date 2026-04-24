@@ -43,8 +43,9 @@ enum ArenaClass {
 }
 ```
 
-Stored in the `streams` MySQL row and propagated to ExtentNodes via
-`ForwardInitExtent`.
+Stored in the `streams` MySQL row. Propagated from SM to ExtentNodes via
+`RegisterExtent` (per-extent allocation); the Primary further propagates it
+to secondaries on the first forwarded append via `ForwardInitExtent`.
 
 ### Extent Storage
 
@@ -239,13 +240,17 @@ in strict order per extent; their own byte_pos is computed locally. This
 change applies to both Dedicated and Shared — the Forward wire format is
 unified.
 
-Two additions:
+Three additions:
 
-- `ForwardInitExtent` gains an `arena_class: u8` field (consuming a previously
-  reserved byte). Secondaries use it to decide whether to open a per-extent
-  arena (Dedicated) or route appends into their own `SharedArenaPool`.
-- `ForwardInitArena` is a new fire-and-forget opcode sent by a Primary when it
-  rolls its active shared arena. It carries `arena_id: u64` and
+- `RegisterExtent` (SM → Primary) gains an `arena_class: u8` field. The SM
+  reads `streams.arena_class` during extent allocation and carries it to the
+  Primary.
+- `ForwardInitExtent` (Primary → Secondaries) gains an `arena_class: u8`
+  field (consuming a previously reserved byte). Secondaries use it to decide
+  whether to open a per-extent arena (Dedicated) or route appends into their
+  own `SharedArenaPool`.
+- `ForwardInitArena` is a new fire-and-forget opcode sent by a Primary when
+  it rolls its active shared arena. It carries `arena_id: u64` and
   `arena_capacity: u32`. Secondaries allocate a shared arena tagged with the
   same `arena_id` and install it as their active arena for subsequent
   Forwards.
@@ -466,7 +471,9 @@ key, so concurrent uploads produce identical objects safely.
 ### Replication — What Changes
 
 - `Forward` loses `byte_pos`.
-- `ForwardInitExtent` gains `arena_class`.
+- `RegisterExtent` gains `arena_class` (SM → Primary, on extent allocation).
+- `ForwardInitExtent` gains `arena_class` (Primary → Secondaries, on first
+  forwarded append for a new extent).
 - `ForwardInitArena` is new, fire-and-forget (Primary → secondaries on arena
   roll).
 - `NotifyArenaClass` is new, EN → SM, sent when a stream's runtime class
@@ -550,7 +557,7 @@ Per arena (debug):
 | S3 upload fails indefinitely | Existing retry policy. Arena pinned in memory; shared append backpressure applies. |
 | Secondary missed `ForwardInitArena` | Secondary lazily allocates the arena on the first Forward that references its id. |
 | Reader finds arena `Evicted` mid-lookup | Falls through to Tier 2 (S3 cold read). |
-| Cross-class mismatch between Primary and Secondary | Impossible by construction: `arena_class` is a stream property, replicated via `ForwardInitExtent`. |
+| Cross-class mismatch between Primary and Secondary | Impossible by construction: `arena_class` is a stream property carried on `RegisterExtent` (SM → Primary) and on `ForwardInitExtent` (Primary → Secondaries). |
 
 ## Testing
 
