@@ -111,24 +111,29 @@ struct StreamEpoch {
     // historical arenas are reachable via `epoch_arenas` table.
     resident_arenas: Mutex<SmallVec<[ArenaId; 4]>>,
 
-    // Class-specific state:
     class:           ArenaClass,
-    dedicated_state: Option<DedicatedState>,  // Some iff class == Dedicated
 }
+```
 
-struct DedicatedState {
-    // The single-writer pipelined group commit state (previously on Stream).
+`StreamEpoch` is a pure replication/consistency object. It owns no
+concurrency primitives — the stream-level leader-election + pipelined-
+group-commit state stays on `Stream` (below) and is used identically for
+both classes.
+
+```rust
+struct Stream {
+    stream_id:     StreamId,
+    arena_class:   ArenaClass,
+    storage_class: StorageClass,
+    active_epoch:  ArcSwap<StreamEpoch>,
+    ewma:          EwmaStats,                 // for runtime class transitions
+
+    // Pipelined group commit (same shape for both classes):
     in_flight: AtomicU64,
     job_tx:    crossbeam::channel::Sender<AppendJob>,
     job_rx:    crossbeam::channel::Receiver<AppendJob>,
 }
 ```
-
-`Stream` becomes a thin map from `stream_id → Arc<StreamEpoch>` (the active
-epoch) plus metadata like `arena_class`, `storage_class`, EWMA for runtime
-class transitions. No pipelined-group-commit state lives on `Stream` anymore
-— it moved to `DedicatedState`, because Shared streams drive their writes
-through the pool's per-arena writer rather than a stream-level leader.
 
 ## SharedArenaPool
 
@@ -232,56 +237,106 @@ with no re-sorting on seal.
 
 ## Write Path
 
-### Shared-Class Append (Primary)
+### Leader Election (Both Classes)
+
+Every stream uses the same stream-level pipelined group commit pattern that
+Dedicated uses today. Two Tokio tasks on different client connections serve
+the same stream; they race on `stream.in_flight.fetch_add(1, Acquire)`:
+
+- `prev == 0` → **leader**: processes its own payload and then drains
+  followers from `stream.job_rx` in a batch.
+- `prev > 0` → **follower**: pushes `AppendJob { payload, client_reply_tx }`
+  to `stream.job_tx` and returns `None` (deferred response; leader will
+  reply).
+
+This guarantees **only one task writes to the stream's state at a time**,
+so `record_count`, `committed_bytes`, `committed_seq`, and the submission
+order to downstream (pool MPSC or per-stream arena) are all race-free —
+using plain load/store, no `fetch_add`.
+
+Leader-election state lives on `Stream` (not on `StreamEpoch`) and is used
+identically for both classes. The only per-class difference is what the
+leader's inner step does with each payload.
+
+### Leader's Inner Step — Dedicated
+
+For each payload (own + drained followers), in order:
+
+1. `seq = ep.record_count.load()`.
+2. `byte_pos = ep.committed_bytes.load()`.
+3. memcpy payload into the stream's Dedicated arena at `byte_pos`,
+   prefixed with u32 BE len.
+4. Store the per-stream u32 index entry `index[seq] = byte_pos`.
+5. Update `ep.committed_bytes`, `ep.record_count`, `ep.committed_seq`.
+6. If `rf >= 2`: broadcast `Forward(stream_id, epoch, seq, payload)` and
+   push `PendingAck` to the stream's AckQueue. Else: reply
+   `AppendAck { offset: start_offset + seq }` on the follower's
+   `client_reply_tx`.
+
+If the Dedicated arena is full, the leader rolls the arena inline (seal
+old, allocate new, `ForwardInitArena` to secondaries) within its own
+turn. The retry of the triggering payload happens on the new arena; the
+epoch is unaffected. Same as today's extent-full handling, but without
+bumping the epoch or notifying SM.
+
+### Leader's Inner Step — Shared
+
+The same leader election; the inner step substitutes a pool submit for
+the direct memcpy. Because only one task (the leader) touches pool
+submission for this stream at a time, records arrive at the pool MPSC
+in strict sequence order.
+
+Submissions are pipelined: the leader submits up to
+`shared_leader_pipeline_depth` (default 32) jobs without awaiting, then
+collects acks in submission order. This keeps the per-record MPSC hop
+from serializing the leader.
 
 ```
-ep = stream.active_epoch               // StreamEpoch, class = Shared
-seq = ep.record_count.fetch_add(1, AcqRel)
+batch  = [own_payload] + drain_followers(stream.job_rx, max_batch)
+arena  = pool.active.load()
+pending: VecDeque<(seq, oneshot::Receiver<SharedAppendAck>, payload, client_reply_tx)>
 
-arena = pool.active.load()             // ArcSwap — cheap read
-job   = SharedAppendJob {
-    stream_id, epoch: ep.epoch, seq, payload, reply: tx
-}
-arena.job_tx.send(job).await
-ack = rx.await
+for payload in batch:
+    if pending.len() >= shared_leader_pipeline_depth:
+        drain_one(&mut pending)              // await oldest; updates committed_seq, forwards, queues PendingAck
+    seq = ep.record_count.load()
+    ep.record_count.store(seq + 1)
+    (tx, rx) = oneshot::channel()
+    arena.job_tx.send(SharedAppendJob {
+        stream_id, epoch: ep.epoch, seq, payload, reply: tx
+    })
+    pending.push_back((seq, rx, payload, client_reply_tx))
 
-ep.committed_bytes.fetch_add(4 + payload.len(), Release)
-ep.resident_arenas.register(ack.arena_id)      // idempotent push to SmallVec
-ep.committed_seq.store(seq + 1, Release)
+while let Some(entry) = pending.pop_front():
+    drain_one(&mut pending, entry)
 
-if ep.replica_info.rf >= 2:
-    forward(stream_id, epoch, seq, payload)    // no byte_pos field
-    ack_queue.push(PendingAck { seq, client_reply_tx })
-else:
-    client_reply_tx.send(AppendAck { offset: ep.start_offset + seq })
+fn drain_one(entry):
+    let ack = entry.rx.await;
+    ep.committed_bytes.store(ep.committed_bytes.load() + 4 + entry.payload.len())
+    ep.resident_arenas.register(ack.arena_id)
+    ep.committed_seq.store(entry.seq + 1, Release)
+    if ep.replica_info.rf >= 2:
+        forward(stream_id, epoch, entry.seq, entry.payload)
+        ack_queue.push(PendingAck { seq: entry.seq, client_reply_tx: entry.client_reply_tx })
+    else:
+        entry.client_reply_tx.send(AppendAck { offset: ep.start_offset + entry.seq })
 ```
 
-Note: the stream-level group-commit leader election **is not used in Shared
-class** — the pool's per-arena writer already serializes concurrent stream
-writers. Shared-class Primaries call `record_count.fetch_add` directly; the
-race with other appenders is resolved at the pool's MPSC (FIFO preserves
-stream-level order because each stream has only one Primary per epoch, and
-that Primary's handler is single-threaded per connection for a given
-stream).
+Note that `record_count` is bumped eagerly (at submission time) but
+`committed_seq` only advances as acks come back in order. Readers observe
+a gap-free prefix as today.
 
-### Dedicated-Class Append (Primary)
+If an ack carries `rolled_to = Some(new_id)`, the leader switches to
+`new_id` for subsequent submissions within the same batch (the pool has
+already installed it as `active`, so a fresh `pool.active.load()` picks
+it up naturally at the start of the next iteration).
 
-Unchanged from today's fast path, except:
+### Ordering Guarantee
 
-- The pipelined-group-commit leader writes into a **Dedicated arena**
-  obtained from a small per-stream arena slot (one active + one pooled
-  spare), not into a per-extent arena.
-- When the Dedicated arena fills, the writer calls `pool_for_this_stream.roll()`
-  (a thin per-stream variant of the same pool mechanism), sealing the old
-  arena and installing a new one. **This does not bump the epoch.** The
-  running extent-level state (`record_count`, `committed_seq`,
-  `committed_bytes`) continues uninterrupted; only the arena changes
-  underneath.
-- The `NOTIFY_SEALED_EXTENT` opcode is deleted. The Primary no longer
-  notifies SM on arena roll; SM learns about the new arena only when the
-  flush task sends `UpdateArenaFlushed` after upload.
-- `resident_arenas` on the epoch records the sequence of arenas this epoch
-  has written to.
+In both classes, the arrival order at the downstream sink (Dedicated
+arena memcpy / Shared pool MPSC) matches the assignment order of `seq`.
+This is the core invariant that makes the per-arena directory's
+`byte_positions[i]` correspond to the `(start_offset + i)`-th record.
 
 ### Forward Protocol
 
@@ -566,6 +621,7 @@ New `ExtentNodeConfig` fields:
 | `shared_arena_size` | 64 MiB | Per-arena buffer size |
 | `max_resident_shared_arenas` | 64 | → 4 GiB shared budget |
 | `shared_writer_channel_capacity` | 4096 | MPSC bound |
+| `shared_leader_pipeline_depth` | 32 | Max in-flight pool submissions per stream leader |
 | `arena_append_timeout_ms` | 1000 | Backpressure timeout |
 | `arena_max_age_ms` | 60,000 | Idle arena roll |
 | `cache_arenas` | 4 | Per-Dedicated-stream arena memory cap |
