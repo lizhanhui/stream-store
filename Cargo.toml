@@ -35,7 +35,7 @@ core_affinity = "0.8"
 papaya = "0.2"
 parking_lot = "0.12"
 aws-config = { version = "1.1.7", features = ["behavior-version-latest"] }
-aws-sdk-s3 = { version = "1.129.0" }
+aws-sdk-s3 = { version = "1.131.0" }
 env_logger = { version = "0.11" }
 zstd = { version = "0.13" }
 lz4 = { version = "1.23.1" }
