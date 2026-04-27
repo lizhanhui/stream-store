@@ -20,7 +20,7 @@ tracing = { workspace = true }
 sysinfo = "0.33"
 papaya = { workspace = true }
 parking_lot = { workspace = true }
-socket2 = "0.5"
+socket2 = "0.6"
 common = { path = "../common" }
 rpc = { path = "../rpc" }
 server = { path = "../server" }
