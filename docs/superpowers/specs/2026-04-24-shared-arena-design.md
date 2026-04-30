@@ -158,21 +158,17 @@ struct SharedArenaConfig {
 
 ### SharedArena
 
-```rust
-struct SharedArena {
-    id:         ArenaId,                  // (node_id << 48) | local_counter
-    buf:        Arc<ArenaBuffer>,
-    state:      AtomicU8,                 // Open | Sealed | Uploaded | Evicted
-    created_at: Instant,
-    directory:  Mutex<ArenaDirectory>,
-    job_tx:     mpsc::Sender<SharedAppendJob>,
-    s3_key:     OnceLock<String>,
-}
+The `SharedArena` struct is defined together with its concurrency
+primitive in the [Arena Concurrency Primitive](#arena-concurrency-primitive)
+section below. Its backing state for per-stream record placement lives in
+the arena directory:
 
+```rust
 struct ArenaDirectory {
-    // Keyed by (stream_id, epoch) — an arena can contain records for multiple
-    // epochs of the same stream if a cross-arena epoch bump happened to land
-    // on this arena (rare but legal).
+    // Keyed by (stream_id, epoch). Within one arena a stream may have at
+    // most one entry per epoch; on epoch bump the stream continues writing
+    // under a new (stream_id, epoch) directory entry in the same or a
+    // subsequent arena.
     entries: HashMap<(StreamId, u64), EpochArenaEntry>,
 }
 
@@ -185,17 +181,9 @@ struct EpochArenaEntry {
 }
 
 struct SharedAppendJob {
-    stream_id: StreamId,
-    epoch:     u64,
-    seq:       u64,
-    payload:   Bytes,
-    reply:     oneshot::Sender<SharedAppendAck>,
-}
-
-struct SharedAppendAck {
-    arena_id:  ArenaId,
-    byte_pos:  u32,                // debug / metrics; reads use directory
-    rolled_to: Option<ArenaId>,    // Some(new_id) if this append caused a roll
+    // One record submitted inside an ArenaBatch from a stream leader.
+    seq:     u64,
+    payload: Bytes,
 }
 ```
 
@@ -205,138 +193,210 @@ struct SharedAppendAck {
 construction. S3 key `{namespace}/arenas/{arena_id:016x}.dat` does not
 collide across ENs. 16 bits of node_id (65,535 ENs) and 48 bits of counter.
 
-### Writer Task
+### Arena Concurrency Primitive
 
-One task per arena, not per pool. Behavior is identical for Shared and
-Dedicated arenas (they differ only in who populates the MPSC — see Write
-Path):
+Both Shared and Dedicated arenas expose the same minimal write primitive —
+a CAS-based leader election plus an MPSC for delegated batches. There is
+**no background writer task**; whichever caller wins the CAS performs the
+memcpy inline, then drains delegated work before yielding:
 
+```rust
+struct SharedArena {
+    id:         ArenaId,
+    buf:        Arc<ArenaBuffer>,
+    state:      AtomicU8,                     // Open | Sealed | Uploaded | Evicted
+    created_at: Instant,
+    directory:  Mutex<ArenaDirectory>,
+
+    // Arena-level leader election (CAS on entry):
+    in_flight:  AtomicU64,
+    job_tx:     crossbeam::channel::Sender<ArenaBatch>,
+    job_rx:     crossbeam::channel::Receiver<ArenaBatch>,
+
+    s3_key:     OnceLock<String>,
+}
+
+struct ArenaBatch {
+    // One batch from one stream leader; records are already in seq order.
+    stream_id: StreamId,
+    epoch:     u64,
+    jobs:      SmallVec<[SharedAppendJob; 16]>,
+    reply:     oneshot::Sender<ArenaBatchAck>,
+}
+
+struct ArenaBatchAck {
+    // Per-job result, in the same order as ArenaBatch.jobs.
+    // Each record's resolved (arena_id, byte_pos) — records in a batch may
+    // straddle an arena roll so arena_id is per-record.
+    results: SmallVec<[JobResult; 16]>,
+}
+
+struct JobResult {
+    arena_id: ArenaId,
+    byte_pos: u32,
+}
 ```
-loop:
-    batch = drain_up_to(job_rx, max_batch_jobs or max_batch_time)
-    group batch by (stream_id, epoch)
-    for ((stream_id, epoch), jobs) in grouped:
-        ensure sufficient arena space; if not:
-            pool.roll()   // pool seals current arena (state ← Sealed),
-                          // moves it into `resident`, allocates a new arena
-                          // and a new writer task, installs as `active`.
-                          // Remaining jobs are requeued to the new arena's
-                          // channel; their eventual reply carries
-                          // rolled_to=Some(new_id).
-            break
-        for job in jobs:
-            memcpy job.payload into buf at cursor, prefixed with u32 BE len
-            directory.entries[(stream_id, epoch)].append(byte_pos, len, seq)
-            cursor += 4 + len
-            job.reply.send(Ack{ arena_id, byte_pos, rolled_to: None })
-```
 
-Per-(stream, epoch) grouping inside the writer keeps each epoch's records
-contiguous within one arena, so the resulting S3 object layout is produced
-with no re-sorting on seal.
+Dedicated arenas use the same shape, except the `in_flight` CAS is
+uncontended by construction (only the owning stream's leader ever
+submits), so it degenerates to a direct-memcpy fast path.
+
+Per-(stream, epoch) grouping in the directory is trivial: each
+`ArenaBatch` belongs to exactly one `(stream_id, epoch)`, so the arena
+leader drops the batch's records into one directory entry.
 
 ## Write Path
 
-### Leader Election (Both Classes)
+The write path is a **two-layer CAS-based leader election**:
 
-Every stream uses the same stream-level pipelined group commit pattern that
-Dedicated uses today. Two Tokio tasks on different client connections serve
-the same stream; they race on `stream.in_flight.fetch_add(1, Acquire)`:
+| Layer | Scope | Outcome |
+|---|---|---|
+| Stream-level | One per `Stream` | Elects a single writer per stream, assembles batches, assigns `seq`, drives replication and ACK ordering |
+| Arena-level | One per arena | Elects a single writer per arena, performs memcpy, updates the arena directory, handles arena roll |
 
-- `prev == 0` → **leader**: processes its own payload and then drains
-  followers from `stream.job_rx` in a batch.
-- `prev > 0` → **follower**: pushes `AppendJob { payload, client_reply_tx }`
-  to `stream.job_tx` and returns `None` (deferred response; leader will
-  reply).
+Shared arenas exercise both layers. Dedicated arenas exercise the stream
+layer and trivially "win" the arena-level CAS (the stream owns the arena
+exclusively).
 
-This guarantees **only one task writes to the stream's state at a time**,
-so `record_count`, `committed_bytes`, `committed_seq`, and the submission
-order to downstream (pool MPSC or per-stream arena) are all race-free —
-using plain load/store, no `fetch_add`.
+### Layer 1: Stream Leader Election (Both Classes)
 
-Leader-election state lives on `Stream` (not on `StreamEpoch`) and is used
-identically for both classes. The only per-class difference is what the
-leader's inner step does with each payload.
-
-### Leader's Inner Step — Dedicated
-
-For each payload (own + drained followers), in order:
-
-1. `seq = ep.record_count.load()`.
-2. `byte_pos = ep.committed_bytes.load()`.
-3. memcpy payload into the stream's Dedicated arena at `byte_pos`,
-   prefixed with u32 BE len.
-4. Store the per-stream u32 index entry `index[seq] = byte_pos`.
-5. Update `ep.committed_bytes`, `ep.record_count`, `ep.committed_seq`.
-6. If `rf >= 2`: broadcast `Forward(stream_id, epoch, seq, payload)` and
-   push `PendingAck` to the stream's AckQueue. Else: reply
-   `AppendAck { offset: start_offset + seq }` on the follower's
-   `client_reply_tx`.
-
-If the Dedicated arena is full, the leader rolls the arena inline (seal
-old, allocate new, `ForwardInitArena` to secondaries) within its own
-turn. The retry of the triggering payload happens on the new arena; the
-epoch is unaffected. Same as today's extent-full handling, but without
-bumping the epoch or notifying SM.
-
-### Leader's Inner Step — Shared
-
-The same leader election; the inner step substitutes a pool submit for
-the direct memcpy. Because only one task (the leader) touches pool
-submission for this stream at a time, records arrive at the pool MPSC
-in strict sequence order.
-
-Submissions are pipelined: the leader submits up to
-`shared_leader_pipeline_depth` (default 32) jobs without awaiting, then
-collects acks in submission order. This keeps the per-record MPSC hop
-from serializing the leader.
+Identical to today's Dedicated fast path:
 
 ```
-batch  = [own_payload] + drain_followers(stream.job_rx, max_batch)
-arena  = pool.active.load()
-pending: VecDeque<(seq, oneshot::Receiver<SharedAppendAck>, payload, client_reply_tx)>
+prev = stream.in_flight.fetch_add(1, Acquire)
+if prev > 0:
+    // follower
+    stream.job_tx.send(AppendJob { payload, client_reply_tx })
+    return None
+// leader turn
+loop:
+    own_batch = collect own payload
+    drained   = drain_up_to(stream.job_rx, max_stream_batch)
+    batch     = own_batch ++ drained
+    for payload in batch: assign seq = ep.record_count.load() then ++
+    write_batch(batch)                          // class-specific, Layer 2
+    for payload in batch:
+        if ep.replica_info.rf >= 2:
+            forward(stream_id, epoch, seq, payload)
+            ack_queue.push(PendingAck { seq, client_reply_tx })
+        else:
+            client_reply_tx.send(AppendAck { offset: ep.start_offset + seq })
+    ep.committed_seq.store(last_seq_in_batch + 1, Release)
+    remaining = stream.in_flight.fetch_sub(batch.len(), Release) - batch.len()
+    if remaining == 0: break
+```
 
-for payload in batch:
-    if pending.len() >= shared_leader_pipeline_depth:
-        drain_one(&mut pending)              // await oldest; updates committed_seq, forwards, queues PendingAck
-    seq = ep.record_count.load()
-    ep.record_count.store(seq + 1)
+Because only the stream leader ever touches `ep.record_count`, seq
+assignment is contention-free (plain load/store). Submission order to
+Layer 2 is strict seq order within the stream's turn, and across turns
+is FIFO by virtue of `in_flight` gating.
+
+### Layer 2: Arena Writer
+
+`write_batch` is the class-specific step.
+
+**Dedicated** — the stream owns the arena exclusively, so no arena-level
+CAS is needed; the stream leader memcpies directly. The arena struct
+still exists, but its `in_flight` / `job_tx` / `job_rx` fields are unused
+on the Dedicated path (kept only to share one struct definition across
+classes):
+
+```
+arena = stream.dedicated_arena
+for job in batch:
+    if arena has insufficient space:
+        roll_dedicated(stream)                 // seal old, allocate new,
+                                               // ForwardInitArena to secondaries
+        arena = stream.dedicated_arena
+    memcpy job.payload into arena at cursor (u32 BE len + payload)
+    directory.entries[(stream_id, epoch)].append(byte_pos, len, seq)
+    cursor += 4 + len
+    record per-job (arena_id, byte_pos) in the stream leader's local list
+```
+
+This is the same machine code as today's fast path — an inline memcpy
+loop with no atomic overhead.
+
+**Shared** — many streams converge on one arena:
+
+```
+arena = pool.active.load()                     // ArcSwap
+prev  = arena.in_flight.fetch_add(1, Acquire)
+if prev == 0:
+    // arena leader
+    process_batch(arena, own_batch)            // see below
+    loop:
+        drained_batches = drain_up_to(arena.job_rx, max_arena_batch)
+        for b in drained_batches: process_batch(arena, b); b.reply.send(...)
+        remaining = arena.in_flight.fetch_sub(1 + drained.len(), Release)
+                    - (1 + drained.len())
+        if remaining == 0: break
+else:
+    // arena follower: delegate own batch and await
     (tx, rx) = oneshot::channel()
-    arena.job_tx.send(SharedAppendJob {
-        stream_id, epoch: ep.epoch, seq, payload, reply: tx
-    })
-    pending.push_back((seq, rx, payload, client_reply_tx))
+    arena.job_tx.send(ArenaBatch { stream_id, epoch, jobs: own_batch, reply: tx })
+    ack = rx.await
+    apply ack.results to the stream leader's local list
 
-while let Some(entry) = pending.pop_front():
-    drain_one(&mut pending, entry)
-
-fn drain_one(entry):
-    let ack = entry.rx.await;
-    ep.committed_bytes.store(ep.committed_bytes.load() + 4 + entry.payload.len())
-    ep.resident_arenas.register(ack.arena_id)
-    ep.committed_seq.store(entry.seq + 1, Release)
-    if ep.replica_info.rf >= 2:
-        forward(stream_id, epoch, entry.seq, entry.payload)
-        ack_queue.push(PendingAck { seq: entry.seq, client_reply_tx: entry.client_reply_tx })
-    else:
-        entry.client_reply_tx.send(AppendAck { offset: ep.start_offset + entry.seq })
+fn process_batch(arena, b):
+    for job in b.jobs:
+        if arena has insufficient space:
+            pool.roll(arena)                   // Sealed → resident; new active;
+                                               // ForwardInitArena to secondaries
+            arena = pool.active.load()
+        memcpy job.payload at cursor
+        directory.entries[(stream_id, epoch)].append(byte_pos, len, job.seq)
+        cursor += 4 + len
+        results.push(JobResult { arena_id: arena.id, byte_pos })
 ```
 
-Note that `record_count` is bumped eagerly (at submission time) but
-`committed_seq` only advances as acks come back in order. Readers observe
-a gap-free prefix as today.
+Notes:
 
-If an ack carries `rolled_to = Some(new_id)`, the leader switches to
-`new_id` for subsequent submissions within the same batch (the pool has
-already installed it as `active`, so a fresh `pool.active.load()` picks
-it up naturally at the start of the next iteration).
+- **Inline memcpy on the winning path**: a stream whose leader wins the
+  arena CAS memcpies directly, with no channel hop. Multi-stream
+  contention is bounded by the arena-level CAS retry, not by waking a
+  long-running writer task.
+- **Per-stream grouping is automatic**: each `ArenaBatch` is one stream
+  so the arena directory entry is updated with contiguous records.
+- **Arena roll mid-batch is legal**: records in one `ArenaBatch` may
+  land on two arenas; per-job `JobResult.arena_id` captures this. The
+  stream leader then registers multiple `arena_id`s into
+  `ep.resident_arenas`.
 
 ### Ordering Guarantee
 
-In both classes, the arrival order at the downstream sink (Dedicated
-arena memcpy / Shared pool MPSC) matches the assignment order of `seq`.
-This is the core invariant that makes the per-arena directory's
-`byte_positions[i]` correspond to the `(start_offset + i)`-th record.
+- Within a stream, within a batch: stream leader assembles payloads in
+  seq order and passes them to Layer 2 in that order; arena memcpy is
+  sequential within a batch. `directory.byte_positions[i]` for record
+  `start_offset + i` is strictly monotonic per stream.
+- Within a stream, across batches: the stream's `in_flight` CAS
+  guarantees that batch B's leader turn only starts after batch A's
+  `fetch_sub` completes. The crossbeam `stream.job_rx` is FIFO, so
+  A's arena submission precedes B's. The arena's `job_rx` is FIFO, so
+  A reaches the arena leader first. Directory entries extend monotonically.
+- Across streams: arena FIFO preserves the cross-stream write order in
+  the buffer, but cross-stream ordering is irrelevant to correctness —
+  each stream's directory entry is independent.
+
+### Arena Roll
+
+Same mechanism for both classes, performed by whichever task currently
+holds the arena's exclusive write turn (the stream leader in Dedicated;
+the arena leader in Shared):
+
+1. Detect insufficient space for the next record.
+2. `state.store(Sealed)` on the current arena.
+3. Move from `ArcSwap(active)` to `pool.resident` (Shared) or from
+   `stream.dedicated_arena` to the stream's recent-arena list
+   (Dedicated).
+4. Allocate a new arena (`ArenaBuffer` via `alloc_zeroed`). Install as
+   the new `active` (Shared) or stream-arena (Dedicated).
+5. `ForwardInitArena` broadcast to secondaries (fire-and-forget).
+6. Sealed arena handed to the S3 flush task.
+7. Continue memcpy on the new arena for the remaining records in the
+   current batch.
+
+No SM round-trip. No epoch bump. No `NOTIFY_SEALED_EXTENT` (deleted).
 
 ### Forward Protocol
 
@@ -410,25 +470,13 @@ the normal LRU. The sealed epoch remains readable from memory until its
 arenas are uploaded and evicted, after which reads go through
 `epoch_arenas` + S3.
 
-### Arena Roll
-
-Identical mechanism in both classes:
-
-1. Writer detects insufficient space for the next batch.
-2. Old arena: `state = Sealed`, moved from `active` to `resident`.
-3. New arena allocated (`ArenaBuffer` via `alloc_zeroed`). New writer task
-   started. Installed as `active`.
-4. `ForwardInitArena` broadcast to secondaries (fire-and-forget).
-5. Sealed arena handed to S3 flush task.
-6. In-flight jobs not yet appended are requeued to the new arena's channel;
-   their acks carry `rolled_to = Some(new_id)` so the caller's epoch-level
-   `resident_arenas` is updated.
-
 ### Backpressure
 
-Shared writer MPSC bounded by `writer_channel_capacity`. Dedicated writers
-use the same per-arena MPSC. Full → caller awaits up to
-`arena_append_timeout_ms`; on timeout, returns `Busy` to the client.
+The arena MPSC is bounded by `writer_channel_capacity` (Shared) or trivially
+uncontended (Dedicated, owned by the stream). If the Shared arena MPSC is
+full, the stream leader awaits up to `arena_append_timeout_ms`; on timeout
+it replies `Busy` to the client. Sustained busy is the signal that drives
+runtime promotion of the stream to Dedicated.
 
 ### Runtime Promotion / Demotion
 
@@ -620,8 +668,9 @@ New `ExtentNodeConfig` fields:
 |---|---|---|
 | `shared_arena_size` | 64 MiB | Per-arena buffer size |
 | `max_resident_shared_arenas` | 64 | → 4 GiB shared budget |
-| `shared_writer_channel_capacity` | 4096 | MPSC bound |
-| `shared_leader_pipeline_depth` | 32 | Max in-flight pool submissions per stream leader |
+| `shared_writer_channel_capacity` | 4096 | Bounded arena MPSC size (in `ArenaBatch` units) |
+| `max_stream_batch` | 64 | Max stream-leader batch size (own + drained followers) |
+| `max_arena_batch` | 32 | Max arena-leader drain per turn |
 | `arena_append_timeout_ms` | 1000 | Backpressure timeout |
 | `arena_max_age_ms` | 60,000 | Idle arena roll |
 | `cache_arenas` | 4 | Per-Dedicated-stream arena memory cap |
@@ -681,8 +730,10 @@ Per epoch (debug):
 - `ArenaId`: uniqueness from `(node_id, counter)`; wire round-trip.
 - `StreamEpoch`: state machine, `resident_arenas` tracking, seal on epoch
   bump.
-- Writer-task roll: in-flight jobs requeue correctly, replies carry
-  `rolled_to`.
+- Arena roll mid-batch: records in one `ArenaBatch` straddling two arenas
+  produce per-record `JobResult.arena_id` correctly.
+- Two-layer CAS: concurrent stream leaders contending on one arena
+  serialize correctly; per-stream directory entries remain monotonic.
 
 ### Integration Tests
 
