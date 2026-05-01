@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use common::errors::{DatabaseSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
-    Epoch, ExtentId, ExtentInfo, ExtentPolicy, ExtentState, NodeMetrics, NodeState, ReplicaDetail,
-    StorageClass, StreamId,
+    ArenaClass, Epoch, ExtentId, ExtentInfo, ExtentPolicy, ExtentState, NodeMetrics, NodeState,
+    ReplicaDetail, StorageClass, StreamId,
 };
 use snafu::ResultExt;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
@@ -23,6 +23,9 @@ pub struct StreamRow {
     pub replication_factor: u8,
     pub cache_extents: u16,
     pub storage_class: StorageClass,
+    /// Declared per-stream arena class. P2 always persists `Dedicated`;
+    /// Shared routing is wired in a later plan.
+    pub arena_class: ArenaClass,
 }
 
 /// A row from the `extent` table.
@@ -191,7 +194,7 @@ impl MetadataStore {
     /// Get a stream by ID.
     pub async fn get_stream(&self, id: StreamId) -> Result<Option<StreamRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT stream_id, stream_name, replication_factor, cache_extents, storage_class FROM stream WHERE stream_id = ?",
+            "SELECT stream_id, stream_name, replication_factor, cache_extents, storage_class, arena_class FROM stream WHERE stream_id = ?",
         )
         .bind(id.0 as i64)
         .fetch_optional(&self.pool)
@@ -205,13 +208,14 @@ impl MetadataStore {
             cache_extents: r.get::<u16, _>("cache_extents"),
             storage_class: StorageClass::from_u8(r.get::<u8, _>("storage_class"))
                 .unwrap_or(StorageClass::S3),
+            arena_class: ArenaClass::from_u8(r.get::<u8, _>("arena_class")).unwrap_or_default(),
         }))
     }
 
     /// Get a stream by name.
     pub async fn get_stream_by_name(&self, name: &str) -> Result<Option<StreamRow>, StorageError> {
         let row = sqlx::query(
-            "SELECT stream_id, stream_name, replication_factor, cache_extents, storage_class FROM stream WHERE stream_name = ?",
+            "SELECT stream_id, stream_name, replication_factor, cache_extents, storage_class, arena_class FROM stream WHERE stream_name = ?",
         )
         .bind(name)
         .fetch_optional(&self.pool)
@@ -225,6 +229,7 @@ impl MetadataStore {
             cache_extents: r.get::<u16, _>("cache_extents"),
             storage_class: StorageClass::from_u8(r.get::<u8, _>("storage_class"))
                 .unwrap_or(StorageClass::S3),
+            arena_class: ArenaClass::from_u8(r.get::<u8, _>("arena_class")).unwrap_or_default(),
         }))
     }
 
