@@ -12,6 +12,7 @@ name = "hasher"
 harness = false
 
 [dependencies]
+arc-swap = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tokio-util = { workspace = true }

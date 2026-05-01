@@ -753,6 +753,11 @@ impl StreamEpoch {
         self.capacity
     }
 
+    /// u64::MAX while the epoch is not sealed; the sealed message count otherwise.
+    pub fn limit_hint(&self) -> u64 {
+        self.limit.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     /// Return a contiguous `Bytes` view of all committed record data in the arena.
     /// Useful for S3 flush -- the sealed extent can be uploaded as a single blob
     /// (after prepending header and appending footer/index).

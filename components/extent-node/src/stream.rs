@@ -1,7 +1,8 @@
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY};
 use common::errors::{InternalSnafu, StorageError};
@@ -9,6 +10,7 @@ use common::types::{Epoch, ExtentId, ExtentState, Offset, StorageClass, StreamId
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::RwLock;
 use rpc::frame::Frame;
+use smallvec::SmallVec;
 use tokio::sync::mpsc;
 use tracing::error;
 
@@ -26,7 +28,7 @@ pub enum SealReason {
 /// Mutable state protected by `RwLock`. Grouped here so that a single
 /// lock acquisition covers all fields that need coordinated mutation.
 struct StreamInner {
-    extents: Vec<StreamEpoch>,
+    // extents: Vec<StreamEpoch>,   // REMOVED — now on Stream as ArcSwap<SmallVec<...>>
 
     /// Next extent ID for autonomous creation within the current epoch.
     /// Initialized to `first_extent_id + 1` when SM sends RegisterEpoch.
@@ -49,117 +51,12 @@ struct StreamInner {
     storage_class: StorageClass,
 }
 
-impl StreamInner {
-    /// Find an extent by its ID.
-    fn find_extent(&self, extent_id: ExtentId) -> Option<&StreamEpoch> {
-        self.extents.iter().find(|e| e.id == extent_id)
-    }
-
-    /// Seal the last extent if it matches `extent_id` and is active.
-    /// Returns `(start_offset, end_offset)` or `None`.
-    fn seal_extent(
-        &self,
-        extent_id: ExtentId,
-        committed_offset: Option<u64>,
-    ) -> Option<(u64, u64)> {
-        let last = self.extents.last()?;
-        if last.id != extent_id {
-            return None;
-        }
-        if last.state() == ExtentState::Sealed {
-            return None;
-        }
-        let start_offset = last.start_offset.0;
-        let end_offset = last.seal(committed_offset);
-        Some((start_offset, end_offset))
-    }
-
-    /// Try to create the next extent (write lock must be held by caller).
-    ///
-    /// Uses `extent_capacity` for the new extent (fixed sizing).
-    /// Extent ID is incremented locally — no SM round-trip needed.
-    ///
-    /// **S3 backpressure**: Before allocating, checks if the stream is at or
-    /// over its extent limit with the oldest extent not yet flushed to S3.
-    /// In that case, eviction is blocked and creating another extent would
-    /// grow memory without bound. Returns `None` — the caller propagates
-    /// this as an error so the client seals via SM and gets a new replica
-    /// set on different nodes.
-    ///
-    /// **Memory streams**: Allocation always proceeds; eviction runs after
-    /// allocation and cleans up oldest extents unconditionally.
-    ///
-    /// Returns `Some((new_extent_id, start_offset))` on success, `None` on
-    /// backpressure.
-    fn try_create_next_extent(
-        &mut self,
-        stream_id: StreamId,
-        epoch: Epoch,
-    ) -> Option<(ExtentId, Offset)> {
-        // S3 backpressure: refuse to allocate if eviction is blocked.
-        if self.max_extents > 0
-            && self.extents.len() >= self.max_extents
-            && self.storage_class == StorageClass::S3
-            && self.extents.first().is_some_and(|e| !e.is_flushed())
-        {
-            return None;
-        }
-
-        let end_offset = self
-            .extents
-            .last()
-            .map(|e| Offset(e.start_offset.0 + e.message_count()))
-            .unwrap_or(Offset(0));
-        let new_id = self.next_extent_id;
-        self.next_extent_id = ExtentId(new_id.0 + 1);
-
-        self.extents.push(StreamEpoch::with_capacity(new_id, end_offset, self.extent_capacity, epoch));
-
-        self.evict_oldest_extents(stream_id);
-        Some((new_id, end_offset))
-    }
-
-    /// Evict oldest extents when count exceeds `max_extents`.
-    ///
-    /// Evicts from the front of the extent list (oldest first). The last extent
-    /// (active/current) is never evicted. Evicted extents are simply dropped.
-    ///
-    /// **S3 streams**: Only flushed extents are eligible for eviction. Sealed-but-
-    /// not-flushed extents are skipped — they must remain in memory until the S3
-    /// upload completes and `mark_flushed()` is called.
-    ///
-    /// **Memory streams**: All sealed extents are eligible (no S3 upload).
-    fn evict_oldest_extents(&mut self, stream_id: StreamId) {
-        if self.max_extents == 0 {
-            if self.extents.len() > 4 {
-                tracing::warn!(
-                    "stream {} has {} extents but max_extents=0 (no eviction); \
-                     memory will grow unbounded",
-                    stream_id,
-                    self.extents.len(),
-                );
-            }
-            return;
-        }
-        let is_s3 = self.storage_class == StorageClass::S3;
-        while self.extents.len() > self.max_extents && self.extents.len() > 1 {
-            // For S3 streams, only evict extents that have been flushed to S3.
-            // The oldest extent is at index 0; if it's not eligible, stop —
-            // we can't skip it and evict a newer one (ordering matters).
-            if is_s3 && !self.extents[0].is_flushed() {
-                break;
-            }
-            let _evicted = self.extents.remove(0);
-        }
-    }
-}
-
 /// A stream: an ordered, append-only sequence of messages backed by a list of extents.
 ///
 /// Thread-safe (`Send + Sync`). All public methods take `&self`:
 /// - Hot-path reads (`epoch`, `in_flight`) use lock-free atomics.
-/// - Extent reads (`append`, `read`, `try_append_active`, ...) use `inner.read()`.
-/// - Mutations (`seal`, `register_extent`, `seal_and_create_next`, ...) use `inner.write()`.
+/// - Epoch reads (`append`, `read`, `try_append_active`, ...) use `self.epochs.load()` (lock-free).
+/// - Mutations of inner fields (`seal`, `register_extent`, etc.) use `inner.write()`.
 ///
 /// The active (last) extent is a lock-free arena. Multiple concurrent appenders
 /// can write to it without any external mutex -- offset assignment, payload copy,
@@ -199,6 +96,13 @@ pub struct Stream {
     /// Lock-free via papaya::HashMap.
     flush_in_progress: papaya::HashMap<ExtentId, ()>,
 
+    /// All StreamEpochs this EN currently tracks for this stream,
+    /// sorted by epoch number ascending. Copy-on-write via ArcSwap:
+    /// readers take a single Arc load (no lock); writers clone the
+    /// SmallVec, mutate, and `store()`. Writes happen only on epoch
+    /// register / arena roll / epoch death — rare.
+    epochs: ArcSwap<SmallVec<[Arc<StreamEpoch>; 4]>>,
+
     /// Mutable state protected by RwLock.
     inner: RwLock<StreamInner>,
 }
@@ -227,14 +131,170 @@ impl Stream {
             job_rx,
             ack_queue: OnceLock::new(),
             flush_in_progress: papaya::HashMap::new(),
+            epochs: ArcSwap::from_pointee(SmallVec::new()),
             inner: RwLock::new(StreamInner {
-                extents: Vec::new(),
                 next_extent_id: ExtentId(0),
                 extent_capacity: DEFAULT_EXTENT_CAPACITY,
                 max_extents: DEFAULT_CACHE_EXTENTS as usize,
                 downstream_txs: Vec::new(),
                 storage_class: StorageClass::S3,
             }),
+        }
+    }
+
+    // ── Epoch vec helpers (lock-free reads, CoW writes) ──────────────
+
+    /// Find the epoch by extent_id in the epochs vec. Used by
+    /// with_extent and every internal find-by-id path.
+    fn find_epoch(&self, extent_id: ExtentId) -> Option<Arc<StreamEpoch>> {
+        self.epochs.load().iter().find(|e| e.id == extent_id).cloned()
+    }
+
+    /// The currently-active (last, highest-epoch) epoch. None if none
+    /// registered yet.
+    fn active_epoch(&self) -> Option<Arc<StreamEpoch>> {
+        self.epochs.load().last().cloned()
+    }
+
+    /// Insert a new epoch, keeping the vec sorted by epoch number.
+    /// RCU: clones the current SmallVec, pushes + sorts, stores.
+    fn insert_epoch(&self, new_ep: Arc<StreamEpoch>) {
+        self.epochs.rcu(|current| {
+            let mut next: SmallVec<[Arc<StreamEpoch>; 4]> = (**current).clone();
+            next.push(new_ep.clone());
+            next.sort_by_key(|e| e.epoch.0);
+            next
+        });
+    }
+
+    /// Remove the epoch with matching epoch number.
+    #[allow(dead_code)]
+    fn remove_epoch_by_number(&self, epoch: Epoch) {
+        self.epochs.rcu(|current| {
+            let mut next: SmallVec<[Arc<StreamEpoch>; 4]> = (**current).clone();
+            next.retain(|e| e.epoch != epoch);
+            next
+        });
+    }
+
+    /// Remove the head epoch (the lowest-epoch StreamEpoch). Used by
+    /// the eviction loop. No-op if the vec is empty.
+    fn remove_head_epoch(&self) {
+        self.epochs.rcu(|current| {
+            let mut next: SmallVec<[Arc<StreamEpoch>; 4]> = (**current).clone();
+            if !next.is_empty() {
+                next.remove(0);
+            }
+            next
+        });
+    }
+
+    // ── Epoch-list mutation methods (moved from StreamInner) ──────────
+
+    /// Find-by-id helper used by seal. Returns a clone of the last
+    /// epoch's Arc if and only if its id matches AND it's still Active.
+    fn seal_epoch_by_id(
+        &self,
+        extent_id: ExtentId,
+        committed_offset: Option<u64>,
+    ) -> Option<(u64, u64)> {
+        let snap = self.epochs.load();
+        let last = snap.last()?;
+        if last.id != extent_id {
+            return None;
+        }
+        if last.state() == ExtentState::Sealed {
+            return None;
+        }
+        let start_offset = last.start_offset.0;
+        let end_offset = last.seal(committed_offset);
+        Some((start_offset, end_offset))
+    }
+
+    /// Allocate a new epoch (autonomous on Primary). Returns
+    /// `Some((new_id, start_offset))` on success, `None` on
+    /// S3-backpressure block.
+    fn try_create_next_epoch(&self, epoch: Epoch) -> Option<(ExtentId, Offset)> {
+        // S3 backpressure check: read the current snapshot + inner fields.
+        let (max_extents, is_s3, capacity) = {
+            let inner = self.inner.read();
+            (inner.max_extents, inner.storage_class == StorageClass::S3, inner.extent_capacity)
+        };
+        {
+            let snap = self.epochs.load();
+            if max_extents > 0
+                && snap.len() >= max_extents
+                && is_s3
+                && snap.first().is_some_and(|e| !e.is_flushed())
+            {
+                return None;
+            }
+        }
+
+        // Compute start_offset + next id; bump next_extent_id under the write lock.
+        let (new_id, start_offset) = {
+            let snap = self.epochs.load();
+            let start = snap
+                .last()
+                .map(|e| Offset(e.start_offset.0 + e.message_count()))
+                .unwrap_or(Offset(0));
+            let mut inner = self.inner.write();
+            let new_id = inner.next_extent_id;
+            inner.next_extent_id = ExtentId(new_id.0 + 1);
+            (new_id, start)
+        };
+
+        // Allocate + insert outside the write lock. Insert ordering is by
+        // epoch number, which is monotone, so the new entry appends at the
+        // tail.
+        let ep = Arc::new(StreamEpoch::with_capacity(new_id, start_offset, capacity, epoch));
+        self.insert_epoch(ep);
+
+        self.evict_oldest_epochs();
+        Some((new_id, start_offset))
+    }
+
+    /// Evict oldest epochs when count exceeds max_extents.
+    ///
+    /// - S3 streams: only flushed epochs are eligible; oldest-first stops at
+    ///   the first un-flushed head.
+    /// - Memory streams: all but the active (last) epoch are eligible.
+    /// - max_extents == 0: unlimited; log a warn if the count grows past 4.
+    fn evict_oldest_epochs(&self) {
+        let (max_extents, is_s3) = {
+            let inner = self.inner.read();
+            (inner.max_extents, inner.storage_class == StorageClass::S3)
+        };
+        if max_extents == 0 {
+            let snap = self.epochs.load();
+            if snap.len() > 4 {
+                tracing::warn!(
+                    "stream {} has {} epochs but max_extents=0 (no eviction); \
+                     memory will grow unbounded",
+                    self.id,
+                    snap.len(),
+                );
+            }
+            return;
+        }
+        // CoW loop: check the head, decide whether to drop it, repeat.
+        loop {
+            let snap = self.epochs.load();
+            if snap.len() <= max_extents.max(1) {
+                break;
+            }
+            // Never evict the active (last) epoch.
+            if snap.len() <= 1 {
+                break;
+            }
+            let head = snap.first().expect("len checked");
+            if is_s3 && !head.is_flushed() {
+                break;
+            }
+            // Drop the snap before RCU so we don't hold an Arc to the victim
+            // across the RCU loop.
+            drop(snap);
+            self.remove_head_epoch();
         }
     }
 
@@ -282,7 +342,7 @@ impl Stream {
     /// Append a message to the specified extent. Returns the assigned
     /// offset and byte position within the extent arena.
     ///
-    /// Only requires a read lock -- the Extent is internally synchronized (lock-free).
+    /// Lock-free on the hot path: reads the epoch snapshot via ArcSwap.
     /// The byte_pos is recorded in the extent's internal index automatically.
     ///
     /// Returns an error if the extent doesn't exist.
@@ -291,8 +351,7 @@ impl Stream {
         extent_id: ExtentId,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
-        let inner = self.inner.read();
-        let extent = inner.find_extent(extent_id).ok_or_else(|| {
+        let extent = self.find_epoch(extent_id).ok_or_else(|| {
             InternalSnafu {
                 message: format!("stream {}: extent {} not found", self.id, extent_id),
             }
@@ -309,8 +368,7 @@ impl Stream {
         &self,
         payload: Bytes,
     ) -> Result<(AppendResult, ExtentId), StorageError> {
-        let inner = self.inner.read();
-        let extent = inner.extents.last().ok_or_else(|| {
+        let extent = self.active_epoch().ok_or_else(|| {
             InternalSnafu {
                 message: format!("stream {}: no active extent", self.id),
             }
@@ -323,15 +381,14 @@ impl Stream {
     /// Replicate a record; the secondary derives byte_pos from its own cursor.
     ///
     /// Delegates to `Extent::replicate()` for deterministic replication.
-    /// Only requires a read lock — the Extent handles writes internally.
+    /// Lock-free on the hot path via ArcSwap epoch snapshot.
     pub fn replicate(
         &self,
         extent_id: ExtentId,
         offset: Offset,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
-        let inner = self.inner.read();
-        let extent = inner.find_extent(extent_id).ok_or_else(|| {
+        let extent = self.find_epoch(extent_id).ok_or_else(|| {
             error!("Stream: {}, Extent: {} is not found", self.id, extent_id);
             InternalSnafu {
                 message: format!("stream {}: extent {} not found", self.id, extent_id),
@@ -353,8 +410,7 @@ impl Stream {
         offset: Offset,
         count: u32,
     ) -> Result<Vec<Bytes>, StorageError> {
-        let inner = self.inner.read();
-        let extent = inner.find_extent(extent_id).ok_or_else(|| {
+        let extent = self.find_epoch(extent_id).ok_or_else(|| {
             InternalSnafu {
                 message: format!("stream {}: extent {} not found", self.id, extent_id),
             }
@@ -378,26 +434,21 @@ impl Stream {
 
     /// Whether this stream can accept appends (its last extent is active/unsealed).
     pub fn is_mutable(&self) -> bool {
-        let inner = self.inner.read();
-        inner
-            .extents
-            .last()
+        self.active_epoch()
             .map(|e| e.state() == ExtentState::Active)
             .unwrap_or(false)
     }
 
     /// The extent ID of the active (last) extent, or None if no extents.
     pub fn active_extent_id(&self) -> Option<ExtentId> {
-        let inner = self.inner.read();
-        inner.extents.last().map(|e| e.id)
+        self.active_epoch().map(|e| e.id)
     }
 
     /// The extent ID of the last mutable extent at the given epoch.
     /// Returns None if no unsealed extent exists at that epoch.
     pub fn active_extent_at_epoch(&self, epoch: Epoch) -> Option<ExtentId> {
-        let inner = self.inner.read();
-        inner
-            .extents
+        self.epochs
+            .load()
             .iter()
             .rev()
             .find(|e| e.epoch == epoch && e.state() == ExtentState::Active)
@@ -407,9 +458,8 @@ impl Stream {
     /// The last sealed extent at the given epoch.
     /// Returns `(extent_id, start_offset, end_offset)` or None if no sealed extent exists at that epoch.
     pub fn last_sealed_extent_at_epoch(&self, epoch: Epoch) -> Option<(ExtentId, u64, u64)> {
-        let inner = self.inner.read();
-        inner
-            .extents
+        self.epochs
+            .load()
             .iter()
             .rev()
             .find(|e| e.epoch == epoch && e.is_sealed())
@@ -419,10 +469,7 @@ impl Stream {
     /// The maximum offset (exclusive): the next offset that would be assigned.
     /// Returns `Offset(0)` if the stream has no extents.
     pub fn max_offset(&self) -> Offset {
-        let inner = self.inner.read();
-        inner
-            .extents
-            .last()
+        self.active_epoch()
             .map(|e| e.next_offset())
             .unwrap_or(Offset(0))
     }
@@ -436,8 +483,7 @@ impl Stream {
     where
         F: FnOnce(&StreamEpoch) -> R,
     {
-        let inner = self.inner.read();
-        inner.find_extent(extent_id).map(f)
+        self.find_epoch(extent_id).map(|ep| f(&ep))
     }
 
     /// Report extents for this stream that belong to the specified epoch.
@@ -447,9 +493,8 @@ impl Stream {
     /// Filters by per-extent epoch, so only extents actually created under the
     /// requested epoch are returned.
     pub fn report_extents(&self, epoch: Epoch) -> Vec<(ExtentId, Offset, u64, ExtentState)> {
-        let inner = self.inner.read();
-        inner
-            .extents
+        self.epochs
+            .load()
             .iter()
             .filter(|e| e.epoch == epoch)
             .map(|e| {
@@ -468,8 +513,7 @@ impl Stream {
     /// extent was already sealed (e.g., primary already sealed via extent-full path).
     /// Returns 0 if the extent is not found or not sealed.
     pub fn sealed_end_offset(&self, extent_id: ExtentId) -> u64 {
-        let inner = self.inner.read();
-        if let Some(extent) = inner.find_extent(extent_id)
+        if let Some(extent) = self.find_epoch(extent_id)
             && extent.is_sealed()
         {
             return extent.start_offset.0 + extent.message_count();
@@ -564,16 +608,19 @@ impl Stream {
         extent_capacity: u32,
     ) {
         self.epoch.store(epoch.0, Ordering::Release);
-        let mut inner = self.inner.write();
-        inner.extent_capacity = extent_capacity;
-        inner.next_extent_id = ExtentId(id.0 + 1);
-        inner.extents.push(StreamEpoch::with_capacity(
+        {
+            let mut inner = self.inner.write();
+            inner.extent_capacity = extent_capacity;
+            inner.next_extent_id = ExtentId(id.0 + 1);
+        }
+        let ep = Arc::new(StreamEpoch::with_capacity(
             id,
             start_offset,
             extent_capacity,
             epoch,
         ));
-        inner.evict_oldest_extents(self.id);
+        self.insert_epoch(ep);
+        self.evict_oldest_epochs();
     }
 
     /// Simplified register_extent for tests and backward compatibility.
@@ -603,8 +650,7 @@ impl Stream {
     /// After seal, the stream has no active extent until SM sends a new `RegisterEpoch`
     /// or the Primary autonomously creates one via `create_next_extent()`.
     pub fn seal(&self, extent_id: ExtentId, committed_offset: Option<u64>) -> Option<(u64, u64)> {
-        let inner = self.inner.write();
-        inner.seal_extent(extent_id, committed_offset)
+        self.seal_epoch_by_id(extent_id, committed_offset)
     }
 
     /// Autonomously create the next extent on extent-full (Primary only, within same epoch).
@@ -616,8 +662,7 @@ impl Stream {
     /// backpressure blocks creation (S3 flush backlog).
     pub fn create_next_extent(&self) -> Option<(ExtentId, Offset)> {
         let epoch = Epoch(self.epoch.load(Ordering::Acquire));
-        let mut inner = self.inner.write();
-        inner.try_create_next_extent(self.id, epoch)
+        self.try_create_next_epoch(epoch)
     }
 
     /// Seal the active extent and create a new one.
@@ -625,17 +670,11 @@ impl Stream {
     /// Acquires the write lock internally. Returns the seal notification
     /// if a seal+create occurred, or None if already sealed / no active extent.
     pub fn seal_and_create_next(&self, _reason: SealReason) -> Option<SealNotification> {
-        let mut inner = self.inner.write();
-        let active_id = inner.extents.last().map(|e| e.id)?;
-        let (_, end_offset) = inner.seal_extent(active_id, None)?;
-
-        // Capacity is fixed (self.extent_capacity); no adaptive scaling.
-
-        // try_create_next_extent runs eviction first, then allocates.
-        // Returns None on backpressure (S3 flush backlog blocking eviction).
+        let active_id = self.active_epoch()?.id;
+        let (_, end_offset) = self.seal_epoch_by_id(active_id, None)?;
         let epoch = Epoch(self.epoch.load(Ordering::Acquire));
-        let (new_id, _) = inner.try_create_next_extent(self.id, epoch)?;
-        let new_capacity = inner.extents.last().map(|e| e.capacity()).unwrap_or(0);
+        let (new_id, _) = self.try_create_next_epoch(epoch)?;
+        let new_capacity = self.active_epoch().map(|e| e.capacity()).unwrap_or(0);
         Some(SealNotification {
             sealed_extent_id: active_id,
             end_offset,
@@ -665,9 +704,10 @@ pub struct SealNotification {
 impl std::fmt::Debug for Stream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.read();
+        let epochs_snap = self.epochs.load();
         f.debug_struct("Stream")
             .field("id", &self.id)
-            .field("extents", &inner.extents)
+            .field("epochs", &*epochs_snap)
             .field("epoch", &self.epoch.load(Ordering::Relaxed))
             .field("next_extent_id", &inner.next_extent_id)
             .field("extent_capacity", &inner.extent_capacity)
