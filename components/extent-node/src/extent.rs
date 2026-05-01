@@ -198,7 +198,7 @@ pub struct Extent {
     index: Box<[AtomicU32]>,
 
     /// Bitmap of extent lifecycle flags (AtomicU8):
-    /// - `FLAG_INIT_FORWARD` (0x01): prepend ForwardInitExtent before first Forward
+    /// - `FLAG_INIT_FORWARD` (0x01): prepend ForwardInitEpoch before first Forward
     ///   (checked inline during `send_forward()`)
     /// - `FLAG_CHECKSUM_RECEIVED` (0x02): ForwardChecksum received from primary
     ///   (secondary side, checked by `try_verify_checksum()`)
@@ -292,7 +292,7 @@ impl Extent {
     }
 
     /// Atomically check and clear the `FLAG_INIT_FORWARD` bit.
-    /// Returns `true` if the flag was set (i.e., caller should prepend ForwardInitExtent).
+    /// Returns `true` if the flag was set (i.e., caller should prepend ForwardInitEpoch).
     pub fn take_init_forward(&self) -> bool {
         self.flags.fetch_and(!FLAG_INIT_FORWARD, Ordering::AcqRel) & FLAG_INIT_FORWARD != 0
     }

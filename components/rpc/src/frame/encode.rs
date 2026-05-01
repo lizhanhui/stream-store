@@ -95,7 +95,7 @@ impl Frame {
             // stream_id(4) + extent_id(4) + epoch(4) + offset(8) + byte_pos(8)
             VariableHeader::Forward { .. } => 4 + 4 + 4 + 8 + 8,
             // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_class(1)
-            VariableHeader::ForwardInitExtent { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 1,
+            VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 1,
             // stream_id(4) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
             VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 4 + 8,
             // stream_id(4) + extent_id(4) + epoch(4)
@@ -498,7 +498,7 @@ impl Frame {
                 dst.put_u64(offset.0);
                 dst.put_u64(*byte_pos);
             }
-            VariableHeader::ForwardInitExtent {
+            VariableHeader::ForwardInitEpoch {
                 stream_id,
                 extent_id,
                 epoch,

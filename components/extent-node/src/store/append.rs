@@ -323,7 +323,7 @@ impl ExtentNodeStore {
                             },
                             Some(payload_for_forward),
                         );
-                        // Inject ForwardInitExtent if this is the first forward for the extent.
+                        // Inject ForwardInitEpoch if this is the first forward for the extent.
                         if let Some(init) = self.maybe_build_init_forward(stream, &forward_frame) {
                             stream.send_forward(init);
                         }

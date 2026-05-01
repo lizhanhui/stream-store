@@ -242,10 +242,10 @@ impl RequestHandler for ExtentNodeStore {
         match frame.opcode() {
             Opcode::Append => self.handle_append(frame, response_tx).await,
             Opcode::Forward => {
-                // Forward, ForwardInitExtent, and ForwardChecksum share opcode 0x0B.
+                // Forward, ForwardInitEpoch, and ForwardChecksum share opcode 0x0B.
                 match &frame.variable_header {
-                    VariableHeader::ForwardInitExtent { .. } => {
-                        self.handle_forward_init_extent(frame);
+                    VariableHeader::ForwardInitEpoch { .. } => {
+                        self.handle_forward_init_epoch(frame);
                         None // fire-and-forget, no response
                     }
                     VariableHeader::ForwardChecksum { .. } => {

@@ -256,7 +256,7 @@ pub enum VariableHeader {
     /// Sent once by primary when it starts using a new extent,
     /// before any Forward frames for that extent. Carries extent metadata
     /// so the secondary can create the extent with the correct capacity.
-    ForwardInitExtent {
+    ForwardInitEpoch {
         stream_id: StreamId,
         extent_id: ExtentId,
         epoch: Epoch,
@@ -403,7 +403,7 @@ impl VariableHeader {
             | VariableHeader::ReportExtentsResp { .. }
             | VariableHeader::ReportExtentsRespError { .. } => Opcode::ReportExtents,
             VariableHeader::Forward { .. }
-            | VariableHeader::ForwardInitExtent { .. }
+            | VariableHeader::ForwardInitEpoch { .. }
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::ForwardFlushed { .. } => Opcode::Forward,
             VariableHeader::FlushExtent { .. }

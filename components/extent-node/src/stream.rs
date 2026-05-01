@@ -554,7 +554,7 @@ impl Stream {
     }
 
     /// Register a new extent on this stream (called when SM sends RegisterEpoch
-    /// or when a secondary receives ForwardInitExtent).
+    /// or when a secondary receives ForwardInitEpoch).
     ///
     /// `extent_capacity` is the arena size for this specific extent.
     pub fn register_extent(

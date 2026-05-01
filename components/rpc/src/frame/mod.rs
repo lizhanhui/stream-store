@@ -11,7 +11,7 @@ use bytes::Bytes;
 use common::types::{
     Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
     FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
-    FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
+    FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
     FLAG_SEAL_COMMIT_RESP, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
@@ -124,7 +124,7 @@ impl Frame {
             | VariableHeader::SealEpochCommitResp { request_id, .. } => *request_id,
             VariableHeader::Watermark { .. }
             | VariableHeader::Forward { .. }
-            | VariableHeader::ForwardInitExtent { .. }
+            | VariableHeader::ForwardInitEpoch { .. }
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::ForwardFlushed { .. }
             | VariableHeader::UpdateExtentProgress { .. }
@@ -156,7 +156,7 @@ impl Frame {
             | VariableHeader::RegisterExtentAckError { stream_id, .. }
             | VariableHeader::Watermark { stream_id, .. }
             | VariableHeader::Forward { stream_id, .. }
-            | VariableHeader::ForwardInitExtent { stream_id, .. }
+            | VariableHeader::ForwardInitEpoch { stream_id, .. }
             | VariableHeader::ForwardChecksum { stream_id, .. }
             | VariableHeader::FlushExtent { stream_id, .. }
             | VariableHeader::FlushExtentResp { stream_id, .. }
@@ -212,7 +212,7 @@ impl Frame {
             | VariableHeader::RegisterExtentAckError { extent_id, .. }
             | VariableHeader::RegisterEpoch { extent_id, .. }
             | VariableHeader::Forward { extent_id, .. }
-            | VariableHeader::ForwardInitExtent { extent_id, .. }
+            | VariableHeader::ForwardInitEpoch { extent_id, .. }
             | VariableHeader::ForwardChecksum { extent_id, .. }
             | VariableHeader::FlushExtent { extent_id, .. }
             | VariableHeader::FlushExtentResp { extent_id, .. }
@@ -242,7 +242,7 @@ impl Frame {
             VariableHeader::RegisterEpoch { config, .. } => config.epoch,
             VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
             VariableHeader::Forward { epoch, .. }
-            | VariableHeader::ForwardInitExtent { epoch, .. }
+            | VariableHeader::ForwardInitEpoch { epoch, .. }
             | VariableHeader::FlushExtent { epoch, .. } => *epoch,
             VariableHeader::ReportExtents { epoch, .. }
             | VariableHeader::ReportExtentsResp { epoch, .. }
@@ -328,7 +328,7 @@ impl Frame {
             VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
             VariableHeader::UpdateExtentFlushed { .. } => FLAG_EXTENT_FLUSHED,
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
-            VariableHeader::ForwardInitExtent { .. } => FLAG_FORWARD_INIT_EXTENT,
+            VariableHeader::ForwardInitEpoch { .. } => FLAG_FORWARD_INIT_EPOCH,
             VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,
             VariableHeader::ForwardFlushed { .. } => FLAG_FORWARD_FLUSHED,
             VariableHeader::DescribeStream {

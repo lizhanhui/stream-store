@@ -11,10 +11,10 @@ use crate::stream::Stream;
 
 impl ExtentNodeStore {
     /// Check if a Forward or ForwardChecksum frame targets an extent that
-    /// needs ForwardInitExtent. Returns the init frame if so.
+    /// needs ForwardInitEpoch. Returns the init frame if so.
     ///
     /// Called on the leader side before pushing to the channel. FIFO channel
-    /// ordering guarantees ForwardInitExtent arrives before the Forward frame
+    /// ordering guarantees ForwardInitEpoch arrives before the Forward frame
     /// on the wire. The atomic `take_init_forward()` ensures exactly-once
     /// semantics — the init frame is built once and cloned to all secondaries.
     ///
@@ -43,7 +43,7 @@ impl ExtentNodeStore {
 
             let epoch = epoch.unwrap_or(ext.epoch);
             Some(Frame::new(
-                VariableHeader::ForwardInitExtent {
+                VariableHeader::ForwardInitEpoch {
                     stream_id,
                     extent_id,
                     epoch,
@@ -57,12 +57,12 @@ impl ExtentNodeStore {
         })?
     }
 
-    /// Handle ForwardInitExtent (0x0B, flag=0x01) — init-extent notification.
+    /// Handle ForwardInitEpoch (0x0B, flag=0x01) — init-extent notification.
     ///
     /// Ensures the stream exists (creating it if needed), then registers the
     /// extent with the primary's actual capacity and adaptive config.
     /// Fire-and-forget: no response.
-    pub(crate) fn handle_forward_init_extent(&self, frame: Frame) {
+    pub(crate) fn handle_forward_init_epoch(&self, frame: Frame) {
         let (
             stream_id,
             extent_id,
@@ -72,7 +72,7 @@ impl ExtentNodeStore {
             cache_extents,
             storage_class,
         ) = match &frame.variable_header {
-            VariableHeader::ForwardInitExtent {
+            VariableHeader::ForwardInitEpoch {
                 stream_id,
                 extent_id,
                 epoch,
@@ -103,12 +103,12 @@ impl ExtentNodeStore {
 
         if is_new {
             info!(
-                "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}",
+                "ForwardInitEpoch (new stream): stream={}, extent={}, start_offset={}, capacity={}",
                 stream_id, extent_id, start_offset, extent_capacity,
             );
         } else {
             info!(
-                "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}",
+                "ForwardInitEpoch: stream={}, extent={}, start_offset={}, capacity={}",
                 stream_id, extent_id, start_offset, extent_capacity,
             );
         }
@@ -136,7 +136,7 @@ impl ExtentNodeStore {
     /// The Forward frame carries (stream_id, extent_id, epoch, offset, byte_pos)
     /// so the secondary writes each record at the exact same arena position as
     /// the primary. The stream/extent must already exist (created by a prior
-    /// ForwardInitExtent or RegisterEpoch).
+    /// ForwardInitEpoch or RegisterEpoch).
     ///
     /// Returns a cumulative Watermark with the contiguous committed offset,
     /// or None if the forward cannot be processed (bad frame, unknown stream, etc.).
@@ -152,13 +152,13 @@ impl ExtentNodeStore {
             _ => return None,
         };
 
-        // Look up the stream — must exist (created by ForwardInitExtent or RegisterEpoch).
+        // Look up the stream — must exist (created by ForwardInitEpoch or RegisterEpoch).
         let streams = self.streams.pin();
         let stream = match streams.get(&stream_id) {
             Some(s) => s,
             None => {
                 warn!(
-                    "Forward for unknown stream {}, extent {} — missing ForwardInitExtent?",
+                    "Forward for unknown stream {}, extent {} — missing ForwardInitEpoch?",
                     stream_id, extent_id,
                 );
                 return None;

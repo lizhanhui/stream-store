@@ -3,7 +3,7 @@ use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpco
 use common::types::{
     Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
     FLAG_EXTENT_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
-    FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
+    FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
     FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
     StorageClass, StreamConfig, StreamId,
 };
@@ -615,7 +615,7 @@ impl Frame {
                             payload,
                         ))
                     }
-                    FLAG_FORWARD_INIT_EXTENT => {
+                    FLAG_FORWARD_INIT_EPOCH => {
                         let start_offset = Offset(body.get_u64());
                         let extent_capacity = body.get_u32();
                         let cache_extents = body.get_u16();
@@ -627,7 +627,7 @@ impl Frame {
                                 .build()
                             })?;
                         Ok((
-                            VariableHeader::ForwardInitExtent {
+                            VariableHeader::ForwardInitEpoch {
                                 stream_id,
                                 extent_id,
                                 epoch,
