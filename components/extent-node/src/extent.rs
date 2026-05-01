@@ -1,22 +1,13 @@
-use std::alloc::Layout;
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
-use crate::arena::{ArenaBuffer, OwnedArenaSlice};
+use crate::arena::{ArenaBuffer, ArenaDirectory, EpochArenaEntry, OwnedArenaSlice};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
 use common::errors::StorageError;
 use common::errors::{ExtentFullSnafu, ExtentSealedSnafu, InternalSnafu};
-use common::types::{Epoch, ExtentId, ExtentState, Offset};
-
-/// Sentinel for unwritten index entries.
-/// We use 0 so the index can be allocated with `alloc_zeroed` (OS provides
-/// pre-zeroed pages via MAP_ANONYMOUS at near-zero cost), avoiding a 13M+
-/// iteration init loop that caused ~80ms stalls on the hot append path.
-/// Actual byte positions are stored as `byte_pos + 1` to distinguish from
-/// the sentinel (since byte_pos=0 is valid for the first record).
-const INDEX_UNSET: u32 = 0;
+use common::types::{Epoch, ExtentId, ExtentState, Offset, StreamId};
 
 /// Sentinel value for `limit`: extent is not sealed.
 const LIMIT_OPEN: u64 = u64::MAX;
@@ -137,10 +128,8 @@ pub struct Extent {
     ///   with `ExtentSealed`.
     limit: AtomicU64,
 
-    /// Internal index mapping sequence number → byte position (compressed u32).
-    /// Entry i holds the byte_pos for the i-th record appended to this extent.
-    /// Capacity = extent_capacity / MIN_RECORD_SIZE.
-    index: Box<[AtomicU32]>,
+    /// Per-record byte-position directory. P2 holds exactly one entry.
+    directory: ArenaDirectory,
 
     /// Bitmap of extent lifecycle flags (AtomicU8):
     /// - `FLAG_INIT_FORWARD` (0x01): prepend ForwardInitEpoch before first Forward
@@ -184,27 +173,15 @@ impl Extent {
         // Allocate the index with alloc_zeroed: the OS provides pre-zeroed pages
         // (MAP_ANONYMOUS) at near-zero cost, avoiding a 13M+ iteration init loop
         // that caused ~80ms stalls. INDEX_UNSET == 0, so zeroed memory is correct.
-        let index_capacity = (capacity / MIN_RECORD_SIZE) as usize;
-        let index = {
-            let index_layout = Layout::from_size_align(
-                index_capacity * std::mem::size_of::<AtomicU32>(),
-                std::mem::align_of::<AtomicU32>(),
-            )
-            .expect("invalid index layout");
-            // SAFETY: layout is valid, nonzero size. alloc_zeroed returns zeroed memory.
-            // AtomicU32 has the same layout as u32, and 0u32 == INDEX_UNSET.
-            let index_ptr = unsafe { std::alloc::alloc_zeroed(index_layout) };
-            if index_ptr.is_null() {
-                std::alloc::handle_alloc_error(index_layout);
-            }
-            // SAFETY: alloc_zeroed returned a valid allocation of index_capacity * 4 bytes,
-            // all zeroed. AtomicU32 is repr-compatible with u32. We reconstruct the Vec
-            // from the raw parts so it can be converted to Box<[AtomicU32]>.
-            unsafe {
-                Vec::from_raw_parts(index_ptr as *mut AtomicU32, index_capacity, index_capacity)
-            }
-            .into_boxed_slice()
-        };
+        let record_cap = (capacity / MIN_RECORD_SIZE) as usize;
+        // TODO(P3): fill in real stream_id when StreamEpoch is introduced.
+        let entry = EpochArenaEntry::with_capacity(
+            StreamId(0),
+            epoch,
+            start_offset,
+            record_cap,
+        );
+        let directory = ArenaDirectory::new(entry);
 
         Self {
             id,
@@ -218,7 +195,7 @@ impl Extent {
             committed_offset: AtomicU64::new(start_offset.0),
             committed_bytes: AtomicU64::new(0),
             limit: AtomicU64::new(LIMIT_OPEN),
-            index,
+            directory,
             flags: AtomicU8::new(FLAG_INIT_FORWARD),
             hasher: UnsafeCell::new(crc32fast::Hasher::new()),
             finalized_crc32: AtomicU32::new(0),
@@ -477,10 +454,7 @@ impl Extent {
     /// Record byte_pos in the internal index. Called after successful commit.
     /// Stores `byte_pos + 1` to distinguish from the zero sentinel (INDEX_UNSET).
     fn index_record(&self, seq: u64, byte_pos: u64) {
-        let idx = seq as usize;
-        if idx < self.index.len() {
-            self.index[idx].store(byte_pos as u32 + 1, Ordering::Release);
-        }
+        self.directory.single_entry().record(seq, byte_pos);
     }
 
     /// Lookup byte_pos from the internal index.
@@ -489,16 +463,7 @@ impl Extent {
     /// committed yet (still holds the sentinel value 0).
     /// Decodes the stored `byte_pos + 1` encoding back to the real byte_pos.
     pub fn index_lookup(&self, seq: u64) -> Option<u64> {
-        let idx = seq as usize;
-        if idx >= self.index.len() {
-            return None;
-        }
-        let val = self.index[idx].load(Ordering::Acquire);
-        if val == INDEX_UNSET {
-            None
-        } else {
-            Some((val - 1) as u64)
-        }
+        self.directory.single_entry().lookup(seq)
     }
 
     /// Create a `Bytes` view of the entire arena buffer.
@@ -650,12 +615,12 @@ impl Extent {
         let mut seq = self.committed_offset.load(Ordering::Relaxed) - self.start_offset.0;
 
         loop {
-            let idx = seq as usize;
-            if idx >= self.index.len() {
+            let entry = self.directory.single_entry();
+            if (seq as usize) >= entry.record_capacity() {
                 break;
             }
-            let val = self.index[idx].load(Ordering::Acquire);
-            if val == INDEX_UNSET {
+            let val = match entry.raw_slot(seq) { Some(v) => v, None => break };
+            if val == crate::arena::SLOT_UNSET {
                 break; // gap — record not yet replicated
             }
             let byte_pos = (val - 1) as usize;
