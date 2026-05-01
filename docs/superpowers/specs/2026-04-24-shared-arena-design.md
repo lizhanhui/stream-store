@@ -185,7 +185,7 @@ struct EpochArenaEntry {
 }
 
 struct SharedAppendJob {
-    // One record submitted inside an ArenaBatch from a stream leader.
+    // One record submitted inside a WriteBatch from a stream leader.
     seq:     u64,
     payload: Bytes,
 }
@@ -214,22 +214,22 @@ struct SharedArena {
 
     // Arena-level leader election (CAS on entry):
     in_flight:  AtomicU64,
-    job_tx:     crossbeam::channel::Sender<ArenaBatch>,
-    job_rx:     crossbeam::channel::Receiver<ArenaBatch>,
+    job_tx:     crossbeam::channel::Sender<WriteBatch>,
+    job_rx:     crossbeam::channel::Receiver<WriteBatch>,
 
     s3_key:     OnceLock<String>,
 }
 
-struct ArenaBatch {
+struct WriteBatch {
     // One batch from one stream leader; records are already in seq order.
     stream_id: StreamId,
     epoch:     u64,
     jobs:      SmallVec<[SharedAppendJob; 16]>,
-    reply:     oneshot::Sender<ArenaBatchAck>,
+    reply:     oneshot::Sender<WriteBatchAck>,
 }
 
-struct ArenaBatchAck {
-    // Per-job result, in the same order as ArenaBatch.jobs.
+struct WriteBatchAck {
+    // Per-job result, in the same order as WriteBatch.jobs.
     // Each record's resolved (arena_id, byte_pos) — records in a batch may
     // straddle an arena roll so arena_id is per-record.
     results: SmallVec<[JobResult; 16]>,
@@ -246,7 +246,7 @@ uncontended by construction (only the owning stream's leader ever
 submits), so it degenerates to a direct-memcpy fast path.
 
 Per-(stream, epoch) grouping in the directory is trivial: each
-`ArenaBatch` belongs to exactly one `(stream_id, epoch)`, so the arena
+`WriteBatch` belongs to exactly one `(stream_id, epoch)`, so the arena
 leader drops the batch's records into one directory entry.
 
 ## Write Path
@@ -337,7 +337,7 @@ if prev == 0:
 else:
     // arena follower: delegate own batch and await
     (tx, rx) = oneshot::channel()
-    arena.job_tx.send(ArenaBatch { stream_id, epoch, jobs: own_batch, reply: tx })
+    arena.job_tx.send(WriteBatch { stream_id, epoch, jobs: own_batch, reply: tx })
     ack = rx.await
     apply ack.results to the stream leader's local list
 
@@ -358,9 +358,9 @@ Notes:
   arena CAS memcpies directly, with no channel hop. Multi-stream
   contention is bounded by the arena-level CAS retry, not by waking a
   long-running writer task.
-- **Per-stream grouping is automatic**: each `ArenaBatch` is one stream
+- **Per-stream grouping is automatic**: each `WriteBatch` is one stream
   so the arena directory entry is updated with contiguous records.
-- **Arena roll mid-batch is legal**: records in one `ArenaBatch` may
+- **Arena roll mid-batch is legal**: records in one `WriteBatch` may
   land on two arenas; per-job `JobResult.arena_id` captures this. The
   stream leader then registers multiple `arena_id`s into
   `ep.resident_arenas`.
@@ -810,7 +810,7 @@ New `ExtentNodeConfig` fields:
 | `dedicated_arena_size` | 256 MiB | Per-Dedicated-stream arena buffer size. Fixed; no adaptive grow/shrink. |
 | `shared_arena_size` | 64 MiB | Per-Shared-arena buffer size (independent between Primary and Secondary) |
 | `max_resident_shared_arenas` | 64 | → 4 GiB shared budget |
-| `shared_writer_channel_capacity` | 4096 | Bounded arena MPSC size (in `ArenaBatch` units) |
+| `shared_writer_channel_capacity` | 4096 | Bounded arena MPSC size (in `WriteBatch` units) |
 | `max_stream_batch` | 64 | Max stream-leader batch size (own + drained followers) |
 | `max_arena_batch` | 32 | Max arena-leader drain per turn |
 | `arena_append_timeout_ms` | 1000 | Backpressure timeout |
@@ -884,7 +884,7 @@ Per epoch (debug):
 - `ArenaId`: uniqueness from `(node_id, counter)`; wire round-trip.
 - `StreamEpoch`: state machine, `resident_arenas` tracking, seal on epoch
   bump.
-- Arena roll mid-batch: records in one `ArenaBatch` straddling two arenas
+- Arena roll mid-batch: records in one `WriteBatch` straddling two arenas
   produce per-record `JobResult.arena_id` correctly.
 - Two-layer CAS: concurrent stream leaders contending on one arena
   serialize correctly; per-stream directory entries remain monotonic.
