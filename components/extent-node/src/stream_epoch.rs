@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use smallvec::{SmallVec, smallvec};
 
-use crate::arena::{ArenaBuffer, ArenaDirectory, ArenaId, EpochArenaEntry, OwnedArenaSlice};
+use crate::arena::{ArenaBuffer, ArenaDirectory, ArenaId, EpochArenaEntry, JobResult, OwnedArenaSlice, SharedAppendJob};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -92,6 +92,7 @@ pub struct StreamEpoch {
     pub epoch: Epoch,
 
     /// Globally unique arena identifier. Stamped at allocation.
+    #[allow(dead_code)]
     pub(crate) arena_id: ArenaId,
 
     /// Reference-counted arena buffer. Shared with any outstanding `Bytes`
@@ -172,6 +173,19 @@ pub struct StreamEpoch {
     /// all resident arenas. Init 1. When it drops to zero, the owning
     /// Stream removes the StreamEpoch from its epochs vec.
     pub(crate) directory_ref_count: AtomicU32,
+
+    /// Arena-level leader election counter for `write_batch` (mirrors the
+    /// store-level `Stream::in_flight` but scoped to a single StreamEpoch).
+    ///
+    /// Incremented by each `write_batch` caller before writing; the first
+    /// caller (prev == 0) is the arena-level leader and proceeds directly.
+    /// Followers must not call `append_inner` concurrently — the arena's
+    /// single-writer invariant is enforced by the caller at the store level.
+    ///
+    /// Exposed so that `DedicatedArenaPool::write_batch` (added in a later
+    /// phase) can read and update it without going through an Arc.
+    #[allow(dead_code)]
+    pub(crate) arena_in_flight: AtomicU64,
 }
 
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
@@ -218,6 +232,7 @@ impl StreamEpoch {
             finalized_crc32: AtomicU32::new(0),
             resident_arenas: Mutex::new(smallvec![arena_id]),
             directory_ref_count: AtomicU32::new(1),
+            arena_in_flight: AtomicU64::new(0),
         }
     }
 
@@ -275,6 +290,33 @@ impl StreamEpoch {
     /// for unit tests where single-threaded access is guaranteed.
     pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
         self.append_inner(payload)
+    }
+
+    /// Arena-level batch append: processes a slice of [`SharedAppendJob`]s
+    /// by calling [`append_inner`] for each one and collecting the results.
+    ///
+    /// # Concurrency model
+    ///
+    /// `write_batch` is the arena-level analogue of the store-level pipelined
+    /// group-commit loop. The **single-writer invariant** of `append_inner` is
+    /// upheld here via the **store-level** `Stream::in_flight` counter: only one
+    /// thread (the stream-level leader) calls `write_batch` at a time.
+    ///
+    /// `arena_in_flight` is provided as a hook for future phases (e.g. the
+    /// Shared arena pool) where multiple streams may share an arena and require
+    /// a second level of leader election. In P2 (Dedicated path), `write_batch`
+    /// is always called from the store-level leader, so no contention occurs.
+    ///
+    /// # Returns
+    ///
+    /// One [`JobResult`] per input job, in the same order as `jobs`.
+    #[allow(dead_code)]
+    pub(crate) fn write_batch(&self, jobs: &[SharedAppendJob]) -> SmallVec<[JobResult; 8]> {
+        let mut results = SmallVec::with_capacity(jobs.len());
+        for job in jobs {
+            results.push(self.append_inner(job.payload.clone()));
+        }
+        results
     }
 
     /// Single-writer append: plain loads/stores on cursors.
@@ -790,6 +832,7 @@ impl StreamEpoch {
     }
 
     /// Return a snapshot of the arenas holding directory entries for this epoch.
+    #[allow(dead_code)]
     pub(crate) fn resident_arenas(&self) -> SmallVec<[ArenaId; 4]> {
         self.resident_arenas.lock().unwrap().clone()
     }
@@ -1319,5 +1362,66 @@ mod tests {
         }
         // After all corrections, limit should be 50 (the lowest)
         assert!(extent.is_sealed());
+    }
+
+    #[test]
+    fn write_batch_basic() {
+        use crate::arena::SharedAppendJob;
+
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+
+        let jobs = vec![
+            SharedAppendJob::new(1, Bytes::from_static(b"msg0")),
+            SharedAppendJob::new(2, Bytes::from_static(b"msg1")),
+            SharedAppendJob::new(3, Bytes::from_static(b"msg2")),
+        ];
+
+        let results = ext.write_batch(&jobs);
+
+        assert_eq!(results.len(), 3);
+        let r0 = results[0].as_ref().unwrap();
+        let r1 = results[1].as_ref().unwrap();
+        let r2 = results[2].as_ref().unwrap();
+
+        assert_eq!(r0.offset, Offset(0));
+        assert_eq!(r1.offset, Offset(1));
+        assert_eq!(r2.offset, Offset(2));
+        assert_eq!(r0.byte_pos, 0);
+        // "msg0" = 4 bytes, record = 4+4 = 8 bytes
+        assert_eq!(r1.byte_pos, 8);
+        assert_eq!(r2.byte_pos, 16);
+        assert_eq!(ext.message_count(), 3);
+    }
+
+    #[test]
+    fn write_batch_empty() {
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let results = ext.write_batch(&[]);
+        assert!(results.is_empty());
+        assert_eq!(ext.message_count(), 0);
+    }
+
+    #[test]
+    fn write_batch_propagates_errors() {
+        use crate::arena::SharedAppendJob;
+
+        // Tiny capacity: 9 bytes → room for exactly one 4-byte payload record.
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 9, Epoch(0), ArenaId(0));
+
+        let jobs = vec![
+            SharedAppendJob::new(1, Bytes::from_static(b"fits")), // 4+4=8 bytes, fits
+            SharedAppendJob::new(2, Bytes::from_static(b"nope")), // 4+4=8 bytes, exceeds capacity
+        ];
+
+        let results = ext.write_batch(&jobs);
+        assert_eq!(results.len(), 2);
+        assert!(results[0].is_ok());
+        assert!(matches!(results[1], Err(StorageError::ExtentFull { .. })));
+    }
+
+    #[test]
+    fn arena_in_flight_initialized_to_zero() {
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        assert_eq!(ext.arena_in_flight.load(Ordering::Relaxed), 0);
     }
 }
