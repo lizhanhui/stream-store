@@ -34,6 +34,12 @@ impl ExtentNodeStore {
         let epoch = config.epoch;
         let replication_factor = config.replication_factor;
 
+        tracing::debug!(
+            arena_class = ?config.arena_class,
+            stream_id = %stream_id,
+            "RegisterEpoch arena_class"
+        );
+
         // Normalize capacity bounds: 0 means use default.
         let policy = ExtentPolicy {
             cache: config.policy.cache,

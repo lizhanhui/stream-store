@@ -2,8 +2,9 @@ use super::*;
 use bytes::{BufMut, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE,
-    FLAG_SEAL_COMMIT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
+    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME,
+    FLAG_RESPONSE, FLAG_SEAL_COMMIT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
+    StorageClass, StreamConfig, StreamId,
 };
 
 fn sample_append_frame() -> Frame {
@@ -684,5 +685,96 @@ fn update_extent_flushed_round_trip() {
         _ => panic!("expected UpdateExtentFlushed"),
     }
     assert!(decoded.payload.is_none());
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn register_epoch_arena_class_round_trip() {
+    let config = StreamConfig {
+        stream_id: StreamId(77),
+        replication_factor: 3,
+        epoch: Epoch(2),
+        storage_class: StorageClass::S3,
+        arena_class: ArenaClass::Shared,
+        policy: ExtentPolicy { cache: 4 },
+    };
+    let frame = Frame::new(
+        VariableHeader::RegisterEpoch {
+            request_id: 55,
+            extent_id: ExtentId(9),
+            role: 0,
+            config,
+        },
+        None,
+    );
+
+    let mut buf = BytesMut::new();
+    frame.encode(&mut buf);
+
+    let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded.opcode(), Opcode::RegisterEpoch);
+    match &decoded.variable_header {
+        VariableHeader::RegisterEpoch {
+            request_id,
+            extent_id,
+            role,
+            config: decoded_config,
+        } => {
+            assert_eq!(*request_id, 55);
+            assert_eq!(*extent_id, ExtentId(9));
+            assert_eq!(*role, 0);
+            assert_eq!(decoded_config.stream_id, StreamId(77));
+            assert_eq!(decoded_config.replication_factor, 3);
+            assert_eq!(decoded_config.epoch, Epoch(2));
+            assert_eq!(decoded_config.arena_class, ArenaClass::Shared);
+        }
+        _ => panic!("expected RegisterEpoch"),
+    }
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn forward_init_epoch_arena_class_round_trip() {
+    let frame = Frame::new(
+        VariableHeader::ForwardInitEpoch {
+            stream_id: StreamId(42),
+            extent_id: ExtentId(3),
+            epoch: Epoch(7),
+            start_offset: Offset(0),
+            extent_capacity: 1024,
+            cache_extents: 2,
+            storage_class: StorageClass::S3,
+            arena_class: ArenaClass::Shared,
+        },
+        None,
+    );
+
+    let mut buf = BytesMut::new();
+    frame.encode(&mut buf);
+
+    let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded.opcode(), Opcode::Forward);
+    match &decoded.variable_header {
+        VariableHeader::ForwardInitEpoch {
+            stream_id,
+            extent_id,
+            epoch,
+            start_offset,
+            extent_capacity,
+            cache_extents,
+            storage_class,
+            arena_class,
+        } => {
+            assert_eq!(*stream_id, StreamId(42));
+            assert_eq!(*extent_id, ExtentId(3));
+            assert_eq!(*epoch, Epoch(7));
+            assert_eq!(*start_offset, Offset(0));
+            assert_eq!(*extent_capacity, 1024);
+            assert_eq!(*cache_extents, 2);
+            assert_eq!(*storage_class, StorageClass::S3);
+            assert_eq!(*arena_class, ArenaClass::Shared);
+        }
+        _ => panic!("expected ForwardInitEpoch"),
+    }
     assert!(buf.is_empty());
 }

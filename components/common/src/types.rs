@@ -235,6 +235,7 @@ pub struct StreamConfig {
     pub epoch: Epoch,
     pub storage_class: StorageClass,
     pub policy: ExtentPolicy,
+    pub arena_class: ArenaClass,
 }
 
 /// State of an extent in metadata.

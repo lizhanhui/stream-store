@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::types::{
-    Epoch, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+    ArenaClass, Epoch, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
 };
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::build_register_extent_payload;
@@ -84,6 +84,7 @@ async fn register_extent(
                     replication_factor,
                     epoch: Epoch(0),
                     storage_class: StorageClass::S3,
+                    arena_class: ArenaClass::Dedicated,
                     policy: ExtentPolicy { cache: 4 },
                 },
             },

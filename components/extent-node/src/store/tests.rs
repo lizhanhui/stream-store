@@ -5,7 +5,8 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::config::DEFAULT_CACHE_EXTENTS;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass,
+    StreamConfig, StreamId,
 };
 use rpc::frame::{Frame, VariableHeader};
 use server::handler::RequestHandler;
@@ -20,6 +21,7 @@ fn test_config(stream_id: u32, replication_factor: u8) -> StreamConfig {
         replication_factor,
         epoch: Epoch(0),
         storage_class: StorageClass::S3,
+        arena_class: ArenaClass::Dedicated,
         policy: ExtentPolicy {
             cache: DEFAULT_CACHE_EXTENTS,
         },

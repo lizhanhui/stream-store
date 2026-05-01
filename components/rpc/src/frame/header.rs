@@ -1,6 +1,7 @@
 use bytes::Bytes;
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass,
+    StreamConfig, StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.
@@ -264,6 +265,8 @@ pub enum VariableHeader {
         cache_extents: u16,
         /// Storage class for sealed extents: S3 (0) or Memory (1).
         storage_class: StorageClass,
+        /// Arena class for this stream: Dedicated (0) or Shared (1).
+        arena_class: ArenaClass,
     },
     /// CRC32 checksum verification (Forward, flag=0x02). Fire-and-forget.
     /// Sent by primary after sealing an extent so secondaries can verify

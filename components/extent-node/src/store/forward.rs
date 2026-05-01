@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use common::errors::StorageError;
-use common::types::{Epoch, ExtentId, ExtentPolicy, Offset, StreamId};
+use common::types::{ArenaClass, Epoch, ExtentId, ExtentPolicy, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
@@ -51,6 +51,7 @@ impl ExtentNodeStore {
                     extent_capacity: ext.capacity(),
                     cache_extents: stream.max_extents() as u16,
                     storage_class: stream.storage_class(),
+                    arena_class: ArenaClass::Dedicated,
                 },
                 None,
             ))
@@ -71,6 +72,7 @@ impl ExtentNodeStore {
             extent_capacity,
             cache_extents,
             storage_class,
+            arena_class,
         ) = match &frame.variable_header {
             VariableHeader::ForwardInitEpoch {
                 stream_id,
@@ -80,6 +82,7 @@ impl ExtentNodeStore {
                 extent_capacity,
                 cache_extents,
                 storage_class,
+                arena_class,
             } => (
                 *stream_id,
                 *extent_id,
@@ -88,9 +91,16 @@ impl ExtentNodeStore {
                 *extent_capacity,
                 *cache_extents,
                 *storage_class,
+                *arena_class,
             ),
             _ => return,
         };
+
+        tracing::debug!(
+            arena_class = ?arena_class,
+            stream_id = %stream_id,
+            "ForwardInitEpoch arena_class"
+        );
 
         let is_new = self.try_create_stream(
             stream_id,

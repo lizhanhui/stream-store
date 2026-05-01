@@ -74,8 +74,8 @@ impl Frame {
             VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
-            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + cache_extents(2) + storage_class(1)
-            VariableHeader::RegisterEpoch { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 2 + 1,
+            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + cache_extents(2) + storage_class(1) + arena_class(1)
+            VariableHeader::RegisterEpoch { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 2 + 1 + 1,
             // request_id(4) + stream_id(4) + extent_id(4)
             VariableHeader::RegisterEpochAck { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
@@ -94,8 +94,8 @@ impl Frame {
             VariableHeader::ReportExtentsRespError { .. } => 4 + 4 + 4 + 2,
             // stream_id(4) + extent_id(4) + epoch(4) + offset(8)
             VariableHeader::Forward { .. } => 4 + 4 + 4 + 8,
-            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_class(1)
-            VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 1,
+            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_class(1) + arena_class(1)
+            VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 1 + 1,
             // stream_id(4) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
             VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 4 + 8,
             // stream_id(4) + extent_id(4) + epoch(4)
@@ -434,6 +434,7 @@ impl Frame {
                 dst.put_u32(config.epoch.0);
                 dst.put_u16(config.policy.cache);
                 dst.put_u8(config.storage_class.as_u8());
+                dst.put_u8(config.arena_class.as_u8());
             }
             VariableHeader::ConnectAck { request_id }
             | VariableHeader::DisconnectAck { request_id } => {
@@ -504,6 +505,7 @@ impl Frame {
                 extent_capacity,
                 cache_extents,
                 storage_class,
+                arena_class,
             } => {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
@@ -512,6 +514,7 @@ impl Frame {
                 dst.put_u32(*extent_capacity);
                 dst.put_u16(*cache_extents);
                 dst.put_u8(storage_class.as_u8());
+                dst.put_u8(arena_class.as_u8());
             }
             VariableHeader::ForwardChecksum {
                 stream_id,

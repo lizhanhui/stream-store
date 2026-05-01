@@ -8,7 +8,8 @@ use bytes::Bytes;
 use common::config::DEFAULT_CACHE_EXTENTS;
 use common::errors::{InternalSnafu, StorageError};
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass,
+    StreamConfig, StreamId,
 };
 use futures_util::future;
 use rpc::frame::{Frame, VariableHeader};
@@ -766,6 +767,7 @@ impl StreamManagerStore {
                 epoch: Epoch(0),
                 storage_class,
                 policy,
+                arena_class: ArenaClass::Dedicated,
             };
             let (extent_id, primary_addr) =
                 self.allocate_and_notify_replica_set(config, 0).await?;
@@ -1175,9 +1177,9 @@ impl StreamManagerStore {
             self.store.get_stream_replication_factor(stream_id).await? as usize;
         let cache_extents = self.store.get_stream_cache_extents(stream_id).await?;
         let stream_row = self.store.get_stream(stream_id).await?;
-        let storage_class = stream_row
-            .map(|r| r.storage_class)
-            .unwrap_or(StorageClass::S3);
+        let (storage_class, arena_class) = stream_row
+            .map(|r| (r.storage_class, r.arena_class))
+            .unwrap_or((StorageClass::S3, ArenaClass::Dedicated));
         // Failover allocation: degrade RF if necessary, as long as quorum is preserved.
         // Quorum = floor(RF/2) + 1. E.g., RF=3 → quorum=2, so degraded RF=2 is acceptable.
         let quorum = replication_factor / 2 + 1;
@@ -1211,6 +1213,7 @@ impl StreamManagerStore {
                     replication_factor: node_addrs.len() as u8,
                     epoch,
                     storage_class,
+                    arena_class,
                     policy: ExtentPolicy { cache: cache_extents },
                 };
 

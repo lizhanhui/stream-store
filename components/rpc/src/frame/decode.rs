@@ -1,8 +1,8 @@
 use bytes::{Buf, Bytes, BytesMut};
 use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpcodeSnafu};
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
-    FLAG_EXTENT_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
+    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME,
+    FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
     FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
     FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
     StorageClass, StreamConfig, StreamId,
@@ -536,6 +536,7 @@ impl Frame {
                         }
                         .build()
                     })?;
+                    let arena_class = ArenaClass::from_u8(body.get_u8()).unwrap_or_default();
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::RegisterEpoch {
@@ -547,6 +548,7 @@ impl Frame {
                                 replication_factor,
                                 epoch,
                                 storage_class,
+                                arena_class,
                                 policy: ExtentPolicy {
                                     cache,
                                 },
@@ -624,6 +626,7 @@ impl Frame {
                                 }
                                 .build()
                             })?;
+                        let arena_class = ArenaClass::from_u8(body.get_u8()).unwrap_or_default();
                         Ok((
                             VariableHeader::ForwardInitEpoch {
                                 stream_id,
@@ -633,6 +636,7 @@ impl Frame {
                                 extent_capacity,
                                 cache_extents,
                                 storage_class,
+                                arena_class,
                             },
                             None,
                         ))
