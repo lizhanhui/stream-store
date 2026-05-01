@@ -458,17 +458,18 @@ Goal: Move today's `Extent` (minus the parts extracted in Phase 1) to a new `str
 | `mod extent;` in lib.rs | `mod stream_epoch;` |
 | method names on `Extent` | unchanged on `StreamEpoch` |
 | `AppendResult` | unchanged (moves with the file) |
-| local variable names `extent` | `epoch` (spec vocabulary) |
-| `ExtentState` | `EpochState` (rename the enum in `common/src/types.rs` too) |
+| local variable names `extent` | `epoch` (spec vocabulary), WHERE the local refers to a `&StreamEpoch`. Do not rename `extent_id` locals — that's still the column name. |
 
-Note: `ExtentId` (u32, in `common/src/types.rs`) is NOT renamed in P2. The spec says `(stream_id, epoch)` should fully replace it, but the MySQL `extent_id` column is still present (Phase 1 of P1 deferred column removal). Keep `ExtentId` with its current name and semantics; P2 just renames the Rust struct that used to be called `Extent`.
+**Scope reduction vs. original P2 draft:** `ExtentState` is NOT renamed in this plan. Today's enum lives in `common/src/types.rs` and is used by 24 files including every integration test and the entire stream-manager metadata layer. The spec's eventual state machine (`Open | Sealed`, collapsing `Active | Sealed | Flushed`) is a bigger semantic change than this plan covers, so the rename happens in a later plan alongside the state-machine collapse. `ExtentState::Active | Sealed | Flushed` stays intact in P2.
+
+Similarly, `ExtentId` (u32 row id in `common/src/types.rs`) is NOT renamed. The MySQL `extent_id` column is still present (P1 deferred column removal), so the Rust row-identity type keeps matching it.
 
 - [ ] **Step 1: Create stream_epoch.rs**
 
 `git mv components/extent-node/src/extent.rs components/extent-node/src/stream_epoch.rs`
 
 Then in `stream_epoch.rs`:
-1. Rename `pub struct Extent` → `pub struct StreamEpoch` (replace_all on `extent.rs` is fine — match whole word).
+1. Rename `pub struct Extent` → `pub struct StreamEpoch` (replace_all on the file, match whole word).
 2. Rename `impl Extent` → `impl StreamEpoch`.
 3. Doc comments: replace "extent" with "epoch" only where the spec vocabulary changed. Concretely:
    - "Extent has been flushed" → "StreamEpoch has been flushed"
@@ -477,11 +478,11 @@ Then in `stream_epoch.rs`:
    - "`Extent::` " → "`StreamEpoch::`"
    - Leave "extent_id" literal (it's still the column/field name).
 4. Rename local method `Extent::seal` helpers that return `(start, end)` — no signature change, just doc tweaks.
-5. `impl Debug for Extent` → `impl Debug for StreamEpoch`.
+5. `impl Debug for Extent` → `impl Debug for StreamEpoch` if one exists.
 
-- [ ] **Step 2: Rename ExtentState → EpochState**
+- [ ] **Step 2: DO NOT rename ExtentState or ExtentId**
 
-In `components/common/src/types.rs`: rename `enum ExtentState` → `enum EpochState`. Variants (`Active`, `Sealed`, `Flushed`) unchanged. Update `Display`/`FromStr`/serialization impls.
+`ExtentState` remains the name of the state enum in `common/src/types.rs`. `ExtentId` remains the u32 row-identity type. Only the `Extent` struct → `StreamEpoch` rename is in scope for this plan.
 
 - [ ] **Step 3: Update lib.rs**
 
@@ -493,10 +494,10 @@ In `components/common/src/types.rs`: rename `enum ExtentState` → `enum EpochSt
 
 Run:
 ```bash
-grep -rn 'crate::extent::\|use crate::extent\|extent::Extent\|: Extent\|-> Extent\|&Extent\|&mut Extent\|Vec<Extent>\|ExtentState\b' components/ tests/ --include='*.rs'
+grep -rn 'crate::extent::\|use crate::extent\|extent::Extent\|: Extent\b\|-> Extent\b\|&Extent\b\|&mut Extent\b\|Vec<Extent>\|Box<Extent>\|Extent::with_capacity' components/ tests/ --include='*.rs'
 ```
 
-For every match, rewrite to `StreamEpoch` / `stream_epoch` / `EpochState` as appropriate. The pattern set is small; ≤ 50 files in `components/extent-node/src` and `tests/`.
+For every match, rewrite to `StreamEpoch` / `stream_epoch` as appropriate. The pattern set is localized to `components/extent-node/src` — integration tests use `client::` APIs, not `Extent` directly.
 
 - [ ] **Step 5: Update Stream to hold StreamEpoch**
 
@@ -522,12 +523,13 @@ refactor(epoch): rename Extent to StreamEpoch and move to stream_epoch.rs
 Introduces the spec's StreamEpoch vocabulary on the ExtentNode side:
 
   Extent          -> StreamEpoch
-  ExtentState     -> EpochState
   extent.rs       -> stream_epoch.rs
   crate::extent   -> crate::stream_epoch
 
-ExtentId stays as the u32 row-identity type; the MySQL extent_id column
-is still present (column removal is deferred to a later plan).
+ExtentId (u32 row identity) and ExtentState (Active | Sealed | Flushed)
+both stay: the MySQL extent_id column is still present and the state
+machine's eventual collapse to Open | Sealed is a bigger semantic
+change deferred to a later plan.
 
 No behavior change. Stream.extents is still a Vec<StreamEpoch>; the
 ArcSwap<SmallVec<Arc<StreamEpoch>>> migration is Phase 3.
