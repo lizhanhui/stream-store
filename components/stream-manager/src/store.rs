@@ -340,7 +340,7 @@ impl StreamManagerStore {
     /// Register the new extent on the Primary ExtentNode and wait for its ACK.
     ///
     /// This guarantees the Primary is ready to accept appends before any client
-    /// learns about the new extent (via SealStreamManagerResp or DescribeStream).
+    /// learns about the new extent (via SealStreamResp or DescribeStream).
     ///
     /// Uses a 1-second timeout covering both TCP connect and the RegisterEpoch
     /// round-trip. On a healthy LAN this completes in sub-millisecond; a timeout
@@ -804,11 +804,11 @@ impl StreamManagerStore {
 
     /// Seal an extent for a stream and allocate a new replica set.
     ///
-    /// Receives SealStreamManagerRequest(stream_id, epoch) from the client.
+    /// Receives SealStreamRequest(stream_id, epoch) from the client.
     /// SM forwards seal to the Primary of that epoch and allocates a new extent.
     async fn handle_seal_stream_manager(&self, frame: Frame) -> Frame {
         let (request_id, stream_id, epoch) = match &frame.variable_header {
-            VariableHeader::SealStreamManagerRequest {
+            VariableHeader::SealStreamRequest {
                 request_id,
                 stream_id,
                 epoch,
@@ -818,7 +818,7 @@ impl StreamManagerStore {
                     frame.request_id(),
                     frame.stream_id(),
                     ErrorCode::InternalError,
-                    "invalid SealStreamManagerRequest frame",
+                    "invalid SealStreamRequest frame",
                 );
             }
         };
@@ -1440,7 +1440,7 @@ impl StreamManagerStore {
     /// 2. Forward SealEpochPrepare to the Primary — it knows the ground truth.
     /// 3. Primary seals its active extent and responds with SealEpochResp.
     /// 4. SM reconciles metadata, bumps epoch, allocates new extent on new replica set.
-    /// 5. SM responds to client with SealStreamManagerResp (new epoch/extent info).
+    /// 5. SM responds to client with SealStreamResp (new epoch/extent info).
     async fn handle_epoch_seal(&self, request_id: u32, stream_id: StreamId, epoch: Epoch) -> Frame {
         info!("Epoch-based seal: stream={}, epoch={}", stream_id, epoch);
 
@@ -1481,7 +1481,7 @@ impl StreamManagerStore {
                 .map(|r| r.node_addr.clone())
                 .unwrap_or_default();
             return Frame::new(
-                VariableHeader::SealStreamManagerResp {
+                VariableHeader::SealStreamResp {
                     request_id,
                     stream_id,
                     offset: Offset(0),
@@ -1620,7 +1620,7 @@ impl StreamManagerStore {
                 {
                     Ok((_new_extent_id, new_primary_addr)) => {
                         return Frame::new(
-                            VariableHeader::SealStreamManagerResp {
+                            VariableHeader::SealStreamResp {
                                 request_id,
                                 stream_id,
                                 offset: Offset(0),
@@ -1687,7 +1687,7 @@ impl StreamManagerStore {
             .await
         {
             Ok((_new_extent_id, new_primary_addr)) => Frame::new(
-                VariableHeader::SealStreamManagerResp {
+                VariableHeader::SealStreamResp {
                     request_id,
                     stream_id,
                     offset: Offset(end_offset),

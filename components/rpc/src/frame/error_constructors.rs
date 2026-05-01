@@ -51,7 +51,7 @@ impl Frame {
         message: &str,
     ) -> Frame {
         Frame::new(
-            VariableHeader::SealStreamManagerRespError {
+            VariableHeader::SealStreamRespError {
                 request_id,
                 stream_id,
                 error_code,
@@ -284,7 +284,7 @@ impl Frame {
                 error_code,
                 message,
             ),
-            VariableHeader::SealStreamManagerRequest {
+            VariableHeader::SealStreamRequest {
                 request_id,
                 stream_id,
                 ..

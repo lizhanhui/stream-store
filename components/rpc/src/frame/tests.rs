@@ -213,7 +213,7 @@ fn read_with_count() {
 #[test]
 fn seal_stream_manager_request_round_trip() {
     let frame = Frame::new(
-        VariableHeader::SealStreamManagerRequest {
+        VariableHeader::SealStreamRequest {
             request_id: 1,
             stream_id: StreamId(10),
             epoch: Epoch(5),
@@ -240,7 +240,7 @@ fn seal_stream_manager_request_round_trip() {
 fn seal_stream_manager_resp_round_trip() {
     let addr = Bytes::from_static(b"127.0.0.1:9001");
     let frame = Frame::new(
-        VariableHeader::SealStreamManagerResp {
+        VariableHeader::SealStreamResp {
             request_id: 2,
             stream_id: StreamId(10),
             offset: Offset(42),
@@ -264,7 +264,7 @@ fn seal_stream_manager_resp_round_trip() {
     assert_eq!(decoded.epoch(), Epoch(6));
     assert!(!decoded.is_error_response());
     match &decoded.variable_header {
-        VariableHeader::SealStreamManagerResp {
+        VariableHeader::SealStreamResp {
             primary_addr,
             new_epoch,
             ..
@@ -272,7 +272,7 @@ fn seal_stream_manager_resp_round_trip() {
             assert_eq!(primary_addr, &addr);
             assert_eq!(*new_epoch, Epoch(6));
         }
-        _ => panic!("expected SealStreamManagerResp"),
+        _ => panic!("expected SealStreamResp"),
     }
     assert!(buf.is_empty());
 }

@@ -82,9 +82,9 @@ impl Frame {
             | VariableHeader::Read { request_id, .. }
             | VariableHeader::ReadResp { request_id, .. }
             | VariableHeader::ReadRespError { request_id, .. }
-            | VariableHeader::SealStreamManagerRequest { request_id, .. }
-            | VariableHeader::SealStreamManagerResp { request_id, .. }
-            | VariableHeader::SealStreamManagerRespError { request_id, .. }
+            | VariableHeader::SealStreamRequest { request_id, .. }
+            | VariableHeader::SealStreamResp { request_id, .. }
+            | VariableHeader::SealStreamRespError { request_id, .. }
             | VariableHeader::SealEpochPrepare { request_id, .. }
             | VariableHeader::SealEpochResp { request_id, .. }
             | VariableHeader::SealEpochRespError { request_id, .. }
@@ -142,9 +142,9 @@ impl Frame {
             | VariableHeader::Read { stream_id, .. }
             | VariableHeader::ReadResp { stream_id, .. }
             | VariableHeader::ReadRespError { stream_id, .. }
-            | VariableHeader::SealStreamManagerRequest { stream_id, .. }
-            | VariableHeader::SealStreamManagerResp { stream_id, .. }
-            | VariableHeader::SealStreamManagerRespError { stream_id, .. }
+            | VariableHeader::SealStreamRequest { stream_id, .. }
+            | VariableHeader::SealStreamResp { stream_id, .. }
+            | VariableHeader::SealStreamRespError { stream_id, .. }
             | VariableHeader::SealEpochPrepare { stream_id, .. }
             | VariableHeader::SealEpochResp { stream_id, .. }
             | VariableHeader::SealEpochRespError { stream_id, .. }
@@ -187,7 +187,7 @@ impl Frame {
             VariableHeader::AppendAck { offset, .. }
             | VariableHeader::ReadResp { offset, .. }
             | VariableHeader::ReadRespError { offset, .. }
-            | VariableHeader::SealStreamManagerResp { offset, .. }
+            | VariableHeader::SealStreamResp { offset, .. }
             | VariableHeader::QueryOffsetResp { offset, .. }
             | VariableHeader::Watermark { offset, .. }
             | VariableHeader::Forward { offset, .. }
@@ -234,11 +234,11 @@ impl Frame {
             | VariableHeader::AppendAck { epoch, .. }
             | VariableHeader::AppendAckError { epoch, .. }
             | VariableHeader::CreateStreamResp { epoch, .. } => *epoch,
-            VariableHeader::SealStreamManagerRequest { epoch, .. }
+            VariableHeader::SealStreamRequest { epoch, .. }
             | VariableHeader::SealEpochPrepare { epoch, .. }
             | VariableHeader::SealEpochResp { epoch, .. }
             | VariableHeader::SealEpochCommit { epoch, .. } => *epoch,
-            VariableHeader::SealStreamManagerResp { new_epoch, .. } => *new_epoch,
+            VariableHeader::SealStreamResp { new_epoch, .. } => *new_epoch,
             VariableHeader::RegisterEpoch { config, .. } => config.epoch,
             VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
             VariableHeader::Forward { epoch, .. }
@@ -266,7 +266,7 @@ impl Frame {
         match &self.variable_header {
             VariableHeader::AppendAckError { error_code, .. }
             | VariableHeader::ReadRespError { error_code, .. }
-            | VariableHeader::SealStreamManagerRespError { error_code, .. }
+            | VariableHeader::SealStreamRespError { error_code, .. }
             | VariableHeader::SealEpochRespError { error_code, .. }
             | VariableHeader::CreateStreamRespError { error_code, .. }
             | VariableHeader::QueryOffsetRespError { error_code, .. }
@@ -296,7 +296,7 @@ impl Frame {
             // ── Error responses: FLAG_RESPONSE_ERROR (0x80) ──
             VariableHeader::AppendAckError { .. }
             | VariableHeader::ReadRespError { .. }
-            | VariableHeader::SealStreamManagerRespError { .. }
+            | VariableHeader::SealStreamRespError { .. }
             | VariableHeader::SealEpochRespError { .. }
             | VariableHeader::CreateStreamRespError { .. }
             | VariableHeader::QueryOffsetRespError { .. }
@@ -312,7 +312,7 @@ impl Frame {
             // ── Success responses: FLAG_RESPONSE (0x01) ──
             VariableHeader::AppendAck { .. }
             | VariableHeader::ReadResp { .. }
-            | VariableHeader::SealStreamManagerResp { .. }
+            | VariableHeader::SealStreamResp { .. }
             | VariableHeader::SealEpochResp { .. }
             | VariableHeader::CreateStreamResp { .. }
             | VariableHeader::QueryOffsetResp { .. }

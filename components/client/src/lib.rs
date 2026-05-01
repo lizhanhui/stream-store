@@ -487,7 +487,7 @@ impl StreamClient {
         epoch: Epoch,
     ) -> Result<(Epoch, String), StorageError> {
         let req = Frame::new(
-            VariableHeader::SealStreamManagerRequest {
+            VariableHeader::SealStreamRequest {
                 request_id: self.alloc_request_id(),
                 stream_id,
                 epoch,
@@ -498,12 +498,12 @@ impl StreamClient {
         Self::check_error(&resp)?;
         if resp.opcode() != Opcode::SealStream {
             return Err(InternalSnafu {
-                message: format!("expected SealStreamManagerResp, got {:?}", resp.opcode()),
+                message: format!("expected SealStreamResp, got {:?}", resp.opcode()),
             }
             .build());
         }
 
-        if let VariableHeader::SealStreamManagerResp {
+        if let VariableHeader::SealStreamResp {
             new_epoch,
             primary_addr,
             ..
@@ -516,7 +516,7 @@ impl StreamClient {
             Ok((*new_epoch, addr))
         } else {
             Err(InternalSnafu {
-                message: "unexpected variable header in SealStreamManagerResp",
+                message: "unexpected variable header in SealStreamResp",
             }
             .build())
         }
