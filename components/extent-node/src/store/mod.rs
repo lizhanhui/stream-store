@@ -299,9 +299,9 @@ impl RequestHandler for ExtentNodeStore {
                 },
                 None,
             )),
-            Opcode::ReportExtents => Some(self.handle_report_extents(frame)),
-            Opcode::FlushExtent => Some(self.handle_flush_extent(frame)),
-            Opcode::UpdateExtent
+            Opcode::ReportEpoch => Some(self.handle_report_extents(frame)),
+            Opcode::FlushEpoch => Some(self.handle_flush_extent(frame)),
+            Opcode::UpdateEpoch
             | Opcode::Watermark
             | Opcode::SealStream
             | Opcode::StreamManagerMembershipChange => {
@@ -315,7 +315,6 @@ impl RequestHandler for ExtentNodeStore {
                 &frame,
                 ErrorCode::InternalError,
                 "unsupported opcode",
-                ExtentId(0),
             )),
         }
     }

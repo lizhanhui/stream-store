@@ -297,16 +297,16 @@ async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, ha
 
             if frame.opcode() == Opcode::Append {
                 let target_stream = frame.stream_id();
-                let target_extent = frame.extent_id();
+                let target_epoch = frame.epoch();
                 let mut batch = vec![frame];
 
-                // Greedily extend: peek next frame, only take if same-extent Append.
+                // Greedily extend: peek next frame, only take if same-epoch Append.
                 while let Some(result) = framed_read.next().now_or_never() {
                     match result {
                         Some(Ok(next)) => {
                             if next.opcode() == Opcode::Append
                                 && next.stream_id() == target_stream
-                                && next.extent_id() == target_extent
+                                && next.epoch() == target_epoch
                             {
                                 batch.push(next);
                             } else {

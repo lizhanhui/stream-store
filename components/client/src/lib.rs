@@ -26,13 +26,11 @@ use tokio_util::codec::{FramedRead, FramedWrite};
 use tracing::warn;
 
 /// Result of a successful append: the logical offset assigned to this record,
-/// plus the extent and epoch the record landed on (for diagnostics).
+/// plus the epoch the record landed on (for diagnostics).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
     /// Logical offset assigned to this record.
     pub offset: Offset,
-    /// The extent the record was written to (server-assigned, for diagnostics).
-    pub extent_id: ExtentId,
     pub epoch: Epoch,
 }
 
@@ -255,7 +253,7 @@ impl StreamClient {
             }
             .build(),
             Some(ErrorCode::ExtentSealed) => ExtentSealedSnafu {
-                extent_id: resp.extent_id(),
+                extent_id: ExtentId(0),
             }
             .build(),
             Some(ErrorCode::EpochStale) => EpochStaleSnafu {
@@ -311,7 +309,7 @@ impl StreamClient {
 
         let stream_id = resp.stream_id();
         self.cache_primary(stream_id, &addr).await;
-        Ok((stream_id, resp.extent_id(), resp.epoch(), addr))
+        Ok((stream_id, ExtentId(0), resp.epoch(), addr))
     }
 
     /// Append a message to a stream. Returns the assigned offset and diagnostics.
@@ -339,7 +337,6 @@ impl StreamClient {
 
         Ok(AppendResult {
             offset: resp.offset(),
-            extent_id: resp.extent_id(),
             epoch: resp.epoch(),
         })
     }
@@ -355,11 +352,11 @@ impl StreamClient {
         offset: Offset,
         count: u16,
     ) -> Result<Vec<Bytes>, StorageError> {
+        let _ = extent_id;
         let req = Frame::new(
             VariableHeader::Read {
                 request_id: self.alloc_request_id(),
                 stream_id,
-                extent_id,
                 offset,
                 count: count as u32,
             },
@@ -562,38 +559,38 @@ impl StreamClient {
         Ok(extents)
     }
 
-    /// Describe a single extent with replica info and node liveness.
+    /// Describe a single extent (epoch) with replica info and node liveness.
     pub async fn describe_extent(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
     ) -> Result<ExtentInfo, StorageError> {
+        let _ = extent_id;
         let req = Frame::new(
-            VariableHeader::DescribeExtent {
+            VariableHeader::DescribeEpoch {
                 request_id: self.alloc_request_id(),
                 stream_id,
-                extent_id,
             },
             None,
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::DescribeExtent {
+        if resp.opcode() != Opcode::DescribeEpoch {
             return Err(InternalSnafu {
-                message: format!("expected DescribeExtent response, got {:?}", resp.opcode()),
+                message: format!("expected DescribeEpoch response, got {:?}", resp.opcode()),
             }
             .build());
         }
         let extents = parse_extent_info_vec(resp.payload.as_deref().unwrap_or_default())
             .ok_or_else(|| {
                 InternalSnafu {
-                    message: "invalid DescribeExtent response payload",
+                    message: "invalid DescribeEpoch response payload",
                 }
                 .build()
             })?;
         extents.into_iter().next().ok_or_else(|| {
             InternalSnafu {
-                message: "DescribeExtent response returned empty result",
+                message: "DescribeEpoch response returned empty result",
             }
             .build()
         })

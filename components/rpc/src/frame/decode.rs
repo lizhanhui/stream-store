@@ -1,11 +1,11 @@
 use bytes::{Buf, Bytes, BytesMut};
 use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpcodeSnafu};
 use common::types::{
-    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME,
-    FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
-    FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
-    FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
-    StorageClass, StreamConfig, StreamId,
+    ArenaClass, Epoch, ErrorCode, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
+    FLAG_EXTENT_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
+    FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
+    FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass,
+    StreamConfig, StreamId,
 };
 
 use super::{FixedHeader, Frame, VariableHeader};
@@ -85,7 +85,6 @@ impl Frame {
                 let stream_id = StreamId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
-                    let extent_id = ExtentId(body.get_u32());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
                             message: "unknown Append error code",
@@ -98,20 +97,17 @@ impl Frame {
                             request_id,
                             stream_id,
                             epoch,
-                            extent_id,
                             error_code,
                         },
                         payload,
                     ))
                 } else if flags & FLAG_RESPONSE != 0 {
-                    let extent_id = ExtentId(body.get_u32());
                     let offset = Offset(body.get_u64());
                     Ok((
                         VariableHeader::AppendAck {
                             request_id,
                             stream_id,
                             epoch,
-                            extent_id,
                             offset,
                         },
                         None,
@@ -133,7 +129,6 @@ impl Frame {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
-                    let extent_id = ExtentId(body.get_u32());
                     let offset = Offset(body.get_u64());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
@@ -146,7 +141,6 @@ impl Frame {
                         VariableHeader::ReadRespError {
                             request_id,
                             stream_id,
-                            extent_id,
                             offset,
                             error_code,
                         },
@@ -166,14 +160,12 @@ impl Frame {
                         payload,
                     ))
                 } else {
-                    let extent_id = ExtentId(body.get_u32());
                     let offset = Offset(body.get_u64());
                     let count = body.get_u32();
                     Ok((
                         VariableHeader::Read {
                             request_id,
                             stream_id,
-                            extent_id,
                             offset,
                             count,
                         },
@@ -235,12 +227,10 @@ impl Frame {
                 if flags == FLAG_SEAL_COMMIT_RESP {
                     let request_id = body.get_u32();
                     let stream_id = StreamId(body.get_u32());
-                    let extent_id = ExtentId(body.get_u32());
                     return Ok((
                         VariableHeader::SealEpochCommitResp {
                             request_id,
                             stream_id,
-                            extent_id,
                         },
                         None,
                     ));
@@ -248,7 +238,6 @@ impl Frame {
                 if flags & FLAG_SEAL_COMMIT != 0 {
                     let request_id = body.get_u32();
                     let stream_id = StreamId(body.get_u32());
-                    let extent_id = ExtentId(body.get_u32());
                     let epoch = Epoch(body.get_u32());
                     let start_offset = body.get_u64();
                     let end_offset = body.get_u64();
@@ -256,7 +245,6 @@ impl Frame {
                         VariableHeader::SealEpochCommit {
                             request_id,
                             stream_id,
-                            extent_id,
                             epoch,
                             start_offset,
                             end_offset,
@@ -285,7 +273,6 @@ impl Frame {
                     ))
                 } else if flags & FLAG_RESPONSE != 0 {
                     let epoch = Epoch(body.get_u32());
-                    let extent_id = ExtentId(body.get_u32());
                     let start_offset = body.get_u64();
                     let end_offset = body.get_u64();
                     let payload = Self::read_payload(body);
@@ -294,7 +281,6 @@ impl Frame {
                             request_id,
                             stream_id,
                             epoch,
-                            extent_id,
                             start_offset,
                             end_offset,
                         },
@@ -308,14 +294,12 @@ impl Frame {
                     .build())
                 } else {
                     let epoch = Epoch(body.get_u32());
-                    let extent_id_from = ExtentId(body.get_u32());
                     let start_offset = body.get_u64();
                     Ok((
                         VariableHeader::SealEpochPrepare {
                             request_id,
                             stream_id,
                             epoch,
-                            extent_id_from,
                             start_offset,
                         },
                         None,
@@ -342,7 +326,6 @@ impl Frame {
                     ))
                 } else if flags & FLAG_RESPONSE != 0 {
                     let stream_id = StreamId(body.get_u32());
-                    let extent_id = ExtentId(body.get_u32());
                     let epoch = Epoch(body.get_u32());
                     let addr_len = body.get_u16() as usize;
                     let primary_addr = body.split_to(addr_len).freeze();
@@ -350,7 +333,6 @@ impl Frame {
                         VariableHeader::CreateStreamResp {
                             request_id,
                             stream_id,
-                            extent_id,
                             epoch,
                             primary_addr,
                         },
@@ -498,7 +480,6 @@ impl Frame {
             Opcode::RegisterEpoch => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
-                let extent_id = ExtentId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
@@ -508,10 +489,9 @@ impl Frame {
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::RegisterExtentAckError {
+                        VariableHeader::RegisterEpochAckError {
                             request_id,
                             stream_id,
-                            extent_id,
                             error_code,
                         },
                         payload,
@@ -521,7 +501,6 @@ impl Frame {
                         VariableHeader::RegisterEpochAck {
                             request_id,
                             stream_id,
-                            extent_id,
                         },
                         None,
                     ))
@@ -546,7 +525,6 @@ impl Frame {
                     Ok((
                         VariableHeader::RegisterEpoch {
                             request_id,
-                            extent_id,
                             role,
                             config: StreamConfig {
                                 stream_id,
@@ -566,13 +544,11 @@ impl Frame {
             // ── Watermark: fire-and-forget ──
             Opcode::Watermark => {
                 let stream_id = StreamId(body.get_u32());
-                let extent_id = ExtentId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 let offset = Offset(body.get_u64());
                 Ok((
                     VariableHeader::Watermark {
                         stream_id,
-                        extent_id,
                         epoch,
                         offset,
                     },
@@ -582,7 +558,6 @@ impl Frame {
             // ── Forward: flag-based variants (append/init/checksum/flushed) ──
             Opcode::Forward => {
                 let stream_id = StreamId(body.get_u32());
-                let extent_id = ExtentId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 match flags {
                     FLAG_FORWARD_CHECKSUM => {
@@ -591,7 +566,6 @@ impl Frame {
                         Ok((
                             VariableHeader::ForwardChecksum {
                                 stream_id,
-                                extent_id,
                                 epoch,
                                 checksum,
                                 committed_bytes,
@@ -602,7 +576,6 @@ impl Frame {
                     FLAG_FORWARD_FLUSHED => Ok((
                         VariableHeader::ForwardFlushed {
                             stream_id,
-                            extent_id,
                             epoch,
                         },
                         None,
@@ -613,7 +586,6 @@ impl Frame {
                         Ok((
                             VariableHeader::Forward {
                                 stream_id,
-                                extent_id,
                                 epoch,
                                 offset,
                             },
@@ -641,7 +613,6 @@ impl Frame {
                         Ok((
                             VariableHeader::ForwardInitEpoch {
                                 stream_id,
-                                extent_id,
                                 epoch,
                                 start_offset,
                                 extent_capacity,
@@ -711,24 +682,22 @@ impl Frame {
                     ))
                 }
             }
-            // ── DescribeExtent: request (0x00), response (0x01), error (0x80) ──
-            Opcode::DescribeExtent => {
+            // ── DescribeEpoch: request (0x00), response (0x01), error (0x80) ──
+            Opcode::DescribeEpoch => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
-                    let extent_id = ExtentId(body.get_u32());
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
-                            message: "unknown DescribeExtent error code",
+                            message: "unknown DescribeEpoch error code",
                         }
                         .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::DescribeExtentRespError {
+                        VariableHeader::DescribeEpochRespError {
                             request_id,
                             stream_id,
-                            extent_id,
                             error_code,
                         },
                         payload,
@@ -736,19 +705,17 @@ impl Frame {
                 } else if flags & FLAG_RESPONSE != 0 {
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::DescribeExtentResp {
+                        VariableHeader::DescribeEpochResp {
                             request_id,
                             stream_id,
                         },
                         payload,
                     ))
                 } else {
-                    let extent_id = ExtentId(body.get_u32());
                     Ok((
-                        VariableHeader::DescribeExtent {
+                        VariableHeader::DescribeEpoch {
                             request_id,
                             stream_id,
-                            extent_id,
                         },
                         None,
                     ))
@@ -797,33 +764,29 @@ impl Frame {
                     ))
                 }
             }
-            // ── UpdateExtent: fire-and-forget, flag-based variants ──
-            Opcode::UpdateExtent => {
+            // ── UpdateEpoch: fire-and-forget, flag-based variants ──
+            Opcode::UpdateEpoch => {
                 let stream_id = StreamId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 match flags {
                     FLAG_EXTENT_PROGRESS => {
-                        let extent_id = ExtentId(body.get_u32());
                         let current_offset = Offset(body.get_u64());
                         Ok((
-                            VariableHeader::UpdateExtentProgress {
+                            VariableHeader::UpdateEpochProgress {
                                 stream_id,
                                 epoch,
-                                extent_id,
                                 current_offset,
                             },
                             None,
                         ))
                     }
                     FLAG_EXTENT_FLUSHED => {
-                        let extent_id = ExtentId(body.get_u32());
                         let start_offset = Offset(body.get_u64());
                         let end_offset = Offset(body.get_u64());
                         Ok((
-                            VariableHeader::UpdateExtentFlushed {
+                            VariableHeader::UpdateEpochFlushed {
                                 stream_id,
                                 epoch,
-                                extent_id,
                                 start_offset,
                                 end_offset,
                             },
@@ -831,26 +794,26 @@ impl Frame {
                         ))
                     }
                     _ => Err(InternalSnafu {
-                        message: format!("unknown UpdateExtent flag: {flags:#x}"),
+                        message: format!("unknown UpdateEpoch flag: {flags:#x}"),
                     }
                     .build()),
                 }
             }
-            // ── ReportExtents: request (0x00), response (0x01), error (0x80) ──
-            Opcode::ReportExtents => {
+            // ── ReportEpoch: request (0x00), response (0x01), error (0x80) ──
+            Opcode::ReportEpoch => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
-                            message: "unknown ReportExtents error code",
+                            message: "unknown ReportEpoch error code",
                         }
                         .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::ReportExtentsRespError {
+                        VariableHeader::ReportEpochRespError {
                             request_id,
                             stream_id,
                             epoch,
@@ -861,7 +824,7 @@ impl Frame {
                 } else if flags & FLAG_RESPONSE != 0 {
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::ReportExtentsResp {
+                        VariableHeader::ReportEpochResp {
                             request_id,
                             stream_id,
                             epoch,
@@ -870,7 +833,7 @@ impl Frame {
                     ))
                 } else {
                     Ok((
-                        VariableHeader::ReportExtents {
+                        VariableHeader::ReportEpoch {
                             request_id,
                             stream_id,
                             epoch,
@@ -879,34 +842,31 @@ impl Frame {
                     ))
                 }
             }
-            // ── FlushExtent: request (0x00), response (0x01), error (0x80) ──
-            Opcode::FlushExtent => {
+            // ── FlushEpoch: request (0x00), response (0x01), error (0x80) ──
+            Opcode::FlushEpoch => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
-                let extent_id = ExtentId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
-                            message: "unknown FlushExtent error code",
+                            message: "unknown FlushEpoch error code",
                         }
                         .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::FlushExtentRespError {
+                        VariableHeader::FlushEpochRespError {
                             request_id,
                             stream_id,
-                            extent_id,
                             error_code,
                         },
                         payload,
                     ))
                 } else if flags & FLAG_RESPONSE != 0 {
                     Ok((
-                        VariableHeader::FlushExtentResp {
+                        VariableHeader::FlushEpochResp {
                             request_id,
                             stream_id,
-                            extent_id,
                         },
                         None,
                     ))
@@ -915,10 +875,9 @@ impl Frame {
                     let start_offset = body.get_u64();
                     let end_offset = body.get_u64();
                     Ok((
-                        VariableHeader::FlushExtent {
+                        VariableHeader::FlushEpoch {
                             request_id,
                             stream_id,
-                            extent_id,
                             epoch,
                             start_offset,
                             end_offset,

@@ -13,19 +13,13 @@ impl ExtentNodeStore {
     ///
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
     pub(crate) fn handle_register_epoch(&self, frame: Frame) -> Frame {
-        let (extent_id, role, config) = match &frame.variable_header {
-            VariableHeader::RegisterEpoch {
-                extent_id,
-                role,
-                config,
-                ..
-            } => (*extent_id, *role, *config),
+        let (role, config) = match &frame.variable_header {
+            VariableHeader::RegisterEpoch { role, config, .. } => (*role, *config),
             _ => {
                 return Frame::error_from_request(
                     &frame,
                     ErrorCode::InternalError,
                     "invalid RegisterEpoch frame",
-                    ExtentId(0),
                 );
             }
         };
@@ -33,6 +27,12 @@ impl ExtentNodeStore {
         let stream_id = config.stream_id;
         let epoch = config.epoch;
         let replication_factor = config.replication_factor;
+
+        // `extent_id` no longer travels on the wire. The EN's local bookkeeping
+        // still identifies extents by id; later phases collapse that to
+        // (stream_id, epoch). For now, synthesize a per-epoch extent id (the
+        // old allocator produced 1-based ids, so we use `epoch + 1`).
+        let extent_id = ExtentId(epoch.0 + 1);
 
         tracing::debug!(
             arena_class = ?config.arena_class,
@@ -54,7 +54,6 @@ impl ExtentNodeStore {
                         &frame,
                         ErrorCode::InternalError,
                         "invalid RegisterEpoch payload",
-                        ExtentId(0),
                     );
                 }
             };
@@ -127,7 +126,6 @@ impl ExtentNodeStore {
             VariableHeader::RegisterEpochAck {
                 request_id: frame.request_id(),
                 stream_id,
-                extent_id,
             },
             None,
         )

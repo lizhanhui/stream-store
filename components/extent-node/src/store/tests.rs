@@ -44,7 +44,6 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
             Frame::new(
                 VariableHeader::RegisterEpoch {
                     request_id: req_id,
-                    extent_id: ExtentId(1),
                     role: 0,
                     config: test_config(stream_id, 1),
                 },
@@ -132,7 +131,6 @@ async fn append_to_sealed_stream_reports_extent_id() {
     assert_eq!(resp.opcode(), Opcode::Append);
     assert!(resp.is_error_response());
     assert_eq!(resp.error_code(), ErrorCode::ExtentSealed as u16);
-    assert_eq!(resp.extent_id(), ExtentId(1));
 }
 
 #[tokio::test]
@@ -182,7 +180,6 @@ async fn append_read_query_offset() {
                 VariableHeader::Read {
                     request_id: 30,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     offset: Offset(0),
                     count: 3,
                 },
@@ -213,7 +210,6 @@ async fn append_read_query_offset() {
                 VariableHeader::Read {
                     request_id: 31,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     offset: Offset(1),
                     count: 1,
                 },
@@ -248,7 +244,6 @@ async fn register_extent_creates_stream() {
             Frame::new(
                 VariableHeader::RegisterEpoch {
                     request_id: 1,
-                    extent_id: ExtentId(100),
                     role: 0,
                     config: test_config(42, 2),
                 },
@@ -268,7 +263,9 @@ async fn register_extent_creates_stream() {
     assert!(ri.is_primary());
     assert!(!ri.is_standalone());
     assert_eq!(ri.replica_addrs, vec!["127.0.0.1:9802"]);
-    assert_eq!(ri.extent_id, ExtentId(100));
+    // The extent_id is no longer transmitted on the wire; the EN synthesizes
+    // it from the epoch (epoch+1). Registered with epoch=0 → extent_id=1.
+    assert_eq!(ri.extent_id, ExtentId(1));
     assert_eq!(ri.replication_factor, 2);
 
     // AckQueue should be initialized for Primary.
@@ -296,7 +293,6 @@ async fn register_extent_secondary() {
             Frame::new(
                 VariableHeader::RegisterEpoch {
                     request_id: 1,
-                    extent_id: ExtentId(100),
                     role: 1,
                     config: test_config(42, 2),
                 },
@@ -336,7 +332,6 @@ async fn register_extent_then_append_rf1() {
             Frame::new(
                 VariableHeader::RegisterEpoch {
                     request_id: 1,
-                    extent_id: ExtentId(50),
                     role: 0,
                     config: test_config(10, 1),
                 },
@@ -393,7 +388,6 @@ async fn primary_append_defers_and_broadcasts() {
             Frame::new(
                 VariableHeader::RegisterEpoch {
                     request_id: 1,
-                    extent_id: ExtentId(50),
                     role: 0,
                     config: test_config(10, 3),
                 },
@@ -480,7 +474,6 @@ async fn secondary_returns_watermark() {
             Frame::new(
                 VariableHeader::RegisterEpoch {
                     request_id: 1,
-                    extent_id: ExtentId(50),
                     role: 1,
                     config: test_config(10, 2),
                 },
@@ -497,7 +490,6 @@ async fn secondary_returns_watermark() {
             Frame::new(
                 VariableHeader::Forward {
                     stream_id: StreamId(10),
-                    extent_id: ExtentId(50),
                     epoch: Epoch(0),
                     offset: Offset(0),
                 },
@@ -525,8 +517,7 @@ async fn cumulative_ack_drains_multiple_pending() {
         ack_queue.enqueue(PendingAck {
             request_id: i as u32,
             stream_id: StreamId(10),
-            extent_id: ExtentId(0),
-            epoch: Epoch(0),
+            extent_id: ExtentId(0),            epoch: Epoch(0),
             response_tx: resp_tx.clone(),
             assigned_offset: i,
             created_at: Instant::now(),
@@ -581,8 +572,7 @@ async fn pending_ack_timeout() {
     ack_queue.enqueue(PendingAck {
         request_id: 42,
         stream_id: StreamId(10),
-        extent_id: ExtentId(0),
-        epoch: Epoch(0),
+        extent_id: ExtentId(0),        epoch: Epoch(0),
         response_tx: resp_tx.clone(),
         assigned_offset: 0,
         created_at: Instant::now() - DEFAULT_REPLICATION_TIMEOUT - Duration::from_secs(1),
@@ -592,8 +582,7 @@ async fn pending_ack_timeout() {
     ack_queue.enqueue(PendingAck {
         request_id: 43,
         stream_id: StreamId(10),
-        extent_id: ExtentId(0),
-        epoch: Epoch(0),
+        extent_id: ExtentId(0),        epoch: Epoch(0),
         response_tx: resp_tx.clone(),
         assigned_offset: 1,
         created_at: Instant::now(),
@@ -723,7 +712,6 @@ async fn concurrent_multi_stream_appends() {
                     VariableHeader::Read {
                         request_id: 0,
                         stream_id: sid,
-                        extent_id: ExtentId(1),
                         offset: Offset(0),
                         count: 100,
                     },
@@ -854,7 +842,6 @@ async fn concurrent_readers_and_writers_different_streams() {
                             VariableHeader::Read {
                                 request_id: 0,
                                 stream_id: sid,
-                                extent_id: ExtentId(1),
                                 offset: Offset(0),
                                 count: 10,
                             },
@@ -1014,7 +1001,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
             Frame::new(
                 VariableHeader::RegisterEpoch {
                     request_id: 1,
-                    extent_id: ExtentId(50),
                     role: 1,
                     config: test_config(10, 2),
                 },
@@ -1031,7 +1017,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                 Frame::new(
                     VariableHeader::Forward {
                         stream_id: StreamId(10),
-                        extent_id: ExtentId(50),
                         epoch: Epoch(0),
                         offset: Offset(i as u64),
                     },
@@ -1051,7 +1036,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                     request_id: 20,
                     stream_id: StreamId(10),
                     epoch: Epoch(0),
-                    extent_id_from: ExtentId(50),
                     start_offset: 0,
                 },
                 None,
@@ -1074,7 +1058,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                 Frame::new(
                     VariableHeader::Forward {
                         stream_id: StreamId(10),
-                        extent_id: ExtentId(50),
                         epoch: Epoch(0),
                         offset: Offset(i as u64),
                     },
@@ -1094,7 +1077,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
             Frame::new(
                 VariableHeader::Forward {
                     stream_id: StreamId(10),
-                    extent_id: ExtentId(50),
                     epoch: Epoch(0),
                     offset: Offset(4),
                 },
@@ -1139,7 +1121,6 @@ async fn handle_seal_is_idempotent() {
                     request_id: 20,
                     stream_id: sid,
                     epoch: Epoch(0),
-                    extent_id_from: ExtentId(1),
                     start_offset: 0,
                 },
                 None,
@@ -1163,7 +1144,6 @@ async fn handle_seal_is_idempotent() {
                     request_id: 21,
                     stream_id: sid,
                     epoch: Epoch(0),
-                    extent_id_from: ExtentId(1),
                     start_offset: 0,
                 },
                 None,
@@ -1304,7 +1284,7 @@ async fn append_n(store: &ExtentNodeStore, sid: StreamId, n: u32) -> Offset {
 
 /// Seal an extent via SealEpochPrepare (the production RPC path).
 /// Returns the end_offset from the SealEpochResp.
-async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, extent_id: ExtentId) -> u64 {
+async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, _extent_id: ExtentId) -> u64 {
     let resp = store
         .handle_frame(
             Frame::new(
@@ -1312,7 +1292,6 @@ async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, extent_id: ExtentI
                     request_id: 200,
                     stream_id: sid,
                     epoch: Epoch(0),
-                    extent_id_from: extent_id,
                     start_offset: 0,
                 },
                 None,
@@ -1344,10 +1323,9 @@ async fn flush_extent_seals_active_extent() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::FlushExtent {
+                VariableHeader::FlushEpoch {
                     request_id: 50,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 3,
@@ -1358,7 +1336,7 @@ async fn flush_extent_seals_active_extent() {
         )
         .await;
     let resp = result.expect("FlushExtent should return a response");
-    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert_eq!(resp.opcode(), Opcode::FlushEpoch);
     assert!(!resp.is_error_response());
 
     // Verify extent is now sealed.
@@ -1408,10 +1386,9 @@ async fn flush_extent_corrects_sealed_extent() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::FlushExtent {
+                VariableHeader::FlushEpoch {
                     request_id: 51,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 3,
@@ -1422,7 +1399,7 @@ async fn flush_extent_corrects_sealed_extent() {
         )
         .await;
     let resp = result.expect("FlushExtent should return a response");
-    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert_eq!(resp.opcode(), Opcode::FlushEpoch);
     assert!(!resp.is_error_response());
 
     // Verify extent is still sealed and the FlushRequest carries the corrected offset.
@@ -1478,10 +1455,9 @@ async fn flush_extent_skips_flushed() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::FlushExtent {
+                VariableHeader::FlushEpoch {
                     request_id: 52,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 2,
@@ -1492,7 +1468,7 @@ async fn flush_extent_skips_flushed() {
         )
         .await;
     let resp = result.expect("FlushExtent should return a response");
-    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert_eq!(resp.opcode(), Opcode::FlushEpoch);
     assert!(!resp.is_error_response());
     assert!(
         flush_rx.try_recv().is_err(),
@@ -1503,7 +1479,11 @@ async fn flush_extent_skips_flushed() {
 #[tokio::test]
 async fn flush_extent_skips_missing_extent() {
     // B9: FlushExtent for a non-existent extent → no FlushRequest, no panic.
-    let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
+    // After wire-protocol collapse (stream_id, epoch) is the identity; we can
+    // no longer aim at a specific missing extent_id from the wire. This test
+    // is retained as a compile-only smoke; the "missing extent" case
+    // collapses into "missing stream" — covered by the next test.
+    let (flush_tx, _flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
     let mut store = test_store();
     store.set_flush_tx(flush_tx);
 
@@ -1512,10 +1492,9 @@ async fn flush_extent_skips_missing_extent() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::FlushExtent {
+                VariableHeader::FlushEpoch {
                     request_id: 53,
                     stream_id: StreamId(1),
-                    extent_id: ExtentId(99),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 10,
@@ -1526,12 +1505,8 @@ async fn flush_extent_skips_missing_extent() {
         )
         .await;
     let resp = result.expect("FlushExtent should return a response");
-    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert_eq!(resp.opcode(), Opcode::FlushEpoch);
     assert!(!resp.is_error_response());
-    assert!(
-        flush_rx.try_recv().is_err(),
-        "no FlushRequest for missing extent"
-    );
 }
 
 #[tokio::test]
@@ -1544,10 +1519,9 @@ async fn flush_extent_skips_missing_stream() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::FlushExtent {
+                VariableHeader::FlushEpoch {
                     request_id: 54,
                     stream_id: StreamId(999),
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 5,
@@ -1558,7 +1532,7 @@ async fn flush_extent_skips_missing_stream() {
         )
         .await;
     let resp = result.expect("FlushExtent should return a response");
-    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert_eq!(resp.opcode(), Opcode::FlushEpoch);
     assert!(!resp.is_error_response());
     assert!(
         flush_rx.try_recv().is_err(),
@@ -1590,10 +1564,9 @@ async fn flush_extent_dedup() {
     }
 
     let flush_frame = Frame::new(
-        VariableHeader::FlushExtent {
+        VariableHeader::FlushEpoch {
             request_id: 55,
             stream_id: sid,
-            extent_id: ExtentId(1),
             epoch: Epoch(0),
             start_offset: 0,
             end_offset: 3,
@@ -1630,10 +1603,9 @@ async fn flush_extent_no_s3_configured() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::FlushExtent {
+                VariableHeader::FlushEpoch {
                     request_id: 56,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 2,
@@ -1644,7 +1616,7 @@ async fn flush_extent_no_s3_configured() {
         )
         .await;
     let resp = result.expect("FlushExtent should return a response");
-    assert_eq!(resp.opcode(), Opcode::FlushExtent);
+    assert_eq!(resp.opcode(), Opcode::FlushEpoch);
     assert!(resp.is_error_response());
 }
 
@@ -1667,7 +1639,6 @@ async fn seal_commit_corrects_higher_offset() {
                 VariableHeader::SealEpochCommit {
                     request_id: 60,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 3,
@@ -1716,7 +1687,6 @@ async fn seal_commit_seals_active_extent() {
                 VariableHeader::SealEpochCommit {
                     request_id: 61,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 3,
@@ -1762,7 +1732,6 @@ async fn seal_commit_noop_lower_offset() {
                 VariableHeader::SealEpochCommit {
                     request_id: 62,
                     stream_id: sid,
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 5,
@@ -1801,7 +1770,6 @@ async fn seal_commit_unknown_stream() {
                 VariableHeader::SealEpochCommit {
                     request_id: 63,
                     stream_id: StreamId(999),
-                    extent_id: ExtentId(1),
                     epoch: Epoch(0),
                     start_offset: 0,
                     end_offset: 5,

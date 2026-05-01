@@ -20,16 +20,16 @@ impl Frame {
         match &self.variable_header {
             // request_id(4) + stream_id(4) + epoch(4)
             VariableHeader::Append { .. } => 4 + 4 + 4,
-            // request_id(4) + stream_id(4) + epoch(4) + extent_id(4) + offset(8)
-            VariableHeader::AppendAck { .. } => 4 + 4 + 4 + 4 + 8,
-            // request_id(4) + stream_id(4) + epoch(4) + extent_id(4) + error_code(2)
-            VariableHeader::AppendAckError { .. } => 4 + 4 + 4 + 4 + 2,
-            // request_id(4) + stream_id(4) + extent_id(4) + offset(8) + count(4)
-            VariableHeader::Read { .. } => 4 + 4 + 4 + 8 + 4,
+            // request_id(4) + stream_id(4) + epoch(4) + offset(8)
+            VariableHeader::AppendAck { .. } => 4 + 4 + 4 + 8,
+            // request_id(4) + stream_id(4) + epoch(4) + error_code(2)
+            VariableHeader::AppendAckError { .. } => 4 + 4 + 4 + 2,
+            // request_id(4) + stream_id(4) + offset(8) + count(4)
+            VariableHeader::Read { .. } => 4 + 4 + 8 + 4,
             // request_id(4) + stream_id(4) + offset(8) + count(4)
             VariableHeader::ReadResp { .. } => 4 + 4 + 8 + 4,
-            // request_id(4) + stream_id(4) + extent_id(4) + offset(8) + error_code(2)
-            VariableHeader::ReadRespError { .. } => 4 + 4 + 4 + 8 + 2,
+            // request_id(4) + stream_id(4) + offset(8) + error_code(2)
+            VariableHeader::ReadRespError { .. } => 4 + 4 + 8 + 2,
             // request_id(4) + stream_id(4) + epoch(4)
             VariableHeader::SealStreamRequest { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + offset(8) + new_epoch(4) + addr_len(2) + addr(N)
@@ -38,24 +38,22 @@ impl Frame {
             }
             // request_id(4) + stream_id(4) + error_code(2)
             VariableHeader::SealStreamRespError { .. } => 4 + 4 + 2,
-            // request_id(4) + stream_id(4) + epoch(4) + extent_id_from(4) + start_offset(8)
-            VariableHeader::SealEpochPrepare { .. } => 4 + 4 + 4 + 4 + 8,
-            // request_id(4) + stream_id(4) + epoch(4) + extent_id(4) + start_offset(8) + end_offset(8)
-            VariableHeader::SealEpochResp { .. } => 4 + 4 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(4) + epoch(4) + start_offset(8)
+            VariableHeader::SealEpochPrepare { .. } => 4 + 4 + 4 + 8,
+            // request_id(4) + stream_id(4) + epoch(4) + start_offset(8) + end_offset(8)
+            VariableHeader::SealEpochResp { .. } => 4 + 4 + 4 + 8 + 8,
             // request_id(4) + stream_id(4) + error_code(2)
             VariableHeader::SealEpochRespError { .. } => 4 + 4 + 2,
-            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + end_offset(8)
-            VariableHeader::SealEpochCommit { .. } => 4 + 4 + 4 + 4 + 8 + 8,
-            // request_id(4) + stream_id(4) + extent_id(4)
-            VariableHeader::SealEpochCommitResp { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + epoch(4) + start_offset(8) + end_offset(8)
+            VariableHeader::SealEpochCommit { .. } => 4 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(4)
+            VariableHeader::SealEpochCommitResp { .. } => 4 + 4,
             // request_id(4) + name_len(2) + name(N) + replication_factor(1) + cache_extents(2) + storage_class(1)
             VariableHeader::CreateStream { stream_name, .. } => {
                 4 + 2 + stream_name.len() + 1 + 2 + 1
             }
-            // request_id(4) + stream_id(4) + extent_id(4) + epoch(4) + addr_len(2) + addr(N)
-            VariableHeader::CreateStreamResp { primary_addr, .. } => {
-                4 + 4 + 4 + 4 + 2 + primary_addr.len()
-            }
+            // request_id(4) + stream_id(4) + epoch(4) + addr_len(2) + addr(N)
+            VariableHeader::CreateStreamResp { primary_addr, .. } => 4 + 4 + 4 + 2 + primary_addr.len(),
             // request_id(4) + error_code(2)
             VariableHeader::CreateStreamRespError { .. } => 4 + 2,
             // request_id(4) + stream_id(4)
@@ -74,38 +72,38 @@ impl Frame {
             VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
-            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + cache_extents(2) + storage_class(1) + arena_class(1)
-            VariableHeader::RegisterEpoch { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 2 + 1 + 1,
-            // request_id(4) + stream_id(4) + extent_id(4)
-            VariableHeader::RegisterEpochAck { .. } => 4 + 4 + 4,
-            // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
-            VariableHeader::RegisterExtentAckError { .. } => 4 + 4 + 4 + 2,
-            // stream_id(4) + extent_id(4) + epoch(4) + offset(8)
-            VariableHeader::Watermark { .. } => 4 + 4 + 4 + 8,
-            // stream_id(4) + epoch(4) + extent_id(4) + current_offset(8)
-            VariableHeader::UpdateExtentProgress { .. } => 4 + 4 + 4 + 8,
-            // stream_id(4) + epoch(4) + extent_id(4)
-            VariableHeader::UpdateExtentFlushed { .. } => 4 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(4) + role(1) + replication_factor(1) + epoch(4) + cache_extents(2) + storage_class(1) + arena_class(1)
+            VariableHeader::RegisterEpoch { .. } => 4 + 4 + 1 + 1 + 4 + 2 + 1 + 1,
+            // request_id(4) + stream_id(4)
+            VariableHeader::RegisterEpochAck { .. } => 4 + 4,
+            // request_id(4) + stream_id(4) + error_code(2)
+            VariableHeader::RegisterEpochAckError { .. } => 4 + 4 + 2,
+            // stream_id(4) + epoch(4) + offset(8)
+            VariableHeader::Watermark { .. } => 4 + 4 + 8,
+            // stream_id(4) + epoch(4) + current_offset(8)
+            VariableHeader::UpdateEpochProgress { .. } => 4 + 4 + 8,
+            // stream_id(4) + epoch(4) + start_offset(8) + end_offset(8)
+            VariableHeader::UpdateEpochFlushed { .. } => 4 + 4 + 8 + 8,
             // request_id(4) + stream_id(4) + epoch(4)
-            VariableHeader::ReportExtents { .. } => 4 + 4 + 4,
+            VariableHeader::ReportEpoch { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + epoch(4)
-            VariableHeader::ReportExtentsResp { .. } => 4 + 4 + 4,
+            VariableHeader::ReportEpochResp { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + epoch(4) + error_code(2)
-            VariableHeader::ReportExtentsRespError { .. } => 4 + 4 + 4 + 2,
-            // stream_id(4) + extent_id(4) + epoch(4) + offset(8)
-            VariableHeader::Forward { .. } => 4 + 4 + 4 + 8,
-            // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_class(1) + arena_class(1)
-            VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 1 + 1,
-            // stream_id(4) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
-            VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 4 + 8,
-            // stream_id(4) + extent_id(4) + epoch(4)
-            VariableHeader::ForwardFlushed { .. } => 4 + 4 + 4,
-            // request_id(4) + stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + end_offset(8)
-            VariableHeader::FlushExtent { .. } => 4 + 4 + 4 + 4 + 8 + 8,
-            // request_id(4) + stream_id(4) + extent_id(4)
-            VariableHeader::FlushExtentResp { .. } => 4 + 4 + 4,
-            // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
-            VariableHeader::FlushExtentRespError { .. } => 4 + 4 + 4 + 2,
+            VariableHeader::ReportEpochRespError { .. } => 4 + 4 + 4 + 2,
+            // stream_id(4) + epoch(4) + offset(8)
+            VariableHeader::Forward { .. } => 4 + 4 + 8,
+            // stream_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_class(1) + arena_class(1)
+            VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 8 + 4 + 2 + 1 + 1,
+            // stream_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
+            VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 8,
+            // stream_id(4) + epoch(4)
+            VariableHeader::ForwardFlushed { .. } => 4 + 4,
+            // request_id(4) + stream_id(4) + epoch(4) + start_offset(8) + end_offset(8)
+            VariableHeader::FlushEpoch { .. } => 4 + 4 + 4 + 8 + 8,
+            // request_id(4) + stream_id(4)
+            VariableHeader::FlushEpochResp { .. } => 4 + 4,
+            // request_id(4) + stream_id(4) + error_code(2)
+            VariableHeader::FlushEpochRespError { .. } => 4 + 4 + 2,
             // no variable header, just payload
             VariableHeader::StreamManagerMembershipChange => 0,
             // request_id(4) + stream_id(4) + count(4) [+ name_len(2) + name(N) if FLAG_DESCRIBE_STREAM_BY_NAME]
@@ -116,13 +114,13 @@ impl Frame {
             }
             // request_id(4) + stream_id(4)
             VariableHeader::DescribeStreamResp { .. }
-            | VariableHeader::DescribeExtentResp { .. } => 4 + 4,
+            | VariableHeader::DescribeEpochResp { .. } => 4 + 4,
             // request_id(4) + stream_id(4) + error_code(2)
             VariableHeader::DescribeStreamRespError { .. } => 4 + 4 + 2,
-            // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
-            VariableHeader::DescribeExtentRespError { .. } => 4 + 4 + 4 + 2,
-            // request_id(4) + stream_id(4) + extent_id(4)
-            VariableHeader::DescribeExtent { .. } => 4 + 4 + 4,
+            // request_id(4) + stream_id(4) + error_code(2)
+            VariableHeader::DescribeEpochRespError { .. } => 4 + 4 + 2,
+            // request_id(4) + stream_id(4)
+            VariableHeader::DescribeEpoch { .. } => 4 + 4,
             // request_id(4) + stream_id(4) + offset(8)
             VariableHeader::Seek { .. } | VariableHeader::SeekResp { .. } => 4 + 4 + 8,
             // request_id(4) + stream_id(4) + offset(8) + error_code(2)
@@ -144,12 +142,12 @@ impl Frame {
                 | VariableHeader::RegisterEpoch { .. }
                 | VariableHeader::Forward { .. }
                 | VariableHeader::StreamManagerMembershipChange
-                | VariableHeader::ReportExtentsResp { .. }
-                | VariableHeader::ReportExtentsRespError { .. }
+                | VariableHeader::ReportEpochResp { .. }
+                | VariableHeader::ReportEpochRespError { .. }
                 | VariableHeader::DescribeStreamResp { .. }
                 | VariableHeader::DescribeStreamRespError { .. }
-                | VariableHeader::DescribeExtentResp { .. }
-                | VariableHeader::DescribeExtentRespError { .. }
+                | VariableHeader::DescribeEpochResp { .. }
+                | VariableHeader::DescribeEpochRespError { .. }
                 | VariableHeader::SeekResp { .. }
                 | VariableHeader::SeekRespError { .. }
                 | VariableHeader::AppendAckError { .. }
@@ -160,8 +158,8 @@ impl Frame {
                 | VariableHeader::QueryOffsetRespError { .. }
                 | VariableHeader::ConnectAckError { .. }
                 | VariableHeader::DisconnectAckError { .. }
-                | VariableHeader::RegisterExtentAckError { .. }
-                | VariableHeader::FlushExtentRespError { .. }
+                | VariableHeader::RegisterEpochAckError { .. }
+                | VariableHeader::FlushEpochRespError { .. }
         )
     }
 
@@ -203,38 +201,32 @@ impl Frame {
                 request_id,
                 stream_id,
                 epoch,
-                extent_id,
                 offset,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
             }
             VariableHeader::AppendAckError {
                 request_id,
                 stream_id,
                 epoch,
-                extent_id,
                 error_code,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::Read {
                 request_id,
                 stream_id,
-                extent_id,
                 offset,
                 count,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u32(*count);
             }
@@ -252,13 +244,11 @@ impl Frame {
             VariableHeader::ReadRespError {
                 request_id,
                 stream_id,
-                extent_id,
                 offset,
                 error_code,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u16(*error_code as u16);
             }
@@ -298,27 +288,23 @@ impl Frame {
                 request_id,
                 stream_id,
                 epoch,
-                extent_id_from,
                 start_offset,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
-                dst.put_u32(extent_id_from.0);
                 dst.put_u64(*start_offset);
             }
             VariableHeader::SealEpochResp {
                 request_id,
                 stream_id,
                 epoch,
-                extent_id,
                 start_offset,
                 end_offset,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u64(*start_offset);
                 dst.put_u64(*end_offset);
             }
@@ -334,14 +320,12 @@ impl Frame {
             VariableHeader::SealEpochCommit {
                 request_id,
                 stream_id,
-                extent_id,
                 epoch,
                 start_offset,
                 end_offset,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(*start_offset);
                 dst.put_u64(*end_offset);
@@ -349,11 +333,9 @@ impl Frame {
             VariableHeader::SealEpochCommitResp {
                 request_id,
                 stream_id,
-                extent_id,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
             }
             VariableHeader::CreateStream {
                 request_id,
@@ -372,13 +354,11 @@ impl Frame {
             VariableHeader::CreateStreamResp {
                 request_id,
                 stream_id,
-                extent_id,
                 epoch,
                 primary_addr,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u16(primary_addr.len() as u16);
                 dst.extend_from_slice(primary_addr);
@@ -422,13 +402,11 @@ impl Frame {
             }
             VariableHeader::RegisterEpoch {
                 request_id,
-                extent_id,
                 role,
                 config,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(config.stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u8(*role);
                 dst.put_u8(config.replication_factor);
                 dst.put_u32(config.epoch.0);
@@ -458,48 +436,39 @@ impl Frame {
             VariableHeader::RegisterEpochAck {
                 request_id,
                 stream_id,
-                extent_id,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
             }
-            VariableHeader::RegisterExtentAckError {
+            VariableHeader::RegisterEpochAckError {
                 request_id,
                 stream_id,
-                extent_id,
                 error_code,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::Watermark {
                 stream_id,
-                extent_id,
                 epoch,
                 offset,
             } => {
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(offset.0);
             }
             VariableHeader::Forward {
                 stream_id,
-                extent_id,
                 epoch,
                 offset,
             } => {
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(offset.0);
             }
             VariableHeader::ForwardInitEpoch {
                 stream_id,
-                extent_id,
                 epoch,
                 start_offset,
                 extent_capacity,
@@ -508,7 +477,6 @@ impl Frame {
                 arena_class,
             } => {
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(start_offset.0);
                 dst.put_u32(*extent_capacity);
@@ -518,59 +486,49 @@ impl Frame {
             }
             VariableHeader::ForwardChecksum {
                 stream_id,
-                extent_id,
                 epoch,
                 checksum,
                 committed_bytes,
             } => {
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u32(*checksum);
                 dst.put_u64(*committed_bytes);
             }
             VariableHeader::ForwardFlushed {
                 stream_id,
-                extent_id,
                 epoch,
             } => {
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
             }
-            VariableHeader::FlushExtent {
+            VariableHeader::FlushEpoch {
                 request_id,
                 stream_id,
-                extent_id,
                 epoch,
                 start_offset,
                 end_offset,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(*start_offset);
                 dst.put_u64(*end_offset);
             }
-            VariableHeader::FlushExtentResp {
+            VariableHeader::FlushEpochResp {
                 request_id,
                 stream_id,
-                extent_id,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
             }
-            VariableHeader::FlushExtentRespError {
+            VariableHeader::FlushEpochRespError {
                 request_id,
                 stream_id,
-                extent_id,
                 error_code,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u16(*error_code as u16);
             }
             VariableHeader::StreamManagerMembershipChange => {
@@ -594,7 +552,7 @@ impl Frame {
                 request_id,
                 stream_id,
             }
-            | VariableHeader::DescribeExtentResp {
+            | VariableHeader::DescribeEpochResp {
                 request_id,
                 stream_id,
             } => {
@@ -610,25 +568,21 @@ impl Frame {
                 dst.put_u32(stream_id.0);
                 dst.put_u16(*error_code as u16);
             }
-            VariableHeader::DescribeExtentRespError {
+            VariableHeader::DescribeEpochRespError {
                 request_id,
                 stream_id,
-                extent_id,
                 error_code,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u16(*error_code as u16);
             }
-            VariableHeader::DescribeExtent {
+            VariableHeader::DescribeEpoch {
                 request_id,
                 stream_id,
-                extent_id,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
-                dst.put_u32(extent_id.0);
             }
             VariableHeader::Seek {
                 request_id,
@@ -659,31 +613,27 @@ impl Frame {
                 dst.put_u64(offset.0);
                 dst.put_u16(*error_code as u16);
             }
-            VariableHeader::UpdateExtentProgress {
+            VariableHeader::UpdateEpochProgress {
                 stream_id,
                 epoch,
-                extent_id,
                 current_offset,
             } => {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u64(current_offset.0);
             }
-            VariableHeader::UpdateExtentFlushed {
+            VariableHeader::UpdateEpochFlushed {
                 stream_id,
                 epoch,
-                extent_id,
                 start_offset,
                 end_offset,
             } => {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
-                dst.put_u32(extent_id.0);
                 dst.put_u64(start_offset.0);
                 dst.put_u64(end_offset.0);
             }
-            VariableHeader::ReportExtents {
+            VariableHeader::ReportEpoch {
                 request_id,
                 stream_id,
                 epoch,
@@ -692,7 +642,7 @@ impl Frame {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
             }
-            VariableHeader::ReportExtentsResp {
+            VariableHeader::ReportEpochResp {
                 request_id,
                 stream_id,
                 epoch,
@@ -701,7 +651,7 @@ impl Frame {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
             }
-            VariableHeader::ReportExtentsRespError {
+            VariableHeader::ReportEpochRespError {
                 request_id,
                 stream_id,
                 epoch,

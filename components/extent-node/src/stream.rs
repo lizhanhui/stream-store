@@ -162,6 +162,16 @@ impl Stream {
         self.epochs.load().iter().find(|e| e.id == extent_id).cloned()
     }
 
+    /// Find the extent whose range covers `offset`. Used by handlers that
+    /// receive an offset on the wire without an extent_id.
+    pub fn find_extent_for_offset(&self, offset: Offset) -> Option<ExtentId> {
+        self.epochs
+            .load()
+            .iter()
+            .find(|e| offset.0 >= e.start_offset.0 && offset.0 < e.next_offset().0)
+            .map(|e| e.id)
+    }
+
     /// The currently-active (last, highest-epoch) epoch. None if none
     /// registered yet.
     fn active_epoch(&self) -> Option<Arc<StreamEpoch>> {

@@ -511,18 +511,20 @@ impl StreamManagerClient {
                 extent_id,
                 current_offset,
                 epoch,
-            } => (
-                Frame::new(
-                    VariableHeader::UpdateExtentProgress {
-                        stream_id,
-                        epoch,
-                        extent_id,
-                        current_offset: Offset(current_offset),
-                    },
-                    None,
-                ),
-                format!("UpdateExtentProgress stream={stream_id}"),
-            ),
+            } => {
+                let _ = extent_id;
+                (
+                    Frame::new(
+                        VariableHeader::UpdateEpochProgress {
+                            stream_id,
+                            epoch,
+                            current_offset: Offset(current_offset),
+                        },
+                        None,
+                    ),
+                    format!("UpdateEpochProgress stream={stream_id}"),
+                )
+            }
             ExtentUpdate::Flushed {
                 stream_id,
                 extent_id,
@@ -531,16 +533,15 @@ impl StreamManagerClient {
                 end_offset,
             } => (
                 Frame::new(
-                    VariableHeader::UpdateExtentFlushed {
+                    VariableHeader::UpdateEpochFlushed {
                         stream_id,
                         epoch,
-                        extent_id,
                         start_offset: Offset(start_offset),
                         end_offset: Offset(end_offset),
                     },
                     None,
                 ),
-                format!("UpdateExtentFlushed stream={stream_id} extent={extent_id}"),
+                format!("UpdateEpochFlushed stream={stream_id} extent={extent_id}"),
             ),
         };
         match tokio::time::timeout(rpc_request_timeout, framed.send(frame)).await {

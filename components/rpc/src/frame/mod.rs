@@ -9,10 +9,10 @@ mod tests;
 
 use bytes::Bytes;
 use common::types::{
-    Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
-    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
-    FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
-    FLAG_SEAL_COMMIT_RESP, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    Epoch, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
+    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EPOCH,
+    FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, Offset, Opcode,
+    PROTOCOL_VERSION, StreamId,
 };
 
 pub use header::{FixedHeader, VariableHeader};
@@ -104,22 +104,22 @@ impl Frame {
             | VariableHeader::HeartbeatError { request_id, .. }
             | VariableHeader::RegisterEpoch { request_id, .. }
             | VariableHeader::RegisterEpochAck { request_id, .. }
-            | VariableHeader::RegisterExtentAckError { request_id, .. }
-            | VariableHeader::ReportExtents { request_id, .. }
-            | VariableHeader::ReportExtentsResp { request_id, .. }
-            | VariableHeader::ReportExtentsRespError { request_id, .. }
+            | VariableHeader::RegisterEpochAckError { request_id, .. }
+            | VariableHeader::ReportEpoch { request_id, .. }
+            | VariableHeader::ReportEpochResp { request_id, .. }
+            | VariableHeader::ReportEpochRespError { request_id, .. }
             | VariableHeader::DescribeStream { request_id, .. }
             | VariableHeader::DescribeStreamResp { request_id, .. }
             | VariableHeader::DescribeStreamRespError { request_id, .. }
-            | VariableHeader::DescribeExtent { request_id, .. }
-            | VariableHeader::DescribeExtentResp { request_id, .. }
-            | VariableHeader::DescribeExtentRespError { request_id, .. }
+            | VariableHeader::DescribeEpoch { request_id, .. }
+            | VariableHeader::DescribeEpochResp { request_id, .. }
+            | VariableHeader::DescribeEpochRespError { request_id, .. }
             | VariableHeader::Seek { request_id, .. }
             | VariableHeader::SeekResp { request_id, .. }
             | VariableHeader::SeekRespError { request_id, .. }
-            | VariableHeader::FlushExtent { request_id, .. }
-            | VariableHeader::FlushExtentResp { request_id, .. }
-            | VariableHeader::FlushExtentRespError { request_id, .. }
+            | VariableHeader::FlushEpoch { request_id, .. }
+            | VariableHeader::FlushEpochResp { request_id, .. }
+            | VariableHeader::FlushEpochRespError { request_id, .. }
             | VariableHeader::SealEpochCommit { request_id, .. }
             | VariableHeader::SealEpochCommitResp { request_id, .. } => *request_id,
             VariableHeader::Watermark { .. }
@@ -127,8 +127,8 @@ impl Frame {
             | VariableHeader::ForwardInitEpoch { .. }
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::ForwardFlushed { .. }
-            | VariableHeader::UpdateExtentProgress { .. }
-            | VariableHeader::UpdateExtentFlushed { .. }
+            | VariableHeader::UpdateEpochProgress { .. }
+            | VariableHeader::UpdateEpochFlushed { .. }
             | VariableHeader::StreamManagerMembershipChange => 0,
         }
     }
@@ -153,26 +153,28 @@ impl Frame {
             | VariableHeader::QueryOffsetResp { stream_id, .. }
             | VariableHeader::QueryOffsetRespError { stream_id, .. }
             | VariableHeader::RegisterEpochAck { stream_id, .. }
-            | VariableHeader::RegisterExtentAckError { stream_id, .. }
+            | VariableHeader::RegisterEpochAckError { stream_id, .. }
             | VariableHeader::Watermark { stream_id, .. }
             | VariableHeader::Forward { stream_id, .. }
             | VariableHeader::ForwardInitEpoch { stream_id, .. }
             | VariableHeader::ForwardChecksum { stream_id, .. }
-            | VariableHeader::FlushExtent { stream_id, .. }
-            | VariableHeader::FlushExtentResp { stream_id, .. }
-            | VariableHeader::FlushExtentRespError { stream_id, .. }
+            | VariableHeader::ForwardFlushed { stream_id, .. }
+            | VariableHeader::FlushEpoch { stream_id, .. }
+            | VariableHeader::FlushEpochResp { stream_id, .. }
+            | VariableHeader::FlushEpochRespError { stream_id, .. }
             | VariableHeader::SealEpochCommit { stream_id, .. }
             | VariableHeader::SealEpochCommitResp { stream_id, .. }
-            | VariableHeader::UpdateExtentProgress { stream_id, .. }
-            | VariableHeader::ReportExtents { stream_id, .. }
-            | VariableHeader::ReportExtentsResp { stream_id, .. }
-            | VariableHeader::ReportExtentsRespError { stream_id, .. }
+            | VariableHeader::UpdateEpochProgress { stream_id, .. }
+            | VariableHeader::UpdateEpochFlushed { stream_id, .. }
+            | VariableHeader::ReportEpoch { stream_id, .. }
+            | VariableHeader::ReportEpochResp { stream_id, .. }
+            | VariableHeader::ReportEpochRespError { stream_id, .. }
             | VariableHeader::DescribeStream { stream_id, .. }
             | VariableHeader::DescribeStreamResp { stream_id, .. }
             | VariableHeader::DescribeStreamRespError { stream_id, .. }
-            | VariableHeader::DescribeExtent { stream_id, .. }
-            | VariableHeader::DescribeExtentResp { stream_id, .. }
-            | VariableHeader::DescribeExtentRespError { stream_id, .. }
+            | VariableHeader::DescribeEpoch { stream_id, .. }
+            | VariableHeader::DescribeEpochResp { stream_id, .. }
+            | VariableHeader::DescribeEpochRespError { stream_id, .. }
             | VariableHeader::Seek { stream_id, .. }
             | VariableHeader::SeekResp { stream_id, .. }
             | VariableHeader::SeekRespError { stream_id, .. } => *stream_id,
@@ -199,34 +201,6 @@ impl Frame {
         }
     }
 
-    /// Get the extent_id for this frame (ExtentId(0) for opcodes without extent_id).
-    pub fn extent_id(&self) -> ExtentId {
-        match &self.variable_header {
-            VariableHeader::AppendAck { extent_id, .. }
-            | VariableHeader::AppendAckError { extent_id, .. }
-            | VariableHeader::Read { extent_id, .. }
-            | VariableHeader::ReadRespError { extent_id, .. }
-            | VariableHeader::SealEpochResp { extent_id, .. }
-            | VariableHeader::CreateStreamResp { extent_id, .. }
-            | VariableHeader::RegisterEpochAck { extent_id, .. }
-            | VariableHeader::RegisterExtentAckError { extent_id, .. }
-            | VariableHeader::RegisterEpoch { extent_id, .. }
-            | VariableHeader::Forward { extent_id, .. }
-            | VariableHeader::ForwardInitEpoch { extent_id, .. }
-            | VariableHeader::ForwardChecksum { extent_id, .. }
-            | VariableHeader::FlushExtent { extent_id, .. }
-            | VariableHeader::FlushExtentResp { extent_id, .. }
-            | VariableHeader::FlushExtentRespError { extent_id, .. }
-            | VariableHeader::SealEpochCommit { extent_id, .. }
-            | VariableHeader::SealEpochCommitResp { extent_id, .. }
-            | VariableHeader::Watermark { extent_id, .. }
-            | VariableHeader::DescribeExtent { extent_id, .. }
-            | VariableHeader::DescribeExtentRespError { extent_id, .. } => *extent_id,
-            VariableHeader::SealEpochPrepare { extent_id_from, .. } => *extent_id_from,
-            _ => ExtentId(0),
-        }
-    }
-
     /// Get the epoch for this frame (Epoch(0) for opcodes without epoch).
     pub fn epoch(&self) -> Epoch {
         match &self.variable_header {
@@ -240,13 +214,17 @@ impl Frame {
             | VariableHeader::SealEpochCommit { epoch, .. } => *epoch,
             VariableHeader::SealStreamResp { new_epoch, .. } => *new_epoch,
             VariableHeader::RegisterEpoch { config, .. } => config.epoch,
-            VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
+            VariableHeader::UpdateEpochProgress { epoch, .. }
+            | VariableHeader::UpdateEpochFlushed { epoch, .. } => *epoch,
+            VariableHeader::Watermark { epoch, .. } => *epoch,
             VariableHeader::Forward { epoch, .. }
             | VariableHeader::ForwardInitEpoch { epoch, .. }
-            | VariableHeader::FlushExtent { epoch, .. } => *epoch,
-            VariableHeader::ReportExtents { epoch, .. }
-            | VariableHeader::ReportExtentsResp { epoch, .. }
-            | VariableHeader::ReportExtentsRespError { epoch, .. } => *epoch,
+            | VariableHeader::ForwardChecksum { epoch, .. }
+            | VariableHeader::ForwardFlushed { epoch, .. }
+            | VariableHeader::FlushEpoch { epoch, .. } => *epoch,
+            VariableHeader::ReportEpoch { epoch, .. }
+            | VariableHeader::ReportEpochResp { epoch, .. }
+            | VariableHeader::ReportEpochRespError { epoch, .. } => *epoch,
             _ => Epoch(0),
         }
     }
@@ -273,12 +251,12 @@ impl Frame {
             | VariableHeader::ConnectAckError { error_code, .. }
             | VariableHeader::DisconnectAckError { error_code, .. }
             | VariableHeader::HeartbeatError { error_code, .. }
-            | VariableHeader::RegisterExtentAckError { error_code, .. }
-            | VariableHeader::ReportExtentsRespError { error_code, .. }
+            | VariableHeader::RegisterEpochAckError { error_code, .. }
+            | VariableHeader::ReportEpochRespError { error_code, .. }
             | VariableHeader::DescribeStreamRespError { error_code, .. }
-            | VariableHeader::DescribeExtentRespError { error_code, .. }
+            | VariableHeader::DescribeEpochRespError { error_code, .. }
             | VariableHeader::SeekRespError { error_code, .. }
-            | VariableHeader::FlushExtentRespError { error_code, .. } => *error_code as u16,
+            | VariableHeader::FlushEpochRespError { error_code, .. } => *error_code as u16,
             _ => 0,
         }
     }
@@ -303,12 +281,12 @@ impl Frame {
             | VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. }
-            | VariableHeader::RegisterExtentAckError { .. }
-            | VariableHeader::ReportExtentsRespError { .. }
+            | VariableHeader::RegisterEpochAckError { .. }
+            | VariableHeader::ReportEpochRespError { .. }
             | VariableHeader::DescribeStreamRespError { .. }
-            | VariableHeader::DescribeExtentRespError { .. }
+            | VariableHeader::DescribeEpochRespError { .. }
             | VariableHeader::SeekRespError { .. }
-            | VariableHeader::FlushExtentRespError { .. } => FLAG_RESPONSE_ERROR,
+            | VariableHeader::FlushEpochRespError { .. } => FLAG_RESPONSE_ERROR,
             // ── Success responses: FLAG_RESPONSE (0x01) ──
             VariableHeader::AppendAck { .. }
             | VariableHeader::ReadResp { .. }
@@ -319,14 +297,14 @@ impl Frame {
             | VariableHeader::ConnectAck { .. }
             | VariableHeader::DisconnectAck { .. }
             | VariableHeader::RegisterEpochAck { .. }
-            | VariableHeader::ReportExtentsResp { .. }
+            | VariableHeader::ReportEpochResp { .. }
             | VariableHeader::DescribeStreamResp { .. }
-            | VariableHeader::DescribeExtentResp { .. }
+            | VariableHeader::DescribeEpochResp { .. }
             | VariableHeader::SeekResp { .. }
-            | VariableHeader::FlushExtentResp { .. } => FLAG_RESPONSE,
+            | VariableHeader::FlushEpochResp { .. } => FLAG_RESPONSE,
             // ── Per-opcode request-side flags ──
-            VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
-            VariableHeader::UpdateExtentFlushed { .. } => FLAG_EXTENT_FLUSHED,
+            VariableHeader::UpdateEpochProgress { .. } => FLAG_EXTENT_PROGRESS,
+            VariableHeader::UpdateEpochFlushed { .. } => FLAG_EXTENT_FLUSHED,
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
             VariableHeader::ForwardInitEpoch { .. } => FLAG_FORWARD_INIT_EPOCH,
             VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,

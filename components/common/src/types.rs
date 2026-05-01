@@ -139,13 +139,13 @@ pub enum Opcode {
     Watermark = 0x17,
     /// Async extent update from EN to SM. Fire-and-forget.
     /// Flags distinguish variants: sealed (0x00) or progress (0x01).
-    UpdateExtent = 0x18,
+    UpdateEpoch = 0x18,
     /// SM queries an EN for all extents it holds for a stream (recovery path).
     /// Flags: 0x00=request, 0x01=response, 0x80=error.
-    ReportExtents = 0x19,
+    ReportEpoch = 0x19,
     /// SM commands EN to flush a sealed extent to S3 (disaster recovery).
     /// Fire-and-forget: no response.
-    FlushExtent = 0x1B,
+    FlushEpoch = 0x1B,
 
     // -- Cluster management (0x20-0x2F): StreamManager -> ExtentNode/Client --
     StreamManagerMembershipChange = 0x20,
@@ -155,7 +155,7 @@ pub enum Opcode {
     /// Request flag 0x02=by-name lookup (FLAG_DESCRIBE_STREAM_BY_NAME).
     DescribeStream = 0x30,
     /// Describe a single extent. Flags: 0x00=request, 0x01=response, 0x80=error.
-    DescribeExtent = 0x32,
+    DescribeEpoch = 0x32,
     /// Seek: resolve offset to extent. Flags: 0x00=request, 0x01=response, 0x80=error.
     Seek = 0x34,
 }
@@ -177,14 +177,14 @@ impl Opcode {
             0x14 => Some(Opcode::Heartbeat),
             0x15 => Some(Opcode::RegisterEpoch),
             0x17 => Some(Opcode::Watermark),
-            0x18 => Some(Opcode::UpdateExtent),
-            0x19 => Some(Opcode::ReportExtents),
-            0x1B => Some(Opcode::FlushExtent),
+            0x18 => Some(Opcode::UpdateEpoch),
+            0x19 => Some(Opcode::ReportEpoch),
+            0x1B => Some(Opcode::FlushEpoch),
             // Cluster management
             0x20 => Some(Opcode::StreamManagerMembershipChange),
             // Management
             0x30 => Some(Opcode::DescribeStream),
-            0x32 => Some(Opcode::DescribeExtent),
+            0x32 => Some(Opcode::DescribeEpoch),
             0x34 => Some(Opcode::Seek),
             _ => None,
         }

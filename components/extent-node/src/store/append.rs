@@ -55,7 +55,6 @@ impl ExtentNodeStore {
                         &frame,
                         ErrorCode::UnknownStream,
                         &format!("stream {} not found", stream_id),
-                        ExtentId(0),
                     ));
                 }
             };
@@ -66,7 +65,6 @@ impl ExtentNodeStore {
                     &frame,
                     ErrorCode::EpochStale,
                     &format!("epoch stale: client={}, current={}", client_epoch, epoch),
-                    ExtentId(0),
                 ));
             }
 
@@ -137,7 +135,6 @@ impl ExtentNodeStore {
                     request_id,
                     stream_id,
                     epoch,
-                    ExtentId(0),
                     ErrorCode::ExtentSealed,
                     "extent full: eviction blocked, seal required",
                 );
@@ -222,11 +219,11 @@ impl ExtentNodeStore {
         let (append_result, extent_id) = match stream.try_append_active(payload) {
             Ok(r) => r,
             Err(StorageError::ExtentSealed { extent_id, .. }) => {
+                let _ = extent_id;
                 let err = Frame::append_ack_error(
                     request_id,
                     stream_id,
                     epoch,
-                    extent_id,
                     ErrorCode::ExtentSealed,
                     "extent is sealed",
                 );
@@ -246,7 +243,6 @@ impl ExtentNodeStore {
                     request_id,
                     stream_id,
                     epoch,
-                    ExtentId(0),
                     ErrorCode::InternalError,
                     &e.to_string(),
                 );
@@ -279,7 +275,6 @@ impl ExtentNodeStore {
                         request_id,
                         stream_id,
                         epoch,
-                        extent_id,
                         offset,
                     },
                     None,
@@ -299,7 +294,6 @@ impl ExtentNodeStore {
                             request_id,
                             stream_id,
                             epoch,
-                            extent_id,
                             offset,
                         },
                         None,
@@ -316,7 +310,6 @@ impl ExtentNodeStore {
                         let forward_frame = Frame::new(
                             VariableHeader::Forward {
                                 stream_id,
-                                extent_id,
                                 epoch,
                                 offset,
                             },
@@ -354,7 +347,6 @@ impl ExtentNodeStore {
                         request_id,
                         stream_id,
                         epoch,
-                        extent_id,
                         offset,
                     },
                     None,
@@ -621,7 +613,6 @@ impl ExtentNodeStore {
         let frame = Frame::new(
             VariableHeader::ForwardChecksum {
                 stream_id,
-                extent_id: sealed_extent_id,
                 epoch: stream.epoch(),
                 checksum,
                 committed_bytes,
@@ -677,7 +668,6 @@ impl ExtentNodeStore {
                             frame,
                             ErrorCode::UnknownStream,
                             &format!("stream {} not found", stream_id),
-                            ExtentId(0),
                         ));
                     }
                     return responses;
@@ -692,7 +682,6 @@ impl ExtentNodeStore {
                         frame,
                         ErrorCode::EpochStale,
                         &format!("epoch stale: client={}, current={}", client_epoch, epoch),
-                        ExtentId(0),
                     ));
                 }
                 return responses;
@@ -741,11 +730,11 @@ impl ExtentNodeStore {
                         });
                     }
                     Err(StorageError::ExtentSealed { extent_id, .. }) => {
+                        let _ = extent_id;
                         let err = Frame::append_ack_error(
                             request_id,
                             stream_id,
                             epoch,
-                            extent_id,
                             ErrorCode::ExtentSealed,
                             "extent is sealed",
                         );
@@ -767,7 +756,6 @@ impl ExtentNodeStore {
                             request_id,
                             stream_id,
                             epoch,
-                            ExtentId(0),
                             ErrorCode::InternalError,
                             &e.to_string(),
                         );
@@ -801,7 +789,6 @@ impl ExtentNodeStore {
                                     request_id: entry.request_id,
                                     stream_id,
                                     epoch,
-                                    extent_id: entry.extent_id,
                                     offset: entry.offset,
                                 },
                                 None,
@@ -821,7 +808,6 @@ impl ExtentNodeStore {
                                         request_id: entry.request_id,
                                         stream_id,
                                         epoch,
-                                        extent_id: entry.extent_id,
                                         offset: entry.offset,
                                     },
                                     None,
@@ -838,7 +824,6 @@ impl ExtentNodeStore {
                                     let forward_frame = Frame::new(
                                         VariableHeader::Forward {
                                             stream_id,
-                                            extent_id: entry.extent_id,
                                             epoch,
                                             offset: entry.offset,
                                         },
@@ -879,7 +864,6 @@ impl ExtentNodeStore {
                                     request_id: entry.request_id,
                                     stream_id,
                                     epoch,
-                                    extent_id: entry.extent_id,
                                     offset: entry.offset,
                                 },
                                 None,

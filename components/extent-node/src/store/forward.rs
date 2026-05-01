@@ -24,15 +24,14 @@ impl ExtentNodeStore {
         let (stream_id, extent_id, epoch) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
-                extent_id,
                 epoch,
                 ..
-            } => (*stream_id, *extent_id, Some(*epoch)),
+            } => (*stream_id, ExtentId(epoch.0 + 1), Some(*epoch)),
             VariableHeader::ForwardChecksum {
                 stream_id,
-                extent_id,
+                epoch,
                 ..
-            } => (*stream_id, *extent_id, None),
+            } => (*stream_id, ExtentId(epoch.0 + 1), None),
             _ => return None,
         };
 
@@ -45,7 +44,6 @@ impl ExtentNodeStore {
             Some(Frame::new(
                 VariableHeader::ForwardInitEpoch {
                     stream_id,
-                    extent_id,
                     epoch,
                     start_offset: ext.start_offset,
                     extent_capacity: ext.capacity(),
@@ -66,7 +64,6 @@ impl ExtentNodeStore {
     pub(crate) fn handle_forward_init_epoch(&self, frame: Frame) {
         let (
             stream_id,
-            extent_id,
             epoch,
             start_offset,
             extent_capacity,
@@ -76,7 +73,6 @@ impl ExtentNodeStore {
         ) = match &frame.variable_header {
             VariableHeader::ForwardInitEpoch {
                 stream_id,
-                extent_id,
                 epoch,
                 start_offset,
                 extent_capacity,
@@ -85,7 +81,6 @@ impl ExtentNodeStore {
                 arena_class,
             } => (
                 *stream_id,
-                *extent_id,
                 *epoch,
                 *start_offset,
                 *extent_capacity,
@@ -95,6 +90,9 @@ impl ExtentNodeStore {
             ),
             _ => return,
         };
+
+        // Synthesize a local extent id from the epoch (one extent per epoch).
+        let extent_id = ExtentId(epoch.0 + 1);
 
         tracing::debug!(
             arena_class = ?arena_class,
@@ -151,15 +149,17 @@ impl ExtentNodeStore {
     /// Returns a cumulative Watermark with the contiguous committed offset,
     /// or None if the forward cannot be processed (bad frame, unknown stream, etc.).
     pub(crate) fn handle_forward(&self, frame: Frame) -> Option<Frame> {
-        let (stream_id, extent_id, epoch, offset) = match &frame.variable_header {
+        let (stream_id, epoch, offset) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
-                extent_id,
                 epoch,
                 offset,
-            } => (*stream_id, *extent_id, *epoch, *offset),
+            } => (*stream_id, *epoch, *offset),
             _ => return None,
         };
+
+        // Synthesize a local extent id from the epoch (one extent per epoch).
+        let extent_id = ExtentId(epoch.0 + 1);
 
         // Look up the stream — must exist (created by ForwardInitEpoch or RegisterEpoch).
         let streams = self.streams.pin();
@@ -242,7 +242,6 @@ impl ExtentNodeStore {
         Some(Frame::new(
             VariableHeader::Watermark {
                 stream_id,
-                extent_id,
                 epoch,
                 offset: watermark,
             },
@@ -252,17 +251,18 @@ impl ExtentNodeStore {
 
     /// Handle ForwardChecksum (0x0B, flag=0x02) — CRC32 verification for sealed extent.
     pub(crate) fn handle_forward_checksum(&self, frame: Frame) {
-        let (stream_id, extent_id, primary_crc32, primary_committed_bytes) =
+        let (stream_id, epoch, primary_crc32, primary_committed_bytes) =
             match &frame.variable_header {
                 VariableHeader::ForwardChecksum {
                     stream_id,
-                    extent_id,
+                    epoch,
                     checksum,
                     committed_bytes,
                     ..
-                } => (*stream_id, *extent_id, *checksum, *committed_bytes),
+                } => (*stream_id, *epoch, *checksum, *committed_bytes),
                 _ => return,
             };
+        let extent_id = ExtentId(epoch.0 + 1);
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
@@ -312,14 +312,15 @@ impl ExtentNodeStore {
 
     /// Handle ForwardFlushed (0x05, flag=0x03) — extent flushed to S3 notification.
     pub(crate) fn handle_forward_flushed(&self, frame: Frame) {
-        let (stream_id, extent_id) = match &frame.variable_header {
+        let (stream_id, epoch) = match &frame.variable_header {
             VariableHeader::ForwardFlushed {
                 stream_id,
-                extent_id,
+                epoch,
                 ..
-            } => (*stream_id, *extent_id),
+            } => (*stream_id, *epoch),
             _ => return,
         };
+        let extent_id = ExtentId(epoch.0 + 1);
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {

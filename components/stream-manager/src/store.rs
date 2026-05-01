@@ -31,6 +31,7 @@ async fn seal_epoch_static(
     extent_id_from: ExtentId,
     start_offset: u64,
 ) -> Result<(ExtentId, u64, u64, Option<Bytes>), StorageError> {
+    let _ = extent_id_from;
     let client = client::StreamClient::connect(addr).await.map_err(|e| {
         InternalSnafu {
             message: format!("connect to ExtentNode {addr} for Seal: {e}"),
@@ -44,7 +45,6 @@ async fn seal_epoch_static(
                 request_id: 0,
                 stream_id,
                 epoch,
-                extent_id_from,
                 start_offset,
             },
             None,
@@ -68,11 +68,10 @@ async fn seal_epoch_static(
     // Parse SealEpochResp.
     match &resp.variable_header {
         VariableHeader::SealEpochResp {
-            extent_id,
             start_offset: so,
             end_offset,
             ..
-        } => Ok((*extent_id, *so, *end_offset, resp.payload.clone())),
+        } => Ok((ExtentId(0), *so, *end_offset, resp.payload.clone())),
         _ => Err(InternalSnafu {
             message: format!(
                 "ExtentNode {addr} returned unexpected response: {:?}",
@@ -131,7 +130,7 @@ async fn report_extents_from_node_static(
 
     let resp = client
         .send_frame(Frame::new(
-            VariableHeader::ReportExtents {
+            VariableHeader::ReportEpoch {
                 request_id: 0,
                 stream_id,
                 epoch,
@@ -359,7 +358,7 @@ impl StreamManagerStore {
     ) -> Result<(), StorageError> {
         let payload = build_register_extent_payload(secondary_addrs);
         let addr = primary_addr.to_string();
-        let eid = extent_id;
+        let _eid = extent_id;
 
         let result = tokio::time::timeout(Duration::from_millis(500), async {
             let client = client::StreamClient::connect(&addr).await.map_err(|e| {
@@ -375,7 +374,6 @@ impl StreamManagerStore {
                 .send_frame(Frame::new(
                     VariableHeader::RegisterEpoch {
                         request_id: 0,
-                        extent_id: eid,
                         role: 0, // Primary
                         config,
                     },
@@ -446,7 +444,6 @@ impl StreamManagerStore {
                             .send_frame(Frame::new(
                                 VariableHeader::RegisterEpoch {
                                     request_id: 0,
-                                    extent_id: eid,
                                     role,
                                     config,
                                 },
@@ -552,7 +549,7 @@ impl RequestHandler for StreamManagerStore {
     ) -> Option<Frame> {
         match frame.opcode() {
             // Fire-and-forget: no response frame
-            Opcode::UpdateExtent => {
+            Opcode::UpdateEpoch => {
                 self.handle_extent_update(frame).await;
                 None
             }
@@ -566,12 +563,12 @@ impl RequestHandler for StreamManagerStore {
                     Opcode::SealStream => self.handle_seal_stream_manager(frame).await,
                     Opcode::QueryOffset => self.handle_query_offset(frame).await,
                     Opcode::DescribeStream => self.handle_describe_stream(frame).await,
-                    Opcode::DescribeExtent => self.handle_describe_extent(frame).await,
+                    Opcode::DescribeEpoch => self.handle_describe_extent(frame).await,
                     Opcode::Seek => self.handle_seek(frame).await,
-                    Opcode::ReportExtents => self.handle_report_extents(frame).await,
+                    Opcode::ReportEpoch => self.handle_report_extents(frame).await,
                     Opcode::RegisterEpoch
                     | Opcode::Watermark
-                    | Opcode::UpdateExtent
+                    | Opcode::UpdateEpoch
                     | Opcode::SealEpoch
                     | Opcode::StreamManagerMembershipChange => {
                         warn!(opcode = ?frame.opcode(), "SM received unexpected response/fire-and-forget opcode");
@@ -581,7 +578,6 @@ impl RequestHandler for StreamManagerStore {
                         &frame,
                         ErrorCode::InternalError,
                         &format!("StreamManager: unsupported opcode {:?}", frame.opcode()),
-                        ExtentId(0),
                     ),
                 };
                 Some(response)
@@ -614,7 +610,6 @@ impl StreamManagerStore {
                             &frame,
                             ErrorCode::InternalError,
                             &e.to_string(),
-                            ExtentId(0),
                         )
                     }
                 }
@@ -623,7 +618,6 @@ impl StreamManagerStore {
                 &frame,
                 ErrorCode::InternalError,
                 "invalid Connect payload",
-                ExtentId(0),
             ),
         }
     }
@@ -653,7 +647,6 @@ impl StreamManagerStore {
                             &frame,
                             ErrorCode::InternalError,
                             &e.to_string(),
-                            ExtentId(0),
                         )
                     }
                 }
@@ -662,7 +655,6 @@ impl StreamManagerStore {
                 &frame,
                 ErrorCode::InternalError,
                 "invalid Heartbeat payload",
-                ExtentId(0),
             ),
         }
     }
@@ -688,7 +680,6 @@ impl StreamManagerStore {
                         &frame,
                         ErrorCode::InternalError,
                         &e.to_string(),
-                        ExtentId(0),
                     )
                 }
             },
@@ -696,7 +687,6 @@ impl StreamManagerStore {
                 &frame,
                 ErrorCode::InternalError,
                 "invalid Disconnect payload",
-                ExtentId(0),
             ),
         }
     }
@@ -727,7 +717,6 @@ impl StreamManagerStore {
                     &frame,
                     ErrorCode::InternalError,
                     "invalid CreateStream frame",
-                    ExtentId(0),
                 );
             }
         };
@@ -740,7 +729,6 @@ impl StreamManagerStore {
                 &frame,
                 ErrorCode::InternalError,
                 "replication_factor must be >= 1",
-                ExtentId(0),
             );
         }
 
@@ -782,23 +770,24 @@ impl StreamManagerStore {
         .await;
 
         match result {
-            Ok((stream_id, extent_id, primary_addr)) => Frame::new(
-                VariableHeader::CreateStreamResp {
-                    request_id: frame.request_id(),
-                    stream_id,
-                    extent_id,
-                    epoch: Epoch(0),
-                    primary_addr: Bytes::from(primary_addr),
-                },
-                None,
-            ),
+            Ok((stream_id, extent_id, primary_addr)) => {
+                let _ = extent_id;
+                Frame::new(
+                    VariableHeader::CreateStreamResp {
+                        request_id: frame.request_id(),
+                        stream_id,
+                        epoch: Epoch(0),
+                        primary_addr: Bytes::from(primary_addr),
+                    },
+                    None,
+                )
+            }
             Err(e) => {
                 error!("create_stream failed: {e}");
                 Frame::error_from_request(
                     &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
-                    ExtentId(0),
                 )
             }
         }
@@ -903,6 +892,7 @@ impl StreamManagerStore {
             let addr = replica.node_addr.clone();
             let sid = stream_id;
             let eid = extent_id;
+            let _ = eid;
             let ep = extent_row.epoch;
             let so = extent_start_offset;
             let eo = end_offset;
@@ -913,7 +903,6 @@ impl StreamManagerStore {
                             rpc::frame::VariableHeader::SealEpochCommit {
                                 request_id: 0,
                                 stream_id: sid,
-                                extent_id: eid,
                                 epoch: ep,
                                 start_offset: so,
                                 end_offset: eo,
@@ -1284,7 +1273,6 @@ impl StreamManagerStore {
                     &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
-                    ExtentId(0),
                 )
             }
         }
@@ -1315,7 +1303,6 @@ impl StreamManagerStore {
                         &frame,
                         ErrorCode::UnknownStream,
                         &format!("stream not found: {name_str}"),
-                        ExtentId(0),
                     );
                 }
                 Err(e) => {
@@ -1324,7 +1311,6 @@ impl StreamManagerStore {
                         &frame,
                         ErrorCode::InternalError,
                         &e.to_string(),
-                        ExtentId(0),
                     );
                 }
             }
@@ -1349,7 +1335,6 @@ impl StreamManagerStore {
                     &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
-                    ExtentId(0),
                 )
             }
         }
@@ -1361,13 +1346,17 @@ impl StreamManagerStore {
     /// Response: DescribeExtentResp with encoded Vec<ExtentInfo> (length 1)
     async fn handle_describe_extent(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
-        let extent_id = frame.extent_id();
+        // `extent_id` no longer travels on the wire for DescribeEpoch; identity
+        // is now (stream_id, epoch). For this commit we still look up by the
+        // stream's latest epoch — a later phase collapses the SM metadata row
+        // to a single per-(stream, epoch) lookup that matches this behaviour.
+        let extent_id = ExtentId(0);
 
         match self.store.describe_extent(stream_id, extent_id).await {
             Ok(Some(info)) => {
                 let payload = encode_extent_info_vec(&[info]);
                 Frame::new(
-                    VariableHeader::DescribeExtentResp {
+                    VariableHeader::DescribeEpochResp {
                         request_id: frame.request_id(),
                         stream_id,
                     },
@@ -1381,7 +1370,6 @@ impl StreamManagerStore {
                     "extent not found: stream={}, extent={}",
                     stream_id, extent_id
                 ),
-                ExtentId(0),
             ),
             Err(e) => {
                 error!("describe_extent failed: {e}");
@@ -1389,7 +1377,6 @@ impl StreamManagerStore {
                     &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
-                    ExtentId(0),
                 )
             }
         }
@@ -1422,7 +1409,6 @@ impl StreamManagerStore {
                     "no extent contains offset {} for stream {:?}",
                     offset, stream_id
                 ),
-                ExtentId(0),
             ),
             Err(e) => {
                 error!("seek failed: {e}");
@@ -1430,7 +1416,6 @@ impl StreamManagerStore {
                     &frame,
                     ErrorCode::InternalError,
                     &e.to_string(),
-                    ExtentId(0),
                 )
             }
         }
@@ -1718,15 +1703,16 @@ impl StreamManagerStore {
     /// - Flushed: extent was flushed to S3 (EN confirms upload). SM broadcasts ForwardFlushed to all replicas.
     async fn handle_extent_update(&self, frame: Frame) {
         match &frame.variable_header {
-            VariableHeader::UpdateExtentProgress {
+            VariableHeader::UpdateEpochProgress {
                 stream_id,
                 epoch,
-                extent_id,
                 current_offset,
             } => {
+                // `extent_id` no longer travels on the wire; synthesize one from epoch.
+                let extent_id = ExtentId(epoch.0);
                 if let Err(e) = self
                     .store
-                    .record_extent_progress(*stream_id, *epoch, *extent_id, current_offset.0)
+                    .record_extent_progress(*stream_id, *epoch, extent_id, current_offset.0)
                     .await
                 {
                     warn!(
@@ -1735,15 +1721,16 @@ impl StreamManagerStore {
                     );
                 }
             }
-            VariableHeader::UpdateExtentFlushed {
+            VariableHeader::UpdateEpochFlushed {
                 stream_id,
                 epoch,
-                extent_id,
                 start_offset,
                 end_offset,
             } => {
+                // `extent_id` no longer travels on the wire; synthesize one from epoch.
+                let extent_id = ExtentId(epoch.0);
                 info!(
-                    "UpdateExtentFlushed: stream={}, epoch={}, extent={}, start_offset={}, end_offset={}",
+                    "UpdateEpochFlushed: stream={}, epoch={}, extent={}, start_offset={}, end_offset={}",
                     stream_id, epoch, extent_id, start_offset.0, end_offset.0
                 );
                 if let Err(e) = self
@@ -1751,7 +1738,7 @@ impl StreamManagerStore {
                     .record_extent_flushed(
                         *stream_id,
                         *epoch,
-                        *extent_id,
+                        extent_id,
                         start_offset.0,
                         end_offset.0,
                     )
@@ -1765,7 +1752,7 @@ impl StreamManagerStore {
                     // Broadcast ForwardFlushed to all replicas so they can mark the
                     // extent eligible for eviction. Idempotent — safe even if the
                     // Primary already broadcast this notification.
-                    self.broadcast_forward_flushed(*stream_id, *epoch, *extent_id)
+                    self.broadcast_forward_flushed(*stream_id, *epoch, extent_id)
                         .await;
                 }
             }
@@ -1799,6 +1786,7 @@ impl StreamManagerStore {
             let addr = replica.node_addr.clone();
             let sid = stream_id;
             let eid = extent_id;
+            let _ = eid;
             let ep = epoch;
             tokio::spawn(async move {
                 match client::StreamClient::connect(&addr).await {
@@ -1806,7 +1794,6 @@ impl StreamManagerStore {
                         let frame = Frame::new(
                             VariableHeader::ForwardFlushed {
                                 stream_id: sid,
-                                extent_id: eid,
                                 epoch: ep,
                             },
                             None,
@@ -1911,10 +1898,9 @@ impl StreamManagerStore {
                 match client::StreamClient::connect(&addr).await {
                     Ok(c) => {
                         let frame = rpc::frame::Frame::new(
-                            rpc::frame::VariableHeader::FlushExtent {
+                            rpc::frame::VariableHeader::FlushEpoch {
                                 request_id: 0,
                                 stream_id: sid,
-                                extent_id: eid,
                                 epoch: ep,
                                 start_offset: so,
                                 end_offset: eo,
@@ -1959,7 +1945,6 @@ impl StreamManagerStore {
             &frame,
             ErrorCode::InternalError,
             "ReportExtents not yet implemented",
-            ExtentId(0),
         )
     }
 }

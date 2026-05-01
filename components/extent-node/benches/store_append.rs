@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::types::{ArenaClass, Epoch, ExtentId, ExtentPolicy, StorageClass, StreamConfig, StreamId};
+use common::types::{ArenaClass, Epoch, ExtentPolicy, StorageClass, StreamConfig, StreamId};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use extent_node::store::ExtentNodeStore;
 use rpc::frame::{Frame, VariableHeader};
@@ -32,13 +32,13 @@ const THREAD_COUNTS: &[usize] = &[1, 2, 4, 8];
 
 /// Register a stream+extent on the store, mirroring the test helper in store.rs.
 async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u32, extent_id: u32) {
+    let _ = extent_id;
     let payload = build_register_extent_payload(&[]);
     let _ = store
         .handle_frame(
             Frame::new(
                 VariableHeader::RegisterEpoch {
                     request_id: 0,
-                    extent_id: ExtentId(extent_id),
                     role: 0,
                     config: StreamConfig {
                         stream_id: StreamId(stream_id),

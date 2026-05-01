@@ -202,7 +202,6 @@ impl AckQueueInner {
                             request_id: ack.request_id,
                             stream_id: ack.stream_id,
                             epoch: ack.epoch,
-                            extent_id: ack.extent_id,
                             offset: Offset(ack.assigned_offset),
                         },
                         None,
@@ -232,7 +231,6 @@ impl AckQueueInner {
                     ack.request_id,
                     ack.stream_id,
                     ack.epoch,
-                    ack.extent_id,
                     ErrorCode::InternalError,
                     "replication timeout",
                 );

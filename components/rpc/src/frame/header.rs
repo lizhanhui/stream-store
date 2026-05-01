@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use common::types::{
-    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass,
-    StreamConfig, StreamId,
+    ArenaClass, Epoch, ErrorCode, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig,
+    StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.
@@ -33,20 +33,17 @@ pub enum VariableHeader {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
-        extent_id: ExtentId,
         offset: Offset,
     },
     AppendAckError {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
-        extent_id: ExtentId,
         error_code: ErrorCode,
     },
     Read {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         offset: Offset,
         count: u32,
     },
@@ -59,7 +56,6 @@ pub enum VariableHeader {
     ReadRespError {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         offset: Offset,
         error_code: ErrorCode,
     },
@@ -84,14 +80,12 @@ pub enum VariableHeader {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
-        extent_id_from: ExtentId,
         start_offset: u64,
     },
     SealEpochResp {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
-        extent_id: ExtentId,
         start_offset: u64,
         end_offset: u64,
     },
@@ -106,7 +100,6 @@ pub enum VariableHeader {
     SealEpochCommit {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         start_offset: u64,
         end_offset: u64,
@@ -115,7 +108,6 @@ pub enum VariableHeader {
     SealEpochCommitResp {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
     },
     CreateStream {
         request_id: u32,
@@ -129,7 +121,6 @@ pub enum VariableHeader {
     CreateStreamResp {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         primary_addr: Bytes,
     },
@@ -180,7 +171,6 @@ pub enum VariableHeader {
     },
     RegisterEpoch {
         request_id: u32,
-        extent_id: ExtentId,
         /// 0 = Primary, 1+ = Secondary.
         role: u8,
         /// Stream identity, replication, epoch, durability, and sizing policy.
@@ -189,54 +179,49 @@ pub enum VariableHeader {
     RegisterEpochAck {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
     },
-    RegisterExtentAckError {
+    RegisterEpochAckError {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         error_code: ErrorCode,
     },
     Watermark {
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         offset: Offset,
     },
-    /// Active extent progress report (UpdateExtent, flag=0x01).
+    /// Active extent progress report (UpdateEpoch, flag=0x01).
     /// Fire-and-forget periodic update of current offset for observability.
-    UpdateExtentProgress {
+    UpdateEpochProgress {
         stream_id: StreamId,
         epoch: Epoch,
-        extent_id: ExtentId,
         current_offset: Offset,
     },
-    /// Extent flushed to S3 (UpdateExtent, flag=0x02).
+    /// Extent flushed to S3 (UpdateEpoch, flag=0x02).
     /// Fire-and-forget: EN notifies SM after successful S3 upload.
     ///
     /// Carries `start_offset` and `end_offset` so SM can materialize a
     /// `Flushed` row directly (see `record_extent_flushed` in
     /// stream-manager/metadata.rs).
-    UpdateExtentFlushed {
+    UpdateEpochFlushed {
         stream_id: StreamId,
         epoch: Epoch,
-        extent_id: ExtentId,
         start_offset: Offset,
         end_offset: Offset,
     },
     /// SM queries an EN for all extents it holds for a stream at a given epoch (0x19).
-    ReportExtents {
+    ReportEpoch {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
     },
-    /// EN response to ReportExtents with extent state for reconciliation (0x1A).
-    ReportExtentsResp {
+    /// EN response to ReportEpoch with extent state for reconciliation (0x1A).
+    ReportEpochResp {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
     },
-    ReportExtentsRespError {
+    ReportEpochRespError {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
@@ -248,7 +233,6 @@ pub enum VariableHeader {
     /// Fire-and-forget: no request_id; secondary responds with cumulative Watermark.
     Forward {
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         offset: Offset,
     },
@@ -258,7 +242,6 @@ pub enum VariableHeader {
     /// so the secondary can create the extent with the correct capacity.
     ForwardInitEpoch {
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         start_offset: Offset,
         extent_capacity: u32,
@@ -273,7 +256,6 @@ pub enum VariableHeader {
     /// data integrity of the replicated extent.
     ForwardChecksum {
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         checksum: u32,
         committed_bytes: u64,
@@ -283,30 +265,26 @@ pub enum VariableHeader {
     /// the extent as eligible for memory eviction.
     ForwardFlushed {
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
     },
     /// SM commands EN to flush a sealed extent to S3 (disaster recovery, 0x1B).
     /// Request-response: SM sends request, EN responds with Resp or RespError.
-    FlushExtent {
+    FlushEpoch {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         start_offset: u64,
         end_offset: u64,
     },
-    /// Successful FlushExtent response: EN accepted the flush (or already flushed).
-    FlushExtentResp {
+    /// Successful FlushEpoch response: EN accepted the flush (or already flushed).
+    FlushEpochResp {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
     },
-    /// Error FlushExtent response: EN could not process the flush.
-    FlushExtentRespError {
+    /// Error FlushEpoch response: EN could not process the flush.
+    FlushEpochRespError {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         error_code: ErrorCode,
     },
     StreamManagerMembershipChange,
@@ -326,19 +304,17 @@ pub enum VariableHeader {
         stream_id: StreamId,
         error_code: ErrorCode,
     },
-    DescribeExtent {
-        request_id: u32,
-        stream_id: StreamId,
-        extent_id: ExtentId,
-    },
-    DescribeExtentResp {
+    DescribeEpoch {
         request_id: u32,
         stream_id: StreamId,
     },
-    DescribeExtentRespError {
+    DescribeEpochResp {
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
+    },
+    DescribeEpochRespError {
+        request_id: u32,
+        stream_id: StreamId,
         error_code: ErrorCode,
     },
     Seek {
@@ -397,27 +373,27 @@ impl VariableHeader {
             }
             VariableHeader::RegisterEpoch { .. }
             | VariableHeader::RegisterEpochAck { .. }
-            | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterEpoch,
+            | VariableHeader::RegisterEpochAckError { .. } => Opcode::RegisterEpoch,
             VariableHeader::Watermark { .. } => Opcode::Watermark,
-            VariableHeader::UpdateExtentProgress { .. }
-            | VariableHeader::UpdateExtentFlushed { .. } => Opcode::UpdateExtent,
-            VariableHeader::ReportExtents { .. }
-            | VariableHeader::ReportExtentsResp { .. }
-            | VariableHeader::ReportExtentsRespError { .. } => Opcode::ReportExtents,
+            VariableHeader::UpdateEpochProgress { .. }
+            | VariableHeader::UpdateEpochFlushed { .. } => Opcode::UpdateEpoch,
+            VariableHeader::ReportEpoch { .. }
+            | VariableHeader::ReportEpochResp { .. }
+            | VariableHeader::ReportEpochRespError { .. } => Opcode::ReportEpoch,
             VariableHeader::Forward { .. }
             | VariableHeader::ForwardInitEpoch { .. }
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::ForwardFlushed { .. } => Opcode::Forward,
-            VariableHeader::FlushExtent { .. }
-            | VariableHeader::FlushExtentResp { .. }
-            | VariableHeader::FlushExtentRespError { .. } => Opcode::FlushExtent,
+            VariableHeader::FlushEpoch { .. }
+            | VariableHeader::FlushEpochResp { .. }
+            | VariableHeader::FlushEpochRespError { .. } => Opcode::FlushEpoch,
             VariableHeader::StreamManagerMembershipChange => Opcode::StreamManagerMembershipChange,
             VariableHeader::DescribeStream { .. }
             | VariableHeader::DescribeStreamResp { .. }
             | VariableHeader::DescribeStreamRespError { .. } => Opcode::DescribeStream,
-            VariableHeader::DescribeExtent { .. }
-            | VariableHeader::DescribeExtentResp { .. }
-            | VariableHeader::DescribeExtentRespError { .. } => Opcode::DescribeExtent,
+            VariableHeader::DescribeEpoch { .. }
+            | VariableHeader::DescribeEpochResp { .. }
+            | VariableHeader::DescribeEpochRespError { .. } => Opcode::DescribeEpoch,
             VariableHeader::Seek { .. }
             | VariableHeader::SeekResp { .. }
             | VariableHeader::SeekRespError { .. } => Opcode::Seek,

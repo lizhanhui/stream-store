@@ -2,9 +2,9 @@ use super::*;
 use bytes::{BufMut, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME,
-    FLAG_RESPONSE, FLAG_SEAL_COMMIT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
-    StorageClass, StreamConfig, StreamId,
+    ArenaClass, Epoch, ErrorCode, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE,
+    FLAG_SEAL_COMMIT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass,
+    StreamConfig, StreamId,
 };
 
 fn sample_append_frame() -> Frame {
@@ -147,7 +147,6 @@ fn watermark_no_request_id() {
     let frame = Frame::new(
         VariableHeader::Watermark {
             stream_id: StreamId(42),
-            extent_id: ExtentId(7),
             epoch: Epoch(1),
             offset: Offset(100),
         },
@@ -156,13 +155,13 @@ fn watermark_no_request_id() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 4 (stream_id) + 4 (extent_id) + 4 (epoch) + 8 (offset) = 28 bytes
-    assert_eq!(buf.len(), 28);
+    // 8 (fixed) + 4 (stream_id) + 4 (epoch) + 8 (offset) = 24 bytes
+    assert_eq!(buf.len(), 24);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::Watermark);
     assert_eq!(decoded.stream_id(), StreamId(42));
-    assert_eq!(decoded.extent_id(), ExtentId(7));
+    assert_eq!(decoded.epoch(), Epoch(1));
     assert_eq!(decoded.offset(), Offset(100));
     assert_eq!(decoded.request_id(), 0); // not present on wire
 }
@@ -174,7 +173,6 @@ fn append_ack_round_trip() {
             request_id: 10,
             stream_id: StreamId(1),
             epoch: Epoch(3),
-            extent_id: ExtentId(2),
             offset: Offset(42),
         },
         None,
@@ -187,7 +185,6 @@ fn append_ack_round_trip() {
     assert_eq!(decoded.offset(), Offset(42));
     assert_eq!(decoded.stream_id(), StreamId(1));
     assert_eq!(decoded.epoch(), Epoch(3));
-    assert_eq!(decoded.extent_id(), ExtentId(2));
 }
 
 #[test]
@@ -196,7 +193,6 @@ fn read_with_count() {
         VariableHeader::Read {
             request_id: 5,
             stream_id: StreamId(10),
-            extent_id: ExtentId(2),
             offset: Offset(50),
             count: 20,
         },
@@ -307,7 +303,6 @@ fn seal_epoch_request_round_trip() {
             request_id: 4,
             stream_id: StreamId(20),
             epoch: Epoch(3),
-            extent_id_from: ExtentId(7),
             start_offset: 100,
         },
         None,
@@ -315,8 +310,8 @@ fn seal_epoch_request_round_trip() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 4 + 4 + 4 + 4 + 8 = 32
-    assert_eq!(buf.len(), 32);
+    // 8 (fixed) + 4 + 4 + 4 + 8 = 28
+    assert_eq!(buf.len(), 28);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealEpoch);
@@ -324,15 +319,12 @@ fn seal_epoch_request_round_trip() {
     assert_eq!(decoded.request_id(), 4);
     assert_eq!(decoded.stream_id(), StreamId(20));
     assert_eq!(decoded.epoch(), Epoch(3));
-    assert_eq!(decoded.extent_id(), ExtentId(7));
     assert!(!decoded.is_error_response());
     match &decoded.variable_header {
         VariableHeader::SealEpochPrepare {
-            extent_id_from,
             start_offset,
             ..
         } => {
-            assert_eq!(*extent_id_from, ExtentId(7));
             assert_eq!(*start_offset, 100);
         }
         _ => panic!("expected SealEpochPrepare"),
@@ -347,7 +339,6 @@ fn seal_epoch_resp_round_trip() {
             request_id: 5,
             stream_id: StreamId(20),
             epoch: Epoch(4),
-            extent_id: ExtentId(8),
             start_offset: 100,
             end_offset: 500,
         },
@@ -356,8 +347,8 @@ fn seal_epoch_resp_round_trip() {
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
-    // 8 (fixed) + 4 + 4 + 4 + 4 + 8 + 8 = 40 (vh) + 4 + 10 = 54
-    assert_eq!(buf.len(), 54);
+    // 8 (fixed) + 4 + 4 + 4 + 8 + 8 = 36 (vh) + 4 + 10 = 50
+    assert_eq!(buf.len(), 50);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::SealEpoch);
@@ -365,7 +356,6 @@ fn seal_epoch_resp_round_trip() {
     assert_eq!(decoded.request_id(), 5);
     assert_eq!(decoded.stream_id(), StreamId(20));
     assert_eq!(decoded.epoch(), Epoch(4));
-    assert_eq!(decoded.extent_id(), ExtentId(8));
     assert!(!decoded.is_error_response());
     match &decoded.variable_header {
         VariableHeader::SealEpochResp {
@@ -406,7 +396,6 @@ fn append_ack_error_frame() {
         42,
         StreamId(9),
         Epoch(3),
-        ExtentId(7),
         ErrorCode::ExtentSealed,
         "extent sealed",
     );
@@ -421,7 +410,6 @@ fn append_ack_error_frame() {
     assert_eq!(decoded.stream_id(), StreamId(9));
     assert_eq!(decoded.epoch(), Epoch(3));
     assert_eq!(decoded.error_code(), ErrorCode::ExtentSealed as u16);
-    assert_eq!(decoded.extent_id(), ExtentId(7));
     assert_eq!(decoded.payload, Some(Bytes::from_static(b"extent sealed")));
 }
 
@@ -507,7 +495,6 @@ fn create_stream_resp_round_trip() {
         VariableHeader::CreateStreamResp {
             request_id: 5,
             stream_id: StreamId(42),
-            extent_id: ExtentId(1),
             epoch: Epoch(0),
             primary_addr: Bytes::from_static(b"127.0.0.1:9000"),
         },
@@ -521,7 +508,6 @@ fn create_stream_resp_round_trip() {
     assert_eq!(decoded.opcode(), Opcode::CreateStream);
     assert_eq!(decoded.request_id(), 5);
     assert_eq!(decoded.stream_id(), StreamId(42));
-    assert_eq!(decoded.extent_id(), ExtentId(1));
     match &decoded.variable_header {
         VariableHeader::CreateStreamResp { primary_addr, .. } => {
             assert_eq!(primary_addr, &Bytes::from_static(b"127.0.0.1:9000"));
@@ -569,7 +555,6 @@ fn seal_epoch_commit_round_trip() {
         VariableHeader::SealEpochCommit {
             request_id: 77,
             stream_id: StreamId(7),
-            extent_id: ExtentId(3),
             epoch: Epoch(2),
             start_offset: 100,
             end_offset: 500,
@@ -588,14 +573,12 @@ fn seal_epoch_commit_round_trip() {
         VariableHeader::SealEpochCommit {
             request_id,
             stream_id,
-            extent_id,
             epoch,
             start_offset,
             end_offset,
         } => {
             assert_eq!(*request_id, 77);
             assert_eq!(*stream_id, StreamId(7));
-            assert_eq!(*extent_id, ExtentId(3));
             assert_eq!(*epoch, Epoch(2));
             assert_eq!(*start_offset, 100);
             assert_eq!(*end_offset, 500);
@@ -607,12 +590,11 @@ fn seal_epoch_commit_round_trip() {
 }
 
 #[test]
-fn flush_extent_round_trip() {
+fn flush_epoch_round_trip() {
     let frame = Frame::new(
-        VariableHeader::FlushExtent {
+        VariableHeader::FlushEpoch {
             request_id: 88,
             stream_id: StreamId(12),
-            extent_id: ExtentId(5),
             epoch: Epoch(3),
             start_offset: 0,
             end_offset: 1000,
@@ -624,38 +606,35 @@ fn flush_extent_round_trip() {
     frame.encode(&mut buf);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::FlushExtent);
+    assert_eq!(decoded.opcode(), Opcode::FlushEpoch);
     assert_eq!(decoded.flags(), 0x00);
     assert_eq!(decoded.request_id(), 88);
     match &decoded.variable_header {
-        VariableHeader::FlushExtent {
+        VariableHeader::FlushEpoch {
             request_id,
             stream_id,
-            extent_id,
             epoch,
             start_offset,
             end_offset,
         } => {
             assert_eq!(*request_id, 88);
             assert_eq!(*stream_id, StreamId(12));
-            assert_eq!(*extent_id, ExtentId(5));
             assert_eq!(*epoch, Epoch(3));
             assert_eq!(*start_offset, 0);
             assert_eq!(*end_offset, 1000);
         }
-        _ => panic!("expected FlushExtent"),
+        _ => panic!("expected FlushEpoch"),
     }
     assert!(decoded.payload.is_none());
     assert!(buf.is_empty());
 }
 
 #[test]
-fn update_extent_flushed_round_trip() {
+fn update_epoch_flushed_round_trip() {
     let frame = Frame::new(
-        VariableHeader::UpdateExtentFlushed {
+        VariableHeader::UpdateEpochFlushed {
             stream_id: StreamId(91),
             epoch: Epoch(5),
-            extent_id: ExtentId(17),
             start_offset: Offset(1_234),
             end_offset: Offset(9_999),
         },
@@ -666,23 +645,21 @@ fn update_extent_flushed_round_trip() {
     frame.encode(&mut buf);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::UpdateExtent);
+    assert_eq!(decoded.opcode(), Opcode::UpdateEpoch);
     assert_eq!(decoded.flags(), 0x02); // FLAG_EXTENT_FLUSHED
     match &decoded.variable_header {
-        VariableHeader::UpdateExtentFlushed {
+        VariableHeader::UpdateEpochFlushed {
             stream_id,
             epoch,
-            extent_id,
             start_offset,
             end_offset,
         } => {
             assert_eq!(*stream_id, StreamId(91));
             assert_eq!(*epoch, Epoch(5));
-            assert_eq!(*extent_id, ExtentId(17));
             assert_eq!(*start_offset, Offset(1_234));
             assert_eq!(*end_offset, Offset(9_999));
         }
-        _ => panic!("expected UpdateExtentFlushed"),
+        _ => panic!("expected UpdateEpochFlushed"),
     }
     assert!(decoded.payload.is_none());
     assert!(buf.is_empty());
@@ -701,7 +678,6 @@ fn register_epoch_arena_class_round_trip() {
     let frame = Frame::new(
         VariableHeader::RegisterEpoch {
             request_id: 55,
-            extent_id: ExtentId(9),
             role: 0,
             config,
         },
@@ -716,12 +692,10 @@ fn register_epoch_arena_class_round_trip() {
     match &decoded.variable_header {
         VariableHeader::RegisterEpoch {
             request_id,
-            extent_id,
             role,
             config: decoded_config,
         } => {
             assert_eq!(*request_id, 55);
-            assert_eq!(*extent_id, ExtentId(9));
             assert_eq!(*role, 0);
             assert_eq!(decoded_config.stream_id, StreamId(77));
             assert_eq!(decoded_config.replication_factor, 3);
@@ -738,7 +712,6 @@ fn forward_init_epoch_arena_class_round_trip() {
     let frame = Frame::new(
         VariableHeader::ForwardInitEpoch {
             stream_id: StreamId(42),
-            extent_id: ExtentId(3),
             epoch: Epoch(7),
             start_offset: Offset(0),
             extent_capacity: 1024,
@@ -757,7 +730,6 @@ fn forward_init_epoch_arena_class_round_trip() {
     match &decoded.variable_header {
         VariableHeader::ForwardInitEpoch {
             stream_id,
-            extent_id,
             epoch,
             start_offset,
             extent_capacity,
@@ -766,7 +738,6 @@ fn forward_init_epoch_arena_class_round_trip() {
             arena_class,
         } => {
             assert_eq!(*stream_id, StreamId(42));
-            assert_eq!(*extent_id, ExtentId(3));
             assert_eq!(*epoch, Epoch(7));
             assert_eq!(*start_offset, Offset(0));
             assert_eq!(*extent_capacity, 1024);
@@ -795,7 +766,6 @@ fn register_epoch_unknown_arena_class_errors() {
     let frame = Frame::new(
         VariableHeader::RegisterEpoch {
             request_id: 1,
-            extent_id: ExtentId(1),
             role: 0,
             config,
         },
@@ -805,11 +775,11 @@ fn register_epoch_unknown_arena_class_errors() {
     frame.encode(&mut buf);
     // RegisterEpoch has a payload section (u32 payload_len trailer). The
     // arena_class byte is the last byte of the variable header — i.e.
-    // immediately before the 4-byte payload_len. Variable header is 22 bytes:
-    //   request_id(4) stream_id(4) extent_id(4) role(1) rf(1)
+    // immediately before the 4-byte payload_len. Variable header is 18 bytes:
+    //   request_id(4) stream_id(4) role(1) rf(1)
     //   epoch(4) cache(2) storage_class(1) arena_class(1).
-    // Fixed header is 8 bytes; arena_class is at byte offset 8 + 22 - 1 = 29.
-    buf[29] = 0xFE;
+    // Fixed header is 8 bytes; arena_class is at byte offset 8 + 18 - 1 = 25.
+    buf[25] = 0xFE;
     let err = Frame::decode(&mut buf).expect_err("unknown arena_class must fail decode");
     assert!(
         format!("{err}").contains("arena class"),
@@ -823,7 +793,6 @@ fn forward_init_epoch_unknown_arena_class_errors() {
     let frame = Frame::new(
         VariableHeader::ForwardInitEpoch {
             stream_id: StreamId(1),
-            extent_id: ExtentId(1),
             epoch: Epoch(0),
             start_offset: Offset(0),
             extent_capacity: 1024,

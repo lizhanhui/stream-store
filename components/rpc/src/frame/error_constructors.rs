@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, StreamId};
+use common::types::{Epoch, ErrorCode, Offset, StreamId};
 
 use super::{Frame, VariableHeader};
 
@@ -8,7 +8,6 @@ impl Frame {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
-        extent_id: ExtentId,
         error_code: ErrorCode,
         message: &str,
     ) -> Frame {
@@ -17,7 +16,6 @@ impl Frame {
                 request_id,
                 stream_id,
                 epoch,
-                extent_id,
                 error_code,
             },
             Some(Bytes::copy_from_slice(message.as_bytes())),
@@ -27,7 +25,6 @@ impl Frame {
     pub fn read_resp_error(
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         offset: Offset,
         error_code: ErrorCode,
         message: &str,
@@ -36,7 +33,6 @@ impl Frame {
             VariableHeader::ReadRespError {
                 request_id,
                 stream_id,
-                extent_id,
                 offset,
                 error_code,
             },
@@ -136,25 +132,23 @@ impl Frame {
         )
     }
 
-    pub fn register_extent_ack_error(
+    pub fn register_epoch_ack_error(
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         error_code: ErrorCode,
         message: &str,
     ) -> Frame {
         Frame::new(
-            VariableHeader::RegisterExtentAckError {
+            VariableHeader::RegisterEpochAckError {
                 request_id,
                 stream_id,
-                extent_id,
                 error_code,
             },
             Some(Bytes::copy_from_slice(message.as_bytes())),
         )
     }
 
-    pub fn report_extents_resp_error(
+    pub fn report_epoch_resp_error(
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
@@ -162,7 +156,7 @@ impl Frame {
         message: &str,
     ) -> Frame {
         Frame::new(
-            VariableHeader::ReportExtentsRespError {
+            VariableHeader::ReportEpochRespError {
                 request_id,
                 stream_id,
                 epoch,
@@ -188,18 +182,16 @@ impl Frame {
         )
     }
 
-    pub fn describe_extent_resp_error(
+    pub fn describe_epoch_resp_error(
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         error_code: ErrorCode,
         message: &str,
     ) -> Frame {
         Frame::new(
-            VariableHeader::DescribeExtentRespError {
+            VariableHeader::DescribeEpochRespError {
                 request_id,
                 stream_id,
-                extent_id,
                 error_code,
             },
             Some(Bytes::copy_from_slice(message.as_bytes())),
@@ -224,18 +216,16 @@ impl Frame {
         )
     }
 
-    pub fn flush_extent_resp_error(
+    pub fn flush_epoch_resp_error(
         request_id: u32,
         stream_id: StreamId,
-        extent_id: ExtentId,
         error_code: ErrorCode,
         message: &str,
     ) -> Frame {
         Frame::new(
-            VariableHeader::FlushExtentRespError {
+            VariableHeader::FlushEpochRespError {
                 request_id,
                 stream_id,
-                extent_id,
                 error_code,
             },
             Some(Bytes::copy_from_slice(message.as_bytes())),
@@ -246,13 +236,7 @@ impl Frame {
         request: &Frame,
         error_code: ErrorCode,
         message: &str,
-        extent_id: ExtentId,
     ) -> Frame {
-        let effective_extent_id = if extent_id != ExtentId(0) {
-            extent_id
-        } else {
-            request.extent_id()
-        };
         match &request.variable_header {
             VariableHeader::Append {
                 request_id,
@@ -262,24 +246,17 @@ impl Frame {
                 *request_id,
                 *stream_id,
                 *epoch,
-                effective_extent_id,
                 error_code,
                 message,
             ),
             VariableHeader::Read {
                 request_id,
                 stream_id,
-                extent_id,
                 offset,
                 ..
             } => Self::read_resp_error(
                 *request_id,
                 *stream_id,
-                if effective_extent_id != ExtentId(0) {
-                    effective_extent_id
-                } else {
-                    *extent_id
-                },
                 *offset,
                 error_code,
                 message,
@@ -312,25 +289,19 @@ impl Frame {
             }
             VariableHeader::RegisterEpoch {
                 request_id,
-                extent_id,
                 config,
                 ..
-            } => Self::register_extent_ack_error(
+            } => Self::register_epoch_ack_error(
                 *request_id,
                 config.stream_id,
-                if effective_extent_id != ExtentId(0) {
-                    effective_extent_id
-                } else {
-                    *extent_id
-                },
                 error_code,
                 message,
             ),
-            VariableHeader::ReportExtents {
+            VariableHeader::ReportEpoch {
                 request_id,
                 stream_id,
                 epoch,
-            } => Self::report_extents_resp_error(
+            } => Self::report_epoch_resp_error(
                 *request_id,
                 *stream_id,
                 *epoch,
@@ -342,18 +313,12 @@ impl Frame {
                 stream_id,
                 ..
             } => Self::describe_stream_resp_error(*request_id, *stream_id, error_code, message),
-            VariableHeader::DescribeExtent {
+            VariableHeader::DescribeEpoch {
                 request_id,
                 stream_id,
-                extent_id,
-            } => Self::describe_extent_resp_error(
+            } => Self::describe_epoch_resp_error(
                 *request_id,
                 *stream_id,
-                if effective_extent_id != ExtentId(0) {
-                    effective_extent_id
-                } else {
-                    *extent_id
-                },
                 error_code,
                 message,
             ),
@@ -362,15 +327,13 @@ impl Frame {
                 stream_id,
                 offset,
             } => Self::seek_resp_error(*request_id, *stream_id, *offset, error_code, message),
-            VariableHeader::FlushExtent {
+            VariableHeader::FlushEpoch {
                 request_id,
                 stream_id,
-                extent_id,
                 ..
-            } => Self::flush_extent_resp_error(
+            } => Self::flush_epoch_resp_error(
                 *request_id,
                 *stream_id,
-                *extent_id,
                 error_code,
                 message,
             ),

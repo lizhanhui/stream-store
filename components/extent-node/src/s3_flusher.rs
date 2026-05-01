@@ -183,7 +183,6 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
         let flushed_frame = Frame::new(
             VariableHeader::ForwardFlushed {
                 stream_id: req.stream_id,
-                extent_id: req.extent_id,
                 epoch,
             },
             None,

@@ -65,6 +65,7 @@ async fn register_extent(
     replication_factor: u8,
     replica_addrs: &[&str],
 ) {
+    let _ = extent_id;
     use futures_util::{SinkExt, StreamExt};
     use rpc::codec::FrameCodec;
     use tokio_util::codec::Framed;
@@ -77,7 +78,6 @@ async fn register_extent(
         .send(Frame::new(
             VariableHeader::RegisterEpoch {
                 request_id: 0,
-                extent_id: ExtentId(extent_id),
                 role,
                 config: StreamConfig {
                     stream_id: StreamId(stream_id),

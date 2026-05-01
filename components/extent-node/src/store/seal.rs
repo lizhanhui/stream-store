@@ -9,19 +9,18 @@ use super::ExtentNodeStore;
 use crate::s3_flusher::FlushRequest;
 
 impl ExtentNodeStore {
-    /// Handle REPORT_EXTENTS: SM queries this EN for all extents it holds for a stream.
-    /// Used during crash recovery so SM can discover extents it doesn't know about.
+    /// Handle REPORT_EPOCH: SM queries this EN for the stream's current epoch state.
+    /// Used during crash recovery so SM can discover epochs it doesn't know about.
     pub(crate) fn handle_report_extents(&self, frame: Frame) -> Frame {
         let (stream_id, epoch) = match &frame.variable_header {
-            VariableHeader::ReportExtents {
+            VariableHeader::ReportEpoch {
                 stream_id, epoch, ..
             } => (*stream_id, *epoch),
             _ => {
                 return Frame::error_from_request(
                     &frame,
                     ErrorCode::InternalError,
-                    "invalid ReportExtents frame",
-                    ExtentId(0),
+                    "invalid ReportEpoch frame",
                 );
             }
         };
@@ -32,7 +31,7 @@ impl ExtentNodeStore {
             None => {
                 // Stream not found — return empty response.
                 return Frame::new(
-                    VariableHeader::ReportExtentsResp {
+                    VariableHeader::ReportEpochResp {
                         request_id: frame.request_id(),
                         stream_id,
                         epoch,
@@ -54,7 +53,7 @@ impl ExtentNodeStore {
         }
 
         Frame::new(
-            VariableHeader::ReportExtentsResp {
+            VariableHeader::ReportEpochResp {
                 request_id: frame.request_id(),
                 stream_id,
                 epoch: stream.epoch(),
@@ -65,19 +64,17 @@ impl ExtentNodeStore {
 
     pub(crate) fn handle_seal(&self, frame: Frame) -> Frame {
         // Parse SealEpochPrepare fields.
-        let (request_id, stream_id, epoch, extent_id_from, req_start_offset) =
+        let (request_id, stream_id, epoch, req_start_offset) =
             match &frame.variable_header {
                 VariableHeader::SealEpochPrepare {
                     request_id,
                     stream_id,
                     epoch,
-                    extent_id_from,
                     start_offset,
                 } => (
                     *request_id,
                     *stream_id,
                     *epoch,
-                    *extent_id_from,
                     *start_offset,
                 ),
                 _ => {
@@ -106,7 +103,6 @@ impl ExtentNodeStore {
                         request_id,
                         stream_id,
                         epoch,
-                        extent_id: extent_id_from,
                         start_offset: req_start_offset,
                         end_offset: req_start_offset,
                     },
@@ -136,6 +132,13 @@ impl ExtentNodeStore {
             }
         }
 
+        // `extent_id_from` no longer travels on the wire; the SealEpoch identity
+        // is (stream_id, epoch). For now we derive a synthetic sentinel of 0 to
+        // keep the existing local sealing logic unchanged — the plan's later
+        // phases remove this threading entirely when the autonomous-create path
+        // is deleted.
+        let extent_id_from = ExtentId(0);
+
         // Find the LAST MUTABLE extent for (stream_id, epoch).
         // Only seal extents at the requested epoch — newer epochs are untouched.
         let active_id = match stream.active_extent_at_epoch(epoch) {
@@ -154,7 +157,6 @@ impl ExtentNodeStore {
                         request_id,
                         stream_id,
                         epoch,
-                        extent_id,
                         start_offset,
                         end_offset,
                     },
@@ -220,7 +222,6 @@ impl ExtentNodeStore {
                         request_id,
                         stream_id,
                         epoch,
-                        extent_id: sealed_extent_id,
                         start_offset,
                         end_offset,
                     },
@@ -247,7 +248,6 @@ impl ExtentNodeStore {
                         request_id,
                         stream_id,
                         epoch,
-                        extent_id: active_id,
                         start_offset,
                         end_offset,
                     },
@@ -298,24 +298,22 @@ impl ExtentNodeStore {
         Some(buf.freeze())
     }
 
-    /// Handle FLUSH_EXTENT (0x1B): SM commands this EN to upload a sealed extent
+    /// Handle FLUSH_EPOCH (0x1B): SM commands this EN to upload a sealed epoch
     /// to S3 on behalf of a dead Primary (disaster recovery).
     ///
-    /// Returns FlushExtentResp on success (accepted), FlushExtentRespError on skip/error.
+    /// Returns FlushEpochResp on success (accepted), FlushEpochRespError on skip/error.
     pub(crate) fn handle_flush_extent(&self, frame: Frame) -> Frame {
-        let (request_id, stream_id, extent_id, _epoch, start_offset, end_offset) =
+        let (request_id, stream_id, epoch, start_offset, end_offset) =
             match &frame.variable_header {
-                VariableHeader::FlushExtent {
+                VariableHeader::FlushEpoch {
                     request_id,
                     stream_id,
-                    extent_id,
                     epoch,
                     start_offset,
                     end_offset,
                 } => (
                     *request_id,
                     *stream_id,
-                    *extent_id,
                     *epoch,
                     *start_offset,
                     *end_offset,
@@ -324,11 +322,26 @@ impl ExtentNodeStore {
                     return Frame::error_from_request(
                         &frame,
                         ErrorCode::InternalError,
-                        "invalid FlushExtent frame",
-                        ExtentId(0),
+                        "invalid FlushEpoch frame",
                     );
                 }
             };
+        let _ = epoch;
+
+        // `extent_id` no longer travels on the wire for FlushEpoch. The EN's
+        // local bookkeeping still identifies extents by id. Look up the extent
+        // whose offset range matches the flush request; fall back to the
+        // active extent if no range match.
+        let extent_id = {
+            let guard = self.streams.pin();
+            guard
+                .get(&stream_id)
+                .and_then(|s| {
+                    s.find_extent_for_offset(common::types::Offset(start_offset))
+                        .or_else(|| s.active_extent_id())
+                })
+                .unwrap_or(ExtentId(0))
+        };
 
         // Guard: S3 must be configured.
         let flush_tx = match self.flush_tx {
@@ -338,10 +351,9 @@ impl ExtentNodeStore {
                     "FlushExtent: no S3 configured, ignoring stream={} extent={}",
                     stream_id, extent_id,
                 );
-                return Frame::flush_extent_resp_error(
+                return Frame::flush_epoch_resp_error(
                     request_id,
                     stream_id,
-                    extent_id,
                     ErrorCode::InternalError,
                     "no S3 configured",
                 );
@@ -389,10 +401,9 @@ impl ExtentNodeStore {
                 stream_id, extent_id,
             );
             return Frame::new(
-                VariableHeader::FlushExtentResp {
+                VariableHeader::FlushEpochResp {
                     request_id,
                     stream_id,
-                    extent_id,
                 },
                 None,
             );
@@ -412,10 +423,9 @@ impl ExtentNodeStore {
                     stream_id, extent_id,
                 );
                 return Frame::new(
-                    VariableHeader::FlushExtentResp {
+                    VariableHeader::FlushEpochResp {
                         request_id,
                         stream_id,
-                        extent_id,
                     },
                     None,
                 );
@@ -440,10 +450,9 @@ impl ExtentNodeStore {
             if let Some(s) = self.streams.pin().get(&stream_id) {
                 s.finish_flush(extent_id);
             }
-            return Frame::flush_extent_resp_error(
+            return Frame::flush_epoch_resp_error(
                 request_id,
                 stream_id,
-                extent_id,
                 ErrorCode::InternalError,
                 "flush channel full",
             );
@@ -454,10 +463,9 @@ impl ExtentNodeStore {
             stream_id, extent_id,
         );
         Frame::new(
-            VariableHeader::FlushExtentResp {
+            VariableHeader::FlushEpochResp {
                 request_id,
                 stream_id,
-                extent_id,
             },
             None,
         )
@@ -466,19 +474,17 @@ impl ExtentNodeStore {
     /// Handle SealEpoch phase 2: commit local seal point to SM's
     /// authoritative committed offset. Returns SealEpochCommitResp.
     pub(crate) fn handle_seal_commit(&self, frame: Frame) -> Frame {
-        let (request_id, stream_id, extent_id, _epoch, _start_offset, end_offset) =
+        let (request_id, stream_id, _epoch, _start_offset, end_offset) =
             match &frame.variable_header {
                 VariableHeader::SealEpochCommit {
                     request_id,
                     stream_id,
-                    extent_id,
                     epoch,
                     start_offset,
                     end_offset,
                 } => (
                     *request_id,
                     *stream_id,
-                    *extent_id,
                     *epoch,
                     *start_offset,
                     *end_offset,
@@ -488,10 +494,23 @@ impl ExtentNodeStore {
                         &frame,
                         ErrorCode::InternalError,
                         "invalid SealEpochCommit frame",
-                        ExtentId(0),
                     );
                 }
             };
+
+        // `extent_id` no longer travels on the wire for SealEpochCommit.
+        // Look up the extent that matches the committed offset range; fall
+        // back to the active extent.
+        let extent_id = {
+            let guard = self.streams.pin();
+            guard
+                .get(&stream_id)
+                .and_then(|s| {
+                    s.find_extent_for_offset(common::types::Offset(_start_offset))
+                        .or_else(|| s.active_extent_id())
+                })
+                .unwrap_or(ExtentId(0))
+        };
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
@@ -501,7 +520,6 @@ impl ExtentNodeStore {
                     VariableHeader::SealEpochCommitResp {
                         request_id,
                         stream_id,
-                        extent_id,
                     },
                     None,
                 );
@@ -525,7 +543,6 @@ impl ExtentNodeStore {
             VariableHeader::SealEpochCommitResp {
                 request_id,
                 stream_id,
-                extent_id,
             },
             None,
         )

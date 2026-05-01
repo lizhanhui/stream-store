@@ -31,7 +31,7 @@ mod tests {
     use super::*;
     use crate::frame::VariableHeader;
     use bytes::Bytes;
-    use common::types::{Epoch, ExtentId, StreamId};
+    use common::types::{Epoch, StreamId};
 
     #[test]
     fn codec_round_trip() {
@@ -60,7 +60,6 @@ mod tests {
         let frame = Frame::new(
             VariableHeader::Forward {
                 stream_id: StreamId(10),
-                extent_id: ExtentId(5),
                 epoch: Epoch(0),
                 offset: Offset(3),
             },
