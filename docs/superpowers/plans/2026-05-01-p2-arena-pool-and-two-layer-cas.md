@@ -546,7 +546,24 @@ Goal: replace `RwLock<StreamInner { extents: Vec<StreamEpoch> }>` with `ArcSwap<
 **Files:**
 - Modify: `components/extent-node/src/stream.rs`
 
-- [ ] **Step 1: Add imports**
+- [ ] **Step 1: Add arc-swap to workspace + extent-node**
+
+`arc-swap` is not yet in the workspace. Before editing Rust source, edit the root `Cargo.toml`:
+
+```toml
+# in the [workspace.dependencies] section, alphabetically:
+arc-swap = "1.7"
+```
+
+Then in `components/extent-node/Cargo.toml` under `[dependencies]`:
+
+```toml
+arc-swap = { workspace = true }
+```
+
+Run `cargo check -p extent-node 2>&1 | tail -3` and expect the new dep to resolve cleanly. Then proceed with the ArcSwap import edits below.
+
+- [ ] **Step 2: Add imports**
 
 At the top of `components/extent-node/src/stream.rs`:
 ```rust
@@ -554,7 +571,7 @@ use arc_swap::ArcSwap;
 use smallvec::{SmallVec, smallvec};
 ```
 
-- [ ] **Step 2: Replace the field**
+- [ ] **Step 3: Replace the field**
 
 Change `StreamInner`:
 ```rust
@@ -594,7 +611,7 @@ In `Stream::new`:
 epochs: ArcSwap::from_pointee(SmallVec::new()),
 ```
 
-- [ ] **Step 3: Add the helper methods per spec**
+- [ ] **Step 4: Add the helper methods per spec**
 
 Add to `impl Stream`:
 
@@ -660,7 +677,7 @@ impl StreamEpoch {
 }
 ```
 
-- [ ] **Step 4: Migrate every `inner.read().extents` / `inner.write().extents` call site**
+- [ ] **Step 5: Migrate every `inner.read().extents` / `inner.write().extents` call site**
 
 Grep:
 ```bash
@@ -676,7 +693,7 @@ For each:
 
 Keep `inner` for the non-epoch fields (next_extent_id, extent_capacity, etc.).
 
-- [ ] **Step 5: Update StreamInner eviction path**
+- [ ] **Step 6: Update StreamInner eviction path**
 
 `StreamInner::evict_oldest_extents` currently mutates `self.extents`. Move the eviction logic out of `StreamInner` onto `Stream`. The body becomes:
 
@@ -718,7 +735,7 @@ impl Stream {
 
 Call sites that used to call `inner.evict_oldest_extents(stream_id)` now call `self.evict_oldest_epochs()`.
 
-- [ ] **Step 6: Update `try_create_next_extent`**
+- [ ] **Step 7: Update `try_create_next_extent`**
 
 Move the body to `impl Stream` (not `StreamInner`) since it needs `insert_epoch`:
 
@@ -756,11 +773,11 @@ impl Stream {
 }
 ```
 
-- [ ] **Step 7: Remove `StreamInner::find_extent` / `seal_extent` / `try_create_next_extent` / `evict_oldest_extents`**
+- [ ] **Step 8: Remove `StreamInner::find_extent` / `seal_extent` / `try_create_next_extent` / `evict_oldest_extents`**
 
 These are now on `Stream`.
 
-- [ ] **Step 8: Build + test**
+- [ ] **Step 9: Build + test**
 
 Run: `cargo check --workspace --tests --benches 2>&1 | tail -10`
 Expected: clean.
@@ -768,7 +785,7 @@ Expected: clean.
 Run: `cargo test --lib --workspace 2>&1 | grep -E '^test result:'`
 Expected: same pass count.
 
-- [ ] **Step 9: Commit**
+- [ ] **Step 10: Commit**
 
 ```bash
 git add -A
