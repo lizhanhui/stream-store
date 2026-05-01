@@ -1,4 +1,5 @@
 pub mod ack_queue;
+pub mod arena;
 pub mod downstream;
 pub mod extent;
 pub mod s3;

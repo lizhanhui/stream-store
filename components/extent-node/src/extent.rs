@@ -1,8 +1,8 @@
-use std::alloc::{Layout, alloc, dealloc};
+use std::alloc::Layout;
 use std::cell::UnsafeCell;
-use std::ops::Deref;
-use std::ptr::NonNull;
 use std::sync::Arc;
+
+use crate::arena::{ArenaBuffer, OwnedArenaSlice};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -33,61 +33,6 @@ const FLAG_CHECKSUM_RECEIVED: u8 = 0x02;
 /// Extent has been flushed to S3 and is eligible for memory eviction.
 /// Set by Primary locally after upload, and by Secondaries on ForwardFlushed.
 pub const FLAG_FLUSHED: u8 = 0x04;
-
-/// Owns the raw heap allocation for an extent's arena buffer.
-/// Wrapped in `Arc` so that `Bytes` slices keep the buffer alive
-/// even after the `Extent` is dropped.
-struct ArenaBuffer {
-    ptr: NonNull<u8>,
-    capacity: u32,
-    layout: Layout,
-}
-
-// SAFETY: The raw allocation is exclusively managed by ArenaBuffer via Arc.
-// No aliased mutable access is possible once shared.
-unsafe impl Send for ArenaBuffer {}
-unsafe impl Sync for ArenaBuffer {}
-
-impl ArenaBuffer {
-}
-
-impl Drop for ArenaBuffer {
-    fn drop(&mut self) {
-        // SAFETY: ptr and layout were produced by alloc() in ArenaBuffer::new().
-        unsafe {
-            dealloc(self.ptr.as_ptr(), self.layout);
-        }
-    }
-}
-
-/// A reference-counted slice into an `ArenaBuffer`.
-/// Implements `Deref<Target=[u8]>` so it can be passed to `Bytes::from_owner()`.
-struct OwnedArenaSlice {
-    _arena: Arc<ArenaBuffer>,
-    ptr: *const u8,
-    len: u32,
-}
-
-// SAFETY: The underlying memory is owned by Arc<ArenaBuffer> which is Send+Sync.
-// The ptr/len describe an immutable view into that allocation.
-unsafe impl Send for OwnedArenaSlice {}
-unsafe impl Sync for OwnedArenaSlice {}
-
-impl Deref for OwnedArenaSlice {
-    type Target = [u8];
-
-    fn deref(&self) -> &[u8] {
-        // SAFETY: ptr is valid for len bytes as long as _arena is alive,
-        // and _arena is kept alive by the Arc clone in this struct.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len as usize) }
-    }
-}
-
-impl AsRef<[u8]> for OwnedArenaSlice {
-    fn as_ref(&self) -> &[u8] {
-        self.deref()
-    }
-}
 
 /// Result of a successful append: the logical offset and the byte position
 /// within the arena where the record was written. The caller can use the
@@ -233,19 +178,8 @@ unsafe impl Sync for Extent {}
 impl Extent {
     /// Create a new active extent with the specified capacity in bytes.
     pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: u32, epoch: Epoch) -> Self {
-        let layout = Layout::from_size_align(capacity as usize, 8).expect("invalid layout");
-        // SAFETY: layout is valid, nonzero size.
-        let ptr = unsafe { alloc(layout) };
-        if ptr.is_null() {
-            std::alloc::handle_alloc_error(layout);
-        }
-
-        let arena = Arc::new(ArenaBuffer {
-            ptr: NonNull::new(ptr).unwrap(),
-            capacity,
-            layout,
-        });
-        let buf = arena.ptr.as_ptr();
+        let arena = ArenaBuffer::new(capacity);
+        let buf = arena.ptr_mut();
 
         // Allocate the index with alloc_zeroed: the OS provides pre-zeroed pages
         // (MAP_ANONYMOUS) at near-zero cost, avoiding a 13M+ iteration init loop
@@ -573,8 +507,8 @@ impl Extent {
     /// so the memory stays alive as long as any derived slice is held by a reader.
     fn arena_as_bytes(&self) -> Bytes {
         let arena = Arc::clone(&self.arena);
-        let ptr = arena.ptr.as_ptr() as *const u8;
-        let len = arena.capacity;
+        let ptr = arena.ptr() as *const u8;
+        let len = arena.capacity();
         Bytes::from_owner(OwnedArenaSlice {
             _arena: arena,
             ptr,
