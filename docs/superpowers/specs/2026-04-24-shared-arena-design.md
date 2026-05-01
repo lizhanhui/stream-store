@@ -72,7 +72,8 @@ dual-run, no feature flag, and no backwards-compatibility layer.
 | `NOTIFY_SEALED_EXTENT`, autonomous extent creation | **Removed.** Arena-full never triggers an epoch bump or SM round-trip. |
 | `Forward` carrying `byte_pos` | Removed. Secondaries compute byte_pos locally from strict append order. |
 | Per-extent arena + per-extent u32 index (Dedicated) | Per-epoch arena pool (Dedicated): one writer per stream, rolls arenas within an epoch. Per-arena directory (same as Shared). |
-| S3 key `{ns}/data/{stream}/{start}_{end}.dat` | Per-arena key: `{ns}/arenas/{arena_id:016x}.dat` for both classes. |
+| S3 key `{ns}/data/{stream}/{start}_{end}.dat` | Two shapes coexist: Shape A (normal arena upload) keyed `{ns}/arenas/{arena_id:016x}.dat`; Shape B (DR per-stream upload) keyed `{ns}/data/{stream}/{start}_{end}.dat` (same as today, used for both Dedicated normal flush and any-class DR flush). |
+| Adaptive per-stream extent capacity (`min/max_extent_capacity`, `extent_growth_factor`, idle-shrink) | **Removed.** `ArenaClass` solves the same tradeoff: Dedicated uses a fixed `dedicated_arena_size`, Shared uses the pool's `shared_arena_size`. Primary and Secondary size shared arenas independently. |
 
 ## Core Abstractions
 
@@ -308,8 +309,7 @@ classes):
 arena = stream.dedicated_arena
 for job in batch:
     if arena has insufficient space:
-        roll_dedicated(stream)                 // seal old, allocate new,
-                                               // ForwardInitArena to secondaries
+        roll_dedicated(stream)                 // seal old, allocate new
         arena = stream.dedicated_arena
     memcpy job.payload into arena at cursor (u32 BE len + payload)
     directory.entries[(stream_id, epoch)].append(byte_pos, len, seq)
@@ -344,8 +344,7 @@ else:
 fn process_batch(arena, b):
     for job in b.jobs:
         if arena has insufficient space:
-            pool.roll(arena)                   // Sealed → resident; new active;
-                                               // ForwardInitArena to secondaries
+            pool.roll(arena)                   // Sealed → resident; new active
             arena = pool.active.load()
         memcpy job.payload at cursor
         directory.entries[(stream_id, epoch)].append(byte_pos, len, job.seq)
@@ -394,12 +393,20 @@ the arena leader in Shared):
    (Dedicated).
 4. Allocate a new arena (`ArenaBuffer` via `alloc_zeroed`). Install as
    the new `active` (Shared) or stream-arena (Dedicated).
-5. `ForwardInitArena` broadcast to secondaries (fire-and-forget).
-6. Sealed arena handed to the S3 flush task.
-7. Continue memcpy on the new arena for the remaining records in the
+5. Sealed arena handed to the S3 flush task (fire-and-forget,
+   compaction and upload run off the critical path).
+6. Continue memcpy on the new arena for the remaining records in the
    current batch.
 
-No SM round-trip. No epoch bump. No `NOTIFY_SEALED_EXTENT` (deleted).
+Arena identity is **local to each EN**. A Primary and its Secondaries
+each run their own pools and roll arenas independently based on their
+own fill pressure; there is no cross-replica coordination on arena
+boundaries. The Primary's `arena_id` is never exposed on the replication
+wire. What the replicas share is only the per-`(stream, epoch)` record
+stream, not the arena packaging.
+
+No SM round-trip on roll. No epoch bump. No `NOTIFY_SEALED_EXTENT`
+(deleted).
 
 ### Forward Protocol
 
@@ -412,10 +419,6 @@ No SM round-trip. No epoch bump. No `NOTIFY_SEALED_EXTENT` (deleted).
   for a new epoch. Carries `epoch`, `start_offset`, `arena_class`.
   Secondaries use `arena_class` to decide whether to open a Dedicated arena
   for this epoch or route appends into the shared pool.
-- `ForwardInitArena` (new, Primary → Secondary, fire-and-forget): sent on
-  arena roll. Carries `arena_id` and `arena_capacity`. Secondaries
-  allocate an arena tagged with the same `arena_id` so replicas agree on
-  arena identity for DR flush.
 - `SealStream` (client → SM): **user-facing** stream-writer API. Request
   carries `(stream_id, current_epoch)`. SM verifies the epoch matches
   MySQL (stale client → SM responds with the newer epoch + redirect
@@ -436,9 +439,15 @@ No SM round-trip. No epoch bump. No `NOTIFY_SEALED_EXTENT` (deleted).
 - `UpdateArenaFlushed` (EN → SM): notifies SM after a Shape A arena upload
   completes. Carries `arena_id`, `s3_key`, and the list of `(stream, epoch,
   start, end)` primary-cohort entries in the object.
-- `ForwardFlushed` (new, Primary → Secondary, fire-and-forget): sent after
-  a successful Shape A upload. Carries `arena_id`. Secondaries drop their
-  secondary-cohort entries for this arena.
+- `ForwardFlushed` (new, Primary → Secondary, fire-and-forget): sent
+  after a successful Shape A upload. Carries the **list of flushed
+  entries** `Vec<(stream_id, epoch, start_offset, end_offset)>`
+  (the same list sent to SM in `UpdateArenaFlushed`). Arena identity
+  is not on the wire — each secondary matches entries against its
+  own directory by `(stream_id, epoch, offset range)` and drops
+  matching `EpochArenaEntry`s regardless of which local arena they
+  live in. Typically ≤ 32 KiB per message for a 64 MiB arena with
+  ~1000 streams; fire-and-forget off the hot path.
 - `FlushEpochStream` (new, SM → EN): DR request. Carries
   `(stream_id, epoch)`. EN gathers resident records for that tuple across
   all arenas, builds a Shape B object, uploads, and replies with
@@ -723,17 +732,21 @@ dropped at seal.
    where `entries = Vec<(stream_id, epoch, start_offset, end_offset)>`.
 5. SM writes one `epoch_arenas` row per entry
    (`s3_key_kind = 0`) in a single transaction.
-6. Primary broadcasts `ForwardFlushed(arena_id)` to peer replicas
-   (fire-and-forget). Secondaries receiving this walk the arena's
-   directory and, for each entry where
-   `StreamEpoch.replica_info.primary_node_id != self.node_id`
-   (i.e., secondary-cohort entries), drop the entry. The arena's
-   buffer refcount drops as entries release.
+6. Primary broadcasts `ForwardFlushed(entries)` to peer replicas
+   (fire-and-forget), carrying the same `entries` list sent to SM. Each
+   secondary matches each entry by `(stream_id, epoch, offset range)`
+   against its own arena directories and drops the matching
+   `EpochArenaEntry`. Because secondary arenas are sized and rolled
+   independently of the Primary's, one logical entry on the Primary
+   may correspond to entries spanning multiple local arenas on a
+   secondary — the secondary drops all matching entries. Each dropped
+   entry's release decrements its arena buffer's refcount; when the
+   refcount hits zero the allocation is freed.
 7. Arena becomes LRU-eligible.
 
 Secondaries never participate in Shape A upload. They accumulate
-secondary-cohort entries as Forwards arrive; they release them when
-`ForwardFlushed` or a DR request resolves the entry.
+entries as Forwards arrive; they release them when `ForwardFlushed` or
+a DR request resolves the entry.
 
 ### DR Path — Per-Stream Urgent Upload (Shape B)
 
@@ -794,7 +807,8 @@ New `ExtentNodeConfig` fields:
 
 | Field | Default | Notes |
 |---|---|---|
-| `shared_arena_size` | 64 MiB | Per-arena buffer size |
+| `dedicated_arena_size` | 256 MiB | Per-Dedicated-stream arena buffer size. Fixed; no adaptive grow/shrink. |
+| `shared_arena_size` | 64 MiB | Per-Shared-arena buffer size (independent between Primary and Secondary) |
 | `max_resident_shared_arenas` | 64 | → 4 GiB shared budget |
 | `shared_writer_channel_capacity` | 4096 | Bounded arena MPSC size (in `ArenaBatch` units) |
 | `max_stream_batch` | 64 | Max stream-leader batch size (own + drained followers) |
@@ -812,10 +826,22 @@ New per-stream `CreateStream` field:
 |---|---|
 | `arena_class` | `Dedicated` |
 
-Removed: `min_extent_capacity`, `max_extent_capacity`, `extent_growth_factor`,
-`cache_extents`, `max_records_per_shared_extent`, `shared_extent_max_age_ms`.
-These either become `shared_arena_size` / `cache_arenas` (different unit) or
-disappear (no per-extent record/age caps in the new model).
+**Removed configuration** (obsolete under the new model):
+
+- `min_extent_capacity`, `max_extent_capacity`, `extent_growth_factor` —
+  adaptive per-stream extent sizing is no longer needed. The tradeoff it
+  was solving (high-throughput vs low-throughput streams sharing one
+  sizing knob) is now resolved by `ArenaClass`: Dedicated uses a fixed
+  `dedicated_arena_size`, Shared uses the pool's `shared_arena_size`.
+- `cache_extents` — replaced by `cache_arenas` (per-Dedicated-stream) and
+  `max_resident_shared_arenas` (global).
+- `max_records_per_shared_extent`, `shared_extent_max_age_ms` — no
+  per-extent record/age caps in the new model; epochs live until
+  epoch-bump seal.
+
+The adaptive-capacity implementation (grow factor, idle-shrink timer)
+is deleted from the EN. The `adaptive-capacity.md` design doc is
+obsolete.
 
 ## Metrics
 
@@ -845,7 +871,7 @@ Per epoch (debug):
 | MPSC channel full | Caller awaits up to `arena_append_timeout_ms`; on timeout returns `Busy`. Sustained busy → runtime promotion for Shared-class streams. |
 | Arena allocation OOM | EN refuses new Shared writes; reports via `node_metrics`; SM avoids placing new Shared epochs there. |
 | S3 upload fails indefinitely | Existing retry policy. Arena pinned; writer backpressure applies. |
-| Secondary missed `ForwardInitArena` | Secondary lazily allocates arena on first Forward referencing its id (analogous to Lazy Secondary Extent Creation). |
+| `ForwardFlushed` arrives for entries a secondary doesn't have | No-op; the entry may have already been evicted or never recorded (e.g., arrived on a secondary that joined the replica set after the record). Safe because the message is advisory for memory reclamation, not for correctness. |
 | Reader finds arena `Evicted` mid-lookup | Falls through to Tier 2. |
 | Cross-class mismatch Primary vs Secondary | Impossible: `arena_class` carried on `RegisterEpoch` (SM → Primary) and `ForwardInitEpoch` (Primary → Secondary); any mismatch fails epoch registration. |
 
