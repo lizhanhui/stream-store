@@ -107,12 +107,20 @@ struct StreamEpoch {
     limit:           AtomicU64,               // set at seal time
     record_count:    AtomicU64,
     committed_seq:   AtomicU64,
-    committed_bytes: AtomicU64,               // extent-relative cumulative bytes
+    committed_bytes: AtomicU64,               // epoch-relative cumulative bytes
 
-    // Memory accounting (both classes) — which arenas this epoch has touched.
-    // In append order. Entries drop off when an arena is evicted from the pool;
-    // historical arenas are reachable via `epoch_arenas` table.
+    // Which arenas (shared or dedicated, on this EN) currently hold at
+    // least one directory entry for this (stream, epoch). In append
+    // order. Populated on first write into a new arena; entries are
+    // removed as directory entries drop (Shape A upload, ForwardFlushed
+    // release, or arena eviction).
     resident_arenas: Mutex<SmallVec<[ArenaId; 4]>>,
+
+    // Reference count of live directory entries for this (stream, epoch)
+    // across all resident arenas. When this hits zero, the owning
+    // Stream removes the epoch from Stream::epochs and this StreamEpoch
+    // is dropped (once outstanding readers release their Arc clones).
+    directory_ref_count: AtomicU32,
 
     class:           ArenaClass,
 }
@@ -128,8 +136,22 @@ struct Stream {
     stream_id:     StreamId,
     arena_class:   ArenaClass,
     storage_class: StorageClass,
-    active_epoch:  ArcSwap<StreamEpoch>,
-    ewma:          EwmaStats,                 // for runtime class transitions
+
+    // All StreamEpochs this EN currently tracks for this stream:
+    //   - the currently-open epoch (highest key), and
+    //   - every sealed epoch that still has at least one resident arena
+    //     directory entry on this EN.
+    // An entry is inserted when SM registers a new epoch (RegisterEpoch)
+    // and removed when the epoch's directory_ref_count reaches zero.
+    // BTreeMap keeps the keys sorted so "latest epoch" is `iter().next_back()`.
+    epochs: RwLock<BTreeMap<u64, Arc<StreamEpoch>>>,
+
+    // Cache of the currently-open epoch for hot-path append. Invariant:
+    // always equals the highest-numbered entry in `epochs`. Updated
+    // atomically with `epochs` during epoch bump.
+    active_epoch: ArcSwap<StreamEpoch>,
+
+    ewma: EwmaStats,                          // for runtime class transitions
 
     // Pipelined group commit (same shape for both classes):
     in_flight: AtomicU64,
@@ -137,6 +159,43 @@ struct Stream {
     job_rx:    crossbeam::channel::Receiver<AppendJob>,
 }
 ```
+
+### StreamEpoch Lifecycle
+
+A `StreamEpoch` is tracked on an EN as long as its records are still
+needed in memory:
+
+1. **Birth**: on `RegisterEpoch` (SM → Primary) or on the first
+   `Forward` for a new epoch (Secondary lazy init). The EN inserts
+   `Arc::new(StreamEpoch { ... })` into `Stream::epochs`, then
+   `active_epoch.store(it)`.
+2. **Epoch bump**: `SealEpoch` Commit transitions the epoch to `Sealed`
+   and sets `limit`. A subsequent `RegisterEpoch` for the new epoch
+   inserts the new entry and updates `active_epoch`. **The sealed
+   epoch remains in `epochs` until its records are no longer resident.**
+3. **Directory-entry accounting**: every write that creates a new
+   `EpochArenaEntry` for `(stream, epoch)` in some arena increments
+   the epoch's `directory_ref_count`. Every release of such an entry
+   (Shape A upload primary-cohort skip or include, `ForwardFlushed`
+   full-range coverage, or arena eviction) decrements it.
+4. **Death**: when `directory_ref_count` hits zero, the owning `Stream`
+   removes the epoch from `epochs`. Any outstanding `Arc<StreamEpoch>`
+   clones held by in-flight readers or flush tasks keep the struct
+   alive until they release; the allocation is then freed.
+
+This guarantees:
+
+- **Shape A compaction** can always look up
+  `StreamEpoch.replica_info.primary_node_id` for any directory entry
+  it walks: the entry's existence implies the epoch is still in
+  `Stream::epochs`.
+- **`ForwardFlushed` release** on a secondary can always translate a
+  flushed offset range into `byte_positions` indices via
+  `StreamEpoch.start_offset`.
+- **Reads** resolve against any still-resident epoch of the stream,
+  not just the active one.
+- **DR flush** (`FlushEpochStream(stream, epoch)`) can always locate
+  the epoch's resident records while any are still in memory.
 
 ## SharedArenaPool
 
@@ -531,11 +590,17 @@ Two tiers.
 ### Tier 1: Per-Arena Directory (Warm, In-Memory)
 
 ```
-for arena_id in ep.resident_arenas:
-    arena = lookup(arena_id)               // shared pool or dedicated pool
+// Locate the target epoch: the request carries (stream_id, offset).
+// Binary-search `stream.epochs` for the epoch whose [start_offset, limit)
+// covers `offset`. For open epochs, `limit` is effectively infinite.
+ep = stream.find_epoch_containing(offset)      // may be sealed but still
+                                               // resident on this EN
+
+for arena_id in ep.resident_arenas.lock().iter():
+    arena = lookup(arena_id)                   // shared pool or dedicated pool
     if arena is None or arena.state == Evicted:
         continue
-    entry = arena.directory.lock().entries.get(&(stream_id, epoch))
+    entry = arena.directory.lock().entries.get(&(stream_id, ep.epoch))
     if entry.start_offset <= offset < entry.end_offset:
         idx      = (offset - entry.start_offset) as usize
         byte_pos = entry.byte_positions[idx]
@@ -715,11 +780,17 @@ dropped at roll time.
    flush task's queue (fire-and-forget from the arena leader's
    perspective).
 2. Flush task walks the arena's directory. For each `(stream_id, epoch)`
-   entry, it looks up the epoch's `replica_info.primary_node_id`:
+   entry, it looks up the `Arc<StreamEpoch>` via
+   `streams.get(stream_id).epochs.read().get(&epoch)` — the epoch is
+   guaranteed to still be in the map because the directory entry's
+   existence holds a `directory_ref_count` on it. From the epoch it
+   reads `replica_info.primary_node_id`:
    - If that equals this EN's `node_id` → primary-cohort, include in
      the upload.
-   - Otherwise → secondary-cohort, skip and drop the directory entry
-     (its arena buffer refcount is released once all refs go away).
+   - Otherwise → secondary-cohort, skip. In both cases the directory
+     entry is dropped at the end of this step and the epoch's
+     `directory_ref_count` decremented; if it reaches zero, the
+     `Stream` removes the epoch from its `epochs` map.
 
    For each primary-cohort entry:
    - Records are already contiguous in the arena buffer (per-stream
@@ -960,6 +1031,21 @@ Per epoch (debug):
   covers offsets `[a, c)`; Primary sends two `ForwardFlushed` covering
   `[a, b)` then `[b, c)`. Verify the entry is dropped only after the
   second message, and the arena buffer refcount releases then.
+- **StreamEpoch retention across seal**: epoch N fills multiple arenas,
+  epoch N seals, epoch N+1 begins writing. Verify epoch N's
+  `StreamEpoch` remains in `Stream.epochs` until all its arenas'
+  primary-cohort entries have been uploaded (Shape A) and
+  secondary-cohort entries have been released (`ForwardFlushed`);
+  `directory_ref_count` reaches zero and the epoch is dropped.
+- **Read against a sealed-but-resident epoch**: after epoch N seals
+  and N+1 is active, reads against offsets in N's range still resolve
+  via `Stream.epochs.get(N)` + Tier 1 per-arena directory (no S3 fetch
+  while records remain resident).
+- **DR flush for sealed epoch**: SM sends `FlushEpochStream(stream, N)`
+  after N has sealed. EN walks `Stream.epochs.get(N).resident_arenas`,
+  gathers records, uploads Shape B, and acks. After upload and
+  subsequent Shape A uploads resolve remaining entries,
+  `StreamEpoch` is dropped.
 - 100K Shared streams: memory budget respected; evictions behave.
 
 ### Stress Tests
