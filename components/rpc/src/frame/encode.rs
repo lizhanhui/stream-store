@@ -31,13 +31,13 @@ impl Frame {
             // request_id(4) + stream_id(4) + extent_id(4) + offset(8) + error_code(2)
             VariableHeader::ReadRespError { .. } => 4 + 4 + 4 + 8 + 2,
             // request_id(4) + stream_id(4) + epoch(4)
-            VariableHeader::SealStreamManagerRequest { .. } => 4 + 4 + 4,
+            VariableHeader::SealStreamRequest { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + offset(8) + new_epoch(4) + addr_len(2) + addr(N)
-            VariableHeader::SealStreamManagerResp { primary_addr, .. } => {
+            VariableHeader::SealStreamResp { primary_addr, .. } => {
                 4 + 4 + 8 + 4 + 2 + primary_addr.len()
             }
             // request_id(4) + stream_id(4) + error_code(2)
-            VariableHeader::SealStreamManagerRespError { .. } => 4 + 4 + 2,
+            VariableHeader::SealStreamRespError { .. } => 4 + 4 + 2,
             // request_id(4) + stream_id(4) + epoch(4) + extent_id_from(4) + start_offset(8)
             VariableHeader::SealEpochPrepare { .. } => 4 + 4 + 4 + 4 + 8,
             // request_id(4) + stream_id(4) + epoch(4) + extent_id(4) + start_offset(8) + end_offset(8)
@@ -92,8 +92,8 @@ impl Frame {
             VariableHeader::ReportExtentsResp { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + epoch(4) + error_code(2)
             VariableHeader::ReportExtentsRespError { .. } => 4 + 4 + 4 + 2,
-            // stream_id(4) + extent_id(4) + epoch(4) + offset(8) + byte_pos(8)
-            VariableHeader::Forward { .. } => 4 + 4 + 4 + 8 + 8,
+            // stream_id(4) + extent_id(4) + epoch(4) + offset(8)
+            VariableHeader::Forward { .. } => 4 + 4 + 4 + 8,
             // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_class(1)
             VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 4 + 8 + 4 + 2 + 1,
             // stream_id(4) + extent_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
@@ -153,7 +153,7 @@ impl Frame {
                 | VariableHeader::SeekResp { .. }
                 | VariableHeader::SeekRespError { .. }
                 | VariableHeader::AppendAckError { .. }
-                | VariableHeader::SealStreamManagerRespError { .. }
+                | VariableHeader::SealStreamRespError { .. }
                 | VariableHeader::SealEpochResp { .. }
                 | VariableHeader::SealEpochRespError { .. }
                 | VariableHeader::CreateStreamRespError { .. }
@@ -262,7 +262,7 @@ impl Frame {
                 dst.put_u64(offset.0);
                 dst.put_u16(*error_code as u16);
             }
-            VariableHeader::SealStreamManagerRequest {
+            VariableHeader::SealStreamRequest {
                 request_id,
                 stream_id,
                 epoch,
@@ -271,7 +271,7 @@ impl Frame {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
             }
-            VariableHeader::SealStreamManagerResp {
+            VariableHeader::SealStreamResp {
                 request_id,
                 stream_id,
                 offset,
@@ -285,7 +285,7 @@ impl Frame {
                 dst.put_u16(primary_addr.len() as u16);
                 dst.extend_from_slice(primary_addr);
             }
-            VariableHeader::SealStreamManagerRespError {
+            VariableHeader::SealStreamRespError {
                 request_id,
                 stream_id,
                 error_code,
@@ -490,13 +490,11 @@ impl Frame {
                 extent_id,
                 epoch,
                 offset,
-                byte_pos,
             } => {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(extent_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(offset.0);
-                dst.put_u64(*byte_pos);
             }
             VariableHeader::ForwardInitEpoch {
                 stream_id,

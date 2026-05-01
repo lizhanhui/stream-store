@@ -320,7 +320,7 @@ impl Stream {
         Ok((result, extent.id))
     }
 
-    /// Replicate a record at the exact position assigned by the primary.
+    /// Replicate a record; the secondary derives byte_pos from its own cursor.
     ///
     /// Delegates to `Extent::replicate()` for deterministic replication.
     /// Only requires a read lock — the Extent handles writes internally.
@@ -328,7 +328,6 @@ impl Stream {
         &self,
         extent_id: ExtentId,
         offset: Offset,
-        byte_pos: u64,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
         let inner = self.inner.read();
@@ -339,7 +338,7 @@ impl Stream {
             }
             .build()
         })?;
-        extent.replicate(offset, byte_pos, payload)
+        extent.replicate(offset, payload)
     }
 
     /// Read `count` messages starting from the given logical `offset` within

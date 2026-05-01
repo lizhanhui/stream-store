@@ -416,22 +416,19 @@ impl Extent {
         })
     }
 
-    /// Replicate a record at the exact position assigned by the primary.
+    /// Replicate a record; byte_pos is derived from the running write_cursor.
     ///
-    /// This method is used by secondaries to write records at the same
-    /// `byte_pos` and logical offset as the primary, ensuring bit-for-bit
-    /// identical arena layouts across replicas.
+    /// Secondaries call this instead of `append_inner`. Forward frames arrive in
+    /// strict per-connection FIFO order (TCP guarantees), so computing byte_pos
+    /// from `self.write_cursor` produces the same value the primary used.
     ///
-    /// Forward frames arrive in strict offset order (guaranteed by the
-    /// per-address FIFO mpsc channel), so CRC32 is computed inline and
-    /// committed state is advanced directly — matching `append_inner`
-    /// semantics on the primary.
+    /// CRC32 is computed inline and committed state is advanced directly —
+    /// matching `append_inner` semantics on the primary.
     ///
     /// Returns the logical offset on success.
     pub fn replicate(
         &self,
         offset: Offset,
-        byte_pos: u64,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
         // Reject stale Forward frames from a previous extent (offset < start_offset).
@@ -454,10 +451,15 @@ impl Extent {
         let payload_len = payload.len();
         let record_len = 4 + payload_len;
 
-        // Check capacity.
+        // Compute byte_pos from the running cursor — strict-order replay guarantees
+        // this matches the primary's position.
+        let byte_pos = self.write_cursor.load(Ordering::Relaxed);
+        // Capacity check (same as before, now using local byte_pos).
         if byte_pos + record_len as u64 > self.capacity as u64 {
             return Err(ExtentFullSnafu { extent_id: self.id }.build());
         }
+        // Advance cursor.
+        self.write_cursor.store(byte_pos + record_len as u64, Ordering::Relaxed);
 
         // Write record at exact byte_pos (same layout as append).
         unsafe {
@@ -1037,20 +1039,20 @@ mod tests {
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         let r0 = ext
-            .replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            .replicate(Offset(0), Bytes::from_static(b"msg0"))
             .unwrap();
         assert_eq!(r0.offset, Offset(0));
         assert_eq!(r0.byte_pos, 0);
 
         // "msg0" = 4 bytes payload, record = 4 + 4 = 8 bytes
         let r1 = ext
-            .replicate(Offset(1), 8, Bytes::from_static(b"msg1"))
+            .replicate(Offset(1), Bytes::from_static(b"msg1"))
             .unwrap();
         assert_eq!(r1.offset, Offset(1));
         assert_eq!(r1.byte_pos, 8);
 
         let r2 = ext
-            .replicate(Offset(2), 16, Bytes::from_static(b"msg2"))
+            .replicate(Offset(2), Bytes::from_static(b"msg2"))
             .unwrap();
         assert_eq!(r2.offset, Offset(2));
         assert_eq!(r2.byte_pos, 16);
@@ -1082,7 +1084,7 @@ mod tests {
         for payload in &payloads {
             let result = primary.append(payload.clone()).unwrap();
             secondary
-                .replicate(result.offset, result.byte_pos, payload.clone())
+                .replicate(result.offset, payload.clone())
                 .unwrap();
         }
 
@@ -1094,12 +1096,12 @@ mod tests {
     #[test]
     fn replicate_sealed_extent_rejects() {
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
-        ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+        ext.replicate(Offset(0), Bytes::from_static(b"msg0"))
             .unwrap();
         ext.seal(Some(1)); // seal at 1 record
 
         // Replicate at offset=1 (at limit) should fail.
-        let result = ext.replicate(Offset(1), 8, Bytes::from_static(b"msg1"));
+        let result = ext.replicate(Offset(1), Bytes::from_static(b"msg1"));
         assert!(matches!(result, Err(StorageError::ExtentSealed { .. })));
     }
 
@@ -1216,21 +1218,21 @@ mod tests {
     fn incremental_crc32_via_replicate() {
         // Simulate primary appends to get reference data.
         let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
-        let r0 = primary.append(Bytes::from_static(b"hello")).unwrap();
-        let r1 = primary.append(Bytes::from_static(b"world")).unwrap();
-        let r2 = primary.append(Bytes::from_static(b"!")).unwrap();
+        primary.append(Bytes::from_static(b"hello")).unwrap();
+        primary.append(Bytes::from_static(b"world")).unwrap();
+        primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
         // Simulate secondary receiving the same records via replicate() IN ORDER.
         let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         secondary
-            .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
+            .replicate(Offset(0), Bytes::from_static(b"hello"))
             .unwrap();
         secondary
-            .replicate(Offset(1), r1.byte_pos, Bytes::from_static(b"world"))
+            .replicate(Offset(1), Bytes::from_static(b"world"))
             .unwrap();
         secondary
-            .replicate(Offset(2), r2.byte_pos, Bytes::from_static(b"!"))
+            .replicate(Offset(2), Bytes::from_static(b"!"))
             .unwrap();
 
         // After in-order replicate, try_advance_committed (called inside replicate)
@@ -1253,22 +1255,22 @@ mod tests {
     fn crc32_in_order_replicate() {
         // Simulate primary appends to get reference data.
         let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
-        let r0 = primary.append(Bytes::from_static(b"hello")).unwrap();
-        let r1 = primary.append(Bytes::from_static(b"world")).unwrap();
-        let r2 = primary.append(Bytes::from_static(b"!")).unwrap();
+        primary.append(Bytes::from_static(b"hello")).unwrap();
+        primary.append(Bytes::from_static(b"world")).unwrap();
+        primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
         // Simulate secondary receiving records IN ORDER (guaranteed by FIFO mpsc).
         let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         secondary
-            .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
+            .replicate(Offset(0), Bytes::from_static(b"hello"))
             .unwrap();
         secondary
-            .replicate(Offset(1), r1.byte_pos, Bytes::from_static(b"world"))
+            .replicate(Offset(1), Bytes::from_static(b"world"))
             .unwrap();
         secondary
-            .replicate(Offset(2), r2.byte_pos, Bytes::from_static(b"!"))
+            .replicate(Offset(2), Bytes::from_static(b"!"))
             .unwrap();
 
         // Seal and store primary checksum.
@@ -1284,18 +1286,18 @@ mod tests {
     fn crc32_forward_checksum_arrives_after_records() {
         // ForwardChecksum arrives after all records (normal case with FIFO channel).
         let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
-        let r0 = primary.append(Bytes::from_static(b"hello")).unwrap();
-        let r1 = primary.append(Bytes::from_static(b"world")).unwrap();
+        primary.append(Bytes::from_static(b"hello")).unwrap();
+        primary.append(Bytes::from_static(b"world")).unwrap();
         primary.seal(None);
 
         let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Records arrive in order.
         secondary
-            .replicate(Offset(0), r0.byte_pos, Bytes::from_static(b"hello"))
+            .replicate(Offset(0), Bytes::from_static(b"hello"))
             .unwrap();
         secondary
-            .replicate(Offset(1), r1.byte_pos, Bytes::from_static(b"world"))
+            .replicate(Offset(1), Bytes::from_static(b"world"))
             .unwrap();
 
         // Seal and store primary checksum.

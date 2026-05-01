@@ -62,19 +62,19 @@ pub enum VariableHeader {
         offset: Offset,
         error_code: ErrorCode,
     },
-    SealStreamManagerRequest {
+    SealStreamRequest {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
     },
-    SealStreamManagerResp {
+    SealStreamResp {
         request_id: u32,
         stream_id: StreamId,
         offset: Offset,
         new_epoch: Epoch,
         primary_addr: Bytes,
     },
-    SealStreamManagerRespError {
+    SealStreamRespError {
         request_id: u32,
         stream_id: StreamId,
         error_code: ErrorCode,
@@ -242,15 +242,14 @@ pub enum VariableHeader {
         error_code: ErrorCode,
     },
     /// Per-record replication (Forward, flag=0x00).
-    /// Carries byte_pos so the secondary writes each record at the exact same
-    /// arena position as the primary.
+    /// Secondary computes its own byte_pos from strict-order append; TCP FIFO
+    /// ensures the secondary advances its cursor by the same amount as the primary.
     /// Fire-and-forget: no request_id; secondary responds with cumulative Watermark.
     Forward {
         stream_id: StreamId,
         extent_id: ExtentId,
         epoch: Epoch,
         offset: Offset,
-        byte_pos: u64,
     },
     /// Init-extent notification (Forward, flag=0x01). No payload, no response.
     /// Sent once by primary when it starts using a new extent,
@@ -370,9 +369,9 @@ impl VariableHeader {
             VariableHeader::Read { .. }
             | VariableHeader::ReadResp { .. }
             | VariableHeader::ReadRespError { .. } => Opcode::Read,
-            VariableHeader::SealStreamManagerRequest { .. }
-            | VariableHeader::SealStreamManagerResp { .. }
-            | VariableHeader::SealStreamManagerRespError { .. } => Opcode::SealStream,
+            VariableHeader::SealStreamRequest { .. }
+            | VariableHeader::SealStreamResp { .. }
+            | VariableHeader::SealStreamRespError { .. } => Opcode::SealStream,
             VariableHeader::SealEpochPrepare { .. }
             | VariableHeader::SealEpochResp { .. }
             | VariableHeader::SealEpochRespError { .. }

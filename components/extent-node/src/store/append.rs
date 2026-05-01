@@ -319,7 +319,6 @@ impl ExtentNodeStore {
                                 extent_id,
                                 epoch,
                                 offset,
-                                byte_pos: append_result.byte_pos,
                             },
                             Some(payload_for_forward),
                         );
@@ -654,7 +653,6 @@ impl ExtentNodeStore {
             request_id: u32,
             payload_for_forward: Bytes,
             offset: Offset,
-            byte_pos: u64,
             payload_len: usize,
             extent_id: ExtentId,
         }
@@ -738,7 +736,6 @@ impl ExtentNodeStore {
                             request_id,
                             payload_for_forward,
                             offset: result.offset,
-                            byte_pos: result.byte_pos,
                             payload_len,
                             extent_id: eid,
                         });
@@ -844,7 +841,6 @@ impl ExtentNodeStore {
                                             extent_id: entry.extent_id,
                                             epoch,
                                             offset: entry.offset,
-                                            byte_pos: entry.byte_pos,
                                         },
                                         Some(entry.payload_for_forward.clone()),
                                     );

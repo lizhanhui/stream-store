@@ -494,7 +494,6 @@ async fn secondary_returns_watermark() {
                     extent_id: ExtentId(50),
                     epoch: Epoch(0),
                     offset: Offset(0),
-                    byte_pos: 0,
                 },
                 Some(Bytes::from_static(b"forwarded msg")),
             ),
@@ -1021,7 +1020,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
         .unwrap();
 
     for i in 0u32..2 {
-        let byte_pos = i as u64 * 8;
         let resp = store
             .handle_frame(
                 Frame::new(
@@ -1030,7 +1028,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                         extent_id: ExtentId(50),
                         epoch: Epoch(0),
                         offset: Offset(i as u64),
-                        byte_pos,
                     },
                     Some(Bytes::from(format!("msg{i}"))),
                 ),
@@ -1066,7 +1063,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
     }
 
     for i in 2u32..4 {
-        let byte_pos = i as u64 * 8;
         let resp = store
             .handle_frame(
                 Frame::new(
@@ -1075,7 +1071,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                         extent_id: ExtentId(50),
                         epoch: Epoch(0),
                         offset: Offset(i as u64),
-                        byte_pos,
                     },
                     Some(Bytes::from(format!("msg{i}"))),
                 ),
@@ -1096,7 +1091,6 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                     extent_id: ExtentId(50),
                     epoch: Epoch(0),
                     offset: Offset(4),
-                    byte_pos: 32,
                 },
                 Some(Bytes::from_static(b"should-fail")),
             ),

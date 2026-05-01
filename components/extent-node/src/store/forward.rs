@@ -133,22 +133,21 @@ impl ExtentNodeStore {
 
     /// Handle Forward (0x0B, flag=0x00) — per-record primary→secondary replication.
     ///
-    /// The Forward frame carries (stream_id, extent_id, epoch, offset, byte_pos)
-    /// so the secondary writes each record at the exact same arena position as
-    /// the primary. The stream/extent must already exist (created by a prior
-    /// ForwardInitEpoch or RegisterEpoch).
+    /// The Forward frame carries (stream_id, extent_id, epoch, offset);
+    /// the secondary derives byte_pos from its own write_cursor (strict-order
+    /// TCP FIFO guarantees deterministic replay). The stream/extent must already
+    /// exist (created by a prior ForwardInitEpoch or RegisterEpoch).
     ///
     /// Returns a cumulative Watermark with the contiguous committed offset,
     /// or None if the forward cannot be processed (bad frame, unknown stream, etc.).
     pub(crate) fn handle_forward(&self, frame: Frame) -> Option<Frame> {
-        let (stream_id, extent_id, epoch, offset, byte_pos) = match &frame.variable_header {
+        let (stream_id, extent_id, epoch, offset) = match &frame.variable_header {
             VariableHeader::Forward {
                 stream_id,
                 extent_id,
                 epoch,
                 offset,
-                byte_pos,
-            } => (*stream_id, *extent_id, *epoch, *offset, *byte_pos),
+            } => (*stream_id, *extent_id, *epoch, *offset),
             _ => return None,
         };
 
@@ -168,7 +167,6 @@ impl ExtentNodeStore {
         let replicate_result = stream.replicate(
             extent_id,
             offset,
-            byte_pos,
             frame.payload.clone().unwrap_or_default(),
         );
 

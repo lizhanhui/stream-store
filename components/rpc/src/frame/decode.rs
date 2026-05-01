@@ -194,7 +194,7 @@ impl Frame {
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::SealStreamManagerRespError {
+                        VariableHeader::SealStreamRespError {
                             request_id,
                             stream_id,
                             error_code,
@@ -207,7 +207,7 @@ impl Frame {
                     let addr_len = body.get_u16() as usize;
                     let primary_addr = body.split_to(addr_len).freeze();
                     Ok((
-                        VariableHeader::SealStreamManagerResp {
+                        VariableHeader::SealStreamResp {
                             request_id,
                             stream_id,
                             offset,
@@ -219,7 +219,7 @@ impl Frame {
                 } else {
                     let epoch = Epoch(body.get_u32());
                     Ok((
-                        VariableHeader::SealStreamManagerRequest {
+                        VariableHeader::SealStreamRequest {
                             request_id,
                             stream_id,
                             epoch,
@@ -602,7 +602,6 @@ impl Frame {
                     )),
                     FLAG_FORWARD_APPEND => {
                         let offset = Offset(body.get_u64());
-                        let byte_pos = body.get_u64();
                         let payload = Self::read_payload(body);
                         Ok((
                             VariableHeader::Forward {
@@ -610,7 +609,6 @@ impl Frame {
                                 extent_id,
                                 epoch,
                                 offset,
-                                byte_pos,
                             },
                             payload,
                         ))
