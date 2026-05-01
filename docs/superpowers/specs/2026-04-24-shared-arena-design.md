@@ -173,19 +173,15 @@ struct ArenaDirectory {
 }
 
 struct EpochArenaEntry {
-    // Primary cohort = this EN was Primary for (stream, epoch) at the time
-    // these records were appended. Primary-cohort entries are uploaded on
-    // arena seal. Secondary-cohort entries are held for DR and dropped on
-    // ForwardFlushed from the peer Primary.
-    cohort:           Cohort,      // Primary | Secondary
+    // The entry's cohort (Primary/Secondary) is not stored here; it is
+    // derived at flush time from StreamEpoch.replica_info.primary_node_id,
+    // which is immutable within an epoch.
     start_offset:     u64,
     end_offset:       u64,        // exclusive, running while arena open
     byte_positions:   Vec<u32>,   // per record, within this arena
     arena_start_byte: u32,
     arena_end_byte:   u32,
 }
-
-enum Cohort { Primary, Secondary }
 
 struct SharedAppendJob {
     // One record submitted inside an ArenaBatch from a stream leader.
@@ -707,8 +703,14 @@ dropped at seal.
 
 1. Arena rolls → `state = Sealed` → sealed arena handed to the S3 flush
    task's queue (fire-and-forget from the arena leader's perspective).
-2. Flush task walks the arena's directory filtering
-   `cohort == Primary`. For each such entry:
+2. Flush task walks the arena's directory. For each `(stream_id, epoch)`
+   entry, it looks up the epoch's `replica_info.primary_node_id`:
+   - If that equals this EN's `node_id` → primary-cohort, include in
+     the upload.
+   - Otherwise → secondary-cohort, skip and drop the directory entry
+     (its arena buffer refcount is released once all refs go away).
+
+   For each primary-cohort entry:
    - Records are already contiguous in the arena buffer (per-stream
      gather was done at write time). The compaction step is a linear
      walk over `byte_positions`, grouping into 64-record blocks and
@@ -722,9 +724,11 @@ dropped at seal.
 5. SM writes one `epoch_arenas` row per entry
    (`s3_key_kind = 0`) in a single transaction.
 6. Primary broadcasts `ForwardFlushed(arena_id)` to peer replicas
-   (fire-and-forget). Secondaries receiving this drop their
-   secondary-cohort directory entries for this arena; the arena's
-   buffer refcount drops.
+   (fire-and-forget). Secondaries receiving this walk the arena's
+   directory and, for each entry where
+   `StreamEpoch.replica_info.primary_node_id != self.node_id`
+   (i.e., secondary-cohort entries), drop the entry. The arena's
+   buffer refcount drops as entries release.
 7. Arena becomes LRU-eligible.
 
 Secondaries never participate in Shape A upload. They accumulate
@@ -742,10 +746,10 @@ secondaries).
 Opcode: `FlushEpochStream(stream_id, epoch)` — SM → EN. EN flow:
 
 1. Flush task scans every resident arena in the pool. For each arena
-   whose directory has an entry for `(stream_id, epoch)` **in any
-   cohort** (Primary or Secondary — DR accepts both because the purpose
-   is durability, regardless of who was Primary), collect the entry's
-   slices.
+   whose directory has an entry for `(stream_id, epoch)` — the cohort
+   distinction does not matter here; DR accepts both Primary and
+   Secondary records because the purpose is durability regardless of
+   who was Primary — collect the entry's slices.
 2. Concatenate slices in offset order (zero-copy via `Bytes::slice`
    over the arena buffers).
 3. Build Shape B object (same chunk-compressed format used for
