@@ -778,3 +778,68 @@ fn forward_init_epoch_arena_class_round_trip() {
     }
     assert!(buf.is_empty());
 }
+
+/// Corrupt the final byte (arena_class) of an encoded RegisterEpoch frame
+/// with an unknown value and verify decode returns an error rather than
+/// silently defaulting. Matches the StorageClass unknown-variant policy.
+#[test]
+fn register_epoch_unknown_arena_class_errors() {
+    let config = StreamConfig {
+        stream_id: StreamId(1),
+        replication_factor: 1,
+        epoch: Epoch(0),
+        storage_class: StorageClass::S3,
+        arena_class: ArenaClass::Dedicated,
+        policy: ExtentPolicy { cache: 0 },
+    };
+    let frame = Frame::new(
+        VariableHeader::RegisterEpoch {
+            request_id: 1,
+            extent_id: ExtentId(1),
+            role: 0,
+            config,
+        },
+        None,
+    );
+    let mut buf = BytesMut::new();
+    frame.encode(&mut buf);
+    // RegisterEpoch has a payload section (u32 payload_len trailer). The
+    // arena_class byte is the last byte of the variable header — i.e.
+    // immediately before the 4-byte payload_len. Variable header is 22 bytes:
+    //   request_id(4) stream_id(4) extent_id(4) role(1) rf(1)
+    //   epoch(4) cache(2) storage_class(1) arena_class(1).
+    // Fixed header is 8 bytes; arena_class is at byte offset 8 + 22 - 1 = 29.
+    buf[29] = 0xFE;
+    let err = Frame::decode(&mut buf).expect_err("unknown arena_class must fail decode");
+    assert!(
+        format!("{err}").contains("arena class"),
+        "error should mention arena class; got: {err}"
+    );
+}
+
+/// Same policy check for ForwardInitEpoch.
+#[test]
+fn forward_init_epoch_unknown_arena_class_errors() {
+    let frame = Frame::new(
+        VariableHeader::ForwardInitEpoch {
+            stream_id: StreamId(1),
+            extent_id: ExtentId(1),
+            epoch: Epoch(0),
+            start_offset: Offset(0),
+            extent_capacity: 1024,
+            cache_extents: 1,
+            storage_class: StorageClass::S3,
+            arena_class: ArenaClass::Dedicated,
+        },
+        None,
+    );
+    let mut buf = BytesMut::new();
+    frame.encode(&mut buf);
+    let last = buf.len() - 1;
+    buf[last] = 0xFE;
+    let err = Frame::decode(&mut buf).expect_err("unknown arena_class must fail decode");
+    assert!(
+        format!("{err}").contains("arena class"),
+        "error should mention arena class; got: {err}"
+    );
+}

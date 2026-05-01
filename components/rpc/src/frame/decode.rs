@@ -536,7 +536,12 @@ impl Frame {
                         }
                         .build()
                     })?;
-                    let arena_class = ArenaClass::from_u8(body.get_u8()).unwrap_or_default();
+                    let arena_class = ArenaClass::from_u8(body.get_u8()).ok_or_else(|| {
+                        InvalidFrameSnafu {
+                            message: "unknown arena class",
+                        }
+                        .build()
+                    })?;
                     let payload = Self::read_payload(body);
                     Ok((
                         VariableHeader::RegisterEpoch {
@@ -626,7 +631,13 @@ impl Frame {
                                 }
                                 .build()
                             })?;
-                        let arena_class = ArenaClass::from_u8(body.get_u8()).unwrap_or_default();
+                        let arena_class =
+                            ArenaClass::from_u8(body.get_u8()).ok_or_else(|| {
+                                InvalidFrameSnafu {
+                                    message: "unknown arena class",
+                                }
+                                .build()
+                            })?;
                         Ok((
                             VariableHeader::ForwardInitEpoch {
                                 stream_id,
