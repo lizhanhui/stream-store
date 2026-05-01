@@ -135,7 +135,7 @@ pub enum Opcode {
     Disconnect = 0x12,
     Heartbeat = 0x14,
     /// Register extent replica. Flags: 0x00=request, 0x01=ack, 0x80=error.
-    RegisterExtent = 0x15,
+    RegisterEpoch = 0x15,
     Watermark = 0x17,
     /// Async extent update from EN to SM. Fire-and-forget.
     /// Flags distinguish variants: sealed (0x00) or progress (0x01).
@@ -175,7 +175,7 @@ impl Opcode {
             0x10 => Some(Opcode::Connect),
             0x12 => Some(Opcode::Disconnect),
             0x14 => Some(Opcode::Heartbeat),
-            0x15 => Some(Opcode::RegisterExtent),
+            0x15 => Some(Opcode::RegisterEpoch),
             0x17 => Some(Opcode::Watermark),
             0x18 => Some(Opcode::UpdateExtent),
             0x19 => Some(Opcode::ReportExtents),

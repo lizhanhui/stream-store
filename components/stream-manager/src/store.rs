@@ -342,7 +342,7 @@ impl StreamManagerStore {
     /// This guarantees the Primary is ready to accept appends before any client
     /// learns about the new extent (via SealStreamManagerResp or DescribeStream).
     ///
-    /// Uses a 1-second timeout covering both TCP connect and the RegisterExtent
+    /// Uses a 1-second timeout covering both TCP connect and the RegisterEpoch
     /// round-trip. On a healthy LAN this completes in sub-millisecond; a timeout
     /// indicates the Primary is likely dead or unreachable.
     ///
@@ -364,7 +364,7 @@ impl StreamManagerStore {
             let client = client::StreamClient::connect(&addr).await.map_err(|e| {
                 InternalSnafu {
                     message: format!(
-                        "connect to Primary ExtentNode {addr} for RegisterExtent: {e}"
+                        "connect to Primary ExtentNode {addr} for RegisterEpoch: {e}"
                     ),
                 }
                 .build()
@@ -372,7 +372,7 @@ impl StreamManagerStore {
 
             let resp = client
                 .send_frame(Frame::new(
-                    VariableHeader::RegisterExtent {
+                    VariableHeader::RegisterEpoch {
                         request_id: 0,
                         extent_id: eid,
                         role: 0, // Primary
@@ -383,7 +383,7 @@ impl StreamManagerStore {
                 .await
                 .map_err(|e| {
                     InternalSnafu {
-                        message: format!("RegisterExtent to Primary ExtentNode {addr}: {e}"),
+                        message: format!("RegisterEpoch to Primary ExtentNode {addr}: {e}"),
                     }
                     .build()
                 })?;
@@ -392,7 +392,7 @@ impl StreamManagerStore {
                 let msg = String::from_utf8_lossy(resp.payload.as_deref().unwrap_or_default())
                     .to_string();
                 return Err(InternalSnafu {
-                    message: format!("Primary ExtentNode {addr} rejected RegisterExtent: {msg}"),
+                    message: format!("Primary ExtentNode {addr} rejected RegisterEpoch: {msg}"),
                 }
                 .build());
             }
@@ -404,7 +404,7 @@ impl StreamManagerStore {
         match result {
             Ok(Ok(())) => {
                 info!(
-                    "RegisterExtent ACK from Primary {primary_addr}: stream={}, extent={}, rf={}, secondaries={}",
+                    "RegisterEpoch ACK from Primary {primary_addr}: stream={}, extent={}, rf={}, secondaries={}",
                     config.stream_id,
                     extent_id,
                     config.replication_factor,
@@ -414,13 +414,13 @@ impl StreamManagerStore {
             }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(InternalSnafu {
-                message: format!("RegisterExtent to Primary {primary_addr} timed out (1s)"),
+                message: format!("RegisterEpoch to Primary {primary_addr} timed out (1s)"),
             }
             .build()),
         }
     }
 
-    /// Fire-and-forget RegisterExtent to each Secondary ExtentNode.
+    /// Fire-and-forget RegisterEpoch to each Secondary ExtentNode.
     ///
     /// Secondaries create extents lazily on the first Forward frame, so these
     /// RPCs are hints for pre-allocation, not required for correctness.
@@ -443,7 +443,7 @@ impl StreamManagerStore {
                     Ok(client) => {
                         let result = client
                             .send_frame(Frame::new(
-                                VariableHeader::RegisterExtent {
+                                VariableHeader::RegisterEpoch {
                                     request_id: 0,
                                     extent_id: eid,
                                     role,
@@ -458,26 +458,26 @@ impl StreamManagerStore {
                                     resp.payload.as_deref().unwrap_or_default(),
                                 );
                                 warn!(
-                                    "Secondary {addr} rejected RegisterExtent for stream={} extent={}: {msg}",
+                                    "Secondary {addr} rejected RegisterEpoch for stream={} extent={}: {msg}",
                                     sid, eid
                                 );
                             }
                             Ok(_) => {
                                 info!(
-                                    "RegisterExtent sent to Secondary {addr}: stream={}, extent={}, role={role}",
+                                    "RegisterEpoch sent to Secondary {addr}: stream={}, extent={}, role={role}",
                                     sid, eid
                                 );
                             }
                             Err(e) => {
                                 warn!(
-                                    "RegisterExtent to Secondary {addr} failed: {e} (will create lazily on first Forward)"
+                                    "RegisterEpoch to Secondary {addr} failed: {e} (will create lazily on first Forward)"
                                 );
                             }
                         }
                     }
                     Err(e) => {
                         warn!(
-                            "connect to Secondary {addr} for RegisterExtent failed: {e} (will create lazily on first Forward)"
+                            "connect to Secondary {addr} for RegisterEpoch failed: {e} (will create lazily on first Forward)"
                         );
                     }
                 }
@@ -490,7 +490,7 @@ impl StreamManagerStore {
     ///
     /// `replication_factor` specifies how many replicas to create for this extent.
     /// The stream_replica table stores node *addresses* (not node IDs) so that the StreamManager
-    /// can connect to ExtentNodes for seal and RegisterExtent operations.
+    /// can connect to ExtentNodes for seal and RegisterEpoch operations.
     async fn allocate_and_notify_replica_set(
         &self,
         config: StreamConfig,
@@ -521,7 +521,7 @@ impl StreamManagerStore {
         );
 
         // Notify ExtentNodes of their replication roles.
-        // Always send RegisterExtent, even for replication_factor=1, so the ExtentNode knows
+        // Always send RegisterEpoch, even for replication_factor=1, so the ExtentNode knows
         // the StreamManager-assigned stream_id and extent_id (required for seal coordination).
         let primary_addr = &node_addrs[0];
         let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
@@ -568,7 +568,7 @@ impl RequestHandler for StreamManagerStore {
                     Opcode::DescribeExtent => self.handle_describe_extent(frame).await,
                     Opcode::Seek => self.handle_seek(frame).await,
                     Opcode::ReportExtents => self.handle_report_extents(frame).await,
-                    Opcode::RegisterExtent
+                    Opcode::RegisterEpoch
                     | Opcode::Watermark
                     | Opcode::UpdateExtent
                     | Opcode::SealEpoch

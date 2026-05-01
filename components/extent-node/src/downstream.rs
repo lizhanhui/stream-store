@@ -9,7 +9,7 @@
 //! On TCP failure, the writer task reconnects in a loop — frames buffered in
 //! the channel survive outages and are drained on reconnect.
 //!
-//! Streams cache cloned `Sender` handles at RegisterExtent time so
+//! Streams cache cloned `Sender` handles at RegisterEpoch time so
 //! the hot append path pushes directly into channels with zero lookup overhead.
 //!
 //! Each connection also spawns a reader task that processes Watermark ACKs
@@ -85,7 +85,7 @@ impl DownstreamPool {
 
     /// Get or create a `Sender` for the given secondary address.
     ///
-    /// Called at `handle_register_extent` time (cold path). Returns a clone
+    /// Called at `handle_register_epoch` time (cold path). Returns a clone
     /// of the sender that can be cached in the Stream struct for zero-lookup
     /// inline pushes on the hot append path.
     ///

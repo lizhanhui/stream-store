@@ -52,7 +52,7 @@ async fn start_extent_node() -> (String, Arc<ExtentNodeStore>) {
     (addr, store)
 }
 
-/// Helper: send a RegisterExtent to an ExtentNode via raw connection.
+/// Helper: send a RegisterEpoch to an ExtentNode via raw connection.
 ///
 /// For broadcast replication:
 /// - Primary receives `replica_addrs` = all secondary addresses.
@@ -75,7 +75,7 @@ async fn register_extent(
     let payload = build_register_extent_payload(replica_addrs);
     framed
         .send(Frame::new(
-            VariableHeader::RegisterExtent {
+            VariableHeader::RegisterEpoch {
                 request_id: 0,
                 extent_id: ExtentId(extent_id),
                 role,
@@ -93,7 +93,7 @@ async fn register_extent(
         .unwrap();
 
     let resp = framed.next().await.unwrap().unwrap();
-    assert_eq!(resp.opcode(), Opcode::RegisterExtent);
+    assert_eq!(resp.opcode(), Opcode::RegisterEpoch);
 }
 
 /// Test RF=2: Primary broadcasts to 1 Secondary.

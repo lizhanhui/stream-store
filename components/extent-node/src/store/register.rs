@@ -9,12 +9,12 @@ use tracing::info;
 use super::{ExtentNodeStore, ReplicaInfo};
 
 impl ExtentNodeStore {
-    /// Handle RegisterExtent from StreamManager: assign this ExtentNode a role in broadcast replication.
+    /// Handle RegisterEpoch from StreamManager: assign this ExtentNode a role in broadcast replication.
     ///
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
-    pub(crate) fn handle_register_extent(&self, frame: Frame) -> Frame {
+    pub(crate) fn handle_register_epoch(&self, frame: Frame) -> Frame {
         let (extent_id, role, config) = match &frame.variable_header {
-            VariableHeader::RegisterExtent {
+            VariableHeader::RegisterEpoch {
                 extent_id,
                 role,
                 config,
@@ -24,7 +24,7 @@ impl ExtentNodeStore {
                 return Frame::error_from_request(
                     &frame,
                     ErrorCode::InternalError,
-                    "invalid RegisterExtent frame",
+                    "invalid RegisterEpoch frame",
                     ExtentId(0),
                 );
             }
@@ -47,7 +47,7 @@ impl ExtentNodeStore {
                     return Frame::error_from_request(
                         &frame,
                         ErrorCode::InternalError,
-                        "invalid RegisterExtent payload",
+                        "invalid RegisterEpoch payload",
                         ExtentId(0),
                     );
                 }
@@ -55,7 +55,7 @@ impl ExtentNodeStore {
 
         // Create the stream locally if it doesn't exist, then register the new extent.
         // Skip extent creation if it already exists (idempotent — extent may have been
-        // lazily created by a forwarded append that arrived before this RegisterExtent).
+        // lazily created by a forwarded append that arrived before this RegisterEpoch).
         self.try_create_stream(stream_id, config.storage_class, &policy);
 
         // Register the extent (idempotent — skips if already exists).
@@ -65,7 +65,7 @@ impl ExtentNodeStore {
                 stream.register_extent(extent_id, stream.max_offset(), epoch, DEFAULT_EXTENT_CAPACITY);
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
-                // from authoritative source (RegisterExtent carries the real epoch).
+                // from authoritative source (RegisterEpoch carries the real epoch).
                 stream.set_epoch(epoch);
             }
         }
@@ -81,7 +81,7 @@ impl ExtentNodeStore {
             replica_addrs.join(", ")
         };
         info!(
-            "RegisterExtent: stream={}, extent={}, role={role_name}, rf={}, secondaries=[{addrs_info}]",
+            "RegisterEpoch: stream={}, extent={}, role={role_name}, rf={}, secondaries=[{addrs_info}]",
             stream_id, extent_id, replication_factor,
         );
 
@@ -118,7 +118,7 @@ impl ExtentNodeStore {
         self.replicas.pin().insert(stream_id, Arc::new(ri));
 
         Frame::new(
-            VariableHeader::RegisterExtentAck {
+            VariableHeader::RegisterEpochAck {
                 request_id: frame.request_id(),
                 stream_id,
                 extent_id,

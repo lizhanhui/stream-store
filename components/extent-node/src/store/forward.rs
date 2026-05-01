@@ -136,7 +136,7 @@ impl ExtentNodeStore {
     /// The Forward frame carries (stream_id, extent_id, epoch, offset, byte_pos)
     /// so the secondary writes each record at the exact same arena position as
     /// the primary. The stream/extent must already exist (created by a prior
-    /// ForwardInitExtent or RegisterExtent).
+    /// ForwardInitExtent or RegisterEpoch).
     ///
     /// Returns a cumulative Watermark with the contiguous committed offset,
     /// or None if the forward cannot be processed (bad frame, unknown stream, etc.).
@@ -152,7 +152,7 @@ impl ExtentNodeStore {
             _ => return None,
         };
 
-        // Look up the stream — must exist (created by ForwardInitExtent or RegisterExtent).
+        // Look up the stream — must exist (created by ForwardInitExtent or RegisterEpoch).
         let streams = self.streams.pin();
         let stream = match streams.get(&stream_id) {
             Some(s) => s,

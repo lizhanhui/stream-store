@@ -75,9 +75,9 @@ impl Frame {
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
             // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + cache_extents(2) + storage_class(1)
-            VariableHeader::RegisterExtent { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 2 + 1,
+            VariableHeader::RegisterEpoch { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 2 + 1,
             // request_id(4) + stream_id(4) + extent_id(4)
-            VariableHeader::RegisterExtentAck { .. } => 4 + 4 + 4,
+            VariableHeader::RegisterEpochAck { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
             VariableHeader::RegisterExtentAckError { .. } => 4 + 4 + 4 + 2,
             // stream_id(4) + extent_id(4) + epoch(4) + offset(8)
@@ -141,7 +141,7 @@ impl Frame {
                 | VariableHeader::Disconnect { .. }
                 | VariableHeader::Heartbeat { .. }
                 | VariableHeader::HeartbeatError { .. }
-                | VariableHeader::RegisterExtent { .. }
+                | VariableHeader::RegisterEpoch { .. }
                 | VariableHeader::Forward { .. }
                 | VariableHeader::StreamManagerMembershipChange
                 | VariableHeader::ReportExtentsResp { .. }
@@ -420,7 +420,7 @@ impl Frame {
             | VariableHeader::Heartbeat { request_id } => {
                 dst.put_u32(*request_id);
             }
-            VariableHeader::RegisterExtent {
+            VariableHeader::RegisterEpoch {
                 request_id,
                 extent_id,
                 role,
@@ -454,7 +454,7 @@ impl Frame {
                 dst.put_u32(*request_id);
                 dst.put_u16(*error_code as u16);
             }
-            VariableHeader::RegisterExtentAck {
+            VariableHeader::RegisterEpochAck {
                 request_id,
                 stream_id,
                 extent_id,

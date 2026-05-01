@@ -310,7 +310,7 @@ impl Frame {
             VariableHeader::Heartbeat { request_id } => {
                 Self::heartbeat_error(*request_id, error_code, message)
             }
-            VariableHeader::RegisterExtent {
+            VariableHeader::RegisterEpoch {
                 request_id,
                 extent_id,
                 config,

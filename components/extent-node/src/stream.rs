@@ -29,7 +29,7 @@ struct StreamInner {
     extents: Vec<Extent>,
 
     /// Next extent ID for autonomous creation within the current epoch.
-    /// Initialized to `first_extent_id + 1` when SM sends RegisterExtent.
+    /// Initialized to `first_extent_id + 1` when SM sends RegisterEpoch.
     next_extent_id: ExtentId,
 
     /// Fixed capacity for every extent on this stream. Set at register_extent time
@@ -41,7 +41,7 @@ struct StreamInner {
     max_extents: usize,
 
     /// Cached per-secondary Sender clones (Primary only).
-    /// Populated at RegisterExtent time from DownstreamPool.
+    /// Populated at RegisterEpoch time from DownstreamPool.
     /// Vec since RF is small (1-3); iteration is the hot path.
     downstream_txs: Vec<mpsc::Sender<Frame>>,
 
@@ -189,7 +189,7 @@ pub struct Stream {
     job_rx: Receiver<AppendJob>,
 
     /// Per-stream ACK queue for quorum-based replication (Primary only).
-    /// `None` on Secondaries. Initialized once at RegisterExtent time via `OnceLock`.
+    /// `None` on Secondaries. Initialized once at RegisterEpoch time via `OnceLock`.
     /// Has its own internal Mutex — lives outside `inner`'s RwLock to avoid
     /// forcing the append hot path into a write lock.
     ack_queue: OnceLock<AckQueue>,
@@ -245,7 +245,7 @@ impl Stream {
         Epoch(self.epoch.load(Ordering::Acquire))
     }
 
-    /// Update the epoch (e.g., when RegisterExtent arrives for an already lazily-created extent).
+    /// Update the epoch (e.g., when RegisterEpoch arrives for an already lazily-created extent).
     pub fn set_epoch(&self, epoch: Epoch) {
         self.epoch.store(epoch.0, Ordering::Release);
     }
@@ -553,7 +553,7 @@ impl Stream {
         self.inner.write().storage_class = class;
     }
 
-    /// Register a new extent on this stream (called when SM sends RegisterExtent
+    /// Register a new extent on this stream (called when SM sends RegisterEpoch
     /// or when a secondary receives ForwardInitExtent).
     ///
     /// `extent_capacity` is the arena size for this specific extent.
@@ -601,7 +601,7 @@ impl Stream {
     /// via SM. The sealed extent will accept late forwarded appends up to that offset.
     /// If `None`, the extent uses its local record_count (primary sealing itself).
     ///
-    /// After seal, the stream has no active extent until SM sends a new `RegisterExtent`
+    /// After seal, the stream has no active extent until SM sends a new `RegisterEpoch`
     /// or the Primary autonomously creates one via `create_next_extent()`.
     pub fn seal(&self, extent_id: ExtentId, committed_offset: Option<u64>) -> Option<(u64, u64)> {
         let inner = self.inner.write();
@@ -646,7 +646,7 @@ impl Stream {
         })
     }
 
-    /// Set cached downstream senders (Primary only, called at RegisterExtent time).
+    /// Set cached downstream senders (Primary only, called at RegisterEpoch time).
     pub(crate) fn set_downstream_txs(&self, txs: Vec<mpsc::Sender<Frame>>) {
         self.inner.write().downstream_txs = txs;
     }
@@ -684,7 +684,7 @@ mod tests {
     use super::*;
     use common::config::DEFAULT_EXTENT_CAPACITY;
 
-    /// Helper: create a stream with one active extent (simulating RegisterExtent from SM).
+    /// Helper: create a stream with one active extent (simulating RegisterEpoch from SM).
     fn new_stream_with_extent(id: StreamId) -> Stream {
         let stream = Stream::new(id);
         stream.register_extent_simple(
@@ -804,7 +804,7 @@ mod tests {
         // After seal, stream has no active extent until register_extent.
         assert!(!stream.is_mutable());
 
-        // Register a new extent (simulating SM sending RegisterExtent).
+        // Register a new extent (simulating SM sending RegisterEpoch).
         let second_extent_id = ExtentId(1);
         stream.register_extent_simple(
             second_extent_id,

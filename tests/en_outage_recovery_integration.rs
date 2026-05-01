@@ -260,7 +260,7 @@ async fn client_recovers_after_primary_killed() {
     );
 
     // Resume appending on the new primary.
-    // Wait briefly for RegisterExtent to propagate to the new primary.
+    // Wait briefly for RegisterEpoch to propagate to the new primary.
     sleep(Duration::from_millis(200)).await;
     let new_client = StreamClient::connect(&new_primary.node_addr).await.unwrap();
     let mut appended_after = 0;

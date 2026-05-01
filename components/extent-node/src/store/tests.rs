@@ -26,8 +26,8 @@ fn test_config(stream_id: u32, replication_factor: u8) -> StreamConfig {
     }
 }
 
-/// Register a stream on the ExtentNode via RegisterExtent (RF=1, Primary, no secondaries).
-/// This is the production path: StreamManager assigns a stream_id and sends RegisterExtent.
+/// Register a stream on the ExtentNode via RegisterEpoch (RF=1, Primary, no secondaries).
+/// This is the production path: StreamManager assigns a stream_id and sends RegisterEpoch.
 async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -> StreamId {
     use rpc::payload::build_register_extent_payload;
 
@@ -36,7 +36,7 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
     let resp = store
         .handle_frame(
             Frame::new(
-                VariableHeader::RegisterExtent {
+                VariableHeader::RegisterEpoch {
                     request_id: req_id,
                     extent_id: ExtentId(1),
                     role: 0,
@@ -48,7 +48,7 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
         )
         .await
         .unwrap();
-    assert_eq!(resp.opcode(), Opcode::RegisterExtent);
+    assert_eq!(resp.opcode(), Opcode::RegisterEpoch);
     sid
 }
 
@@ -235,12 +235,12 @@ async fn register_extent_creates_stream() {
 
     let store = ExtentNodeStore::new();
 
-    // RegisterExtent as Primary with 1 secondary (RF=2).
+    // RegisterEpoch as Primary with 1 secondary (RF=2).
     let payload = build_register_extent_payload(&["127.0.0.1:9802"]);
     let resp = store
         .handle_frame(
             Frame::new(
-                VariableHeader::RegisterExtent {
+                VariableHeader::RegisterEpoch {
                     request_id: 1,
                     extent_id: ExtentId(100),
                     role: 0,
@@ -253,7 +253,7 @@ async fn register_extent_creates_stream() {
         .await
         .unwrap();
 
-    assert_eq!(resp.opcode(), Opcode::RegisterExtent);
+    assert_eq!(resp.opcode(), Opcode::RegisterEpoch);
     assert_eq!(resp.stream_id(), StreamId(42));
 
     assert!(store.streams.pin().contains_key(&StreamId(42)));
@@ -283,12 +283,12 @@ async fn register_extent_secondary() {
 
     let store = ExtentNodeStore::new();
 
-    // RegisterExtent as Secondary (RF=2, no replica addrs).
+    // RegisterEpoch as Secondary (RF=2, no replica addrs).
     let payload = build_register_extent_payload(&[]);
     let resp = store
         .handle_frame(
             Frame::new(
-                VariableHeader::RegisterExtent {
+                VariableHeader::RegisterEpoch {
                     request_id: 1,
                     extent_id: ExtentId(100),
                     role: 1,
@@ -301,7 +301,7 @@ async fn register_extent_secondary() {
         .await
         .unwrap();
 
-    assert_eq!(resp.opcode(), Opcode::RegisterExtent);
+    assert_eq!(resp.opcode(), Opcode::RegisterEpoch);
 
     let ri = store.get_replica_info(StreamId(42)).unwrap();
     assert!(!ri.is_primary());
@@ -328,7 +328,7 @@ async fn register_extent_then_append_rf1() {
     store
         .handle_frame(
             Frame::new(
-                VariableHeader::RegisterExtent {
+                VariableHeader::RegisterEpoch {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 0,
@@ -385,7 +385,7 @@ async fn primary_append_defers_and_broadcasts() {
     store
         .handle_frame(
             Frame::new(
-                VariableHeader::RegisterExtent {
+                VariableHeader::RegisterEpoch {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 0,
@@ -472,7 +472,7 @@ async fn secondary_returns_watermark() {
     store
         .handle_frame(
             Frame::new(
-                VariableHeader::RegisterExtent {
+                VariableHeader::RegisterEpoch {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 1,
@@ -1007,7 +1007,7 @@ async fn secondary_accepts_forwarded_append_after_seal() {
     store
         .handle_frame(
             Frame::new(
-                VariableHeader::RegisterExtent {
+                VariableHeader::RegisterEpoch {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 1,

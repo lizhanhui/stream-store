@@ -46,7 +46,7 @@ pub struct ExtentNodeStore {
     /// Uses `IdentityBuildHasher` — StreamId is a server-assigned u32, so the
     /// identity hash (no mixing) is safe and eliminates ~15 ns of SipHash per lookup.
     pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
-    /// Replication info per stream_id (registered via RegisterExtent).
+    /// Replication info per stream_id (registered via RegisterEpoch).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
     pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>, IdentityBuildHasher>,
     /// Direct TCP connection pool for broadcast replication (None for standalone/test mode).
@@ -149,7 +149,7 @@ impl ExtentNodeStore {
         self.flush_tx = Some(flush_tx);
     }
 
-    /// Get the replication info for a stream, if registered via RegisterExtent.
+    /// Get the replication info for a stream, if registered via RegisterEpoch.
     pub fn get_replica_info(&self, stream_id: StreamId) -> Option<ReplicaInfo> {
         self.replicas
             .pin()
@@ -265,7 +265,7 @@ impl RequestHandler for ExtentNodeStore {
                 VariableHeader::SealEpochCommit { .. } => Some(self.handle_seal_commit(frame)),
                 _ => Some(self.handle_seal(frame)),
             },
-            Opcode::RegisterExtent => Some(self.handle_register_extent(frame)),
+            Opcode::RegisterEpoch => Some(self.handle_register_epoch(frame)),
             Opcode::Connect => Some(Frame::new(
                 VariableHeader::ConnectAck {
                     request_id: frame.request_id(),

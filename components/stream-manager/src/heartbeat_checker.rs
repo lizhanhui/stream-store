@@ -12,7 +12,7 @@ use crate::store::StreamManagerStore;
 /// the lease on each check interval. For each expired node the leader:
 /// 1. Marks the node as DEAD in metadata.
 /// 2. Resolves the true committed offset from surviving replicas.
-/// 3. Seals and allocates replacement extents with proper RF and RegisterExtent.
+/// 3. Seals and allocates replacement extents with proper RF and RegisterEpoch.
 ///
 /// Returns when the shutdown signal is received.
 pub async fn run_heartbeat_checker(
@@ -101,7 +101,7 @@ pub async fn run_heartbeat_checker(
 ///    otherwise secondary quorum). Falls back to metadata end_offset if all replicas
 ///    are unreachable.
 /// 2. Bump epoch (replica set is changing due to node failure).
-/// 3. Seal-and-allocate with proper replication factor, RegisterExtent to new Primary,
+/// 3. Seal-and-allocate with proper replication factor, RegisterEpoch to new Primary,
 ///    and fire-and-forget notify to secondaries.
 async fn check_expired_nodes(
     sm_store: &Arc<StreamManagerStore>,

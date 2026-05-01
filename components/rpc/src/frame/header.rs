@@ -177,7 +177,7 @@ pub enum VariableHeader {
         request_id: u32,
         error_code: ErrorCode,
     },
-    RegisterExtent {
+    RegisterEpoch {
         request_id: u32,
         extent_id: ExtentId,
         /// 0 = Primary, 1+ = Secondary.
@@ -185,7 +185,7 @@ pub enum VariableHeader {
         /// Stream identity, replication, epoch, durability, and sizing policy.
         config: StreamConfig,
     },
-    RegisterExtentAck {
+    RegisterEpochAck {
         request_id: u32,
         stream_id: StreamId,
         extent_id: ExtentId,
@@ -393,9 +393,9 @@ impl VariableHeader {
             VariableHeader::Heartbeat { .. } | VariableHeader::HeartbeatError { .. } => {
                 Opcode::Heartbeat
             }
-            VariableHeader::RegisterExtent { .. }
-            | VariableHeader::RegisterExtentAck { .. }
-            | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterExtent,
+            VariableHeader::RegisterEpoch { .. }
+            | VariableHeader::RegisterEpochAck { .. }
+            | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterEpoch,
             VariableHeader::Watermark { .. } => Opcode::Watermark,
             VariableHeader::UpdateExtentProgress { .. }
             | VariableHeader::UpdateExtentFlushed { .. } => Opcode::UpdateExtent,

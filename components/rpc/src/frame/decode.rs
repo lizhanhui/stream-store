@@ -494,15 +494,15 @@ impl Frame {
                     Ok((VariableHeader::Heartbeat { request_id }, payload))
                 }
             }
-            // ── RegisterExtent: request (0x00), ack (0x01), error (0x80) ──
-            Opcode::RegisterExtent => {
+            // ── RegisterEpoch: request (0x00), ack (0x01), error (0x80) ──
+            Opcode::RegisterEpoch => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
                 let extent_id = ExtentId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
-                            message: "unknown RegisterExtent error code",
+                            message: "unknown RegisterEpoch error code",
                         }
                         .build()
                     })?;
@@ -518,7 +518,7 @@ impl Frame {
                     ))
                 } else if flags & FLAG_RESPONSE != 0 {
                     Ok((
-                        VariableHeader::RegisterExtentAck {
+                        VariableHeader::RegisterEpochAck {
                             request_id,
                             stream_id,
                             extent_id,
@@ -538,7 +538,7 @@ impl Frame {
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::RegisterExtent {
+                        VariableHeader::RegisterEpoch {
                             request_id,
                             extent_id,
                             role,

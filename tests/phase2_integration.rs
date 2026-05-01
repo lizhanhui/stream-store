@@ -165,7 +165,7 @@ async fn stream_manager_integration() {
         assert_eq!(returned_addr, extent_node_addr); // only one ExtentNode registered
 
         // Append to ExtentNode directly using the SM-assigned stream_id.
-        // The EN knows about this stream_id because SM sent RegisterExtent.
+        // The EN knows about this stream_id because SM sent RegisterEpoch.
         let en_client = client::StreamClient::connect(&extent_node_addr)
             .await
             .unwrap();

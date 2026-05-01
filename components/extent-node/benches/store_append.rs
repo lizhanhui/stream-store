@@ -36,7 +36,7 @@ async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u32, extent_i
     let _ = store
         .handle_frame(
             Frame::new(
-                VariableHeader::RegisterExtent {
+                VariableHeader::RegisterEpoch {
                     request_id: 0,
                     extent_id: ExtentId(extent_id),
                     role: 0,

@@ -169,7 +169,7 @@ async fn describe_stream_rf2_integration() {
         "primary_addr {primary_addr} should be one of en1={extent_node_1_addr} or en2={extent_node_2_addr}"
     );
 
-    // Give a moment for RegisterExtent to settle on both ENs.
+    // Give a moment for RegisterEpoch to settle on both ENs.
     sleep(Duration::from_millis(100)).await;
 
     // Append messages to the primary.

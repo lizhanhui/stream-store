@@ -141,7 +141,7 @@ pub fn parse_heartbeat_payload(payload: &[u8]) -> Option<(String, NodeMetrics)> 
 pub const ROLE_PRIMARY: u8 = 0;
 pub const ROLE_SECONDARY: u8 = 1;
 
-/// Build a RegisterExtent payload containing the replica addresses.
+/// Build a RegisterEpoch payload containing the replica addresses.
 ///
 /// Wire format (payload only — stream_id, extent_id, role, replication_factor
 /// are now in the variable header):
@@ -159,7 +159,7 @@ pub fn build_register_extent_payload(replica_addrs: &[&str]) -> Bytes {
     buf.freeze()
 }
 
-/// Parse a RegisterExtent payload (replica addresses only).
+/// Parse a RegisterEpoch payload (replica addresses only).
 ///
 /// Wire format: `[num_addrs:u16][addr1_len:u16][addr1]...`
 ///
