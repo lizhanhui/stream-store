@@ -733,15 +733,21 @@ dropped at seal.
 5. SM writes one `epoch_arenas` row per entry
    (`s3_key_kind = 0`) in a single transaction.
 6. Primary broadcasts `ForwardFlushed(entries)` to peer replicas
-   (fire-and-forget), carrying the same `entries` list sent to SM. Each
-   secondary matches each entry by `(stream_id, epoch, offset range)`
-   against its own arena directories and drops the matching
-   `EpochArenaEntry`. Because secondary arenas are sized and rolled
-   independently of the Primary's, one logical entry on the Primary
-   may correspond to entries spanning multiple local arenas on a
-   secondary — the secondary drops all matching entries. Each dropped
-   entry's release decrements its arena buffer's refcount; when the
-   refcount hits zero the allocation is freed.
+   (fire-and-forget), carrying the same `entries` list sent to SM. For
+   each flushed `(stream_id, epoch, start, end)`, the secondary walks
+   its own arena directories and releases the matching offset range.
+   Release is **range-based, not entry-based**: because secondary
+   arenas roll independently of the Primary's, one Primary-side flushed
+   range may partially or fully cover a secondary's
+   `EpochArenaEntry`, and one secondary entry may be covered by
+   several incoming `ForwardFlushed` messages over time.
+   Each entry tracks a small cumulative-covered range set; when the
+   union reaches the entry's `[start, end)`, the entry is dropped and
+   its arena buffer refcount decrements. When the refcount hits zero
+   the allocation is freed. The covered-range translation uses
+   `StreamEpoch.start_offset + byte_positions.index` — the same
+   arithmetic used by Shape A compaction and Shape B DR gather, so no
+   new primitive is needed.
 7. Arena becomes LRU-eligible.
 
 Secondaries never participate in Shape A upload. They accumulate
@@ -786,6 +792,43 @@ offset and take the first covering row.
 Explicitly out of scope for this iteration. DR upload is triggered only
 by SM's fallback-seal flow (Primary detected dead during `SealEpoch`).
 A periodic staleness scan may be added later.
+
+### Cohort-Switch Within a Single Arena
+
+A shared arena's directory may contain entries for the same stream
+under both roles — for example, when an EN serves as secondary for
+`(stream, epoch_N)`, then epoch_N seals, and SM promotes the same EN
+to Primary for `(stream, epoch_N+1)`. New appends land in whichever
+arena is currently active at the pool, which may be the same arena
+that still holds the secondary-cohort entry for `epoch_N`. The arena
+then simultaneously holds:
+
+- A secondary-cohort entry for `(stream, epoch_N)`.
+- A primary-cohort entry for `(stream, epoch_N+1)`.
+
+This is handled entirely by the mechanisms already defined:
+
+- **Shape A upload** iterates directory entries and looks up each
+  epoch's `replica_info.primary_node_id`. The `epoch_N` entry is
+  skipped (other node is Primary); the `epoch_N+1` entry is compacted
+  and included. Epochs being strictly monotonic per stream means the
+  S3 object unambiguously advertises the correct offset range.
+- **ForwardFlushed** for `epoch_N` arrives from the actual Primary of
+  `epoch_N` and covers ranges in the secondary-cohort entry. Release
+  proceeds normally; the primary-cohort entry for `epoch_N+1` is
+  unaffected.
+- **Eviction** of the arena waits until both entries are resolved
+  (Shape A uploaded the primary-cohort entry AND all of the
+  secondary-cohort entry's ranges were released by `ForwardFlushed`).
+  The arena may stay pinned longer than one with a single epoch's
+  worth of records; this is a memory cost, not a correctness issue.
+- **Reads** route to the right entry via offset: reads in
+  `[..., epoch_N.end_offset)` resolve through the `epoch_N` entry
+  (or its S3 object once flushed by its owning Primary), reads in
+  `[epoch_N+1.start_offset, ...)` through `epoch_N+1`.
+
+No new state or code path is required — the existing range-based
+release rule and epoch-keyed directory already do the right thing.
 
 ## Eviction
 
@@ -892,8 +935,10 @@ Per epoch (debug):
 ### Integration Tests
 
 - End-to-end append + read on one EN, RF=1, both classes.
-- RF=2: Primary + Secondary agree on `arena_id`; DR flush from secondary
-  produces identical S3 key + bytes.
+- RF=2: Primary and Secondary each roll their own shared arenas
+  independently with unrelated `arena_id`s; reads succeed on either
+  replica; DR flush from secondary (Shape B) produces the per-stream
+  key and is readable.
 - Epoch spanning 2–3 arenas in both classes: reads work across arena
   boundaries.
 - Cold read after eviction: `epoch_arenas` directs to the right object /
@@ -902,6 +947,17 @@ Per epoch (debug):
   threshold, subsequent arenas in the same epoch are Dedicated, reads
   work across class boundary.
 - Demotion: symmetric.
+- **Cohort switch within one arena**: EN is secondary for epoch N,
+  epoch N seals, EN is promoted to Primary for epoch N+1, subsequent
+  appends land in the same shared arena as N's secondary entry.
+  Verify: Shape A upload includes only the primary-cohort entry,
+  `ForwardFlushed` for epoch N releases the secondary-cohort entry,
+  arena evicts once both resolve, reads resolve to the correct
+  epoch's S3 object.
+- **Partial ForwardFlushed coverage**: a secondary's `EpochArenaEntry`
+  covers offsets `[a, c)`; Primary sends two `ForwardFlushed` covering
+  `[a, b)` then `[b, c)`. Verify the entry is dropped only after the
+  second message, and the arena buffer refcount releases then.
 - 100K Shared streams: memory budget respected; evictions behave.
 
 ### Stress Tests
