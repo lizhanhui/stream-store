@@ -7,6 +7,8 @@
 
 mod buffer;
 mod directory;
+mod pool;
 
 pub(crate) use buffer::{ArenaBuffer, OwnedArenaSlice};
 pub(crate) use directory::{ArenaDirectory, EpochArenaEntry, SLOT_UNSET};
+pub(crate) use pool::{ArenaPool, DedicatedArenaPool, SharedArenaPool};

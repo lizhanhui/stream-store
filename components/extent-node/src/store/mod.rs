@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use common::config::DEFAULT_EXTENT_CAPACITY;
 use common::hasher::IdentityBuildHasher;
 use common::types::{Epoch, ErrorCode, ExtentId, ExtentPolicy, Opcode, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
@@ -24,6 +25,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::warn;
 
 use crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT;
+use crate::arena::{ArenaPool, DedicatedArenaPool};
 use crate::downstream::DownstreamPool;
 use crate::s3::S3Client;
 use crate::s3_flusher::FlushRequest;
@@ -46,6 +48,8 @@ pub struct ExtentNodeStore {
     /// Uses `IdentityBuildHasher` — StreamId is a server-assigned u32, so the
     /// identity hash (no mixing) is safe and eliminates ~15 ns of SipHash per lookup.
     pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
+    /// Default arena pool for newly created streams (Dedicated: one arena per epoch).
+    pub(crate) default_pool: Arc<dyn ArenaPool>,
     /// Replication info per stream_id (registered via RegisterEpoch).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
     pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>, IdentityBuildHasher>,
@@ -75,6 +79,7 @@ impl ExtentNodeStore {
     pub fn new() -> Self {
         Self {
             streams: papaya::HashMap::with_hasher(IdentityBuildHasher),
+            default_pool: Arc::new(DedicatedArenaPool::new(DEFAULT_EXTENT_CAPACITY)),
 
             replicas: papaya::HashMap::with_hasher(IdentityBuildHasher),
             downstream: OnceLock::new(),
@@ -118,7 +123,7 @@ impl ExtentNodeStore {
             stream.set_storage_class(storage_class);
             false
         } else {
-            let stream = Stream::new(stream_id);
+            let stream = Stream::new(stream_id, Arc::clone(&self.default_pool));
             if policy.cache > 0 {
                 stream.set_max_extents(policy.cache as usize);
             }
