@@ -1,102 +1,166 @@
 //! Arena-level batch write types for pipelined group commit.
 //!
-//! P2.7.1: defines the types used by `StreamEpoch::write_batch`.
-//! P2.7.2: `StreamEpoch::write_batch` and `arena_in_flight` are wired in.
-//! Store-level callers (P2.8+) use `WriteBatch`/`WriteBatchAck` directly.
+//! Spec (§ Arena Concurrency Primitive):
+//!
+//! ```text
+//! struct WriteBatch {
+//!     stream_id: StreamId,
+//!     epoch:     u64,
+//!     jobs:      SmallVec<[SharedAppendJob; 16]>,
+//!     reply:     oneshot::Sender<WriteBatchAck>,
+//! }
+//! struct WriteBatchAck { results: SmallVec<[JobResult; 16]> }
+//! struct JobResult { arena_id: ArenaId, byte_pos: u32 }
+//! ```
+//!
+//! In P2 we introduce these types and `StreamEpoch::write_batch`; the
+//! channel-delegation path is unused on the Dedicated fast path (the
+//! stream-level leader is the sole writer), so `reply`-via-oneshot is
+//! plumbed but not yet exercised. A later plan wires it hot when
+//! `SharedArenaPool` streams contend on a single arena.
+//!
+//! One deliberate deviation from the spec text: `JobResult` also
+//! carries a per-record `Result<(), StorageError>`. The spec assumes
+//! every record in a WriteBatchAck succeeded; when a single record
+//! exceeds the arena's remaining space (ExtentFull), the caller needs
+//! to know which job failed without losing positioning info for the
+//! successful ones. The extra field costs 16 bytes per result and
+//! keeps the interface honest about partial failures.
 
 #![allow(dead_code)]
 
 use bytes::Bytes;
 use smallvec::SmallVec;
+use tokio::sync::oneshot;
 
 use common::errors::StorageError;
+use common::types::{Epoch, StreamId};
 
-use crate::stream_epoch::AppendResult;
+use crate::arena::ArenaId;
 
 // ── SharedAppendJob ──────────────────────────────────────────────────────────
 
-/// A single append job at the arena level.
+/// One record submitted inside a [`WriteBatch`] from a stream leader.
 ///
-/// Arena-level equivalent of the store-level `AppendJob`; no client
-/// `response_tx` at this level — the store layer handles responses.
+/// Spec: `{ seq: u64, payload: Bytes }`. `seq` is the epoch-relative
+/// sequence number assigned by the stream-level leader before the batch
+/// is dispatched to the arena. The store-layer correlation id
+/// (`request_id`) is tracked on the stream-level `AppendJob` and
+/// does not flow into the arena layer.
 #[derive(Debug)]
 pub(crate) struct SharedAppendJob {
-    /// Caller-assigned identifier (mirrors `AppendJob.request_id` for
-    /// correlation when the store layer maps results back to responses).
-    pub(crate) request_id: u32,
-    /// The payload bytes to append.
+    pub(crate) seq: u64,
     pub(crate) payload: Bytes,
 }
 
 impl SharedAppendJob {
-    pub(crate) fn new(request_id: u32, payload: Bytes) -> Self {
-        Self { request_id, payload }
+    pub(crate) fn new(seq: u64, payload: Bytes) -> Self {
+        Self { seq, payload }
     }
 }
 
 // ── WriteBatch ───────────────────────────────────────────────────────────────
 
-/// A batch of [`SharedAppendJob`] items to be processed together by
-/// [`StreamEpoch::write_batch`].
+/// A batch from one stream leader, routed to the arena-level writer.
 ///
-/// Uses `SmallVec<[_; 8]>` for inline storage of small batches (the typical
-/// case is 1–8 jobs per group-commit round).
-pub(crate) struct WriteBatch(pub(crate) SmallVec<[SharedAppendJob; 8]>);
+/// Spec shape — every batch belongs to exactly one `(stream_id, epoch)`
+/// so the arena leader can drop records into one directory entry. The
+/// `reply` oneshot is how followers await the arena leader's result
+/// when multiple streams contend on a shared arena. In P2 every stream
+/// is Dedicated, so the stream leader is always the arena leader and
+/// this oneshot is an API placeholder — the Dedicated path invokes
+/// `StreamEpoch::write_batch` directly and drops the reply.
+pub(crate) struct WriteBatch {
+    pub(crate) stream_id: StreamId,
+    pub(crate) epoch: Epoch,
+    pub(crate) jobs: SmallVec<[SharedAppendJob; 16]>,
+    pub(crate) reply: oneshot::Sender<WriteBatchAck>,
+}
 
 impl WriteBatch {
-    pub(crate) fn new() -> Self {
-        Self(SmallVec::new())
-    }
-
-    pub(crate) fn push(&mut self, job: SharedAppendJob) {
-        self.0.push(job);
+    pub(crate) fn new(
+        stream_id: StreamId,
+        epoch: Epoch,
+        jobs: SmallVec<[SharedAppendJob; 16]>,
+        reply: oneshot::Sender<WriteBatchAck>,
+    ) -> Self {
+        Self {
+            stream_id,
+            epoch,
+            jobs,
+            reply,
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.jobs.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub(crate) fn as_slice(&self) -> &[SharedAppendJob] {
-        &self.0
-    }
-}
-
-impl Default for WriteBatch {
-    fn default() -> Self {
-        Self::new()
+        self.jobs.is_empty()
     }
 }
 
 // ── JobResult ────────────────────────────────────────────────────────────────
 
-/// Per-job outcome from a [`WriteBatch`] call.
-pub(crate) type JobResult = Result<AppendResult, StorageError>;
+/// Per-job resolved placement within an arena after the arena writer
+/// has performed the memcpy.
+///
+/// Spec: `{ arena_id: ArenaId, byte_pos: u32 }`. Records in a batch
+/// may straddle an arena roll (when shared-arena routing lands), so
+/// `arena_id` is per-record, not per-batch. `result` is a P2 extension
+/// (see module docs) — carries the ExtentFull / StorageError from a
+/// single job without poisoning its siblings in the batch.
+#[derive(Debug)]
+pub(crate) struct JobResult {
+    pub(crate) arena_id: ArenaId,
+    pub(crate) byte_pos: u32,
+    pub(crate) result: Result<(), StorageError>,
+}
+
+impl JobResult {
+    pub(crate) fn ok(arena_id: ArenaId, byte_pos: u32) -> Self {
+        Self {
+            arena_id,
+            byte_pos,
+            result: Ok(()),
+        }
+    }
+
+    pub(crate) fn err(arena_id: ArenaId, err: StorageError) -> Self {
+        Self {
+            arena_id,
+            byte_pos: 0,
+            result: Err(err),
+        }
+    }
+
+    pub(crate) fn is_ok(&self) -> bool {
+        self.result.is_ok()
+    }
+}
 
 // ── WriteBatchAck ────────────────────────────────────────────────────────────
 
-/// The result of processing a [`WriteBatch`]: one [`JobResult`] per input
-/// job, in the same order as the original batch.
-pub(crate) struct WriteBatchAck(pub(crate) SmallVec<[JobResult; 8]>);
+/// The result of processing a [`WriteBatch`]: one [`JobResult`] per
+/// input job, in the same order as `WriteBatch.jobs`.
+pub(crate) struct WriteBatchAck {
+    pub(crate) results: SmallVec<[JobResult; 16]>,
+}
 
 impl WriteBatchAck {
     pub(crate) fn new() -> Self {
-        Self(SmallVec::new())
+        Self {
+            results: SmallVec::new(),
+        }
     }
 
     pub(crate) fn push(&mut self, result: JobResult) {
-        self.0.push(result);
-    }
-
-    pub(crate) fn into_inner(self) -> SmallVec<[JobResult; 8]> {
-        self.0
+        self.results.push(result);
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.0.len()
+        self.results.len()
     }
 }
 

@@ -1,9 +1,13 @@
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex};
 
+use crossbeam_channel::{Receiver, Sender, unbounded};
 use smallvec::{SmallVec, smallvec};
 
-use crate::arena::{ArenaBuffer, ArenaDirectory, ArenaId, EpochArenaEntry, JobResult, OwnedArenaSlice, SharedAppendJob};
+use crate::arena::{
+    ArenaBuffer, ArenaDirectory, ArenaId, EpochArenaEntry, JobResult, OwnedArenaSlice,
+    SharedAppendJob, WriteBatch,
+};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -186,6 +190,17 @@ pub struct StreamEpoch {
     /// phase) can read and update it without going through an Arc.
     #[allow(dead_code)]
     pub(crate) arena_in_flight: AtomicU64,
+
+    /// Arena-level delegation channel. Followers submit `WriteBatch`s to
+    /// the arena leader via `arena_job_tx`; the leader drains from
+    /// `arena_job_rx`. Unused on the Dedicated path (the stream leader
+    /// is always the arena leader), but carried as a field so the type
+    /// shape matches the spec and the Shared-arena path (later plan) can
+    /// wire it up without widening `StreamEpoch`.
+    #[allow(dead_code)]
+    pub(crate) arena_job_tx: Sender<WriteBatch>,
+    #[allow(dead_code)]
+    pub(crate) arena_job_rx: Receiver<WriteBatch>,
 }
 
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
@@ -213,6 +228,7 @@ impl StreamEpoch {
         );
         let directory = ArenaDirectory::new(entry);
 
+        let (arena_job_tx, arena_job_rx) = unbounded();
         Self {
             id,
             start_offset,
@@ -233,6 +249,8 @@ impl StreamEpoch {
             resident_arenas: Mutex::new(smallvec![arena_id]),
             directory_ref_count: AtomicU32::new(1),
             arena_in_flight: AtomicU64::new(0),
+            arena_job_tx,
+            arena_job_rx,
         }
     }
 
@@ -309,12 +327,18 @@ impl StreamEpoch {
     ///
     /// # Returns
     ///
-    /// One [`JobResult`] per input job, in the same order as `jobs`.
+    /// One [`JobResult`] per input job, in the same order as `jobs`. Each
+    /// result carries the record's `arena_id` + `byte_pos` plus a
+    /// per-job `Result<(), StorageError>` so a single ExtentFull does not
+    /// poison its siblings.
     #[allow(dead_code)]
-    pub(crate) fn write_batch(&self, jobs: &[SharedAppendJob]) -> SmallVec<[JobResult; 8]> {
-        let mut results = SmallVec::with_capacity(jobs.len());
+    pub(crate) fn write_batch(&self, jobs: &[SharedAppendJob]) -> SmallVec<[JobResult; 16]> {
+        let mut results: SmallVec<[JobResult; 16]> = SmallVec::with_capacity(jobs.len());
         for job in jobs {
-            results.push(self.append_inner(job.payload.clone()));
+            match self.append_inner(job.payload.clone()) {
+                Ok(r) => results.push(JobResult::ok(self.arena_id, r.byte_pos as u32)),
+                Err(e) => results.push(JobResult::err(self.arena_id, e)),
+            }
         }
         results
     }
@@ -1371,25 +1395,27 @@ mod tests {
         let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         let jobs = vec![
-            SharedAppendJob::new(1, Bytes::from_static(b"msg0")),
-            SharedAppendJob::new(2, Bytes::from_static(b"msg1")),
-            SharedAppendJob::new(3, Bytes::from_static(b"msg2")),
+            SharedAppendJob::new(0, Bytes::from_static(b"msg0")),
+            SharedAppendJob::new(1, Bytes::from_static(b"msg1")),
+            SharedAppendJob::new(2, Bytes::from_static(b"msg2")),
         ];
 
         let results = ext.write_batch(&jobs);
 
         assert_eq!(results.len(), 3);
-        let r0 = results[0].as_ref().unwrap();
-        let r1 = results[1].as_ref().unwrap();
-        let r2 = results[2].as_ref().unwrap();
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert!(results[2].is_ok());
 
-        assert_eq!(r0.offset, Offset(0));
-        assert_eq!(r1.offset, Offset(1));
-        assert_eq!(r2.offset, Offset(2));
-        assert_eq!(r0.byte_pos, 0);
+        // All records land in the same arena (Dedicated).
+        assert_eq!(results[0].arena_id, ArenaId(0));
+        assert_eq!(results[1].arena_id, ArenaId(0));
+        assert_eq!(results[2].arena_id, ArenaId(0));
+
+        assert_eq!(results[0].byte_pos, 0);
         // "msg0" = 4 bytes, record = 4+4 = 8 bytes
-        assert_eq!(r1.byte_pos, 8);
-        assert_eq!(r2.byte_pos, 16);
+        assert_eq!(results[1].byte_pos, 8);
+        assert_eq!(results[2].byte_pos, 16);
         assert_eq!(ext.message_count(), 3);
     }
 
@@ -1409,14 +1435,18 @@ mod tests {
         let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 9, Epoch(0), ArenaId(0));
 
         let jobs = vec![
-            SharedAppendJob::new(1, Bytes::from_static(b"fits")), // 4+4=8 bytes, fits
-            SharedAppendJob::new(2, Bytes::from_static(b"nope")), // 4+4=8 bytes, exceeds capacity
+            SharedAppendJob::new(0, Bytes::from_static(b"fits")), // 4+4=8 bytes, fits
+            SharedAppendJob::new(1, Bytes::from_static(b"nope")), // 4+4=8 bytes, exceeds capacity
         ];
 
         let results = ext.write_batch(&jobs);
         assert_eq!(results.len(), 2);
         assert!(results[0].is_ok());
-        assert!(matches!(results[1], Err(StorageError::ExtentFull { .. })));
+        assert!(!results[1].is_ok());
+        assert!(matches!(
+            &results[1].result,
+            Err(StorageError::ExtentFull { .. })
+        ));
     }
 
     #[test]
