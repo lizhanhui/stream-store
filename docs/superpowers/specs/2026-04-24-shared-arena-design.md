@@ -54,8 +54,10 @@ dual-run, no feature flag, and no backwards-compatibility layer.
   on epoch bump** (failure / rebalance). There is no EN-initiated seal in
   either class.
 - **Arena roll**: the Primary (for Shared) or the stream's writer (for
-  Dedicated) finishes the current arena and starts a new one. Epoch is
-  unaffected.
+  Dedicated) closes the current arena and starts a new one. The closed
+  arena transitions through `Rolled → Uploaded → Evicted`. Epoch is
+  unaffected. "Seal" is reserved for epoch bumps and is **never** used
+  for arena lifecycle events.
 
 ## What Changes vs Today
 
@@ -208,7 +210,7 @@ memcpy inline, then drains delegated work before yielding:
 struct SharedArena {
     id:         ArenaId,
     buf:        Arc<ArenaBuffer>,
-    state:      AtomicU8,                     // Open | Sealed | Uploaded | Evicted
+    state:      AtomicU8,                     // Open | Rolled | Uploaded | Evicted
     created_at: Instant,
     directory:  Mutex<ArenaDirectory>,
 
@@ -309,7 +311,7 @@ classes):
 arena = stream.dedicated_arena
 for job in batch:
     if arena has insufficient space:
-        roll_dedicated(stream)                 // seal old, allocate new
+        roll_dedicated(stream)                 // close old, allocate new
         arena = stream.dedicated_arena
     memcpy job.payload into arena at cursor (u32 BE len + payload)
     directory.entries[(stream_id, epoch)].append(byte_pos, len, seq)
@@ -344,7 +346,7 @@ else:
 fn process_batch(arena, b):
     for job in b.jobs:
         if arena has insufficient space:
-            pool.roll(arena)                   // Sealed → resident; new active
+            pool.roll(arena)                   // Rolled → resident; new active
             arena = pool.active.load()
         memcpy job.payload at cursor
         directory.entries[(stream_id, epoch)].append(byte_pos, len, job.seq)
@@ -387,13 +389,13 @@ holds the arena's exclusive write turn (the stream leader in Dedicated;
 the arena leader in Shared):
 
 1. Detect insufficient space for the next record.
-2. `state.store(Sealed)` on the current arena.
+2. `state.store(Rolled)` on the current arena.
 3. Move from `ArcSwap(active)` to `pool.resident` (Shared) or from
    `stream.dedicated_arena` to the stream's recent-arena list
    (Dedicated).
 4. Allocate a new arena (`ArenaBuffer` via `alloc_zeroed`). Install as
    the new `active` (Shared) or stream-arena (Dedicated).
-5. Sealed arena handed to the S3 flush task (fire-and-forget,
+5. Rolled arena handed to the S3 flush task (fire-and-forget,
    compaction and upload run off the critical path).
 6. Continue memcpy on the new arena for the remaining records in the
    current batch.
@@ -545,7 +547,7 @@ via `Bytes::from_owner(OwnedArenaSlice)` keep the arena alive against
 concurrent eviction.
 
 Lock granularity: `directory` is `Mutex<>` during write; once the arena is
-`Sealed`, it is read-only and the lock never contends.
+`Rolled`, it is read-only and the lock never contends.
 
 ### Tier 2: S3 Cold Read
 
@@ -566,17 +568,17 @@ different shapes. Readers route to the right parser via the
 
 ### Shape A: Arena Object (normal fill-and-rotate path)
 
-One object per fully-sealed Shared arena. Key:
+One object per fully-rolled Shared arena. Key:
 `{namespace}/arenas/{arena_id:016x}.dat`. Contains **primary-cohort
 entries only** — i.e., records for `(stream, epoch)` tuples where this
-EN is the Primary. Secondary-cohort entries are dropped at seal time and
-not included.
+EN is the Primary. Secondary-cohort entries are dropped at arena-roll
+time and not included.
 
-On seal, the flush task compacts the arena slice-by-slice: it already
-has each primary-cohort entry's `byte_positions` and the entry's records
-are already contiguous thanks to the per-stream gather done at write
-time, so compaction is a linear walk — one entry at a time, one stream's
-records blocked into 64-record compressed chunks:
+On arena roll, the flush task compacts the arena slice-by-slice: it
+already has each primary-cohort entry's `byte_positions` and the
+entry's records are already contiguous thanks to the per-stream gather
+done at write time, so compaction is a linear walk — one entry at a
+time, one stream's records blocked into 64-record compressed chunks:
 
 ```
 ┌─ Header (fixed 32 bytes) ────────────────────────────────────┐
@@ -622,7 +624,7 @@ cache.
 ### Shape B: Per-Stream Object (DR upload path)
 
 When SM asks the EN to urgently upload a specific `(stream_id, epoch)`
-outside the normal arena-seal schedule (see Flush Lifecycle → DR Flush
+outside the normal arena-roll schedule (see Flush Lifecycle → DR Flush
 below), the EN builds a **per-stream object** in the same
 chunk-compressed format used today for Dedicated streams. Key:
 `{namespace}/data/{stream_id:016x}/{start_offset:016x}_{end_offset:016x}.dat`.
@@ -698,20 +700,20 @@ cluster (resident node, flush status). Not on any hot path.
 ## Flush Lifecycle
 
 Two independent paths produce S3 objects. **Both run on the background
-S3 flush task — off the write critical path.** The arena leader's
-seal-and-rotate completes as soon as the new arena is installed; the
-sealed arena is handed to the flush task for asynchronous
-compaction-plus-upload. Writers continue appending to the new active
-arena without waiting for any S3 work.
+S3 flush task — off the write critical path.** Arena roll completes as
+soon as the new arena is installed; the rolled arena is handed to the
+flush task for asynchronous compaction-plus-upload. Writers continue
+appending to the new active arena without waiting for any S3 work.
 
 ### Normal Path — Arena Fill-and-Rotate (Shape A)
 
-Runs once per sealed arena, on the background flush task. Only
+Runs once per rolled arena, on the background flush task. Only
 includes **primary-cohort** entries; secondary-cohort entries are
-dropped at seal.
+dropped at roll time.
 
-1. Arena rolls → `state = Sealed` → sealed arena handed to the S3 flush
-   task's queue (fire-and-forget from the arena leader's perspective).
+1. Arena rolls → `state = Rolled` → rolled arena handed to the S3
+   flush task's queue (fire-and-forget from the arena leader's
+   perspective).
 2. Flush task walks the arena's directory. For each `(stream_id, epoch)`
    entry, it looks up the epoch's `replica_info.primary_node_id`:
    - If that equals this EN's `node_id` → primary-cohort, include in
@@ -837,8 +839,8 @@ Global LRU over the SharedArenaPool (Shared class) plus a small cap
 arena list.
 
 - Arena becomes LRU-eligible once `state = Uploaded` (or, for Memory
-  `StorageClass`, immediately on `Sealed`).
-- Sealed-but-not-yet-Uploaded arenas are pinned; if too many accumulate,
+  `StorageClass`, immediately on `Rolled`).
+- Rolled-but-not-yet-Uploaded arenas are pinned; if too many accumulate,
   writer backpressure kicks in.
 - Eviction drops the `Arc<SharedArena>` from `resident`. In-flight readers
   keep the underlying buffer alive via their own `Arc` clone in the
@@ -923,7 +925,7 @@ Per epoch (debug):
 ### Unit Tests
 
 - `SharedArenaPool`: allocate, append, roll, evict.
-- `ArenaDirectory`: build, lookup by `(stream, epoch)`, frozen-at-seal.
+- `ArenaDirectory`: build, lookup by `(stream, epoch)`, frozen-on-roll.
 - `ArenaId`: uniqueness from `(node_id, counter)`; wire round-trip.
 - `StreamEpoch`: state machine, `resident_arenas` tracking, seal on epoch
   bump.
