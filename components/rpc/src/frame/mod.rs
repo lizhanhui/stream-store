@@ -10,7 +10,7 @@ mod tests;
 use bytes::Bytes;
 use common::types::{
     Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
-    FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
+    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
     FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
     FLAG_SEAL_COMMIT_RESP, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
@@ -127,7 +127,6 @@ impl Frame {
             | VariableHeader::ForwardInitExtent { .. }
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::ForwardFlushed { .. }
-            | VariableHeader::UpdateExtentSealed { .. }
             | VariableHeader::UpdateExtentProgress { .. }
             | VariableHeader::UpdateExtentFlushed { .. }
             | VariableHeader::StreamManagerMembershipChange => 0,
@@ -164,7 +163,6 @@ impl Frame {
             | VariableHeader::FlushExtentRespError { stream_id, .. }
             | VariableHeader::SealExtentNodeCommit { stream_id, .. }
             | VariableHeader::SealExtentNodeCommitResp { stream_id, .. }
-            | VariableHeader::UpdateExtentSealed { stream_id, .. }
             | VariableHeader::UpdateExtentProgress { stream_id, .. }
             | VariableHeader::ReportExtents { stream_id, .. }
             | VariableHeader::ReportExtentsResp { stream_id, .. }
@@ -242,8 +240,7 @@ impl Frame {
             | VariableHeader::SealExtentNodeCommit { epoch, .. } => *epoch,
             VariableHeader::SealStreamManagerResp { new_epoch, .. } => *new_epoch,
             VariableHeader::RegisterExtent { config, .. } => config.epoch,
-            VariableHeader::UpdateExtentSealed { epoch, .. }
-            | VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
+            VariableHeader::UpdateExtentProgress { epoch, .. } => *epoch,
             VariableHeader::Forward { epoch, .. }
             | VariableHeader::ForwardInitExtent { epoch, .. }
             | VariableHeader::FlushExtent { epoch, .. } => *epoch,
@@ -328,7 +325,6 @@ impl Frame {
             | VariableHeader::SeekResp { .. }
             | VariableHeader::FlushExtentResp { .. } => FLAG_RESPONSE,
             // ── Per-opcode request-side flags ──
-            VariableHeader::UpdateExtentSealed { .. } => FLAG_EXTENT_SEALED,
             VariableHeader::UpdateExtentProgress { .. } => FLAG_EXTENT_PROGRESS,
             VariableHeader::UpdateExtentFlushed { .. } => FLAG_EXTENT_FLUSHED,
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,

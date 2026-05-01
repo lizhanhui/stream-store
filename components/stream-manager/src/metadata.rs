@@ -1218,150 +1218,6 @@ impl MetadataStore {
         Ok(row.map(|(id,)| id))
     }
 
-    /// Record an extent sealed notification from a Primary EN (autonomous extent creation).
-    ///
-    /// Handles out-of-order notifications gracefully:
-    /// 1. Insert the sealed extent if it doesn't exist yet (out-of-order case).
-    /// 2. Seal it (idempotent — only updates Active extents).
-    /// 3. Insert the new active extent (idempotent — INSERT IGNORE).
-    /// 4. Fix start_offset of the new extent if it was inserted out-of-order
-    ///    with a placeholder (start_offset=0 from a later notification).
-    /// 5. Update stream_sequence.
-    ///
-    /// No replica manipulation needed — replicas are stored at (stream_id, epoch)
-    /// level and all extents within an epoch inherit the same replica set.
-    ///
-    /// Safe against a racing `record_extent_flushed`: if the flushed notification
-    /// arrived first and installed a row in state `Flushed`, the `INSERT IGNORE`
-    /// below is a no-op and the `UPDATE ... WHERE state = Active` also matches zero
-    /// rows — state is not regressed.
-    ///
-    /// Safe against a racing `record_extent_flushed`: if the flushed notification
-    /// arrived first and installed a row in state `Flushed`, the `INSERT IGNORE`
-    /// below is a no-op and the `UPDATE ... WHERE state = Active` also matches zero
-    /// rows — state is not regressed.
-    pub async fn record_extent_sealed(
-        &self,
-        stream_id: StreamId,
-        epoch: Epoch,
-        sealed_extent_id: ExtentId,
-        end_offset: u64,
-        new_extent_id: ExtentId,
-    ) -> Result<(), StorageError> {
-        let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
-            message: "acquire connection",
-        })?;
-        let mut tx = conn.begin().await.context(DatabaseSnafu {
-            message: "begin transaction",
-        })?;
-
-        // Validate epoch matches current stream epoch.
-        let row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
-            .bind(stream_id.0)
-            .fetch_optional(&mut *tx)
-            .await
-            .context(DatabaseSnafu {
-                message: "lock stream",
-            })?;
-
-        if let Some(row) = row {
-            let current_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
-            if epoch != current_epoch {
-                // Stale notification from an old epoch — skip.
-                tx.commit()
-                    .await
-                    .context(DatabaseSnafu { message: "commit" })?;
-                return Ok(());
-            }
-        } else {
-            return InternalSnafu {
-                message: format!("stream {:?} not found", stream_id),
-            }
-            .fail();
-        }
-
-        // Insert sealed extent if not yet known (handles out-of-order arrival).
-        sqlx::query(
-            "INSERT IGNORE INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) \
-             VALUES (?, ?, 0, ?, ?, ?)",
-        )
-        .bind(stream_id.0)
-        .bind(sealed_extent_id.0 as i64)
-        .bind(end_offset as i64)
-        .bind(ExtentState::Sealed.as_u8())
-        .bind(epoch.0 as i32)
-        .execute(&mut *tx)
-        .await
-        .context(DatabaseSnafu { message: "insert sealed extent" })?;
-
-        // Seal it (idempotent — only updates if currently Active).
-        sqlx::query(
-            "UPDATE extent SET state = ?, end_offset = ?, sealed_at = NOW() \
-             WHERE stream_id = ? AND extent_id = ? AND state = ?",
-        )
-        .bind(ExtentState::Sealed.as_u8())
-        .bind(end_offset as i64)
-        .bind(stream_id.0)
-        .bind(sealed_extent_id.0 as i64)
-        .bind(ExtentState::Active.as_u8())
-        .execute(&mut *tx)
-        .await
-        .context(DatabaseSnafu {
-            message: "seal extent",
-        })?;
-
-        // Insert new active extent (idempotent — ignore duplicate).
-        sqlx::query(
-            "INSERT IGNORE INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) \
-             VALUES (?, ?, ?, ?, ?, ?)",
-        )
-        .bind(stream_id.0)
-        .bind(new_extent_id.0 as i64)
-        .bind(end_offset as i64)
-        .bind(end_offset as i64)
-        .bind(ExtentState::Active.as_u8())
-        .bind(epoch.0 as i32)
-        .execute(&mut *tx)
-        .await
-        .context(DatabaseSnafu { message: "insert new extent" })?;
-
-        // Fix start_offset on the sealed extent if it was inserted out-of-order
-        // with a placeholder (start_offset=0). Also fix start_offset on the new
-        // extent if a later notification already inserted it with start_offset=0.
-        sqlx::query(
-            "UPDATE extent SET start_offset = ? \
-             WHERE stream_id = ? AND extent_id = ? AND start_offset = 0 AND ? > 0",
-        )
-        .bind(end_offset as i64)
-        .bind(stream_id.0)
-        .bind(new_extent_id.0 as i64)
-        .bind(end_offset as i64)
-        .execute(&mut *tx)
-        .await
-        .context(DatabaseSnafu {
-            message: "fix new extent start_offset",
-        })?;
-
-        // No replica manipulation — replicas are stored at (stream_id, epoch)
-        // level and all extents within an epoch inherit the same replica set.
-
-        // Update stream_sequence to be at least new_extent_id + 1.
-        sqlx::query(
-            "UPDATE stream_sequence SET next_extent_id = GREATEST(next_extent_id, ?) WHERE stream_id = ?",
-        )
-        .bind((new_extent_id.0 + 1) as i64)
-        .bind(stream_id.0)
-        .execute(&mut *tx)
-        .await
-        .context(DatabaseSnafu { message: "update stream_sequence" })?;
-
-        tx.commit()
-            .await
-            .context(DatabaseSnafu { message: "commit" })?;
-
-        Ok(())
-    }
-
     /// Record a progress update for an active extent (periodic observability report).
     ///
     /// Updates end_offset for the extent if the reported offset is larger than
@@ -1431,15 +1287,11 @@ impl MetadataStore {
     /// Record that an extent was flushed to S3 (EN confirms upload via UpdateExtentFlushed).
     ///
     /// Terminal state is always `Flushed` and this is an upsert: the extent row may
-    /// not yet exist when this notification arrives, because the preceding
-    /// `UpdateExtentSealed` is an independent fire-and-forget frame that may be
-    /// reordered, dropped on a full channel, or lost across an SM reconnect/failover.
-    /// The handler therefore accepts any starting row state:
+    /// not yet exist when this notification arrives. The handler accepts any starting
+    /// row state:
     ///
     /// - **row missing**  → `INSERT` a fresh row directly in state `Flushed` with the
-    ///   offsets from the notification. A later `record_extent_sealed` for the same
-    ///   extent is a no-op (its `INSERT IGNORE` finds the row; its
-    ///   `UPDATE ... WHERE state = Active` matches zero rows).
+    ///   offsets from the notification.
     /// - **`Active`**    → `UPDATE` to `Flushed`, set `end_offset` (may have been a
     ///   stale placeholder) and backfill `sealed_at`.
     /// - **`Sealed`**    → `UPDATE` to `Flushed` (the normal, in-order path).

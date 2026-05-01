@@ -9,15 +9,6 @@ use rpc::frame::Frame;
 /// Sent to the SM connection task which forwards it as an UPDATE_EXTENT frame.
 #[derive(Debug, Clone)]
 pub enum ExtentUpdate {
-    /// Extent was sealed and a new one created (autonomous extent creation).
-    Sealed {
-        stream_id: StreamId,
-        sealed_extent_id: ExtentId,
-        end_offset: u64,
-        new_extent_id: ExtentId,
-        new_extent_capacity: u32,
-        epoch: Epoch,
-    },
     /// Periodic progress report for an active extent (observability).
     Progress {
         stream_id: StreamId,

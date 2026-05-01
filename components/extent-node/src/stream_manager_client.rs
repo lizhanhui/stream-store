@@ -6,7 +6,7 @@
 //!    updates touch this connection, so heartbeat latency is bounded by metric
 //!    collection (microseconds) + network RTT + SM MySQL heartbeat queries.
 //!
-//! 2. **Update connection** — dedicated to extent updates (Sealed + Progress).
+//! 2. **Update connection** — dedicated to extent updates (Progress + Flushed).
 //!    Fire-and-forget sends on a separate TCP stream, so slow SM MySQL queries
 //!    cannot cause TCP backpressure on the heartbeat connection.
 //!
@@ -396,16 +396,16 @@ impl StreamManagerClient {
         loop {
             tokio::select! {
                 Some(update) = update_rx.recv() => {
-                    Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
+                    Self::send_update_frame(&mut framed, update, rpc_request_timeout).await;
                     // Drain any additional queued updates to batch them.
                     while let Ok(update) = update_rx.try_recv() {
-                        Self::send_extent_update(&mut framed, update, rpc_request_timeout).await;
+                        Self::send_update_frame(&mut framed, update, rpc_request_timeout).await;
                     }
                 }
                 _ = progress_interval.tick() => {
                     // Periodic progress updates for all active extents.
                     for (stream_id, extent_id, current_offset, epoch) in store.snapshot_active_extents() {
-                        Self::send_extent_update(
+                        Self::send_update_frame(
                             &mut framed,
                             ExtentUpdate::Progress {
                                 stream_id,
@@ -500,33 +500,12 @@ impl StreamManagerClient {
 
     /// Send a single UPDATE_EXTENT frame on an SM connection.
     /// Fire-and-forget: logs and drops on failure.
-    async fn send_extent_update(
+    async fn send_update_frame(
         framed: &mut Framed<TcpStream, FrameCodec>,
         update: ExtentUpdate,
         rpc_request_timeout: Duration,
     ) {
         let (frame, desc) = match update {
-            ExtentUpdate::Sealed {
-                stream_id,
-                sealed_extent_id,
-                end_offset,
-                new_extent_id,
-                new_extent_capacity,
-                epoch,
-            } => (
-                Frame::new(
-                    VariableHeader::UpdateExtentSealed {
-                        stream_id,
-                        epoch,
-                        sealed_extent_id,
-                        end_offset: Offset(end_offset),
-                        new_extent_id,
-                        new_extent_capacity,
-                    },
-                    None,
-                ),
-                format!("UpdateExtentSealed stream={stream_id}"),
-            ),
             ExtentUpdate::Progress {
                 stream_id,
                 extent_id,

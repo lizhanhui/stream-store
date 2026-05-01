@@ -202,17 +202,6 @@ pub enum VariableHeader {
         epoch: Epoch,
         offset: Offset,
     },
-    /// Extent sealed: Primary EN sealed an extent and created a new one (UpdateExtent, flag=0x00).
-    /// Fire-and-forget: no request_id needed.
-    UpdateExtentSealed {
-        stream_id: StreamId,
-        epoch: Epoch,
-        sealed_extent_id: ExtentId,
-        end_offset: Offset,
-        new_extent_id: ExtentId,
-        /// Capacity of the newly created extent (may be different due to adaptive scaling).
-        new_extent_capacity: u32,
-    },
     /// Active extent progress report (UpdateExtent, flag=0x01).
     /// Fire-and-forget periodic update of current offset for observability.
     UpdateExtentProgress {
@@ -225,10 +214,8 @@ pub enum VariableHeader {
     /// Fire-and-forget: EN notifies SM after successful S3 upload.
     ///
     /// Carries `start_offset` and `end_offset` so SM can materialize a
-    /// `Flushed` row even when the preceding `UpdateExtentSealed` has not yet
-    /// arrived (the two notifications are independent fire-and-forget frames
-    /// whose ordering is not guaranteed end-to-end — see
-    /// `record_extent_flushed` in stream-manager/metadata.rs).
+    /// `Flushed` row directly (see `record_extent_flushed` in
+    /// stream-manager/metadata.rs).
     UpdateExtentFlushed {
         stream_id: StreamId,
         epoch: Epoch,
@@ -410,8 +397,7 @@ impl VariableHeader {
             | VariableHeader::RegisterExtentAck { .. }
             | VariableHeader::RegisterExtentAckError { .. } => Opcode::RegisterExtent,
             VariableHeader::Watermark { .. } => Opcode::Watermark,
-            VariableHeader::UpdateExtentSealed { .. }
-            | VariableHeader::UpdateExtentProgress { .. }
+            VariableHeader::UpdateExtentProgress { .. }
             | VariableHeader::UpdateExtentFlushed { .. } => Opcode::UpdateExtent,
             VariableHeader::ReportExtents { .. }
             | VariableHeader::ReportExtentsResp { .. }

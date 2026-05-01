@@ -1,10 +1,7 @@
 //! Integration tests for `MetadataStore::record_extent_flushed`.
 //!
-//! `UpdateExtentSealed` and `UpdateExtentFlushed` are independent fire-and-forget
-//! notifications. Their relative ordering at Stream Manager is not guaranteed
-//! (channel backpressure `try_send` drops, SM reconnect between frames, SM
-//! failover splitting the pair). `record_extent_flushed` must therefore be an
-//! upsert that drives the extent row to `Flushed` from any starting state.
+//! `record_extent_flushed` must be an upsert that drives the extent row to
+//! `Flushed` from any starting state (missing, Active, Sealed, or already Flushed).
 //!
 //! MySQL connection: inherited from `StreamManagerConfig::default().mysql_url()`.
 //!
@@ -62,18 +59,14 @@ async fn get_extent(
         .unwrap_or_else(|| panic!("extent {extent_id} missing on stream {stream_id}"));
     ExtentRowSnapshot {
         state: row.state,
-        start_offset: row.start_offset,
         end_offset: row.end_offset,
-        epoch: row.epoch,
     }
 }
 
 #[derive(Debug)]
 struct ExtentRowSnapshot {
     state: ExtentState,
-    start_offset: u64,
     end_offset: u64,
-    epoch: Epoch,
 }
 
 /// Create a stream and allocate its first extent so Active-state tests have
@@ -106,69 +99,6 @@ async fn record_extent_flushed_ordering_variants() {
         .try_init();
 
     let store = fresh_store().await;
-
-    // ── Scenario 1: sealed_then_flushed — baseline, no regression ───────────
-    //
-    // Sequence: record_extent_sealed → record_extent_flushed. Row starts
-    // Active, transitions to Sealed, then to Flushed. Offsets set by seal.
-    let (s1, e1, ep1) = setup_stream_with_active_extent(&store, "scenario1").await;
-    let new_ext1 = ExtentId(e1.0 + 1);
-    store
-        .record_extent_sealed(s1, ep1, e1, 1000, new_ext1)
-        .await
-        .expect("sealed s1");
-    store
-        .record_extent_flushed(s1, ep1, e1, 0, 1000)
-        .await
-        .expect("flushed s1");
-
-    let snap = get_extent(&store, s1, e1).await;
-    assert_eq!(snap.state, ExtentState::Flushed, "s1 final state");
-    assert_eq!(snap.start_offset, 0, "s1 start_offset");
-    assert_eq!(snap.end_offset, 1000, "s1 end_offset");
-    assert_eq!(snap.epoch, ep1);
-
-    // ── Scenario 2: flushed_then_sealed — out-of-order race ─────────────────
-    //
-    // Sequence: record_extent_flushed arrives FIRST (row is still Active),
-    // record_extent_sealed arrives later. The flushed handler must upsert the
-    // row directly to Flushed. The later sealed handler must NOT regress the
-    // state.
-    let (s2, e2, ep2) = setup_stream_with_active_extent(&store, "scenario2").await;
-    let new_ext2 = ExtentId(e2.0 + 1);
-
-    // At this point e2 is Active.
-    assert_eq!(get_extent(&store, s2, e2).await.state, ExtentState::Active);
-
-    store
-        .record_extent_flushed(s2, ep2, e2, 0, 2048)
-        .await
-        .expect("flushed s2 out-of-order");
-
-    let after_flushed = get_extent(&store, s2, e2).await;
-    assert_eq!(
-        after_flushed.state,
-        ExtentState::Flushed,
-        "s2 after out-of-order flushed"
-    );
-    assert_eq!(
-        after_flushed.end_offset, 2048,
-        "s2 adopted end_offset from flush notification"
-    );
-
-    // Now the late sealed notification arrives.
-    store
-        .record_extent_sealed(s2, ep2, e2, 2048, new_ext2)
-        .await
-        .expect("sealed s2 late");
-
-    let after_late_sealed = get_extent(&store, s2, e2).await;
-    assert_eq!(
-        after_late_sealed.state,
-        ExtentState::Flushed,
-        "s2 must stay Flushed after late sealed"
-    );
-    assert_eq!(after_late_sealed.end_offset, 2048);
 
     // ── Scenario 3: flushed_twice — idempotent ──────────────────────────────
     let (s3, e3, ep3) = setup_stream_with_active_extent(&store, "scenario3").await;

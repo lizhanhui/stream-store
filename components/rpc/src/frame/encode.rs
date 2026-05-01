@@ -82,8 +82,6 @@ impl Frame {
             VariableHeader::RegisterExtentAckError { .. } => 4 + 4 + 4 + 2,
             // stream_id(4) + extent_id(4) + epoch(4) + offset(8)
             VariableHeader::Watermark { .. } => 4 + 4 + 4 + 8,
-            // stream_id(4) + epoch(4) + sealed_extent_id(4) + end_offset(8) + new_extent_id(4) + new_extent_capacity(4)
-            VariableHeader::UpdateExtentSealed { .. } => 4 + 4 + 4 + 8 + 4 + 4,
             // stream_id(4) + epoch(4) + extent_id(4) + current_offset(8)
             VariableHeader::UpdateExtentProgress { .. } => 4 + 4 + 4 + 8,
             // stream_id(4) + epoch(4) + extent_id(4)
@@ -659,21 +657,6 @@ impl Frame {
                 dst.put_u32(stream_id.0);
                 dst.put_u64(offset.0);
                 dst.put_u16(*error_code as u16);
-            }
-            VariableHeader::UpdateExtentSealed {
-                stream_id,
-                epoch,
-                sealed_extent_id,
-                end_offset,
-                new_extent_id,
-                new_extent_capacity,
-            } => {
-                dst.put_u32(stream_id.0);
-                dst.put_u32(epoch.0);
-                dst.put_u32(sealed_extent_id.0);
-                dst.put_u64(end_offset.0);
-                dst.put_u32(new_extent_id.0);
-                dst.put_u32(*new_extent_capacity);
             }
             VariableHeader::UpdateExtentProgress {
                 stream_id,

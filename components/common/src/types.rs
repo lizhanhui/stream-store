@@ -16,8 +16,6 @@ pub const HEADER_LEN: usize = 8;
 /// Error responses use FLAG_RESPONSE_ERROR (0x80) instead.
 pub const FLAG_RESPONSE: u8 = 0x01;
 
-/// Flag on UPDATE_EXTENT: extent was sealed, new extent created.
-pub const FLAG_EXTENT_SEALED: u8 = 0x00;
 /// Flag on UPDATE_EXTENT: progress report for an active extent.
 pub const FLAG_EXTENT_PROGRESS: u8 = 0x01;
 /// Flag on UPDATE_EXTENT: extent was flushed to S3.

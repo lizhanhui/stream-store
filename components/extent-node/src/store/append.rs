@@ -10,7 +10,7 @@ use smallvec::SmallVec;
 use tokio::sync::mpsc::Sender;
 use tracing::{debug, info};
 
-use super::{AppendJob, ExtentNodeStore, ExtentUpdate};
+use super::{AppendJob, ExtentNodeStore};
 use crate::ack_queue::PendingAck;
 use crate::stream::{SealNotification, SealReason, Stream};
 
@@ -129,7 +129,6 @@ impl ExtentNodeStore {
                 if remaining > 1 {
                     let batch_seals = self.drain_follower_jobs(stream_id).await;
                     for notification in &batch_seals {
-                        self.send_extent_update(stream_id, notification);
                         self.send_forward_checksum(stream_id, notification.sealed_extent_id);
                         self.send_flush_request(stream_id, notification);
                     }
@@ -172,13 +171,11 @@ impl ExtentNodeStore {
             if remaining > 1 {
                 let batch_seals = self.drain_follower_jobs(stream_id).await;
                 for notification in &batch_seals {
-                    self.send_extent_update(stream_id, notification);
                     self.send_forward_checksum(stream_id, notification.sealed_extent_id);
                     self.send_flush_request(stream_id, notification);
                 }
             }
             if let Some(ref notification) = seal_notification {
-                self.send_extent_update(stream_id, notification);
                 self.send_forward_checksum(stream_id, notification.sealed_extent_id);
                 self.send_flush_request(stream_id, notification);
             }
@@ -189,7 +186,6 @@ impl ExtentNodeStore {
         if remaining > 1 {
             let batch_seals = self.drain_follower_jobs(stream_id).await;
             for notification in &batch_seals {
-                self.send_extent_update(stream_id, notification);
                 self.send_flush_request(stream_id, notification);
             }
         }
@@ -536,20 +532,6 @@ impl ExtentNodeStore {
             notification
         } else {
             None
-        }
-    }
-
-    /// Send an async UPDATE_EXTENT (Sealed) to SM (fire-and-forget).
-    pub(crate) fn send_extent_update(&self, stream_id: StreamId, notification: &SealNotification) {
-        if let Some(ref tx) = self.update_tx {
-            let _ = tx.try_send(ExtentUpdate::Sealed {
-                stream_id,
-                sealed_extent_id: notification.sealed_extent_id,
-                end_offset: notification.end_offset,
-                new_extent_id: notification.new_extent_id,
-                new_extent_capacity: notification.new_extent_capacity,
-                epoch: notification.epoch,
-            });
         }
     }
 
@@ -947,13 +929,11 @@ impl ExtentNodeStore {
             if remaining > batch_len {
                 let batch_seals = self.drain_follower_jobs(stream_id).await;
                 for notif in &batch_seals {
-                    self.send_extent_update(stream_id, notif);
                     self.send_forward_checksum(stream_id, notif.sealed_extent_id);
                     self.send_flush_request(stream_id, notif);
                 }
             }
             if let Some(ref notif) = seal_notification {
-                self.send_extent_update(stream_id, notif);
                 self.send_forward_checksum(stream_id, notif.sealed_extent_id);
                 self.send_flush_request(stream_id, notif);
             }
@@ -973,7 +953,6 @@ impl ExtentNodeStore {
         if remaining > batch_len {
             let batch_seals = self.drain_follower_jobs(stream_id).await;
             for notif in &batch_seals {
-                self.send_extent_update(stream_id, notif);
                 self.send_forward_checksum(stream_id, notif.sealed_extent_id);
                 self.send_flush_request(stream_id, notif);
             }

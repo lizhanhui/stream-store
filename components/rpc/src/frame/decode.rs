@@ -2,7 +2,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpcodeSnafu};
 use common::types::{
     Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
-    FLAG_EXTENT_PROGRESS, FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
+    FLAG_EXTENT_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM,
     FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
     FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION,
     StorageClass, StreamConfig, StreamId,
@@ -789,23 +789,6 @@ impl Frame {
                 let stream_id = StreamId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 match flags {
-                    FLAG_EXTENT_SEALED => {
-                        let sealed_extent_id = ExtentId(body.get_u32());
-                        let end_offset = Offset(body.get_u64());
-                        let new_extent_id = ExtentId(body.get_u32());
-                        let new_extent_capacity = body.get_u32();
-                        Ok((
-                            VariableHeader::UpdateExtentSealed {
-                                stream_id,
-                                epoch,
-                                sealed_extent_id,
-                                end_offset,
-                                new_extent_id,
-                                new_extent_capacity,
-                            },
-                            None,
-                        ))
-                    }
                     FLAG_EXTENT_PROGRESS => {
                         let extent_id = ExtentId(body.get_u32());
                         let current_offset = Offset(body.get_u64());
