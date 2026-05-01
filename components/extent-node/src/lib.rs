@@ -1,12 +1,12 @@
 pub mod ack_queue;
 pub mod arena;
 pub mod downstream;
-pub mod extent;
 pub mod s3;
 pub mod s3_codec;
 pub mod s3_flusher;
 pub mod store;
 pub mod stream;
+pub mod stream_epoch;
 pub mod stream_manager_client;
 
 use std::net::SocketAddr;

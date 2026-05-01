@@ -25,7 +25,7 @@
 use bytes::Bytes;
 use common::types::StreamId;
 
-use crate::extent::Extent;
+use crate::stream_epoch::StreamEpoch;
 
 /// Magic bytes identifying an S3 extent file: "SEXT" in ASCII.
 pub const S3_EXTENT_MAGIC: u32 = 0x53455854;
@@ -242,7 +242,7 @@ pub fn s3_key(namespace: &str, stream_id: StreamId, start_offset: u64, end_offse
 ///
 /// The extent must be sealed. Returns the complete file bytes
 /// (header + chunk index + compressed data).
-pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compression) -> Vec<u8> {
+pub fn encode_extent(stream_id: StreamId, extent: &StreamEpoch, compression: Compression) -> Vec<u8> {
     let data: Bytes = extent.committed_data();
     let record_count = extent.message_count() as u32;
     let start_offset = extent.start_offset.0;
@@ -342,7 +342,7 @@ pub fn encode_extent(stream_id: StreamId, extent: &Extent, compression: Compress
 /// When `actual_end_offset == end_offset`, the upload uses the canonical key.
 pub fn encode_extent_range(
     stream_id: StreamId,
-    extent: &Extent,
+    extent: &StreamEpoch,
     compression: Compression,
     end_offset: u64,
 ) -> (Vec<u8>, u64) {
@@ -507,8 +507,8 @@ mod tests {
     use common::types::{Epoch, ExtentId, Offset};
 
     /// Helper: create a sealed extent with N records of given payloads.
-    fn sealed_extent(payloads: &[&[u8]]) -> Extent {
-        let extent = Extent::with_capacity(
+    fn sealed_extent(payloads: &[&[u8]]) -> StreamEpoch {
+        let extent = StreamEpoch::with_capacity(
             ExtentId(1),
             Offset(0),
             1024 * 1024, // 1 MiB
@@ -524,9 +524,9 @@ mod tests {
     }
 
     /// Helper: create a sealed extent with start_offset.
-    fn sealed_extent_at(start_offset: u64, payloads: &[&[u8]]) -> Extent {
+    fn sealed_extent_at(start_offset: u64, payloads: &[&[u8]]) -> StreamEpoch {
         let extent =
-            Extent::with_capacity(ExtentId(1), Offset(start_offset), 1024 * 1024, Epoch(0));
+            StreamEpoch::with_capacity(ExtentId(1), Offset(start_offset), 1024 * 1024, Epoch(0));
         for payload in payloads {
             extent
                 .append(Bytes::copy_from_slice(payload))

@@ -21,7 +21,7 @@ pub const FLAG_INIT_FORWARD: u8 = 0x01;
 /// Used by `try_verify_checksum()` to know when to compare.
 const FLAG_CHECKSUM_RECEIVED: u8 = 0x02;
 
-/// Extent has been flushed to S3 and is eligible for memory eviction.
+/// StreamEpoch has been flushed to S3 and is eligible for memory eviction.
 /// Set by Primary locally after upload, and by Secondaries on ForwardFlushed.
 pub const FLAG_FLUSHED: u8 = 0x04;
 
@@ -38,7 +38,7 @@ pub struct AppendResult {
     pub byte_pos: u64,
 }
 
-/// A lock-free extent backed by a pre-allocated contiguous memory arena.
+/// A lock-free stream epoch backed by a pre-allocated contiguous memory arena.
 ///
 /// # Concurrency Model: Pipelined Group Commit
 ///
@@ -80,7 +80,7 @@ pub struct AppendResult {
 /// the length prefix, advancing by `4 + len` bytes to the next record.
 /// This is the same format as the S3 flush layout, enabling zero-copy upload of
 /// sealed extents.
-pub struct Extent {
+pub struct StreamEpoch {
     pub id: ExtentId,
 
     pub start_offset: Offset,
@@ -161,10 +161,10 @@ pub struct Extent {
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
 // used for non-overlapping writes mediated by atomic cursors. The ArenaBuffer
 // itself is Send+Sync, and all concurrent access is bounded by atomic cursors.
-unsafe impl Send for Extent {}
-unsafe impl Sync for Extent {}
+unsafe impl Send for StreamEpoch {}
+unsafe impl Sync for StreamEpoch {}
 
-impl Extent {
+impl StreamEpoch {
     /// Create a new active extent with the specified capacity in bytes.
     pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: u32, epoch: Epoch) -> Self {
         let arena = ArenaBuffer::new(capacity);
@@ -767,9 +767,9 @@ impl Extent {
 }
 
 // Debug impl that doesn't try to print the entire buffer.
-impl std::fmt::Debug for Extent {
+impl std::fmt::Debug for StreamEpoch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Extent")
+        f.debug_struct("StreamEpoch")
             .field("id", &self.id)
             .field("start_offset", &self.start_offset)
             .field("epoch", &self.epoch)
@@ -795,7 +795,7 @@ mod tests {
 
     #[test]
     fn append_and_read() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         let r0 = ext.append(Bytes::from_static(b"msg0")).unwrap();
         let r1 = ext.append(Bytes::from_static(b"msg1")).unwrap();
         let r2 = ext.append(Bytes::from_static(b"msg2")).unwrap();
@@ -825,7 +825,7 @@ mod tests {
 
     #[test]
     fn read_from_middle() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(10), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(10), 4096, Epoch(0));
         let _r0 = ext.append(Bytes::from_static(b"a")).unwrap();
         let r1 = ext.append(Bytes::from_static(b"b")).unwrap();
 
@@ -837,7 +837,7 @@ mod tests {
 
     #[test]
     fn read_out_of_range_returns_empty() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         // No records appended, read at byte_pos 0 returns empty.
         let msgs = ext.read(0, 10).unwrap();
         assert!(msgs.is_empty());
@@ -850,7 +850,7 @@ mod tests {
 
     #[test]
     fn seal_rejects_append() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.append(Bytes::from_static(b"ok")).unwrap();
         ext.seal(None);
 
@@ -861,7 +861,7 @@ mod tests {
 
     #[test]
     fn start_offset_nonzero() {
-        let ext = Extent::with_capacity(ExtentId(2), Offset(100), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(2), Offset(100), 4096, Epoch(0));
         let r = ext.append(Bytes::from_static(b"hello")).unwrap();
         assert_eq!(r.offset, Offset(100));
         assert_eq!(r.byte_pos, 0);
@@ -875,7 +875,7 @@ mod tests {
     fn extent_full_returns_error() {
         // Tiny capacity: 16 bytes. Each record is 4 (len prefix) + payload.
         // "hello" = 5 bytes -> record = 9 bytes. Two records = 18 bytes > 16.
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 16, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 16, Epoch(0));
         ext.append(Bytes::from_static(b"hello")).unwrap(); // 9 bytes, fits
         let result = ext.append(Bytes::from_static(b"world")); // 9 bytes, doesn't fit
         assert!(matches!(result, Err(StorageError::ExtentFull { .. })));
@@ -883,7 +883,7 @@ mod tests {
 
     #[test]
     fn committed_data_returns_arena_slice() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.append(Bytes::from_static(b"abc")).unwrap();
         ext.append(Bytes::from_static(b"de")).unwrap();
 
@@ -900,7 +900,7 @@ mod tests {
 
     #[test]
     fn index_lookup_basic() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Before any append, all index entries are None.
         assert_eq!(ext.index_lookup(0), None);
@@ -924,7 +924,7 @@ mod tests {
 
     #[test]
     fn index_lookup_with_nonzero_start_offset() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(100), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(100), 4096, Epoch(0));
         let r0 = ext.append(Bytes::from_static(b"hello")).unwrap();
         assert_eq!(r0.offset, Offset(100));
 
@@ -935,7 +935,7 @@ mod tests {
     #[test]
     fn replicate_basic() {
         // Simulate a secondary receiving 3 records from the primary.
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         let r0 = ext
             .replicate(Offset(0), Bytes::from_static(b"msg0"))
@@ -970,8 +970,8 @@ mod tests {
     #[test]
     fn replicate_matches_append_layout() {
         // Prove that replicate() produces a bit-for-bit identical arena as append().
-        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
-        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         let payloads: Vec<Bytes> = vec![
             Bytes::from_static(b"hello"),
@@ -994,7 +994,7 @@ mod tests {
 
     #[test]
     fn replicate_sealed_extent_rejects() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.replicate(Offset(0), Bytes::from_static(b"msg0"))
             .unwrap();
         ext.seal(Some(1)); // seal at 1 record
@@ -1009,7 +1009,7 @@ mod tests {
         // Simulate a secondary: primary committed 3 records, but secondary only
         // received 1 before seal. SM seals secondary with committed_offset=3.
         // Late forwarded appends for offsets 1,2 should be accepted.
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Secondary receives 1 of 3 expected messages before seal.
         ext.append(Bytes::from_static(b"msg0")).unwrap();
@@ -1035,7 +1035,7 @@ mod tests {
     #[test]
     fn seal_without_committed_offset_uses_local_count() {
         // Primary sealing itself (extent-full path): no committed_offset provided.
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.append(Bytes::from_static(b"msg0")).unwrap();
         ext.append(Bytes::from_static(b"msg1")).unwrap();
 
@@ -1049,7 +1049,7 @@ mod tests {
 
     #[test]
     fn accepts_post_seal_writes_flag() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Not sealed → false.
         assert!(!ext.accepts_post_seal_writes());
@@ -1063,7 +1063,7 @@ mod tests {
 
     #[test]
     fn incremental_crc32_matches_full_hash() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Before any append, no finalized CRC32.
         assert_eq!(ext.finalized_crc32(), None);
@@ -1091,7 +1091,7 @@ mod tests {
 
     #[test]
     fn incremental_crc32_single_record() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.append(Bytes::from_static(b"only-one")).unwrap();
         ext.seal(None);
 
@@ -1102,7 +1102,7 @@ mod tests {
 
     #[test]
     fn incremental_crc32_empty_payloads() {
-        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         ext.append(Bytes::new()).unwrap(); // empty payload
         ext.append(Bytes::from_static(b"data")).unwrap();
         ext.append(Bytes::new()).unwrap(); // another empty
@@ -1116,14 +1116,14 @@ mod tests {
     #[test]
     fn incremental_crc32_via_replicate() {
         // Simulate primary appends to get reference data.
-        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
         // Simulate secondary receiving the same records via replicate() IN ORDER.
-        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         secondary
             .replicate(Offset(0), Bytes::from_static(b"hello"))
             .unwrap();
@@ -1153,14 +1153,14 @@ mod tests {
     #[test]
     fn crc32_in_order_replicate() {
         // Simulate primary appends to get reference data.
-        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
         // Simulate secondary receiving records IN ORDER (guaranteed by FIFO mpsc).
-        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         secondary
             .replicate(Offset(0), Bytes::from_static(b"hello"))
@@ -1184,12 +1184,12 @@ mod tests {
     #[test]
     fn crc32_forward_checksum_arrives_after_records() {
         // ForwardChecksum arrives after all records (normal case with FIFO channel).
-        let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.seal(None);
 
-        let secondary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Records arrive in order.
         secondary
@@ -1215,7 +1215,7 @@ mod tests {
     #[test]
     fn correct_seal_offset_lowers_limit() {
         // Sealed at 100 records, correct down to 80
-        let extent = Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
         for i in 0..100u32 {
             extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
         }
@@ -1231,7 +1231,7 @@ mod tests {
     #[test]
     fn correct_seal_offset_noop_if_already_lower() {
         // Sealed at 50 records, try to "correct" to 80 → no-op
-        let extent = Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
         for i in 0..50u32 {
             extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
         }
@@ -1245,7 +1245,7 @@ mod tests {
     #[test]
     fn correct_seal_offset_noop_if_unsealed() {
         // Not sealed → correct_seal_offset is a no-op
-        let extent = Extent::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
         extent.append(Bytes::from_static(b"hello")).unwrap();
 
         extent.correct_seal_offset(0); // should not seal or crash
@@ -1255,7 +1255,7 @@ mod tests {
     #[test]
     fn correct_seal_offset_concurrent() {
         // Multiple threads calling correct_seal_offset → CAS loop handles it
-        let extent = Arc::new(Extent::with_capacity(
+        let extent = Arc::new(StreamEpoch::with_capacity(
             ExtentId(1),
             Offset(0),
             1024 * 1024,

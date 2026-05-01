@@ -6,7 +6,7 @@ use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
 use super::ExtentNodeStore;
-use crate::extent::AppendResult;
+use crate::stream_epoch::AppendResult;
 use crate::stream::Stream;
 
 impl ExtentNodeStore {

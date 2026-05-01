@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::ack_queue::AckQueue;
-use crate::extent::{AppendResult, Extent};
+use crate::stream_epoch::{AppendResult, StreamEpoch};
 use crate::store::AppendJob;
 
 /// Reason for sealing the active extent and creating a new one.
@@ -26,7 +26,7 @@ pub enum SealReason {
 /// Mutable state protected by `RwLock`. Grouped here so that a single
 /// lock acquisition covers all fields that need coordinated mutation.
 struct StreamInner {
-    extents: Vec<Extent>,
+    extents: Vec<StreamEpoch>,
 
     /// Next extent ID for autonomous creation within the current epoch.
     /// Initialized to `first_extent_id + 1` when SM sends RegisterEpoch.
@@ -51,7 +51,7 @@ struct StreamInner {
 
 impl StreamInner {
     /// Find an extent by its ID.
-    fn find_extent(&self, extent_id: ExtentId) -> Option<&Extent> {
+    fn find_extent(&self, extent_id: ExtentId) -> Option<&StreamEpoch> {
         self.extents.iter().find(|e| e.id == extent_id)
     }
 
@@ -113,7 +113,7 @@ impl StreamInner {
         let new_id = self.next_extent_id;
         self.next_extent_id = ExtentId(new_id.0 + 1);
 
-        self.extents.push(Extent::with_capacity(new_id, end_offset, self.extent_capacity, epoch));
+        self.extents.push(StreamEpoch::with_capacity(new_id, end_offset, self.extent_capacity, epoch));
 
         self.evict_oldest_extents(stream_id);
         Some((new_id, end_offset))
@@ -434,7 +434,7 @@ impl Stream {
     /// which cannot return a reference from behind the RwLock guard.
     pub fn with_extent<F, R>(&self, extent_id: ExtentId, f: F) -> Option<R>
     where
-        F: FnOnce(&Extent) -> R,
+        F: FnOnce(&StreamEpoch) -> R,
     {
         let inner = self.inner.read();
         inner.find_extent(extent_id).map(f)
@@ -567,7 +567,7 @@ impl Stream {
         let mut inner = self.inner.write();
         inner.extent_capacity = extent_capacity;
         inner.next_extent_id = ExtentId(id.0 + 1);
-        inner.extents.push(Extent::with_capacity(
+        inner.extents.push(StreamEpoch::with_capacity(
             id,
             start_offset,
             extent_capacity,
