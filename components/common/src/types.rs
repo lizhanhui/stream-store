@@ -114,8 +114,8 @@ pub enum Opcode {
     /// Append a message. Flags: 0x00=request, 0x01=ack, 0x80=error.
     Append = 0x03,
     /// Dedicated forward opcode for Primary→Secondary replication.
-    /// Carries all metadata (including byte_pos) so the secondary writes
-    /// each record at the exact same position as the primary.
+    /// Carries (stream_id, extent_id, epoch, offset) so the secondary
+    /// can replay each record in strict per-connection FIFO order.
     Forward = 0x05,
     /// Epoch-based seal: Client ↔ StreamManager.
     /// Flags: 0x00=request, 0x01=response, 0x80=error.
