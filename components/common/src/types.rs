@@ -263,6 +263,51 @@ impl ExtentState {
     }
 }
 
+/// Per-stream arena sizing policy.
+///
+/// - `Dedicated`: the stream has its own arena, one writer per stream
+///   (today's fast path). Arena size = `dedicated_arena_size`.
+/// - `Shared`: appends flow through a node-wide SharedArenaPool where
+///   one arena multiplexes records from many streams. Arena size =
+///   `shared_arena_size`. Not wired at runtime yet — every CreateStream
+///   request currently uses `Dedicated` until a later plan introduces
+///   Shared routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum ArenaClass {
+    Dedicated = 0,
+    Shared = 1,
+}
+
+impl ArenaClass {
+    pub fn from_u8(value: u8) -> Option<ArenaClass> {
+        match value {
+            0 => Some(ArenaClass::Dedicated),
+            1 => Some(ArenaClass::Shared),
+            _ => None,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+}
+
+impl Default for ArenaClass {
+    fn default() -> Self {
+        ArenaClass::Dedicated
+    }
+}
+
+impl Display for ArenaClass {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        match self {
+            ArenaClass::Dedicated => write!(f, "dedicated"),
+            ArenaClass::Shared => write!(f, "shared"),
+        }
+    }
+}
+
 /// Operational state of an ExtentNode node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
