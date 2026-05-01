@@ -227,7 +227,7 @@ fn seal_stream_manager_request_round_trip() {
     assert_eq!(buf.len(), 20);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
+    assert_eq!(decoded.opcode(), Opcode::SealStream);
     assert_eq!(decoded.flags(), 0);
     assert_eq!(decoded.request_id(), 1);
     assert_eq!(decoded.stream_id(), StreamId(10));
@@ -256,7 +256,7 @@ fn seal_stream_manager_resp_round_trip() {
     assert_eq!(buf.len(), 44);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
+    assert_eq!(decoded.opcode(), Opcode::SealStream);
     assert_eq!(decoded.flags(), FLAG_RESPONSE);
     assert_eq!(decoded.request_id(), 2);
     assert_eq!(decoded.stream_id(), StreamId(10));
@@ -290,7 +290,7 @@ fn seal_stream_manager_resp_error_round_trip() {
     frame.encode(&mut buf);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::SealStreamManager);
+    assert_eq!(decoded.opcode(), Opcode::SealStream);
     assert!(decoded.is_error_response());
     assert_eq!(decoded.request_id(), 3);
     assert_eq!(decoded.stream_id(), StreamId(10));

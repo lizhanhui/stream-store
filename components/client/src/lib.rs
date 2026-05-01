@@ -496,7 +496,7 @@ impl StreamClient {
         );
         let resp = self.send_request(req).await?;
         Self::check_error(&resp)?;
-        if resp.opcode() != Opcode::SealStreamManager {
+        if resp.opcode() != Opcode::SealStream {
             return Err(InternalSnafu {
                 message: format!("expected SealStreamManagerResp, got {:?}", resp.opcode()),
             }

@@ -282,7 +282,7 @@ impl RequestHandler for ExtentNodeStore {
             Opcode::FlushExtent => Some(self.handle_flush_extent(frame)),
             Opcode::UpdateExtent
             | Opcode::Watermark
-            | Opcode::SealStreamManager
+            | Opcode::SealStream
             | Opcode::StreamManagerMembershipChange => {
                 warn!(
                     opcode = ?frame.opcode(),

@@ -562,7 +562,7 @@ impl RequestHandler for StreamManagerStore {
                     Opcode::Heartbeat => self.handle_heartbeat(frame).await,
                     Opcode::Disconnect => self.handle_disconnect(frame).await,
                     Opcode::CreateStream => self.handle_create_stream(frame).await,
-                    Opcode::SealStreamManager => self.handle_seal_stream_manager(frame).await,
+                    Opcode::SealStream => self.handle_seal_stream_manager(frame).await,
                     Opcode::QueryOffset => self.handle_query_offset(frame).await,
                     Opcode::DescribeStream => self.handle_describe_stream(frame).await,
                     Opcode::DescribeExtent => self.handle_describe_extent(frame).await,

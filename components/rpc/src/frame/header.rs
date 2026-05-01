@@ -372,7 +372,7 @@ impl VariableHeader {
             | VariableHeader::ReadRespError { .. } => Opcode::Read,
             VariableHeader::SealStreamManagerRequest { .. }
             | VariableHeader::SealStreamManagerResp { .. }
-            | VariableHeader::SealStreamManagerRespError { .. } => Opcode::SealStreamManager,
+            | VariableHeader::SealStreamManagerRespError { .. } => Opcode::SealStream,
             VariableHeader::SealExtentNodePrepare { .. }
             | VariableHeader::SealExtentNodeResp { .. }
             | VariableHeader::SealExtentNodeRespError { .. }

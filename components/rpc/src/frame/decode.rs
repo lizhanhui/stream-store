@@ -181,14 +181,14 @@ impl Frame {
                     ))
                 }
             }
-            // ── SealStreamManager: request (0x00), response (0x01), error (0x80) ──
-            Opcode::SealStreamManager => {
+            // ── SealStream: request (0x00), response (0x01), error (0x80) ──
+            Opcode::SealStream => {
                 let request_id = body.get_u32();
                 let stream_id = StreamId(body.get_u32());
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
-                            message: "unknown SealStreamManager error code",
+                            message: "unknown SealStream error code",
                         }
                         .build()
                     })?;

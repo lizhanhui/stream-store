@@ -119,7 +119,7 @@ pub enum Opcode {
     Forward = 0x05,
     /// Epoch-based seal: Client ↔ StreamManager.
     /// Flags: 0x00=request, 0x01=response, 0x80=error.
-    SealStreamManager = 0x06,
+    SealStream = 0x06,
     /// Epoch-based seal: StreamManager ↔ ExtentNode.
     /// Flags: 0x00=request, 0x01=response, 0x80=error.
     SealExtentNode = 0x07,
@@ -167,7 +167,7 @@ impl Opcode {
             0x01 => Some(Opcode::CreateStream),
             0x03 => Some(Opcode::Append),
             0x05 => Some(Opcode::Forward),
-            0x06 => Some(Opcode::SealStreamManager),
+            0x06 => Some(Opcode::SealStream),
             0x07 => Some(Opcode::SealExtentNode),
             0x08 => Some(Opcode::QueryOffset),
             0x0A => Some(Opcode::Read),
