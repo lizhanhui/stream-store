@@ -14,15 +14,12 @@
 
 use std::sync::Arc;
 
-use common::types::{ArenaClass, Epoch, ExtentId, Offset, StreamId};
+use common::types::{Epoch, ExtentId, Offset, StreamId};
 
 use crate::stream_epoch::StreamEpoch;
 
 /// Allocates StreamEpoch instances for a given (stream_id, epoch).
 pub(crate) trait ArenaPool: Send + Sync {
-    /// The class of streams this pool serves.
-    fn class(&self) -> ArenaClass;
-
     /// Allocate a fresh StreamEpoch wrapped in Arc. Returned object is
     /// ready to insert into `Stream::epochs` via `insert_epoch`.
     fn allocate_epoch(
@@ -46,8 +43,6 @@ impl DedicatedArenaPool {
 }
 
 impl ArenaPool for DedicatedArenaPool {
-    fn class(&self) -> ArenaClass { ArenaClass::Dedicated }
-
     fn allocate_epoch(
         &self,
         _stream_id:   StreamId,
@@ -66,19 +61,19 @@ impl ArenaPool for DedicatedArenaPool {
 
 /// Stub for the future EN-wide shared-arena pool. Routing is not wired
 /// in P2; any caller that lands here signals a bug in stream setup.
+#[allow(dead_code)]
 pub(crate) struct SharedArenaPool {
     _arena_size: u32,
 }
 
 impl SharedArenaPool {
+    #[allow(dead_code)]
     pub(crate) fn new(arena_size: u32) -> Self {
         Self { _arena_size: arena_size }
     }
 }
 
 impl ArenaPool for SharedArenaPool {
-    fn class(&self) -> ArenaClass { ArenaClass::Shared }
-
     fn allocate_epoch(
         &self,
         _stream_id:    StreamId,

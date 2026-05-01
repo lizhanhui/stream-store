@@ -126,7 +126,7 @@ impl Stream {
     // ── Construction ────────────────────────────────────────────────────
 
     /// Create a new stream with no extents. Extents are added via `register_extent()`.
-    pub fn new(id: StreamId, pool: Arc<dyn ArenaPool>) -> Self {
+    pub(crate) fn new(id: StreamId, pool: Arc<dyn ArenaPool>) -> Self {
         let (job_tx, job_rx) = unbounded();
         Self {
             id,
