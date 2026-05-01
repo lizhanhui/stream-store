@@ -173,12 +173,19 @@ struct ArenaDirectory {
 }
 
 struct EpochArenaEntry {
+    // Primary cohort = this EN was Primary for (stream, epoch) at the time
+    // these records were appended. Primary-cohort entries are uploaded on
+    // arena seal. Secondary-cohort entries are held for DR and dropped on
+    // ForwardFlushed from the peer Primary.
+    cohort:           Cohort,      // Primary | Secondary
     start_offset:     u64,
     end_offset:       u64,        // exclusive, running while arena open
     byte_positions:   Vec<u32>,   // per record, within this arena
     arena_start_byte: u32,
     arena_end_byte:   u32,
 }
+
+enum Cohort { Primary, Secondary }
 
 struct SharedAppendJob {
     // One record submitted inside an ArenaBatch from a stream leader.
@@ -430,6 +437,18 @@ No SM round-trip. No epoch bump. No `NOTIFY_SEALED_EXTENT` (deleted).
   to every replica in the epoch's replica_set.
 - `NotifyArenaClass` (new, EN → SM): reports a runtime class transition so
   SM persists the change in `streams.arena_class`.
+- `UpdateArenaFlushed` (EN → SM): notifies SM after a Shape A arena upload
+  completes. Carries `arena_id`, `s3_key`, and the list of `(stream, epoch,
+  start, end)` primary-cohort entries in the object.
+- `ForwardFlushed` (new, Primary → Secondary, fire-and-forget): sent after
+  a successful Shape A upload. Carries `arena_id`. Secondaries drop their
+  secondary-cohort entries for this arena.
+- `FlushEpochStream` (new, SM → EN): DR request. Carries
+  `(stream_id, epoch)`. EN gathers resident records for that tuple across
+  all arenas, builds a Shape B object, uploads, and replies with
+  `UpdateEpochFlushed`.
+- `UpdateEpochFlushed` (EN → SM): DR completion ack. Carries
+  `stream_id, epoch, s3_key, start, end`.
 
 ### Seal (Epoch Bump Only)
 
@@ -534,9 +553,25 @@ If no resident arena has the record:
    decompress; sparse index resolves `offset → byte_pos_in_block`;
    `Bytes::slice`.
 
-## S3 Object Format (All Arenas)
+## S3 Object Format — Two Shapes
 
-One S3 object per arena. Key: `{namespace}/arenas/{arena_id:016x}.dat`.
+Shared arenas produce S3 objects on two independent code paths with
+different shapes. Readers route to the right parser via the
+`s3_key_kind` column in `epoch_arenas`.
+
+### Shape A: Arena Object (normal fill-and-rotate path)
+
+One object per fully-sealed Shared arena. Key:
+`{namespace}/arenas/{arena_id:016x}.dat`. Contains **primary-cohort
+entries only** — i.e., records for `(stream, epoch)` tuples where this
+EN is the Primary. Secondary-cohort entries are dropped at seal time and
+not included.
+
+On seal, the flush task compacts the arena slice-by-slice: it already
+has each primary-cohort entry's `byte_positions` and the entry's records
+are already contiguous thanks to the per-stream gather done at write
+time, so compaction is a linear walk — one entry at a time, one stream's
+records blocked into 64-record compressed chunks:
 
 ```
 ┌─ Header (fixed 32 bytes) ────────────────────────────────────┐
@@ -544,7 +579,7 @@ One S3 object per arena. Key: `{namespace}/arenas/{arena_id:016x}.dat`.
 │  version            : u16  (1)                               │
 │  flags              : u16                                    │
 │  arena_id           : u64                                    │
-│  entry_count        : u32   (number of (stream, epoch) entries)│
+│  entry_count        : u32   (primary-cohort entries only)    │
 │  data_section_start : u32                                    │
 │  crc32              : u32  (over directory + data sections)  │
 │  compression        : u8   (0=none, 1=zstd, 2=lz4)          │
@@ -570,13 +605,37 @@ One S3 object per arena. Key: `{namespace}/arenas/{arena_id:016x}.dat`.
 └──────────────────────────────────────────────────────────────┘
 ```
 
-A Dedicated arena is usually a single entry (one stream, one epoch). A
-Shared arena typically has many entries. The same format supports both
-classes so the S3 read path is uniform.
+A Dedicated arena is always one primary-cohort entry (one stream, one
+epoch). Using the same multi-entry shape with entry_count=1 for
+Dedicated keeps the S3 reader uniform, so the existing per-stream
+chunk-compressed layout also lives inside this header for Dedicated.
 
-Block size = `s3_index_step` records (default 64). Independently
-compressible. Each block is the unit of decompression and of the moka
+Block size = `s3_index_step` records (default 64). Each block is
+independently compressible and is the unit of decompression and moka
 cache.
+
+### Shape B: Per-Stream Object (DR upload path)
+
+When SM asks the EN to urgently upload a specific `(stream_id, epoch)`
+outside the normal arena-seal schedule (see Flush Lifecycle → DR Flush
+below), the EN builds a **per-stream object** in the same
+chunk-compressed format used today for Dedicated streams. Key:
+`{namespace}/data/{stream_id:016x}/{start_offset:016x}_{end_offset:016x}.dat`.
+
+This is the same key shape and the same in-file format used for
+Dedicated extents today, so:
+
+- The S3 reader has one code path for "per-stream object" regardless of
+  whether it was produced by Dedicated normal-path flush or by DR
+  urgent flush.
+- Readers resolve an `epoch_arenas` row to the right parser via
+  `s3_key_kind` (arena vs per-stream).
+
+The EN gathers all records for `(stream_id, epoch)` across every
+resident arena in the pool by walking each arena's directory for
+primary-cohort entries matching the tuple, then concatenates the byte
+slices in offset order (zero-copy via `Bytes::slice` over the arena
+buffers), compresses into 64-record blocks, and uploads.
 
 ## Stream Manager Metadata
 
@@ -612,8 +671,9 @@ CREATE TABLE epoch_arenas (
     stream_id    BIGINT NOT NULL,
     epoch        BIGINT NOT NULL,
     sequence     INT    NOT NULL,   -- 0..N-1 in offset order within epoch
-    arena_id     BIGINT NOT NULL,
+    arena_id     BIGINT NOT NULL,   -- 0 for Shape B (per-stream) objects
     s3_key       VARCHAR(512) NOT NULL,
+    s3_key_kind  TINYINT NOT NULL,  -- 0 = Shape A arena object, 1 = Shape B per-stream object
     start_offset BIGINT NOT NULL,
     end_offset   BIGINT NOT NULL,   -- exclusive
     PRIMARY KEY (stream_id, epoch, sequence),
@@ -621,30 +681,94 @@ CREATE TABLE epoch_arenas (
 );
 ```
 
+A single `(stream_id, epoch, offset)` range may be uploaded under both
+shapes (e.g., DR uploaded it urgently, then the arena's normal seal
+later uploaded it inside a Shape A object). Both rows exist; readers
+prefer whichever they find first. The extra PUT cost is acceptable; S3
+PUT is idempotent and storage cost is tiny relative to durability.
+
 A separate operational `arenas` table tracks per-arena state across the
 cluster (resident node, flush status). Not on any hot path.
 
 ## Flush Lifecycle
 
-Identical for Shared and Dedicated arenas:
+Two independent paths produce S3 objects. **Both run on the background
+S3 flush task — off the write critical path.** The arena leader's
+seal-and-rotate completes as soon as the new arena is installed; the
+sealed arena is handed to the flush task for asynchronous
+compaction-plus-upload. Writers continue appending to the new active
+arena without waiting for any S3 work.
 
-1. Arena rolls → `state = Sealed` → S3 flush task notified.
-2. Flush task walks the directory, compresses per-entry blocks, uploads
-   via `aws-sdk-s3` (multipart above `s3_multipart_threshold`). Retry
-   policy matches today's flusher.
-3. On success: `UpdateArenaFlushed(arena_id, s3_key, entries)` to SM where
-   `entries = Vec<(stream_id, epoch, start_offset, end_offset)>`.
-4. SM writes one `epoch_arenas` row per entry in a single transaction.
-5. Primary broadcasts `ForwardFlushed(arena_id)` to peers (fire-and-forget).
-6. Arena becomes LRU-eligible.
+### Normal Path — Arena Fill-and-Rotate (Shape A)
 
-### DR Flush
+Runs once per sealed arena, on the background flush task. Only
+includes **primary-cohort** entries; secondary-cohort entries are
+dropped at seal.
 
-`FlushExtent (0x1B)` is renamed `FlushArena` with the same opcode number.
-SM's staleness scan looks for sealed-but-unflushed arenas beyond
-`flush_staleness_threshold_ms` and delegates upload to any live replica
-that still holds the arena in memory. S3 PUT is idempotent; all replicas
-agree on `arena_id` and therefore on the key.
+1. Arena rolls → `state = Sealed` → sealed arena handed to the S3 flush
+   task's queue (fire-and-forget from the arena leader's perspective).
+2. Flush task walks the arena's directory filtering
+   `cohort == Primary`. For each such entry:
+   - Records are already contiguous in the arena buffer (per-stream
+     gather was done at write time). The compaction step is a linear
+     walk over `byte_positions`, grouping into 64-record blocks and
+     compressing each block.
+3. Task builds the Shape A layout in a staging buffer and uploads via
+   `aws-sdk-s3` (multipart above `s3_multipart_threshold`). Retry
+   policy matches today's flusher: exponential backoff capped at 30 s,
+   S3 HEAD check on retry to skip if a peer already uploaded.
+4. On success: `UpdateArenaFlushed(arena_id, s3_key, entries)` to SM,
+   where `entries = Vec<(stream_id, epoch, start_offset, end_offset)>`.
+5. SM writes one `epoch_arenas` row per entry
+   (`s3_key_kind = 0`) in a single transaction.
+6. Primary broadcasts `ForwardFlushed(arena_id)` to peer replicas
+   (fire-and-forget). Secondaries receiving this drop their
+   secondary-cohort directory entries for this arena; the arena's
+   buffer refcount drops.
+7. Arena becomes LRU-eligible.
+
+Secondaries never participate in Shape A upload. They accumulate
+secondary-cohort entries as Forwards arrive; they release them when
+`ForwardFlushed` or a DR request resolves the entry.
+
+### DR Path — Per-Stream Urgent Upload (Shape B)
+
+Also runs on the background flush task (given its own priority queue so
+DR work can preempt Shape A backlog). SM triggers this when a stream
+needs durability guarantees faster than its Shared arena will fill:
+after a fallback seal (Primary unreachable, offset quorum resolved from
+secondaries).
+
+Opcode: `FlushEpochStream(stream_id, epoch)` — SM → EN. EN flow:
+
+1. Flush task scans every resident arena in the pool. For each arena
+   whose directory has an entry for `(stream_id, epoch)` **in any
+   cohort** (Primary or Secondary — DR accepts both because the purpose
+   is durability, regardless of who was Primary), collect the entry's
+   slices.
+2. Concatenate slices in offset order (zero-copy via `Bytes::slice`
+   over the arena buffers).
+3. Build Shape B object (same chunk-compressed format used for
+   Dedicated extents today), key
+   `{namespace}/data/{stream_id:016x}/{start_offset:016x}_{end_offset:016x}.dat`.
+4. Upload via `aws-sdk-s3`.
+5. Respond to SM with `UpdateEpochFlushed(stream_id, epoch, s3_key,
+   start_offset, end_offset)`.
+6. SM writes one row to `epoch_arenas` with `arena_id = 0` and
+   `s3_key_kind = 1`, covering the full `[start, end)` range that was
+   uploaded.
+
+DR path does **not** drop directory entries or flush the arena itself —
+the arena continues filling normally, and its eventual Shape A upload
+will re-upload the same primary-cohort records. The extra storage cost
+is bounded and acceptable. Readers binary-search `epoch_arenas` by
+offset and take the first covering row.
+
+### DR Staleness Detection
+
+Explicitly out of scope for this iteration. DR upload is triggered only
+by SM's fallback-seal flow (Primary detected dead during `SealEpoch`).
+A periodic staleness scan may be added later.
 
 ## Eviction
 
