@@ -236,7 +236,7 @@ impl MetadataStore {
     ) -> Result<Vec<(StreamId, Epoch)>, StorageError> {
         let rows = sqlx::query(
             "SELECT DISTINCT e.stream_id, s.epoch \
-             FROM extent e \
+             FROM stream_epochs e \
              INNER JOIN stream s ON e.stream_id = s.stream_id \
              WHERE e.state = ?",
         )
@@ -350,7 +350,7 @@ impl MetadataStore {
 
         // Step 2: Insert extent row.
         sqlx::query(
-            "INSERT INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO stream_epochs (stream_id, extent_id, start_offset, end_offset, state, epoch) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(stream_id.0)
         .bind(extent_id.0 as i64)
@@ -392,7 +392,7 @@ impl MetadataStore {
         end_offset: u64,
     ) -> Result<(), StorageError> {
         sqlx::query(
-            "UPDATE extent SET state = ?, end_offset = ?, sealed_at = NOW() \
+            "UPDATE stream_epochs SET state = ?, end_offset = ?, sealed_at = NOW() \
              WHERE stream_id = ? AND extent_id = ?",
         )
         .bind(ExtentState::Sealed.as_u8())
@@ -430,7 +430,7 @@ impl MetadataStore {
         // Step 1: Lock the target extent row and check state.
         let row = sqlx::query(
             "SELECT state, start_offset \
-             FROM extent WHERE stream_id = ? AND extent_id = ? FOR UPDATE",
+             FROM stream_epochs WHERE stream_id = ? AND extent_id = ? FOR UPDATE",
         )
         .bind(stream_id.0)
         .bind(extent_id.0 as i64)
@@ -456,7 +456,7 @@ impl MetadataStore {
         if state == ExtentState::Sealed {
             // Already sealed — find the successor (next extent with higher extent_id).
             let successor = sqlx::query(
-                "SELECT extent_id, start_offset FROM extent \
+                "SELECT extent_id, start_offset FROM stream_epochs \
                  WHERE stream_id = ? AND extent_id > ? \
                  ORDER BY extent_id ASC LIMIT 1",
             )
@@ -506,7 +506,7 @@ impl MetadataStore {
 
         // Step 2: Seal the active extent (idempotent if already sealed).
         sqlx::query(
-            "UPDATE extent SET state = ?, end_offset = ?, sealed_at = NOW() \
+            "UPDATE stream_epochs SET state = ?, end_offset = ?, sealed_at = NOW() \
              WHERE stream_id = ? AND extent_id = ? AND state = ?",
         )
         .bind(ExtentState::Sealed.as_u8())
@@ -544,7 +544,7 @@ impl MetadataStore {
 
         // Step 4: Insert new extent row.
         sqlx::query(
-            "INSERT INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) VALUES (?, ?, ?, ?, ?, ?)",
+            "INSERT INTO stream_epochs (stream_id, extent_id, start_offset, end_offset, state, epoch) VALUES (?, ?, ?, ?, ?, ?)",
         )
         .bind(stream_id.0)
         .bind(new_extent_id.0 as i64)
@@ -585,7 +585,7 @@ impl MetadataStore {
     ) -> Result<Option<ExtentRow>, StorageError> {
         let row = sqlx::query(
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
-             FROM extent WHERE stream_id = ? AND state = ? LIMIT 1",
+             FROM stream_epochs WHERE stream_id = ? AND state = ? LIMIT 1",
         )
         .bind(stream_id.0)
         .bind(ExtentState::Active.as_u8())
@@ -602,7 +602,7 @@ impl MetadataStore {
     pub async fn get_extents(&self, stream_id: StreamId) -> Result<Vec<ExtentRow>, StorageError> {
         let rows = sqlx::query(
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
-             FROM extent WHERE stream_id = ? ORDER BY extent_id",
+             FROM stream_epochs WHERE stream_id = ? ORDER BY extent_id",
         )
         .bind(stream_id.0)
         .fetch_all(&self.pool)
@@ -621,7 +621,7 @@ impl MetadataStore {
     ) -> Result<Vec<ExtentRow>, StorageError> {
         let rows = sqlx::query(
             "SELECT e.extent_id, e.stream_id, e.start_offset, e.end_offset, e.state, e.epoch \
-             FROM extent e \
+             FROM stream_epochs e \
              INNER JOIN stream_replica r ON e.stream_id = r.stream_id AND e.epoch = r.epoch \
              WHERE r.node_addr = ? AND e.state = ?",
         )
@@ -729,7 +729,7 @@ impl MetadataStore {
         let extent_rows = if count == 0 {
             sqlx::query(
                 "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
-                 FROM extent WHERE stream_id = ? ORDER BY extent_id DESC",
+                 FROM stream_epochs WHERE stream_id = ? ORDER BY extent_id DESC",
             )
             .bind(stream_id.0)
             .fetch_all(&self.pool)
@@ -737,7 +737,7 @@ impl MetadataStore {
         } else {
             sqlx::query(
                 "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
-                 FROM extent WHERE stream_id = ? ORDER BY extent_id DESC LIMIT ?",
+                 FROM stream_epochs WHERE stream_id = ? ORDER BY extent_id DESC LIMIT ?",
             )
             .bind(stream_id.0)
             .bind(count)
@@ -776,7 +776,7 @@ impl MetadataStore {
     ) -> Result<Option<ExtentInfo>, StorageError> {
         let row = sqlx::query(
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
-             FROM extent WHERE stream_id = ? AND extent_id = ?",
+             FROM stream_epochs WHERE stream_id = ? AND extent_id = ?",
         )
         .bind(stream_id.0)
         .bind(extent_id.0 as i64)
@@ -822,7 +822,7 @@ impl MetadataStore {
         // Try sealed/flushed extents first: start_offset <= offset < end_offset.
         let row = sqlx::query(
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
-             FROM extent \
+             FROM stream_epochs \
              WHERE stream_id = ? AND state IN (?, ?) \
                AND start_offset <= ? AND ? < end_offset \
              ORDER BY extent_id ASC LIMIT 1",
@@ -856,7 +856,7 @@ impl MetadataStore {
         // Fall back to the Active extent where start_offset <= offset.
         let row = sqlx::query(
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
-             FROM extent \
+             FROM stream_epochs \
              WHERE stream_id = ? AND state = ? AND start_offset <= ? \
              ORDER BY extent_id DESC LIMIT 1",
         )
@@ -1058,7 +1058,7 @@ impl MetadataStore {
     ) -> Result<Vec<StaleExtentRow>, StorageError> {
         let rows = sqlx::query(
             "SELECT e.stream_id, e.extent_id, e.epoch, e.start_offset, e.end_offset \
-             FROM extent e \
+             FROM stream_epochs e \
              JOIN stream s ON e.stream_id = s.stream_id \
              WHERE e.state = ? \
                AND e.sealed_at IS NOT NULL \
@@ -1263,7 +1263,7 @@ impl MetadataStore {
 
         // Update end_offset only if the new value is larger (monotonic progress).
         sqlx::query(
-            "UPDATE extent SET end_offset = ? \
+            "UPDATE stream_epochs SET end_offset = ? \
              WHERE stream_id = ? AND extent_id = ? AND state = ? AND end_offset < ?",
         )
         .bind(current_offset as i64)
@@ -1344,7 +1344,7 @@ impl MetadataStore {
         // (Flushed) with correct offsets; the subsequent SELECT will observe state
         // = Flushed and hit the idempotent no-op branch.
         sqlx::query(
-            "INSERT IGNORE INTO extent \
+            "INSERT IGNORE INTO stream_epochs \
                  (stream_id, extent_id, start_offset, end_offset, state, epoch, \
                   sealed_at, flushed_at) \
              VALUES (?, ?, ?, ?, ?, ?, NOW(3), NOW(3))",
@@ -1365,7 +1365,7 @@ impl MetadataStore {
         // If the row pre-existed, this returns its original state (Active / Sealed /
         // Flushed). If we just inserted it, this returns Flushed and we no-op.
         let row = sqlx::query(
-            "SELECT epoch, state FROM extent WHERE stream_id = ? AND extent_id = ? FOR UPDATE",
+            "SELECT epoch, state FROM stream_epochs WHERE stream_id = ? AND extent_id = ? FOR UPDATE",
         )
         .bind(stream_id.0)
         .bind(extent_id.0 as i64)
@@ -1420,7 +1420,7 @@ impl MetadataStore {
             ExtentState::Sealed => {
                 // Normal in-order path: Sealed → Flushed.
                 sqlx::query(
-                    "UPDATE extent SET state = ?, flushed_at = NOW(3) \
+                    "UPDATE stream_epochs SET state = ?, flushed_at = NOW(3) \
                      WHERE stream_id = ? AND extent_id = ? AND state = ?",
                 )
                 .bind(ExtentState::Flushed.as_u8())
@@ -1447,7 +1447,7 @@ impl MetadataStore {
                 // (the row's end_offset may be a placeholder or stale progress),
                 // and backfill sealed_at if it was never written.
                 sqlx::query(
-                    "UPDATE extent SET state = ?, end_offset = ?, flushed_at = NOW(3), \
+                    "UPDATE stream_epochs SET state = ?, end_offset = ?, flushed_at = NOW(3), \
                         sealed_at = IFNULL(sealed_at, NOW(3)) \
                      WHERE stream_id = ? AND extent_id = ? AND state = ?",
                 )
@@ -1522,7 +1522,7 @@ impl MetadataStore {
 
             // Insert if not exists; if exists and sealed, update end_offset.
             sqlx::query(
-                "INSERT INTO extent (stream_id, extent_id, start_offset, end_offset, state, epoch) \
+                "INSERT INTO stream_epochs (stream_id, extent_id, start_offset, end_offset, state, epoch) \
                  VALUES (?, ?, ?, ?, ?, ?) \
                  ON DUPLICATE KEY UPDATE \
                    end_offset = IF(state = 1 AND VALUES(state) = 2, VALUES(end_offset), end_offset), \
