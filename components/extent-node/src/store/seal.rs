@@ -64,10 +64,10 @@ impl ExtentNodeStore {
     }
 
     pub(crate) fn handle_seal(&self, frame: Frame) -> Frame {
-        // Parse SealExtentNodePrepare fields.
+        // Parse SealEpochPrepare fields.
         let (request_id, stream_id, epoch, extent_id_from, req_start_offset) =
             match &frame.variable_header {
-                VariableHeader::SealExtentNodePrepare {
+                VariableHeader::SealEpochPrepare {
                     request_id,
                     stream_id,
                     epoch,
@@ -81,11 +81,11 @@ impl ExtentNodeStore {
                     *start_offset,
                 ),
                 _ => {
-                    return Frame::seal_extent_node_resp_error(
+                    return Frame::seal_epoch_resp_error(
                         frame.request_id(),
                         frame.stream_id(),
                         ErrorCode::InternalError,
-                        "invalid SealExtentNodePrepare frame",
+                        "invalid SealEpochPrepare frame",
                     );
                 }
             };
@@ -102,7 +102,7 @@ impl ExtentNodeStore {
                     stream_id, epoch
                 );
                 return Frame::new(
-                    VariableHeader::SealExtentNodeResp {
+                    VariableHeader::SealEpochResp {
                         request_id,
                         stream_id,
                         epoch,
@@ -150,7 +150,7 @@ impl ExtentNodeStore {
                 let payload =
                     self.build_seal_predecessor_payload(stream_id, extent_id_from, extent_id);
                 return Frame::new(
-                    VariableHeader::SealExtentNodeResp {
+                    VariableHeader::SealEpochResp {
                         request_id,
                         stream_id,
                         epoch,
@@ -216,7 +216,7 @@ impl ExtentNodeStore {
                 );
 
                 Frame::new(
-                    VariableHeader::SealExtentNodeResp {
+                    VariableHeader::SealEpochResp {
                         request_id,
                         stream_id,
                         epoch,
@@ -243,7 +243,7 @@ impl ExtentNodeStore {
                     self.build_seal_predecessor_payload(stream_id, extent_id_from, active_id);
 
                 Frame::new(
-                    VariableHeader::SealExtentNodeResp {
+                    VariableHeader::SealEpochResp {
                         request_id,
                         stream_id,
                         epoch,
@@ -349,7 +349,7 @@ impl ExtentNodeStore {
         };
 
         // Guard: extent must exist, be sealed, and not already flushed.
-        // Phase 2 (SealExtentNodeCommit) should have already sealed and
+        // Phase 2 (SealEpochCommit) should have already sealed and
         // committed the offset. Warn if the extent is Active (unexpected)
         // or if local offset differs from SM's authoritative offset.
         let ready = self
@@ -463,12 +463,12 @@ impl ExtentNodeStore {
         )
     }
 
-    /// Handle SealExtentNode phase 2: commit local seal point to SM's
-    /// authoritative committed offset. Returns SealExtentNodeCommitResp.
+    /// Handle SealEpoch phase 2: commit local seal point to SM's
+    /// authoritative committed offset. Returns SealEpochCommitResp.
     pub(crate) fn handle_seal_commit(&self, frame: Frame) -> Frame {
         let (request_id, stream_id, extent_id, _epoch, _start_offset, end_offset) =
             match &frame.variable_header {
-                VariableHeader::SealExtentNodeCommit {
+                VariableHeader::SealEpochCommit {
                     request_id,
                     stream_id,
                     extent_id,
@@ -487,7 +487,7 @@ impl ExtentNodeStore {
                     return Frame::error_from_request(
                         &frame,
                         ErrorCode::InternalError,
-                        "invalid SealExtentNodeCommit frame",
+                        "invalid SealEpochCommit frame",
                         ExtentId(0),
                     );
                 }
@@ -498,7 +498,7 @@ impl ExtentNodeStore {
             Some(s) => s,
             None => {
                 return Frame::new(
-                    VariableHeader::SealExtentNodeCommitResp {
+                    VariableHeader::SealEpochCommitResp {
                         request_id,
                         stream_id,
                         extent_id,
@@ -522,7 +522,7 @@ impl ExtentNodeStore {
         });
 
         Frame::new(
-            VariableHeader::SealExtentNodeCommitResp {
+            VariableHeader::SealEpochCommitResp {
                 request_id,
                 stream_id,
                 extent_id,

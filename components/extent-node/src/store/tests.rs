@@ -1044,7 +1044,7 @@ async fn secondary_accepts_forwarded_append_after_seal() {
     let seal_resp = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodePrepare {
+                VariableHeader::SealEpochPrepare {
                     request_id: 20,
                     stream_id: StreamId(10),
                     epoch: Epoch(0),
@@ -1057,12 +1057,12 @@ async fn secondary_accepts_forwarded_append_after_seal() {
         )
         .await
         .unwrap();
-    assert_eq!(seal_resp.opcode(), Opcode::SealExtentNode);
+    assert_eq!(seal_resp.opcode(), Opcode::SealEpoch);
     match &seal_resp.variable_header {
-        VariableHeader::SealExtentNodeResp { end_offset, .. } => {
+        VariableHeader::SealEpochResp { end_offset, .. } => {
             assert_eq!(*end_offset, 2);
         }
-        _ => panic!("expected SealExtentNodeResp"),
+        _ => panic!("expected SealEpochResp"),
     }
 
     for i in 2u32..4 {
@@ -1135,7 +1135,7 @@ async fn handle_seal_is_idempotent() {
     let seal1 = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodePrepare {
+                VariableHeader::SealEpochPrepare {
                     request_id: 20,
                     stream_id: sid,
                     epoch: Epoch(0),
@@ -1148,18 +1148,18 @@ async fn handle_seal_is_idempotent() {
         )
         .await
         .unwrap();
-    assert_eq!(seal1.opcode(), Opcode::SealExtentNode);
+    assert_eq!(seal1.opcode(), Opcode::SealEpoch);
     match &seal1.variable_header {
-        VariableHeader::SealExtentNodeResp { end_offset, .. } => {
+        VariableHeader::SealEpochResp { end_offset, .. } => {
             assert_eq!(*end_offset, 3);
         }
-        _ => panic!("expected SealExtentNodeResp"),
+        _ => panic!("expected SealEpochResp"),
     }
 
     let seal2 = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodePrepare {
+                VariableHeader::SealEpochPrepare {
                     request_id: 21,
                     stream_id: sid,
                     epoch: Epoch(0),
@@ -1174,17 +1174,17 @@ async fn handle_seal_is_idempotent() {
         .unwrap();
     assert_eq!(
         seal2.opcode(),
-        Opcode::SealExtentNode,
-        "second seal should return SealExtentNodeResp, not Error"
+        Opcode::SealEpoch,
+        "second seal should return SealEpochResp, not Error"
     );
     match &seal2.variable_header {
-        VariableHeader::SealExtentNodeResp { end_offset, .. } => {
+        VariableHeader::SealEpochResp { end_offset, .. } => {
             assert_eq!(
                 *end_offset, 3,
                 "second seal should report same committed offset"
             );
         }
-        _ => panic!("expected SealExtentNodeResp"),
+        _ => panic!("expected SealEpochResp"),
     }
 }
 
@@ -1302,13 +1302,13 @@ async fn append_n(store: &ExtentNodeStore, sid: StreamId, n: u32) -> Offset {
     last
 }
 
-/// Seal an extent via SealExtentNodePrepare (the production RPC path).
-/// Returns the end_offset from the SealExtentNodeResp.
+/// Seal an extent via SealEpochPrepare (the production RPC path).
+/// Returns the end_offset from the SealEpochResp.
 async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, extent_id: ExtentId) -> u64 {
     let resp = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodePrepare {
+                VariableHeader::SealEpochPrepare {
                     request_id: 200,
                     stream_id: sid,
                     epoch: Epoch(0),
@@ -1321,10 +1321,10 @@ async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, extent_id: ExtentI
         )
         .await
         .unwrap();
-    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    assert_eq!(resp.opcode(), Opcode::SealEpoch);
     match &resp.variable_header {
-        VariableHeader::SealExtentNodeResp { end_offset, .. } => *end_offset,
-        other => panic!("expected SealExtentNodeResp, got {:?}", other),
+        VariableHeader::SealEpochResp { end_offset, .. } => *end_offset,
+        other => panic!("expected SealEpochResp, got {:?}", other),
     }
 }
 
@@ -1652,7 +1652,7 @@ async fn flush_extent_no_s3_configured() {
 
 #[tokio::test]
 async fn seal_commit_corrects_higher_offset() {
-    // C13: SealExtentNodeCommit with a lower end_offset than local seal
+    // C13: SealEpochCommit with a lower end_offset than local seal
     // should correct the seal point downward.
     let store = ExtentNodeStore::new();
     let sid = register_stream(&store, 1, 1).await;
@@ -1664,7 +1664,7 @@ async fn seal_commit_corrects_higher_offset() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodeCommit {
+                VariableHeader::SealEpochCommit {
                     request_id: 60,
                     stream_id: sid,
                     extent_id: ExtentId(1),
@@ -1677,8 +1677,8 @@ async fn seal_commit_corrects_higher_offset() {
             None,
         )
         .await;
-    let resp = result.expect("SealExtentNodeCommit should return a response");
-    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    let resp = result.expect("SealEpochCommit should return a response");
+    assert_eq!(resp.opcode(), Opcode::SealEpoch);
     assert!(!resp.is_error_response());
 
     // Verify extent is still sealed. The limit was corrected to 3 internally
@@ -1705,7 +1705,7 @@ async fn seal_commit_corrects_higher_offset() {
 
 #[tokio::test]
 async fn seal_commit_seals_active_extent() {
-    // C14: SealExtentNodeCommit on an Active extent should seal it.
+    // C14: SealEpochCommit on an Active extent should seal it.
     let store = ExtentNodeStore::new();
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 3).await;
@@ -1713,7 +1713,7 @@ async fn seal_commit_seals_active_extent() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodeCommit {
+                VariableHeader::SealEpochCommit {
                     request_id: 61,
                     stream_id: sid,
                     extent_id: ExtentId(1),
@@ -1726,8 +1726,8 @@ async fn seal_commit_seals_active_extent() {
             None,
         )
         .await;
-    let resp = result.expect("SealExtentNodeCommit should return a response");
-    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    let resp = result.expect("SealEpochCommit should return a response");
+    assert_eq!(resp.opcode(), Opcode::SealEpoch);
     assert!(!resp.is_error_response());
 
     // Verify extent is now sealed.
@@ -1737,7 +1737,7 @@ async fn seal_commit_seals_active_extent() {
         let sealed = stream
             .with_extent(ExtentId(1), |ext| ext.is_sealed())
             .unwrap();
-        assert!(sealed, "extent should be sealed after SealExtentNodeCommit");
+        assert!(sealed, "extent should be sealed after SealEpochCommit");
         let count = stream
             .with_extent(ExtentId(1), |ext| ext.message_count())
             .unwrap();
@@ -1747,7 +1747,7 @@ async fn seal_commit_seals_active_extent() {
 
 #[tokio::test]
 async fn seal_commit_noop_lower_offset() {
-    // C15: SealExtentNodeCommit with end_offset > local seal → no-op
+    // C15: SealEpochCommit with end_offset > local seal → no-op
     // (correct_seal_offset only corrects downward).
     let store = ExtentNodeStore::new();
     let sid = register_stream(&store, 1, 1).await;
@@ -1759,7 +1759,7 @@ async fn seal_commit_noop_lower_offset() {
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodeCommit {
+                VariableHeader::SealEpochCommit {
                     request_id: 62,
                     stream_id: sid,
                     extent_id: ExtentId(1),
@@ -1772,8 +1772,8 @@ async fn seal_commit_noop_lower_offset() {
             None,
         )
         .await;
-    let resp = result.expect("SealExtentNodeCommit should return a response");
-    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    let resp = result.expect("SealEpochCommit should return a response");
+    assert_eq!(resp.opcode(), Opcode::SealEpoch);
     assert!(!resp.is_error_response());
 
     // Verify limit stays at 3 (not 5).
@@ -1792,13 +1792,13 @@ async fn seal_commit_noop_lower_offset() {
 
 #[tokio::test]
 async fn seal_commit_unknown_stream() {
-    // C16: SealExtentNodeCommit for a non-existent stream → no panic.
+    // C16: SealEpochCommit for a non-existent stream → no panic.
     let store = ExtentNodeStore::new();
 
     let result = store
         .handle_frame(
             Frame::new(
-                VariableHeader::SealExtentNodeCommit {
+                VariableHeader::SealEpochCommit {
                     request_id: 63,
                     stream_id: StreamId(999),
                     extent_id: ExtentId(1),
@@ -1811,8 +1811,8 @@ async fn seal_commit_unknown_stream() {
             None,
         )
         .await;
-    let resp = result.expect("SealExtentNodeCommit should return a response");
-    assert_eq!(resp.opcode(), Opcode::SealExtentNode);
+    let resp = result.expect("SealEpochCommit should return a response");
+    assert_eq!(resp.opcode(), Opcode::SealEpoch);
     assert!(
         !resp.is_error_response(),
         "should return success for unknown stream"

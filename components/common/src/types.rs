@@ -45,7 +45,7 @@ pub const FLAG_RESPONSE_ERROR: u8 = 0x80;
 pub const FLAG_SEAL_COMMIT: u8 = 0x02;
 
 /// Flag on SEAL_EXTENT_NODE: phase 2 commit acknowledgement.
-/// Sent by EN back to SM after processing SealExtentNodeCommit.
+/// Sent by EN back to SM after processing SealEpochCommit.
 pub const FLAG_SEAL_COMMIT_RESP: u8 = 0x03;
 
 /// Unique identifier for a stream.
@@ -122,7 +122,7 @@ pub enum Opcode {
     SealStream = 0x06,
     /// Epoch-based seal: StreamManager ↔ ExtentNode.
     /// Flags: 0x00=request, 0x01=response, 0x80=error.
-    SealExtentNode = 0x07,
+    SealEpoch = 0x07,
     /// Query max offset. Flags: 0x00=request, 0x01=response, 0x80=error.
     QueryOffset = 0x08,
     /// Read messages. Flags: 0x00=request, 0x01=response, 0x80=error.
@@ -168,7 +168,7 @@ impl Opcode {
             0x03 => Some(Opcode::Append),
             0x05 => Some(Opcode::Forward),
             0x06 => Some(Opcode::SealStream),
-            0x07 => Some(Opcode::SealExtentNode),
+            0x07 => Some(Opcode::SealEpoch),
             0x08 => Some(Opcode::QueryOffset),
             0x0A => Some(Opcode::Read),
             // Lifecycle

@@ -261,8 +261,8 @@ impl RequestHandler for ExtentNodeStore {
             }
             Opcode::Read => Some(self.handle_read(frame)),
             Opcode::QueryOffset => Some(self.handle_query_offset(frame)),
-            Opcode::SealExtentNode => match &frame.variable_header {
-                VariableHeader::SealExtentNodeCommit { .. } => Some(self.handle_seal_commit(frame)),
+            Opcode::SealEpoch => match &frame.variable_header {
+                VariableHeader::SealEpochCommit { .. } => Some(self.handle_seal_commit(frame)),
                 _ => Some(self.handle_seal(frame)),
             },
             Opcode::RegisterExtent => Some(self.handle_register_extent(frame)),

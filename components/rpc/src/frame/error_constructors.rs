@@ -60,14 +60,14 @@ impl Frame {
         )
     }
 
-    pub fn seal_extent_node_resp_error(
+    pub fn seal_epoch_resp_error(
         request_id: u32,
         stream_id: StreamId,
         error_code: ErrorCode,
         message: &str,
     ) -> Frame {
         Frame::new(
-            VariableHeader::SealExtentNodeRespError {
+            VariableHeader::SealEpochRespError {
                 request_id,
                 stream_id,
                 error_code,
@@ -289,11 +289,11 @@ impl Frame {
                 stream_id,
                 ..
             } => Self::seal_stream_manager_resp_error(*request_id, *stream_id, error_code, message),
-            VariableHeader::SealExtentNodePrepare {
+            VariableHeader::SealEpochPrepare {
                 request_id,
                 stream_id,
                 ..
-            } => Self::seal_extent_node_resp_error(*request_id, *stream_id, error_code, message),
+            } => Self::seal_epoch_resp_error(*request_id, *stream_id, error_code, message),
             VariableHeader::CreateStream { request_id, .. } => {
                 Self::create_stream_resp_error(*request_id, error_code, message)
             }

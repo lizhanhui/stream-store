@@ -79,14 +79,14 @@ pub enum VariableHeader {
         stream_id: StreamId,
         error_code: ErrorCode,
     },
-    SealExtentNodePrepare {
+    SealEpochPrepare {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
         extent_id_from: ExtentId,
         start_offset: u64,
     },
-    SealExtentNodeResp {
+    SealEpochResp {
         request_id: u32,
         stream_id: StreamId,
         epoch: Epoch,
@@ -94,15 +94,15 @@ pub enum VariableHeader {
         start_offset: u64,
         end_offset: u64,
     },
-    SealExtentNodeRespError {
+    SealEpochRespError {
         request_id: u32,
         stream_id: StreamId,
         error_code: ErrorCode,
     },
-    /// Phase 2 seal commit (SealExtentNode, flag=0x02).
+    /// Phase 2 seal commit (SealEpoch, flag=0x02).
     /// SM broadcasts the authoritative committed offset so replicas commit
     /// their local seal point. Request-response with request_id.
-    SealExtentNodeCommit {
+    SealEpochCommit {
         request_id: u32,
         stream_id: StreamId,
         extent_id: ExtentId,
@@ -110,8 +110,8 @@ pub enum VariableHeader {
         start_offset: u64,
         end_offset: u64,
     },
-    /// Successful SealExtentNodeCommit response (flag=0x03).
-    SealExtentNodeCommitResp {
+    /// Successful SealEpochCommit response (flag=0x03).
+    SealEpochCommitResp {
         request_id: u32,
         stream_id: StreamId,
         extent_id: ExtentId,
@@ -373,11 +373,11 @@ impl VariableHeader {
             VariableHeader::SealStreamManagerRequest { .. }
             | VariableHeader::SealStreamManagerResp { .. }
             | VariableHeader::SealStreamManagerRespError { .. } => Opcode::SealStream,
-            VariableHeader::SealExtentNodePrepare { .. }
-            | VariableHeader::SealExtentNodeResp { .. }
-            | VariableHeader::SealExtentNodeRespError { .. }
-            | VariableHeader::SealExtentNodeCommit { .. }
-            | VariableHeader::SealExtentNodeCommitResp { .. } => Opcode::SealExtentNode,
+            VariableHeader::SealEpochPrepare { .. }
+            | VariableHeader::SealEpochResp { .. }
+            | VariableHeader::SealEpochRespError { .. }
+            | VariableHeader::SealEpochCommit { .. }
+            | VariableHeader::SealEpochCommitResp { .. } => Opcode::SealEpoch,
             VariableHeader::CreateStream { .. }
             | VariableHeader::CreateStreamResp { .. }
             | VariableHeader::CreateStreamRespError { .. } => Opcode::CreateStream,

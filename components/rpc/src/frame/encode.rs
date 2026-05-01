@@ -39,15 +39,15 @@ impl Frame {
             // request_id(4) + stream_id(4) + error_code(2)
             VariableHeader::SealStreamManagerRespError { .. } => 4 + 4 + 2,
             // request_id(4) + stream_id(4) + epoch(4) + extent_id_from(4) + start_offset(8)
-            VariableHeader::SealExtentNodePrepare { .. } => 4 + 4 + 4 + 4 + 8,
+            VariableHeader::SealEpochPrepare { .. } => 4 + 4 + 4 + 4 + 8,
             // request_id(4) + stream_id(4) + epoch(4) + extent_id(4) + start_offset(8) + end_offset(8)
-            VariableHeader::SealExtentNodeResp { .. } => 4 + 4 + 4 + 4 + 8 + 8,
+            VariableHeader::SealEpochResp { .. } => 4 + 4 + 4 + 4 + 8 + 8,
             // request_id(4) + stream_id(4) + error_code(2)
-            VariableHeader::SealExtentNodeRespError { .. } => 4 + 4 + 2,
+            VariableHeader::SealEpochRespError { .. } => 4 + 4 + 2,
             // stream_id(4) + extent_id(4) + epoch(4) + start_offset(8) + end_offset(8)
-            VariableHeader::SealExtentNodeCommit { .. } => 4 + 4 + 4 + 4 + 8 + 8,
+            VariableHeader::SealEpochCommit { .. } => 4 + 4 + 4 + 4 + 8 + 8,
             // request_id(4) + stream_id(4) + extent_id(4)
-            VariableHeader::SealExtentNodeCommitResp { .. } => 4 + 4 + 4,
+            VariableHeader::SealEpochCommitResp { .. } => 4 + 4 + 4,
             // request_id(4) + name_len(2) + name(N) + replication_factor(1) + cache_extents(2) + storage_class(1)
             VariableHeader::CreateStream { stream_name, .. } => {
                 4 + 2 + stream_name.len() + 1 + 2 + 1
@@ -154,8 +154,8 @@ impl Frame {
                 | VariableHeader::SeekRespError { .. }
                 | VariableHeader::AppendAckError { .. }
                 | VariableHeader::SealStreamManagerRespError { .. }
-                | VariableHeader::SealExtentNodeResp { .. }
-                | VariableHeader::SealExtentNodeRespError { .. }
+                | VariableHeader::SealEpochResp { .. }
+                | VariableHeader::SealEpochRespError { .. }
                 | VariableHeader::CreateStreamRespError { .. }
                 | VariableHeader::QueryOffsetRespError { .. }
                 | VariableHeader::ConnectAckError { .. }
@@ -294,7 +294,7 @@ impl Frame {
                 dst.put_u32(stream_id.0);
                 dst.put_u16(*error_code as u16);
             }
-            VariableHeader::SealExtentNodePrepare {
+            VariableHeader::SealEpochPrepare {
                 request_id,
                 stream_id,
                 epoch,
@@ -307,7 +307,7 @@ impl Frame {
                 dst.put_u32(extent_id_from.0);
                 dst.put_u64(*start_offset);
             }
-            VariableHeader::SealExtentNodeResp {
+            VariableHeader::SealEpochResp {
                 request_id,
                 stream_id,
                 epoch,
@@ -322,7 +322,7 @@ impl Frame {
                 dst.put_u64(*start_offset);
                 dst.put_u64(*end_offset);
             }
-            VariableHeader::SealExtentNodeRespError {
+            VariableHeader::SealEpochRespError {
                 request_id,
                 stream_id,
                 error_code,
@@ -331,7 +331,7 @@ impl Frame {
                 dst.put_u32(stream_id.0);
                 dst.put_u16(*error_code as u16);
             }
-            VariableHeader::SealExtentNodeCommit {
+            VariableHeader::SealEpochCommit {
                 request_id,
                 stream_id,
                 extent_id,
@@ -346,7 +346,7 @@ impl Frame {
                 dst.put_u64(*start_offset);
                 dst.put_u64(*end_offset);
             }
-            VariableHeader::SealExtentNodeCommitResp {
+            VariableHeader::SealEpochCommitResp {
                 request_id,
                 stream_id,
                 extent_id,

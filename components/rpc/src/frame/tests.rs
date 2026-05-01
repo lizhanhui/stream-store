@@ -300,9 +300,9 @@ fn seal_stream_manager_resp_error_round_trip() {
 }
 
 #[test]
-fn seal_extent_node_request_round_trip() {
+fn seal_epoch_request_round_trip() {
     let frame = Frame::new(
-        VariableHeader::SealExtentNodePrepare {
+        VariableHeader::SealEpochPrepare {
             request_id: 4,
             stream_id: StreamId(20),
             epoch: Epoch(3),
@@ -318,7 +318,7 @@ fn seal_extent_node_request_round_trip() {
     assert_eq!(buf.len(), 32);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
+    assert_eq!(decoded.opcode(), Opcode::SealEpoch);
     assert_eq!(decoded.flags(), 0);
     assert_eq!(decoded.request_id(), 4);
     assert_eq!(decoded.stream_id(), StreamId(20));
@@ -326,7 +326,7 @@ fn seal_extent_node_request_round_trip() {
     assert_eq!(decoded.extent_id(), ExtentId(7));
     assert!(!decoded.is_error_response());
     match &decoded.variable_header {
-        VariableHeader::SealExtentNodePrepare {
+        VariableHeader::SealEpochPrepare {
             extent_id_from,
             start_offset,
             ..
@@ -334,15 +334,15 @@ fn seal_extent_node_request_round_trip() {
             assert_eq!(*extent_id_from, ExtentId(7));
             assert_eq!(*start_offset, 100);
         }
-        _ => panic!("expected SealExtentNodePrepare"),
+        _ => panic!("expected SealEpochPrepare"),
     }
     assert!(buf.is_empty());
 }
 
 #[test]
-fn seal_extent_node_resp_round_trip() {
+fn seal_epoch_resp_round_trip() {
     let frame = Frame::new(
-        VariableHeader::SealExtentNodeResp {
+        VariableHeader::SealEpochResp {
             request_id: 5,
             stream_id: StreamId(20),
             epoch: Epoch(4),
@@ -359,7 +359,7 @@ fn seal_extent_node_resp_round_trip() {
     assert_eq!(buf.len(), 54);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
+    assert_eq!(decoded.opcode(), Opcode::SealEpoch);
     assert_eq!(decoded.flags(), FLAG_RESPONSE);
     assert_eq!(decoded.request_id(), 5);
     assert_eq!(decoded.stream_id(), StreamId(20));
@@ -367,7 +367,7 @@ fn seal_extent_node_resp_round_trip() {
     assert_eq!(decoded.extent_id(), ExtentId(8));
     assert!(!decoded.is_error_response());
     match &decoded.variable_header {
-        VariableHeader::SealExtentNodeResp {
+        VariableHeader::SealEpochResp {
             start_offset,
             end_offset,
             ..
@@ -375,22 +375,22 @@ fn seal_extent_node_resp_round_trip() {
             assert_eq!(*start_offset, 100);
             assert_eq!(*end_offset, 500);
         }
-        _ => panic!("expected SealExtentNodeResp"),
+        _ => panic!("expected SealEpochResp"),
     }
     assert_eq!(decoded.payload, Some(Bytes::from_static(b"extra-data")));
     assert!(buf.is_empty());
 }
 
 #[test]
-fn seal_extent_node_resp_error_round_trip() {
+fn seal_epoch_resp_error_round_trip() {
     let frame =
-        Frame::seal_extent_node_resp_error(6, StreamId(20), ErrorCode::ExtentSealed, "node error");
+        Frame::seal_epoch_resp_error(6, StreamId(20), ErrorCode::ExtentSealed, "node error");
 
     let mut buf = BytesMut::new();
     frame.encode(&mut buf);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
+    assert_eq!(decoded.opcode(), Opcode::SealEpoch);
     assert!(decoded.is_error_response());
     assert_eq!(decoded.request_id(), 6);
     assert_eq!(decoded.stream_id(), StreamId(20));
@@ -563,9 +563,9 @@ fn describe_stream_by_name_round_trip() {
 }
 
 #[test]
-fn seal_extent_node_commit_round_trip() {
+fn seal_epoch_commit_round_trip() {
     let frame = Frame::new(
-        VariableHeader::SealExtentNodeCommit {
+        VariableHeader::SealEpochCommit {
             request_id: 77,
             stream_id: StreamId(7),
             extent_id: ExtentId(3),
@@ -580,11 +580,11 @@ fn seal_extent_node_commit_round_trip() {
     frame.encode(&mut buf);
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
-    assert_eq!(decoded.opcode(), Opcode::SealExtentNode);
+    assert_eq!(decoded.opcode(), Opcode::SealEpoch);
     assert_eq!(decoded.flags(), FLAG_SEAL_COMMIT);
     assert_eq!(decoded.request_id(), 77);
     match &decoded.variable_header {
-        VariableHeader::SealExtentNodeCommit {
+        VariableHeader::SealEpochCommit {
             request_id,
             stream_id,
             extent_id,
@@ -599,7 +599,7 @@ fn seal_extent_node_commit_round_trip() {
             assert_eq!(*start_offset, 100);
             assert_eq!(*end_offset, 500);
         }
-        _ => panic!("expected SealExtentNodeCommit"),
+        _ => panic!("expected SealEpochCommit"),
     }
     assert!(decoded.payload.is_none());
     assert!(buf.is_empty());

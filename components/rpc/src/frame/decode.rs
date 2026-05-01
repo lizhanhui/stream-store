@@ -228,8 +228,8 @@ impl Frame {
                     ))
                 }
             }
-            // ── SealExtentNode: prepare (0x00), response (0x01), error (0x80), commit (0x02), commit_resp (0x03) ──
-            Opcode::SealExtentNode => {
+            // ── SealEpoch: prepare (0x00), response (0x01), error (0x80), commit (0x02), commit_resp (0x03) ──
+            Opcode::SealEpoch => {
                 // Commit (phase 2) and commit_resp have a different wire layout.
                 // Check for them first before consuming shared fields.
                 if flags == FLAG_SEAL_COMMIT_RESP {
@@ -237,7 +237,7 @@ impl Frame {
                     let stream_id = StreamId(body.get_u32());
                     let extent_id = ExtentId(body.get_u32());
                     return Ok((
-                        VariableHeader::SealExtentNodeCommitResp {
+                        VariableHeader::SealEpochCommitResp {
                             request_id,
                             stream_id,
                             extent_id,
@@ -253,7 +253,7 @@ impl Frame {
                     let start_offset = body.get_u64();
                     let end_offset = body.get_u64();
                     return Ok((
-                        VariableHeader::SealExtentNodeCommit {
+                        VariableHeader::SealEpochCommit {
                             request_id,
                             stream_id,
                             extent_id,
@@ -270,13 +270,13 @@ impl Frame {
                 if flags & FLAG_RESPONSE_ERROR != 0 {
                     let error_code = ErrorCode::from_u16(body.get_u16()).ok_or_else(|| {
                         InvalidFrameSnafu {
-                            message: "unknown SealExtentNode error code",
+                            message: "unknown SealEpoch error code",
                         }
                         .build()
                     })?;
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::SealExtentNodeRespError {
+                        VariableHeader::SealEpochRespError {
                             request_id,
                             stream_id,
                             error_code,
@@ -290,7 +290,7 @@ impl Frame {
                     let end_offset = body.get_u64();
                     let payload = Self::read_payload(body);
                     Ok((
-                        VariableHeader::SealExtentNodeResp {
+                        VariableHeader::SealEpochResp {
                             request_id,
                             stream_id,
                             epoch,
@@ -311,7 +311,7 @@ impl Frame {
                     let extent_id_from = ExtentId(body.get_u32());
                     let start_offset = body.get_u64();
                     Ok((
-                        VariableHeader::SealExtentNodePrepare {
+                        VariableHeader::SealEpochPrepare {
                             request_id,
                             stream_id,
                             epoch,

@@ -21,9 +21,9 @@ use tracing::{error, info, warn};
 
 /// Seal an ExtentNode's extent and return the sealed extent info.
 ///
-/// Sends SealExtentNodePrepare to the EN and parses SealExtentNodeResp.
+/// Sends SealEpochPrepare to the EN and parses SealEpochResp.
 /// Returns (sealed_extent_id, start_offset, end_offset, optional payload with predecessor extents).
-async fn seal_extent_node_static(
+async fn seal_epoch_static(
     addr: &str,
     stream_id: StreamId,
     epoch: Epoch,
@@ -39,7 +39,7 @@ async fn seal_extent_node_static(
 
     let resp = client
         .send_frame(Frame::new(
-            VariableHeader::SealExtentNodePrepare {
+            VariableHeader::SealEpochPrepare {
                 request_id: 0,
                 stream_id,
                 epoch,
@@ -64,9 +64,9 @@ async fn seal_extent_node_static(
         .build());
     }
 
-    // Parse SealExtentNodeResp.
+    // Parse SealEpochResp.
     match &resp.variable_header {
-        VariableHeader::SealExtentNodeResp {
+        VariableHeader::SealEpochResp {
             extent_id,
             start_offset: so,
             end_offset,
@@ -85,7 +85,7 @@ async fn seal_extent_node_static(
 /// Query an ExtentNode for all extents it holds for a stream (used during recovery/reconciliation).
 ///
 /// Sends a ReportExtents RPC and parses the ReportExtentsResp payload.
-/// Parse the predecessor extent payload from SealExtentNodeResp.
+/// Parse the predecessor extent payload from SealEpochResp.
 /// Same format as ReportExtentsResp: [num:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
 fn parse_seal_predecessor_payload(
     payload: &Bytes,
@@ -571,7 +571,7 @@ impl RequestHandler for StreamManagerStore {
                     Opcode::RegisterExtent
                     | Opcode::Watermark
                     | Opcode::UpdateExtent
-                    | Opcode::SealExtentNode
+                    | Opcode::SealEpoch
                     | Opcode::StreamManagerMembershipChange => {
                         warn!(opcode = ?frame.opcode(), "SM received unexpected response/fire-and-forget opcode");
                         return None;
@@ -828,8 +828,8 @@ impl StreamManagerStore {
 
     /// Seal an extent and allocate a new one.
     ///
-    /// The new seal protocol sends SealExtentNodePrepare to ENs, which seal the
-    /// last mutable extent and return SealExtentNodeResp with extent info.
+    /// The new seal protocol sends SealEpochPrepare to ENs, which seal the
+    /// last mutable extent and return SealEpochResp with extent info.
     ///
     /// **Phase 1 — Seal primary, obtain committed offset.**
     /// - EN-initiated (extent-full): Primary already sealed locally and provides
@@ -908,7 +908,7 @@ impl StreamManagerStore {
                 match client::StreamClient::connect(&addr).await {
                     Ok(c) => {
                         let frame = rpc::frame::Frame::new(
-                            rpc::frame::VariableHeader::SealExtentNodeCommit {
+                            rpc::frame::VariableHeader::SealEpochCommit {
                                 request_id: 0,
                                 stream_id: sid,
                                 extent_id: eid,
@@ -1028,7 +1028,7 @@ impl StreamManagerStore {
             let so = start_offset;
             match tokio::time::timeout(
                 Duration::from_millis(100),
-                seal_extent_node_static(&addr, sid, ep, eid, so),
+                seal_epoch_static(&addr, sid, ep, eid, so),
             )
             .await
             {
@@ -1069,7 +1069,7 @@ impl StreamManagerStore {
             let eid = extent_id;
             let so = start_offset;
             seal_futures.push(async move {
-                let result = seal_extent_node_static(&addr, sid, ep, eid, so).await;
+                let result = seal_epoch_static(&addr, sid, ep, eid, so).await;
                 (addr, role, result)
             });
         }
@@ -1095,7 +1095,7 @@ impl StreamManagerStore {
                         );
                         secondary_offsets.push(*end_offset);
                     }
-                    // Reconcile predecessor extents from the SealExtentNodeResp payload.
+                    // Reconcile predecessor extents from the SealEpochResp payload.
                     if let Some(payload) = payload
                         && let Some(extents) = parse_seal_predecessor_payload(payload)
                         && !extents.is_empty()
@@ -1437,8 +1437,8 @@ impl StreamManagerStore {
     ///
     /// Flow:
     /// 1. Look up the Primary EN for the active extent at this epoch.
-    /// 2. Forward SealExtentNodePrepare to the Primary — it knows the ground truth.
-    /// 3. Primary seals its active extent and responds with SealExtentNodeResp.
+    /// 2. Forward SealEpochPrepare to the Primary — it knows the ground truth.
+    /// 3. Primary seals its active extent and responds with SealEpochResp.
     /// 4. SM reconciles metadata, bumps epoch, allocates new extent on new replica set.
     /// 5. SM responds to client with SealStreamManagerResp (new epoch/extent info).
     async fn handle_epoch_seal(&self, request_id: u32, stream_id: StreamId, epoch: Epoch) -> Frame {
@@ -1541,7 +1541,7 @@ impl StreamManagerStore {
         }
 
         // Forward seal to the Primary EN.
-        let end_offset = match seal_extent_node_static(
+        let end_offset = match seal_epoch_static(
             &primary_addr,
             stream_id,
             active.epoch,
@@ -1551,7 +1551,7 @@ impl StreamManagerStore {
         .await
         {
             Ok((_sealed_eid, _start, end, payload)) => {
-                // Reconcile predecessor extents from the primary's SealExtentNodeResp.
+                // Reconcile predecessor extents from the primary's SealEpochResp.
                 if let Some(ref payload) = payload
                     && let Some(extents) = parse_seal_predecessor_payload(payload)
                     && !extents.is_empty()
@@ -1570,8 +1570,8 @@ impl StreamManagerStore {
             }
             Err(e) => {
                 // Primary unreachable — fall back to quorum seal.
-                // resolve_committed_offset sends SealExtentNode to all replicas;
-                // their SealExtentNodeResp payloads carry predecessor extents which
+                // resolve_committed_offset sends SealEpoch to all replicas;
+                // their SealEpochResp payloads carry predecessor extents which
                 // are reconciled inline — no separate report_extents needed.
                 warn!(
                     "Epoch seal: primary unreachable at {primary_addr}, falling back to quorum seal: {e}"
@@ -1642,10 +1642,10 @@ impl StreamManagerStore {
             }
         };
 
-        // Reconciliation already happened from the SealExtentNodeResp payload above.
+        // Reconciliation already happened from the SealEpochResp payload above.
         // Re-read the active extent — it may have advanced after reconciliation.
         // If no active extent remains (primary already sealed the last one),
-        // use the sealed extent from the SealExtentNodeResp.
+        // use the sealed extent from the SealEpochResp.
         let sealed_extent_id = match self.store.get_active_extent(stream_id).await {
             Ok(Some(ext)) => ext.extent_id,
             Ok(None) => {
