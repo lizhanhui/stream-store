@@ -14,6 +14,10 @@ use tokio::sync::mpsc;
 
 use crate::ack_queue::{AckQueue, DEFAULT_REPLICATION_TIMEOUT, PendingAck};
 
+fn test_store() -> ExtentNodeStore {
+    ExtentNodeStore::new()
+}
+
 /// Build a default `StreamConfig` for tests.
 fn test_config(stream_id: u32, replication_factor: u8) -> StreamConfig {
     StreamConfig {
@@ -56,7 +60,7 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
 
 #[tokio::test]
 async fn create_and_append() {
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
 
     let resp = store
@@ -80,7 +84,7 @@ async fn create_and_append() {
 
 #[tokio::test]
 async fn append_to_unknown_stream() {
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let resp = store
         .handle_frame(
             Frame::new(
@@ -101,7 +105,7 @@ async fn append_to_unknown_stream() {
 
 #[tokio::test]
 async fn append_to_sealed_stream_reports_extent_id() {
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
 
     {
@@ -133,7 +137,7 @@ async fn append_to_sealed_stream_reports_extent_id() {
 
 #[tokio::test]
 async fn append_read_query_offset() {
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
 
     for i in 0u32..3 {
@@ -235,7 +239,7 @@ async fn append_read_query_offset() {
 async fn register_extent_creates_stream() {
     use rpc::payload::build_register_extent_payload;
 
-    let store = ExtentNodeStore::new();
+    let store = test_store();
 
     // RegisterEpoch as Primary with 1 secondary (RF=2).
     let payload = build_register_extent_payload(&["127.0.0.1:9802"]);
@@ -283,7 +287,7 @@ async fn register_extent_creates_stream() {
 async fn register_extent_secondary() {
     use rpc::payload::build_register_extent_payload;
 
-    let store = ExtentNodeStore::new();
+    let store = test_store();
 
     // RegisterEpoch as Secondary (RF=2, no replica addrs).
     let payload = build_register_extent_payload(&[]);
@@ -323,7 +327,7 @@ async fn register_extent_secondary() {
 async fn register_extent_then_append_rf1() {
     use rpc::payload::build_register_extent_payload;
 
-    let store = ExtentNodeStore::new();
+    let store = test_store();
 
     // Register as Primary, RF=1 (standalone).
     let payload = build_register_extent_payload(&[]);
@@ -378,7 +382,7 @@ async fn primary_append_defers_and_broadcasts() {
     let listener2 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr2 = listener2.local_addr().unwrap().to_string();
 
-    let store = Arc::new(ExtentNodeStore::new());
+    let store = Arc::new(test_store());
     let pool = Arc::new(crate::downstream::DownstreamPool::new(Arc::clone(&store)));
     store.set_downstream(Arc::clone(&pool));
 
@@ -467,7 +471,7 @@ async fn primary_append_defers_and_broadcasts() {
 async fn secondary_returns_watermark() {
     use rpc::payload::build_register_extent_payload;
 
-    let store = ExtentNodeStore::new();
+    let store = test_store();
 
     // Register as Secondary (RF=2).
     let payload = build_register_extent_payload(&[]);
@@ -621,7 +625,7 @@ async fn concurrent_multi_stream_appends() {
     const APPENDS_PER_STREAM: u64 = 5_000;
     const PAYLOAD_SIZE: usize = 128;
 
-    let store = Arc::new(ExtentNodeStore::new());
+    let store = Arc::new(test_store());
 
     let mut stream_ids = Vec::new();
     for i in 0..NUM_STREAMS {
@@ -782,7 +786,7 @@ async fn concurrent_readers_and_writers_different_streams() {
     const APPENDS_PER_STREAM: u64 = 2_000;
     const READS_PER_STREAM: u64 = 2_000;
 
-    let store = Arc::new(ExtentNodeStore::new());
+    let store = Arc::new(test_store());
 
     let mut writer_sids = Vec::new();
     for i in 0..NUM_WRITER_STREAMS {
@@ -912,7 +916,7 @@ async fn concurrent_appends_same_stream() {
     const NUM_TASKS: u64 = 8;
     const APPENDS_PER_TASK: u64 = 2_000;
 
-    let store = Arc::new(ExtentNodeStore::new());
+    let store = Arc::new(test_store());
     let sid = register_stream(&store, 1, 1).await;
 
     let start = Instant::now();
@@ -1002,7 +1006,7 @@ async fn concurrent_appends_same_stream() {
 async fn secondary_accepts_forwarded_append_after_seal() {
     use rpc::payload::build_register_extent_payload;
 
-    let store = ExtentNodeStore::new();
+    let store = test_store();
 
     let payload = build_register_extent_payload(&[]);
     store
@@ -1107,7 +1111,7 @@ async fn secondary_accepts_forwarded_append_after_seal() {
 
 #[tokio::test]
 async fn handle_seal_is_idempotent() {
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
 
     for i in 0u32..3 {
@@ -1186,7 +1190,7 @@ async fn handle_seal_is_idempotent() {
 
 #[tokio::test]
 async fn append_with_stale_epoch_returns_epoch_stale() {
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
 
     {
@@ -1216,7 +1220,7 @@ async fn append_with_stale_epoch_returns_epoch_stale() {
 
 #[tokio::test]
 async fn append_with_epoch_zero_bypasses_epoch_check() {
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
 
     {
@@ -1245,7 +1249,7 @@ async fn append_with_epoch_zero_bypasses_epoch_check() {
 
 #[tokio::test]
 async fn append_with_matching_epoch_succeeds() {
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
 
     {
@@ -1330,7 +1334,7 @@ async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, extent_id: ExtentI
 async fn flush_extent_seals_active_extent() {
     // B6: FlushExtent on an Active extent should seal it and enqueue a FlushRequest.
     let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
-    let mut store = ExtentNodeStore::new();
+    let mut store = test_store();
     store.set_flush_tx(flush_tx);
 
     let sid = register_stream(&store, 1, 1).await;
@@ -1379,7 +1383,7 @@ async fn flush_extent_corrects_sealed_extent() {
     // B7: FlushExtent on a Sealed extent with a lower end_offset (SM quorum < local)
     // should correct the seal offset downward and enqueue a FlushRequest.
     let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
-    let mut store = ExtentNodeStore::new();
+    let mut store = test_store();
     store.set_flush_tx(flush_tx);
 
     let sid = register_stream(&store, 1, 1).await;
@@ -1445,7 +1449,7 @@ async fn flush_extent_corrects_sealed_extent() {
 async fn flush_extent_skips_flushed() {
     // B8: FlushExtent on an already-flushed extent → no FlushRequest.
     let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
-    let mut store = ExtentNodeStore::new();
+    let mut store = test_store();
     store.set_flush_tx(flush_tx);
 
     let sid = register_stream(&store, 1, 1).await;
@@ -1500,7 +1504,7 @@ async fn flush_extent_skips_flushed() {
 async fn flush_extent_skips_missing_extent() {
     // B9: FlushExtent for a non-existent extent → no FlushRequest, no panic.
     let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
-    let mut store = ExtentNodeStore::new();
+    let mut store = test_store();
     store.set_flush_tx(flush_tx);
 
     let _sid = register_stream(&store, 1, 1).await;
@@ -1534,7 +1538,7 @@ async fn flush_extent_skips_missing_extent() {
 async fn flush_extent_skips_missing_stream() {
     // B10: FlushExtent for a non-existent stream → no FlushRequest, no panic.
     let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
-    let mut store = ExtentNodeStore::new();
+    let mut store = test_store();
     store.set_flush_tx(flush_tx);
 
     let result = store
@@ -1566,7 +1570,7 @@ async fn flush_extent_skips_missing_stream() {
 async fn flush_extent_dedup() {
     // B11: Duplicate FlushExtent for the same (stream, extent) should be deduplicated.
     let (flush_tx, mut flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
-    let mut store = ExtentNodeStore::new();
+    let mut store = test_store();
     store.set_flush_tx(flush_tx);
 
     let sid = register_stream(&store, 1, 1).await;
@@ -1617,7 +1621,7 @@ async fn flush_extent_dedup() {
 #[tokio::test]
 async fn flush_extent_no_s3_configured() {
     // B12: FlushExtent on a store without flush_tx (S3 not configured) → no panic.
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 2).await;
     seal_via_rpc(&store, sid, ExtentId(1)).await;
@@ -1650,7 +1654,7 @@ async fn flush_extent_no_s3_configured() {
 async fn seal_commit_corrects_higher_offset() {
     // C13: SealEpochCommit with a lower end_offset than local seal
     // should correct the seal point downward.
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 5).await;
     let end = seal_via_rpc(&store, sid, ExtentId(1)).await;
@@ -1702,7 +1706,7 @@ async fn seal_commit_corrects_higher_offset() {
 #[tokio::test]
 async fn seal_commit_seals_active_extent() {
     // C14: SealEpochCommit on an Active extent should seal it.
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 3).await;
 
@@ -1745,7 +1749,7 @@ async fn seal_commit_seals_active_extent() {
 async fn seal_commit_noop_lower_offset() {
     // C15: SealEpochCommit with end_offset > local seal → no-op
     // (correct_seal_offset only corrects downward).
-    let store = ExtentNodeStore::new();
+    let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 3).await;
     let end = seal_via_rpc(&store, sid, ExtentId(1)).await;
@@ -1789,7 +1793,7 @@ async fn seal_commit_noop_lower_offset() {
 #[tokio::test]
 async fn seal_commit_unknown_stream() {
     // C16: SealEpochCommit for a non-existent stream → no panic.
-    let store = ExtentNodeStore::new();
+    let store = test_store();
 
     let result = store
         .handle_frame(

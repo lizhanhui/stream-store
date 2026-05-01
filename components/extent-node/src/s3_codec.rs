@@ -513,6 +513,7 @@ mod tests {
             Offset(0),
             1024 * 1024, // 1 MiB
             Epoch(0),
+            crate::arena::ArenaId(0),
         );
         for payload in payloads {
             extent
@@ -526,7 +527,7 @@ mod tests {
     /// Helper: create a sealed extent with start_offset.
     fn sealed_extent_at(start_offset: u64, payloads: &[&[u8]]) -> StreamEpoch {
         let extent =
-            StreamEpoch::with_capacity(ExtentId(1), Offset(start_offset), 1024 * 1024, Epoch(0));
+            StreamEpoch::with_capacity(ExtentId(1), Offset(start_offset), 1024 * 1024, Epoch(0), crate::arena::ArenaId(0));
         for payload in payloads {
             extent
                 .append(Bytes::copy_from_slice(payload))

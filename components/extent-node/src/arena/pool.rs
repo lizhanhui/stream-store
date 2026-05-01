@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use common::types::{Epoch, ExtentId, Offset, StreamId};
 
+use crate::arena::ArenaIdGenerator;
 use crate::stream_epoch::StreamEpoch;
 
 /// Allocates StreamEpoch instances for a given (stream_id, epoch).
@@ -34,11 +35,12 @@ pub(crate) trait ArenaPool: Send + Sync {
 /// One pool per Stream. Today's fast path: a fresh arena per epoch.
 pub(crate) struct DedicatedArenaPool {
     arena_size: u32,
+    ids: Arc<ArenaIdGenerator>,
 }
 
 impl DedicatedArenaPool {
-    pub(crate) fn new(arena_size: u32) -> Self {
-        Self { arena_size }
+    pub(crate) fn new(arena_size: u32, ids: Arc<ArenaIdGenerator>) -> Self {
+        Self { arena_size, ids }
     }
 }
 
@@ -50,11 +52,13 @@ impl ArenaPool for DedicatedArenaPool {
         start_offset: Offset,
         epoch:        Epoch,
     ) -> Arc<StreamEpoch> {
+        let arena_id = self.ids.next();
         Arc::new(StreamEpoch::with_capacity(
             extent_id,
             start_offset,
             self.arena_size,
             epoch,
+            arena_id,
         ))
     }
 }
@@ -64,12 +68,13 @@ impl ArenaPool for DedicatedArenaPool {
 #[allow(dead_code)]
 pub(crate) struct SharedArenaPool {
     _arena_size: u32,
+    _ids: Arc<ArenaIdGenerator>,
 }
 
 impl SharedArenaPool {
     #[allow(dead_code)]
-    pub(crate) fn new(arena_size: u32) -> Self {
-        Self { _arena_size: arena_size }
+    pub(crate) fn new(arena_size: u32, ids: Arc<ArenaIdGenerator>) -> Self {
+        Self { _arena_size: arena_size, _ids: ids }
     }
 }
 

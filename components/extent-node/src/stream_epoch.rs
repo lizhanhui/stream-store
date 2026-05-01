@@ -1,7 +1,9 @@
 use std::cell::UnsafeCell;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::arena::{ArenaBuffer, ArenaDirectory, EpochArenaEntry, OwnedArenaSlice};
+use smallvec::{SmallVec, smallvec};
+
+use crate::arena::{ArenaBuffer, ArenaDirectory, ArenaId, EpochArenaEntry, OwnedArenaSlice};
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 
 use bytes::Bytes;
@@ -89,6 +91,9 @@ pub struct StreamEpoch {
     /// Used by `report_extents` to filter extents by epoch during SM recovery.
     pub epoch: Epoch,
 
+    /// Globally unique arena identifier. Stamped at allocation.
+    pub(crate) arena_id: ArenaId,
+
     /// Reference-counted arena buffer. Shared with any outstanding `Bytes`
     /// slices, so the memory is not freed until all readers are done.
     arena: Arc<ArenaBuffer>,
@@ -156,6 +161,17 @@ pub struct StreamEpoch {
     /// - **Secondary**: stores the primary's CRC32 from ForwardChecksum, used as
     ///   the expected value for verification.
     finalized_crc32: AtomicU32,
+
+    /// Which arenas on this EN currently hold at least one directory
+    /// entry for this (stream, epoch). P2 always holds exactly one
+    /// (the epoch's own arena); future phases widen this when a
+    /// Primary's record stream spans multiple shared arenas.
+    pub(crate) resident_arenas: Mutex<SmallVec<[ArenaId; 4]>>,
+
+    /// Reference count of live directory entries for this epoch across
+    /// all resident arenas. Init 1. When it drops to zero, the owning
+    /// Stream removes the StreamEpoch from its epochs vec.
+    pub(crate) directory_ref_count: AtomicU32,
 }
 
 // SAFETY: The raw write pointer `buf` is derived from Arc<ArenaBuffer> and only
@@ -166,7 +182,7 @@ unsafe impl Sync for StreamEpoch {}
 
 impl StreamEpoch {
     /// Create a new active extent with the specified capacity in bytes.
-    pub fn with_capacity(id: ExtentId, start_offset: Offset, capacity: u32, epoch: Epoch) -> Self {
+    pub(crate) fn with_capacity(id: ExtentId, start_offset: Offset, capacity: u32, epoch: Epoch, arena_id: ArenaId) -> Self {
         let arena = ArenaBuffer::new(capacity);
         let buf = arena.ptr_mut();
 
@@ -187,6 +203,7 @@ impl StreamEpoch {
             id,
             start_offset,
             epoch,
+            arena_id,
             arena,
             buf,
             capacity,
@@ -199,6 +216,8 @@ impl StreamEpoch {
             flags: AtomicU8::new(FLAG_INIT_FORWARD),
             hasher: UnsafeCell::new(crc32fast::Hasher::new()),
             finalized_crc32: AtomicU32::new(0),
+            resident_arenas: Mutex::new(smallvec![arena_id]),
+            directory_ref_count: AtomicU32::new(1),
         }
     }
 
@@ -769,6 +788,22 @@ impl StreamEpoch {
         let arena = self.arena_as_bytes();
         arena.slice(0..cb)
     }
+
+    /// Return a snapshot of the arenas holding directory entries for this epoch.
+    pub(crate) fn resident_arenas(&self) -> SmallVec<[ArenaId; 4]> {
+        self.resident_arenas.lock().unwrap().clone()
+    }
+
+    #[allow(dead_code)]
+    pub fn incr_directory_ref(&self) -> u32 {
+        self.directory_ref_count.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    #[allow(dead_code)]
+    pub fn decr_directory_ref(&self) -> u32 {
+        let prev = self.directory_ref_count.fetch_sub(1, Ordering::Release);
+        prev.saturating_sub(1)
+    }
 }
 
 // Debug impl that doesn't try to print the entire buffer.
@@ -800,7 +835,7 @@ mod tests {
 
     #[test]
     fn append_and_read() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         let r0 = ext.append(Bytes::from_static(b"msg0")).unwrap();
         let r1 = ext.append(Bytes::from_static(b"msg1")).unwrap();
         let r2 = ext.append(Bytes::from_static(b"msg2")).unwrap();
@@ -830,7 +865,7 @@ mod tests {
 
     #[test]
     fn read_from_middle() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(10), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(10), 4096, Epoch(0), ArenaId(0));
         let _r0 = ext.append(Bytes::from_static(b"a")).unwrap();
         let r1 = ext.append(Bytes::from_static(b"b")).unwrap();
 
@@ -842,7 +877,7 @@ mod tests {
 
     #[test]
     fn read_out_of_range_returns_empty() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         // No records appended, read at byte_pos 0 returns empty.
         let msgs = ext.read(0, 10).unwrap();
         assert!(msgs.is_empty());
@@ -855,7 +890,7 @@ mod tests {
 
     #[test]
     fn seal_rejects_append() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         ext.append(Bytes::from_static(b"ok")).unwrap();
         ext.seal(None);
 
@@ -866,7 +901,7 @@ mod tests {
 
     #[test]
     fn start_offset_nonzero() {
-        let ext = StreamEpoch::with_capacity(ExtentId(2), Offset(100), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(2), Offset(100), 4096, Epoch(0), ArenaId(0));
         let r = ext.append(Bytes::from_static(b"hello")).unwrap();
         assert_eq!(r.offset, Offset(100));
         assert_eq!(r.byte_pos, 0);
@@ -880,7 +915,7 @@ mod tests {
     fn extent_full_returns_error() {
         // Tiny capacity: 16 bytes. Each record is 4 (len prefix) + payload.
         // "hello" = 5 bytes -> record = 9 bytes. Two records = 18 bytes > 16.
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 16, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 16, Epoch(0), ArenaId(0));
         ext.append(Bytes::from_static(b"hello")).unwrap(); // 9 bytes, fits
         let result = ext.append(Bytes::from_static(b"world")); // 9 bytes, doesn't fit
         assert!(matches!(result, Err(StorageError::ExtentFull { .. })));
@@ -888,7 +923,7 @@ mod tests {
 
     #[test]
     fn committed_data_returns_arena_slice() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         ext.append(Bytes::from_static(b"abc")).unwrap();
         ext.append(Bytes::from_static(b"de")).unwrap();
 
@@ -905,7 +940,7 @@ mod tests {
 
     #[test]
     fn index_lookup_basic() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         // Before any append, all index entries are None.
         assert_eq!(ext.index_lookup(0), None);
@@ -929,7 +964,7 @@ mod tests {
 
     #[test]
     fn index_lookup_with_nonzero_start_offset() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(100), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(100), 4096, Epoch(0), ArenaId(0));
         let r0 = ext.append(Bytes::from_static(b"hello")).unwrap();
         assert_eq!(r0.offset, Offset(100));
 
@@ -940,7 +975,7 @@ mod tests {
     #[test]
     fn replicate_basic() {
         // Simulate a secondary receiving 3 records from the primary.
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         let r0 = ext
             .replicate(Offset(0), Bytes::from_static(b"msg0"))
@@ -975,8 +1010,8 @@ mod tests {
     #[test]
     fn replicate_matches_append_layout() {
         // Prove that replicate() produces a bit-for-bit identical arena as append().
-        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
-        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         let payloads: Vec<Bytes> = vec![
             Bytes::from_static(b"hello"),
@@ -999,7 +1034,7 @@ mod tests {
 
     #[test]
     fn replicate_sealed_extent_rejects() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         ext.replicate(Offset(0), Bytes::from_static(b"msg0"))
             .unwrap();
         ext.seal(Some(1)); // seal at 1 record
@@ -1014,7 +1049,7 @@ mod tests {
         // Simulate a secondary: primary committed 3 records, but secondary only
         // received 1 before seal. SM seals secondary with committed_offset=3.
         // Late forwarded appends for offsets 1,2 should be accepted.
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         // Secondary receives 1 of 3 expected messages before seal.
         ext.append(Bytes::from_static(b"msg0")).unwrap();
@@ -1040,7 +1075,7 @@ mod tests {
     #[test]
     fn seal_without_committed_offset_uses_local_count() {
         // Primary sealing itself (extent-full path): no committed_offset provided.
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         ext.append(Bytes::from_static(b"msg0")).unwrap();
         ext.append(Bytes::from_static(b"msg1")).unwrap();
 
@@ -1054,7 +1089,7 @@ mod tests {
 
     #[test]
     fn accepts_post_seal_writes_flag() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         // Not sealed → false.
         assert!(!ext.accepts_post_seal_writes());
@@ -1068,7 +1103,7 @@ mod tests {
 
     #[test]
     fn incremental_crc32_matches_full_hash() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         // Before any append, no finalized CRC32.
         assert_eq!(ext.finalized_crc32(), None);
@@ -1096,7 +1131,7 @@ mod tests {
 
     #[test]
     fn incremental_crc32_single_record() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         ext.append(Bytes::from_static(b"only-one")).unwrap();
         ext.seal(None);
 
@@ -1107,7 +1142,7 @@ mod tests {
 
     #[test]
     fn incremental_crc32_empty_payloads() {
-        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let ext = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         ext.append(Bytes::new()).unwrap(); // empty payload
         ext.append(Bytes::from_static(b"data")).unwrap();
         ext.append(Bytes::new()).unwrap(); // another empty
@@ -1121,14 +1156,14 @@ mod tests {
     #[test]
     fn incremental_crc32_via_replicate() {
         // Simulate primary appends to get reference data.
-        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
         // Simulate secondary receiving the same records via replicate() IN ORDER.
-        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         secondary
             .replicate(Offset(0), Bytes::from_static(b"hello"))
             .unwrap();
@@ -1158,14 +1193,14 @@ mod tests {
     #[test]
     fn crc32_in_order_replicate() {
         // Simulate primary appends to get reference data.
-        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
         // Simulate secondary receiving records IN ORDER (guaranteed by FIFO mpsc).
-        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         secondary
             .replicate(Offset(0), Bytes::from_static(b"hello"))
@@ -1189,12 +1224,12 @@ mod tests {
     #[test]
     fn crc32_forward_checksum_arrives_after_records() {
         // ForwardChecksum arrives after all records (normal case with FIFO channel).
-        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.seal(None);
 
-        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         // Records arrive in order.
         secondary
@@ -1220,7 +1255,7 @@ mod tests {
     #[test]
     fn correct_seal_offset_lowers_limit() {
         // Sealed at 100 records, correct down to 80
-        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
         for i in 0..100u32 {
             extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
         }
@@ -1236,7 +1271,7 @@ mod tests {
     #[test]
     fn correct_seal_offset_noop_if_already_lower() {
         // Sealed at 50 records, try to "correct" to 80 → no-op
-        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
         for i in 0..50u32 {
             extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
         }
@@ -1250,7 +1285,7 @@ mod tests {
     #[test]
     fn correct_seal_offset_noop_if_unsealed() {
         // Not sealed → correct_seal_offset is a no-op
-        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0));
+        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
         extent.append(Bytes::from_static(b"hello")).unwrap();
 
         extent.correct_seal_offset(0); // should not seal or crash
@@ -1265,6 +1300,7 @@ mod tests {
             Offset(0),
             1024 * 1024,
             Epoch(0),
+            ArenaId(0),
         ));
         for i in 0..100u32 {
             extent.append(Bytes::from(vec![i as u8; 10])).unwrap();

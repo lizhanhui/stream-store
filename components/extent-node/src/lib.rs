@@ -20,6 +20,7 @@ use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
 use tracing::info;
 
+use crate::arena::{ArenaIdGenerator, node_prefix_from_id};
 use crate::downstream::DownstreamPool;
 use crate::s3::S3Client;
 use crate::s3_flusher::FlushRequest;
@@ -74,8 +75,28 @@ impl ExtentNode {
             .expect("failed to get ExtentNode local address");
         info!("ExtentNode server bound on {local_addr}");
 
+        // Resolve advertise_addr: auto-detect IP if bind_ip is 0.0.0.0 and advertise_ip not set.
+        // If port was 0 (OS-assigned), use the actual bound port instead.
+        let effective_port = if config.port == 0 {
+            local_addr.port()
+        } else {
+            config.port
+        };
+        let effective_ip = resolve_advertise_ip(&config.bind_ip, &config.advertise_ip);
+        let advertise_addr = format!("{effective_ip}:{effective_port}");
+
+        // Resolve node_id: use config value if set, otherwise fall back to advertise_addr.
+        let node_id = if config.node_id.is_empty() {
+            advertise_addr.clone()
+        } else {
+            config.node_id.clone()
+        };
+
+        // Build a globally-unique ArenaId generator for this EN.
+        let arena_ids = Arc::new(ArenaIdGenerator::new(node_prefix_from_id(&node_id)));
+
         // Create store first (OnceLock for downstream breaks circular dep).
-        let mut store_inner = ExtentNodeStore::new();
+        let mut store_inner = ExtentNodeStore::new_with_ids(arena_ids);
         store_inner.set_replication_timeout(Duration::from_millis(config.replication_timeout_ms));
 
         // Wire up the extent update channel for autonomous extent creation
@@ -115,23 +136,6 @@ impl ExtentNode {
                 }
             }));
         }
-
-        // Resolve advertise_addr: auto-detect IP if bind_ip is 0.0.0.0 and advertise_ip not set.
-        // If port was 0 (OS-assigned), use the actual bound port instead.
-        let effective_port = if config.port == 0 {
-            local_addr.port()
-        } else {
-            config.port
-        };
-        let effective_ip = resolve_advertise_ip(&config.bind_ip, &config.advertise_ip);
-        let advertise_addr = format!("{effective_ip}:{effective_port}");
-
-        // Resolve node_id: use config value if set, otherwise fall back to advertise_addr.
-        let node_id = if config.node_id.is_empty() {
-            advertise_addr.clone()
-        } else {
-            config.node_id.clone()
-        };
 
         // Spawn StreamManagerClient (RAII: sends Disconnect when dropped).
         // Manages two connections: heartbeat (dedicated) and extent updates (dedicated).

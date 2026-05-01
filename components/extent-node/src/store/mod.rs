@@ -25,7 +25,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::warn;
 
 use crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT;
-use crate::arena::{ArenaPool, DedicatedArenaPool};
+use crate::arena::{ArenaIdGenerator, ArenaPool, DedicatedArenaPool};
 use crate::downstream::DownstreamPool;
 use crate::s3::S3Client;
 use crate::s3_flusher::FlushRequest;
@@ -50,6 +50,8 @@ pub struct ExtentNodeStore {
     pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
     /// Default arena pool for newly created streams (Dedicated: one arena per epoch).
     pub(crate) default_pool: Arc<dyn ArenaPool>,
+    /// ArenaId generator shared between the pool and register_extent paths.
+    pub(crate) arena_ids: Arc<ArenaIdGenerator>,
     /// Replication info per stream_id (registered via RegisterEpoch).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
     pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>, IdentityBuildHasher>,
@@ -76,10 +78,24 @@ pub struct ExtentNodeStore {
 
 impl ExtentNodeStore {
     /// Create a new store in standalone mode (no replication) with default arena capacity.
+    /// Uses a default node prefix (1). For production use, call `new_with_ids` and pass
+    /// a node-specific `ArenaIdGenerator`.
     pub fn new() -> Self {
+        let arena_ids = Arc::new(ArenaIdGenerator::new(1));
+        Self::new_with_ids(arena_ids)
+    }
+
+    /// Create a new store with a caller-provided `ArenaIdGenerator`.
+    /// Called by `ExtentNode::start` after resolving the node_id.
+    pub(crate) fn new_with_ids(arena_ids: Arc<ArenaIdGenerator>) -> Self {
+        let default_pool = Arc::new(DedicatedArenaPool::new(
+            DEFAULT_EXTENT_CAPACITY,
+            Arc::clone(&arena_ids),
+        ));
         Self {
             streams: papaya::HashMap::with_hasher(IdentityBuildHasher),
-            default_pool: Arc::new(DedicatedArenaPool::new(DEFAULT_EXTENT_CAPACITY)),
+            default_pool,
+            arena_ids,
 
             replicas: papaya::HashMap::with_hasher(IdentityBuildHasher),
             downstream: OnceLock::new(),
@@ -123,7 +139,7 @@ impl ExtentNodeStore {
             stream.set_storage_class(storage_class);
             false
         } else {
-            let stream = Stream::new(stream_id, Arc::clone(&self.default_pool));
+            let stream = Stream::new(stream_id, Arc::clone(&self.default_pool), Arc::clone(&self.arena_ids));
             if policy.cache > 0 {
                 stream.set_max_extents(policy.cache as usize);
             }
