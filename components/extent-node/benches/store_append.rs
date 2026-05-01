@@ -45,12 +45,7 @@ async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u32, extent_i
                         replication_factor: 1,
                         epoch: Epoch(0),
                         storage_class: StorageClass::S3,
-                        policy: ExtentPolicy {
-                            cache: 4,
-                            min_capacity: 8 * 1024 * 1024,
-                            max_capacity: 256 * 1024 * 1024,
-                            scale_factor: 2,
-                        },
+                        policy: ExtentPolicy { cache: 4 },
                     },
                 },
                 Some(payload),

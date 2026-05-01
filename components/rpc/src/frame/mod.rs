@@ -12,7 +12,7 @@ use common::types::{
     Epoch, ExtentId, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
     FLAG_EXTENT_SEALED, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
     FLAG_FORWARD_INIT_EXTENT, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
-    FLAG_SEAL_COMMIT_RESP, FLAG_SYSTEM_TICK, Offset, Opcode, PROTOCOL_VERSION, StreamId,
+    FLAG_SEAL_COMMIT_RESP, Offset, Opcode, PROTOCOL_VERSION, StreamId,
 };
 
 pub use header::{FixedHeader, VariableHeader};
@@ -65,27 +65,6 @@ impl Frame {
             },
             variable_header,
             payload,
-        }
-    }
-
-    /// Create a system tick frame for idle-shrink capacity scaling.
-    ///
-    /// This is a synthetic Append with `FLAG_SYSTEM_TICK` set and no payload.
-    /// It flows through the normal `handle_append` path but triggers idle-shrink
-    /// instead of writing to the arena.
-    pub fn system_tick(stream_id: StreamId, epoch: Epoch) -> Self {
-        Frame {
-            header: FixedHeader {
-                opcode: Opcode::Append,
-                version: PROTOCOL_VERSION,
-                flags: FLAG_SYSTEM_TICK,
-            },
-            variable_header: VariableHeader::Append {
-                request_id: 0,
-                stream_id,
-                epoch,
-            },
-            payload: None,
         }
     }
 

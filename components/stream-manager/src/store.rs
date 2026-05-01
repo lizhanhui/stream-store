@@ -5,10 +5,7 @@ use bytes::Buf;
 use crate::allocator::Allocator;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
-use common::config::{
-    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
-    DEFAULT_MIN_EXTENT_CAPACITY,
-};
+use common::config::DEFAULT_CACHE_EXTENTS;
 use common::errors::{InternalSnafu, StorageError};
 use common::types::{
     Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
@@ -707,8 +704,6 @@ impl StreamManagerStore {
     ///
     /// Variable header carries stream_name, replication_factor, and extent_capacity.
     /// `replication_factor` must be >= 1; a value of 0 is rejected with an error.
-    /// If min_extent_capacity=0, the default of 8 MiB is used.
-    /// If max_extent_capacity=0, the default of 256 MiB is used.
     ///
     /// Response variable header carries primary_addr.
     async fn handle_create_stream(&self, frame: Frame) -> Frame {
@@ -755,21 +750,6 @@ impl StreamManagerStore {
             } else {
                 policy.cache
             },
-            min_capacity: if policy.min_capacity == 0 {
-                DEFAULT_MIN_EXTENT_CAPACITY
-            } else {
-                policy.min_capacity
-            },
-            max_capacity: if policy.max_capacity == 0 {
-                DEFAULT_MAX_EXTENT_CAPACITY
-            } else {
-                policy.max_capacity
-            },
-            scale_factor: if policy.scale_factor == 0 {
-                DEFAULT_EXTENT_GROWTH_FACTOR
-            } else {
-                policy.scale_factor
-            },
         };
 
         let result = async {
@@ -791,8 +771,8 @@ impl StreamManagerStore {
                 self.allocate_and_notify_replica_set(config, 0).await?;
 
             info!(
-                "stream {stream_name} created: stream_id={}, extent_id={}, primary={primary_addr}, min_capacity={}, max_capacity={}, cache={}, scale_factor={}",
-                stream_id, extent_id, policy.min_capacity, policy.max_capacity, policy.cache, policy.scale_factor
+                "stream {stream_name} created: stream_id={}, extent_id={}, primary={primary_addr}, cache={}",
+                stream_id, extent_id, policy.cache
             );
 
             Ok::<(StreamId, ExtentId, String), StorageError>((stream_id, extent_id, primary_addr))
@@ -1194,9 +1174,6 @@ impl StreamManagerStore {
         let replication_factor =
             self.store.get_stream_replication_factor(stream_id).await? as usize;
         let cache_extents = self.store.get_stream_cache_extents(stream_id).await?;
-        let (min_extent_capacity, max_extent_capacity) =
-            self.store.get_stream_capacity_bounds(stream_id).await?;
-        let extent_growth_factor = self.store.get_stream_growth_factor(stream_id).await?;
         let stream_row = self.store.get_stream(stream_id).await?;
         let storage_class = stream_row
             .map(|r| r.storage_class)
@@ -1234,12 +1211,7 @@ impl StreamManagerStore {
                     replication_factor: node_addrs.len() as u8,
                     epoch,
                     storage_class,
-                    policy: ExtentPolicy {
-                        cache: cache_extents,
-                        min_capacity: min_extent_capacity,
-                        max_capacity: max_extent_capacity,
-                        scale_factor: extent_growth_factor,
-                    },
+                    policy: ExtentPolicy { cache: cache_extents },
                 };
 
                 info!(

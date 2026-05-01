@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use common::config::{DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY};
+use common::config::DEFAULT_EXTENT_CAPACITY;
 use common::types::{ErrorCode, ExtentId, ExtentPolicy};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
@@ -37,17 +37,6 @@ impl ExtentNodeStore {
         // Normalize capacity bounds: 0 means use default.
         let policy = ExtentPolicy {
             cache: config.policy.cache,
-            min_capacity: if config.policy.min_capacity == 0 {
-                DEFAULT_MIN_EXTENT_CAPACITY
-            } else {
-                config.policy.min_capacity
-            },
-            max_capacity: if config.policy.max_capacity == 0 {
-                DEFAULT_MAX_EXTENT_CAPACITY
-            } else {
-                config.policy.max_capacity
-            },
-            scale_factor: config.policy.scale_factor,
         };
 
         // Parse replica addresses from the payload.
@@ -73,7 +62,7 @@ impl ExtentNodeStore {
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
             if stream.with_extent(extent_id, |_| ()).is_none() {
-                stream.register_extent(extent_id, stream.max_offset(), epoch, policy.min_capacity);
+                stream.register_extent(extent_id, stream.max_offset(), epoch, DEFAULT_EXTENT_CAPACITY);
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
                 // from authoritative source (RegisterExtent carries the real epoch).

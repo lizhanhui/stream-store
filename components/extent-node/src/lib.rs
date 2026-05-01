@@ -14,11 +14,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use common::config::{ExtentNodeConfig, resolve_advertise_ip};
-use rpc::frame::Frame;
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, mpsc};
 use tokio::task::JoinHandle;
-use tokio::time::interval;
 use tracing::info;
 
 use crate::downstream::DownstreamPool;
@@ -26,7 +24,6 @@ use crate::s3::S3Client;
 use crate::s3_flusher::FlushRequest;
 use crate::store::{ExtentNodeStore, ExtentUpdate};
 use crate::stream_manager_client::StreamManagerClient;
-use server::RequestHandler;
 
 /// A running ExtentNode with lifecycle management.
 ///
@@ -147,32 +144,6 @@ impl ExtentNode {
             Duration::from_millis(config.request_timeout_ms),
             update_rx,
         );
-
-        // Spawn idle-shrink task: injects system tick appends for idle streams.
-        // Tick frames flow through the normal handle_append path, participating
-        // in leader election and using the same seal-and-create machinery.
-        let tick_store = Arc::clone(&store);
-        let mut tick_shutdown = shutdown_tx.subscribe();
-        let tick_interval_ms = config.heartbeat_interval_ms; // Same cadence as heartbeats
-        task_handles.push(tokio::spawn(async move {
-            let mut ticker = interval(Duration::from_millis(tick_interval_ms as u64));
-            loop {
-                tokio::select! {
-                    _ = ticker.tick() => {
-                        // Snapshot (StreamId, Epoch) pairs — lightweight read-only scan.
-                        let streams = tick_store.stream_epochs();
-                        for (stream_id, epoch) in streams {
-                            let tick_frame = Frame::system_tick(stream_id, epoch);
-                            tick_store.handle_frame(tick_frame, None).await;
-                        }
-                    }
-                    _ = tick_shutdown.recv() => {
-                        info!("idle-shrink task received shutdown signal");
-                        break;
-                    }
-                }
-            }
-        }));
 
         // Spawn accept loop (plain tokio::spawn — worker pinning is handled
         // at the runtime level via on_thread_start core affinity).

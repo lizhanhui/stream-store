@@ -101,8 +101,8 @@ impl ExtentNodeStore {
 
     /// Ensure a stream exists, creating it if needed.
     ///
-    /// Always applies all stream-level configs (cache, storage_class, capacity
-    /// bounds) to the stream, whether existing or new.
+    /// Always applies all stream-level configs (cache, storage_class) to the
+    /// stream, whether existing or new.
     /// Returns `true` if the stream was just created.
     pub(crate) fn try_create_stream(
         &self,
@@ -116,7 +116,6 @@ impl ExtentNodeStore {
                 stream.set_max_extents(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
-            stream.set_capacity_bounds(policy.min_capacity, policy.max_capacity, policy.scale_factor);
             false
         } else {
             let stream = Stream::new(stream_id);
@@ -124,7 +123,6 @@ impl ExtentNodeStore {
                 stream.set_max_extents(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
-            stream.set_capacity_bounds(policy.min_capacity, policy.max_capacity, policy.scale_factor);
             guard.insert(stream_id, stream);
             true
         }
@@ -226,15 +224,6 @@ impl ExtentNodeStore {
                 }
             })
             .collect()
-    }
-
-    /// Lightweight iterator over (StreamId, Epoch) for all active streams.
-    ///
-    /// Used by the idle-shrink tick task to construct system tick frames.
-    /// Pure read-only scan — no write guards, no idle-shrink checks.
-    pub fn stream_epochs(&self) -> Vec<(StreamId, Epoch)> {
-        let guard = self.streams.pin();
-        guard.iter().map(|(k, v)| (*k, v.epoch())).collect()
     }
 }
 

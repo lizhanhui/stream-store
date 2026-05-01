@@ -155,10 +155,7 @@ async fn stream_manager_integration() {
                 1,
                 StorageClass::S3,
                 ExtentPolicy {
-                    min_capacity: 8 * 1024 * 1024,
-                    max_capacity: 256 * 1024 * 1024,
                     cache: 4,
-                    scale_factor: 0,
                 },
             )
             .await

@@ -54,10 +54,7 @@ static GLOBAL: Jemalloc = Jemalloc;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPORT_INTERVAL: Duration = Duration::from_secs(1);
 const REPLICATION_FACTOR: u8 = 2;
-const MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024; // 8 MiB
-const MAX_EXTENT_CAPACITY: u32 = 64 * 1024 * 1024; // 64 MiB
 const CACHE_EXTENTS: u16 = 3;
-const EXTENT_GROWTH_FACTOR: u8 = 8;
 const PIPELINE_DEPTH: usize = 2;
 
 fn num_streams() -> usize {
@@ -231,10 +228,7 @@ async fn main() {
                 REPLICATION_FACTOR,
                 StorageClass::Memory,
                 ExtentPolicy {
-                    min_capacity: MIN_EXTENT_CAPACITY,
-                    max_capacity: MAX_EXTENT_CAPACITY,
                     cache: CACHE_EXTENTS,
-                    scale_factor: EXTENT_GROWTH_FACTOR,
                 },
             )
             .await

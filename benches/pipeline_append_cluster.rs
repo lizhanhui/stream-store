@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR};
+use common::config::DEFAULT_CACHE_EXTENTS;
 use common::errors::{InternalSnafu, StorageError};
 use common::types::{Epoch, ExtentPolicy, StorageClass, StreamId};
 use futures_util::StreamExt;
@@ -54,8 +54,6 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const NUM_SENDERS: usize = 4;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u8 = 2;
-const MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024; // 8 MiB
-const MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024; // 256 MiB
 const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
 
 /// Returns the benchmark duration from `BENCH_DURATION_SECS` env var.
@@ -184,10 +182,7 @@ async fn main() {
             REPLICATION_FACTOR,
             StorageClass::S3,
             ExtentPolicy {
-                min_capacity: MIN_EXTENT_CAPACITY,
-                max_capacity: MAX_EXTENT_CAPACITY,
                 cache: DEFAULT_CACHE_EXTENTS,
-                scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
             },
         )
         .await

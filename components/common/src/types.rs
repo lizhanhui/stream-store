@@ -41,11 +41,6 @@ pub const FLAG_DESCRIBE_STREAM_BY_NAME: u8 = 0x02;
 /// opcode-specific error header instead of the success header layout.
 pub const FLAG_RESPONSE_ERROR: u8 = 0x80;
 
-/// Flag on APPEND: system-generated tick for capacity scaling.
-/// When set, the append is synthetic (no payload), flagged for special handling.
-/// Uses 0x02 (not 0x01) to avoid conflict with FLAG_RESPONSE.
-pub const FLAG_SYSTEM_TICK: u8 = 0x02;
-
 /// Flag on SEAL_EXTENT_NODE: phase 2 commit with authoritative committed offset.
 /// SM broadcasts after computing quorum offset so replicas correct their local
 /// seal point. Uses 0x02 (not 0x01) to avoid conflict with FLAG_RESPONSE.
@@ -231,12 +226,6 @@ impl StorageClass {
 pub struct ExtentPolicy {
     /// Maximum extents to retain in memory for the stream (0 = default).
     pub cache: u16,
-    /// Minimum extent capacity in bytes (0 = default).
-    pub min_capacity: u32,
-    /// Maximum extent capacity in bytes (0 = default).
-    pub max_capacity: u32,
-    /// Adaptive-growth multiplier on extent-full (0 = default).
-    pub scale_factor: u8,
 }
 
 /// Full per-stream configuration threaded through replica registration,

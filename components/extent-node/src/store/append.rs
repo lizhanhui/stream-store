@@ -1,11 +1,10 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use bytes::Bytes;
-use common::config::DEFAULT_IDLE_SHRINK_THRESHOLD_SECS;
 use common::errors::StorageError;
-use common::types::{Epoch, ErrorCode, ExtentId, FLAG_SYSTEM_TICK, Offset, StorageClass, StreamId};
+use common::types::{Epoch, ErrorCode, ExtentId, Offset, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use smallvec::SmallVec;
 use tokio::sync::mpsc::Sender;
@@ -45,8 +44,6 @@ impl ExtentNodeStore {
             own_result,
             extent_full,
             remaining,
-            is_tick,
-            should_shrink,
             payload,
             request_id,
         ) = {
@@ -73,14 +70,9 @@ impl ExtentNodeStore {
                 ));
             }
 
-            let is_tick = frame.flags() & FLAG_SYSTEM_TICK != 0;
             let prev = stream.in_flight().fetch_add(1, Ordering::Acquire);
 
             if prev > 0 {
-                if is_tick {
-                    stream.in_flight().fetch_sub(1, Ordering::Release);
-                    return None;
-                }
                 let job = AppendJob {
                     request_id: frame.request_id(),
                     stream_id,
@@ -93,74 +85,30 @@ impl ExtentNodeStore {
 
             // FAST PATH: I'm the active writer (prev == 0).
 
-            if is_tick {
-                let should_shrink = stream
-                    .should_idle_shrink(Duration::from_secs(DEFAULT_IDLE_SHRINK_THRESHOLD_SECS));
-                let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
+            let payload = frame.payload.clone().unwrap_or_default();
+            let request_id = frame.request_id();
+            let (own_result, extent_full) = self.do_append_and_respond(
+                stream,
+                request_id,
+                stream_id,
+                epoch,
+                payload.clone(),
+                response_tx.cloned(),
+            );
+            if extent_full {
+                // Don't decrement in_flight — we're still the leader.
+                // Will decrement after seal+create+retry below.
                 (
-                    epoch,
-                    None,
-                    false,
-                    remaining,
-                    true,
-                    should_shrink,
-                    Bytes::new(),
-                    0,
+                    epoch, own_result, true, 0, payload, request_id,
                 )
             } else {
-                let payload = frame.payload.clone().unwrap_or_default();
-                let request_id = frame.request_id();
-                let (own_result, extent_full) = self.do_append_and_respond(
-                    stream,
-                    request_id,
-                    stream_id,
-                    epoch,
-                    payload.clone(),
-                    response_tx.cloned(),
-                );
-                if extent_full {
-                    // Don't decrement in_flight — we're still the leader.
-                    // Will decrement after seal+create+retry below.
-                    (
-                        epoch, own_result, true, 0, false, false, payload, request_id,
-                    )
-                } else {
-                    let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
-                    (
-                        epoch, own_result, false, remaining, false, false, payload, request_id,
-                    )
-                }
+                let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
+                (
+                    epoch, own_result, false, remaining, payload, request_id,
+                )
             }
         };
         // Pin guard dropped — safe to .await.
-
-        // ── System tick path ──
-        if is_tick {
-            if remaining > 1 {
-                let batch_seals = self.drain_follower_jobs(stream_id).await;
-                for notification in &batch_seals {
-                    self.send_extent_update(stream_id, notification);
-                    self.send_forward_checksum(stream_id, notification.sealed_extent_id);
-                    self.send_flush_request(stream_id, notification);
-                }
-            }
-            if should_shrink
-                && let Some(ref notification) =
-                    self.seal_and_create(stream_id, SealReason::IdleShrink)
-            {
-                self.send_extent_update(stream_id, notification);
-                self.send_forward_checksum(stream_id, notification.sealed_extent_id);
-                self.send_flush_request(stream_id, notification);
-                info!(
-                    "idle-shrink: stream={}, sealed={}, new={}, capacity={}",
-                    stream_id,
-                    notification.sealed_extent_id,
-                    notification.new_extent_id,
-                    notification.new_extent_capacity,
-                );
-            }
-            return None;
-        }
 
         // ── Extent-full path: seal+create, retry, then drain ──
         if extent_full {
@@ -571,13 +519,6 @@ impl ExtentNodeStore {
         reason: SealReason,
     ) -> Option<SealNotification> {
         if let Some(stream) = self.streams.pin().get(&stream_id) {
-            // For IdleShrink, re-check eligibility under write guard.
-            if matches!(reason, SealReason::IdleShrink)
-                && !stream
-                    .should_idle_shrink(Duration::from_secs(DEFAULT_IDLE_SHRINK_THRESHOLD_SECS))
-            {
-                return None;
-            }
             let t0 = std::time::Instant::now();
             let notification = stream.seal_and_create_next(reason);
             let seal_us = t0.elapsed().as_micros();

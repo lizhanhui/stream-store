@@ -472,12 +472,7 @@ fn create_stream_round_trip() {
             stream_name: Bytes::from_static(b"my-stream"),
             replication_factor: 3,
             storage_class: StorageClass::S3,
-            policy: ExtentPolicy {
-                cache: 4,
-                min_capacity: 8_388_608,
-                max_capacity: 268_435_456,
-                scale_factor: 8,
-            },
+            policy: ExtentPolicy { cache: 4 },
         },
         None,
     );
@@ -497,10 +492,7 @@ fn create_stream_round_trip() {
         } => {
             assert_eq!(stream_name, &Bytes::from_static(b"my-stream"));
             assert_eq!(*replication_factor, 3);
-            assert_eq!(policy.min_capacity, 8_388_608);
-            assert_eq!(policy.max_capacity, 268_435_456);
             assert_eq!(policy.cache, 4);
-            assert_eq!(policy.scale_factor, 8);
         }
         _ => panic!("expected CreateStream"),
     }

@@ -107,12 +107,7 @@ async fn main() {
             "example-stream",
             2,
             StorageClass::S3,
-            ExtentPolicy {
-                min_capacity: 8 * 1024 * 1024,
-                max_capacity: 256 * 1024 * 1024,
-                cache: 4,
-                scale_factor: 2,
-            },
+            ExtentPolicy { cache: 4 },
         )
         .await
         .expect("failed to create stream");

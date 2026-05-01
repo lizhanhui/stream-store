@@ -84,12 +84,7 @@ async fn register_extent(
                     replication_factor,
                     epoch: Epoch(0),
                     storage_class: StorageClass::S3,
-                    policy: ExtentPolicy {
-                        cache: 4,
-                        min_capacity: 8 * 1024 * 1024,
-                        max_capacity: 256 * 1024 * 1024,
-                        scale_factor: 2,
-                    },
+                    policy: ExtentPolicy { cache: 4 },
                 },
             },
             Some(payload),

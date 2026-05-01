@@ -387,11 +387,7 @@ async fn staleness_scan_triggers_dr_flush() {
             "test-staleness-flush",
             2,
             StorageClass::S3,
-            ExtentPolicy {
-                min_capacity: 1024,
-                max_capacity: 1024,
-                ..ExtentPolicy::default()
-            },
+            ExtentPolicy { cache: 0 },
         )
         .await
         .expect("create_stream");

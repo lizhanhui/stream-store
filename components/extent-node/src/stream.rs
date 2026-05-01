@@ -1,13 +1,9 @@
-use std::collections::VecDeque;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
-use common::config::{
-    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
-    DEFAULT_MIN_EXTENT_CAPACITY,
-};
+use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY};
 use common::errors::{InternalSnafu, StorageError};
 use common::types::{Epoch, ExtentId, ExtentState, Offset, StorageClass, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
@@ -21,14 +17,10 @@ use crate::extent::{AppendResult, Extent};
 use crate::store::AppendJob;
 
 /// Reason for sealing the active extent and creating a new one.
-/// Controls the capacity scaling heuristic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealReason {
-    /// Extent arena is full — stream needs more space. Scale up: double capacity.
+    /// Extent arena is full — stream needs more space.
     ExtentFull,
-    /// System tick detected an under-utilized extent (idle > threshold, < 50% full).
-    /// Scale down: halve capacity (or jump to min if completely empty).
-    IdleShrink,
 }
 
 /// Mutable state protected by `RwLock`. Grouped here so that a single
@@ -40,25 +32,9 @@ struct StreamInner {
     /// Initialized to `first_extent_id + 1` when SM sends RegisterExtent.
     next_extent_id: ExtentId,
 
-    /// Minimum extent capacity (floor for adaptive shrink). From SM via RegisterExtent.
-    min_extent_capacity: u32,
-
-    /// Maximum extent capacity (ceiling for adaptive growth). From SM via RegisterExtent.
-    max_extent_capacity: u32,
-
-    /// Capacity to use for the next autonomously created extent.
-    /// Adaptive: grows by `growth_factor` on extent-full, halves on idle-shrink.
-    /// Clamped to [min_extent_capacity, max_extent_capacity].
-    next_extent_capacity: u32,
-
-    /// Growth factor for adaptive capacity scaling on extent-full.
-    /// On extent-full, `next_extent_capacity = min(current * growth_factor, max)`.
-    /// Configurable per stream (default 2). Higher values (e.g. 8) reach
-    /// steady-state faster with fewer extent transitions.
-    growth_factor: u8,
-
-    /// When the current active extent was created (for the 5-minute idle-shrink rule).
-    active_extent_created_at: Option<Instant>,
+    /// Fixed capacity for every extent on this stream. Set at register_extent time
+    /// from config and never changed.
+    extent_capacity: u32,
 
     /// Maximum number of extents to retain. 0 = no limit.
     /// When exceeded, the oldest sealed extents are dropped to free memory.
@@ -68,11 +44,6 @@ struct StreamInner {
     /// Populated at RegisterExtent time from DownstreamPool.
     /// Vec since RF is small (1-3); iteration is the hot path.
     downstream_txs: Vec<mpsc::Sender<Frame>>,
-
-    /// Pool of recycled extents ready for reuse. Avoids ~5ms allocation
-    /// on extent-full transitions. Pre-populated at register_extent time;
-    /// replenished by evict_oldest_extents.
-    extent_pool: VecDeque<Extent>,
 
     /// Storage class for sealed extents: S3 or Memory.
     storage_class: StorageClass,
@@ -105,7 +76,7 @@ impl StreamInner {
 
     /// Try to create the next extent (write lock must be held by caller).
     ///
-    /// Uses `next_extent_capacity` for the new extent (adaptive sizing).
+    /// Uses `extent_capacity` for the new extent (fixed sizing).
     /// Extent ID is incremented locally — no SM round-trip needed.
     ///
     /// **S3 backpressure**: Before allocating, checks if the stream is at or
@@ -141,37 +112,17 @@ impl StreamInner {
             .unwrap_or(Offset(0));
         let new_id = self.next_extent_id;
         self.next_extent_id = ExtentId(new_id.0 + 1);
-        let target_capacity = self.next_extent_capacity;
 
-        // Recycle from pool (O(1) reset, pre-sized at eviction time) or allocate fresh.
-        if let Some(mut recycled) = self.extent_pool.pop_front() {
-            if recycled.capacity() != target_capacity {
-                // Should rarely happen — evict_oldest_extents pre-resizes.
-                // Safety net for capacity changes between eviction and use.
-                recycled.resize(target_capacity);
-            }
-            recycled.reset(new_id, end_offset, epoch);
-            self.extents.push(recycled);
-        } else {
-            self.extents.push(Extent::with_capacity(
-                new_id,
-                end_offset,
-                target_capacity,
-                epoch,
-            ));
-        }
+        self.extents.push(Extent::with_capacity(new_id, end_offset, self.extent_capacity, epoch));
 
-        self.active_extent_created_at = Some(Instant::now());
         self.evict_oldest_extents(stream_id);
         Some((new_id, end_offset))
     }
 
-    /// Recycle oldest extents into the pool when count exceeds `max_extents`.
+    /// Evict oldest extents when count exceeds `max_extents`.
     ///
     /// Evicts from the front of the extent list (oldest first). The last extent
-    /// (active/current) is never evicted. Recycled extents are pushed to the
-    /// pool for O(1) reuse by `try_create_next_extent`. If an extent has outstanding
-    /// reader references (Arc refcount > 1), it is dropped instead of recycled.
+    /// (active/current) is never evicted. Evicted extents are simply dropped.
     ///
     /// **S3 streams**: Only flushed extents are eligible for eviction. Sealed-but-
     /// not-flushed extents are skipped — they must remain in memory until the S3
@@ -198,16 +149,7 @@ impl StreamInner {
             if is_s3 && !self.extents[0].is_flushed() {
                 break;
             }
-            let evicted = self.extents.remove(0);
-            // Only pool extents that already match the target capacity.
-            // Mismatched extents (from growth transitions) are dropped to avoid
-            // blocking resize on the hot append path.
-            if evicted.can_recycle()
-                && self.extent_pool.len() < 2
-                && evicted.capacity() == self.next_extent_capacity
-            {
-                self.extent_pool.push_back(evicted);
-            }
+            let _evicted = self.extents.remove(0);
         }
     }
 }
@@ -288,14 +230,9 @@ impl Stream {
             inner: RwLock::new(StreamInner {
                 extents: Vec::new(),
                 next_extent_id: ExtentId(0),
-                min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                next_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-                growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
-                active_extent_created_at: None,
+                extent_capacity: DEFAULT_EXTENT_CAPACITY,
                 max_extents: DEFAULT_CACHE_EXTENTS as usize,
                 downstream_txs: Vec::new(),
-                extent_pool: VecDeque::new(),
                 storage_class: StorageClass::S3,
             }),
         }
@@ -576,54 +513,9 @@ impl Stream {
         }
     }
 
-    /// Whether this stream's active extent should be idle-shrunk.
-    ///
-    /// Returns `true` if:
-    /// - The active extent has been alive longer than `threshold`
-    /// - The active extent is less than 50% full
-    /// - NOT already at min capacity with zero bytes written (nothing to reclaim)
-    pub fn should_idle_shrink(&self, threshold: std::time::Duration) -> bool {
-        let inner = self.inner.read();
-        let extent = match inner.extents.last() {
-            Some(e) if e.state() == ExtentState::Active => e,
-            _ => return false,
-        };
-
-        // Already at min and empty — nothing to reclaim.
-        if inner.next_extent_capacity <= inner.min_extent_capacity && extent.bytes_written() == 0 {
-            return false;
-        }
-
-        // min_extent_capacity == 0 means adaptive sizing not configured (legacy).
-        if inner.min_extent_capacity == 0 {
-            return false;
-        }
-
-        let created_at = match inner.active_extent_created_at {
-            Some(t) => t,
-            None => return false,
-        };
-
-        if created_at.elapsed() < threshold {
-            return false;
-        }
-
-        extent.bytes_written() < (extent.capacity() as u64) / 2
-    }
-
     /// Return the maximum number of extents to retain (0 = no limit).
     pub fn max_extents(&self) -> usize {
         self.inner.read().max_extents
-    }
-
-    /// Return (min_extent_capacity, max_extent_capacity, growth_factor) for this stream.
-    pub fn capacity_bounds(&self) -> (u32, u32, u8) {
-        let inner = self.inner.read();
-        (
-            inner.min_extent_capacity,
-            inner.max_extent_capacity,
-            inner.growth_factor,
-        )
     }
 
     /// Return the storage class for this stream.
@@ -661,29 +553,10 @@ impl Stream {
         self.inner.write().storage_class = class;
     }
 
-    /// Set the adaptive capacity bounds for this stream.
-    /// Called by `try_create_stream` to apply SM-configured capacity policy.
-    pub fn set_capacity_bounds(&self, min: u32, max: u32, growth_factor: u8) {
-        let mut inner = self.inner.write();
-        inner.min_extent_capacity = min;
-        inner.max_extent_capacity = max;
-        inner.growth_factor = growth_factor;
-        // If next_extent_capacity hasn't been set yet (no extents registered),
-        // initialize it to min so the first extent starts small.
-        if inner.extents.is_empty() {
-            inner.next_extent_capacity = min;
-        }
-    }
-
     /// Register a new extent on this stream (called when SM sends RegisterExtent
     /// or when a secondary receives ForwardInitExtent).
     ///
     /// `extent_capacity` is the arena size for this specific extent.
-    /// For primaries (SM path), this equals `min_extent_capacity` (first extent starts at min).
-    /// For secondaries (ForwardInitExtent), this equals the primary's actual extent capacity.
-    ///
-    /// Stream-level capacity bounds (min, max, growth_factor) are expected to be
-    /// already configured by `try_create_stream` / `set_capacity_bounds`.
     pub fn register_extent(
         &self,
         id: ExtentId,
@@ -693,9 +566,8 @@ impl Stream {
     ) {
         self.epoch.store(epoch.0, Ordering::Release);
         let mut inner = self.inner.write();
-        inner.next_extent_capacity = extent_capacity;
+        inner.extent_capacity = extent_capacity;
         inner.next_extent_id = ExtentId(id.0 + 1);
-        inner.active_extent_created_at = Some(Instant::now());
         inner.extents.push(Extent::with_capacity(
             id,
             start_offset,
@@ -703,21 +575,9 @@ impl Stream {
             epoch,
         ));
         inner.evict_oldest_extents(self.id);
-
-        // Pre-allocate one spare extent for the pool so the first
-        // seal-and-create can recycle instead of allocating fresh.
-        if inner.max_extents > 0 && inner.extent_pool.is_empty() {
-            inner.extent_pool.push_back(Extent::with_capacity(
-                ExtentId(0), // placeholder — reset() overwrites on use
-                Offset(0),
-                extent_capacity,
-                Epoch(0),
-            ));
-        }
     }
 
     /// Simplified register_extent for tests and backward compatibility.
-    /// Sets capacity bounds on the stream then registers the extent.
     #[cfg(test)]
     pub fn register_extent_simple(
         &self,
@@ -726,7 +586,6 @@ impl Stream {
         extent_capacity: u32,
         epoch: Epoch,
     ) {
-        self.set_capacity_bounds(extent_capacity, extent_capacity, 2);
         self.register_extent(id, start_offset, epoch, extent_capacity);
     }
 
@@ -762,37 +621,16 @@ impl Stream {
         inner.try_create_next_extent(self.id, epoch)
     }
 
-    /// Seal the active extent and create a new one with adaptive capacity.
+    /// Seal the active extent and create a new one.
     ///
     /// Acquires the write lock internally. Returns the seal notification
     /// if a seal+create occurred, or None if already sealed / no active extent.
-    pub fn seal_and_create_next(&self, reason: SealReason) -> Option<SealNotification> {
+    pub fn seal_and_create_next(&self, _reason: SealReason) -> Option<SealNotification> {
         let mut inner = self.inner.write();
         let active_id = inner.extents.last().map(|e| e.id)?;
-        let active_bytes_written = inner.extents.last().map(|e| e.bytes_written()).unwrap_or(0);
         let (_, end_offset) = inner.seal_extent(active_id, None)?;
 
-        // Compute next extent capacity based on seal reason.
-        match reason {
-            SealReason::ExtentFull => {
-                // Scale up: multiply capacity by growth_factor (capped at max).
-                inner.next_extent_capacity = (inner
-                    .next_extent_capacity
-                    .saturating_mul(inner.growth_factor as u32))
-                .min(inner.max_extent_capacity);
-            }
-            SealReason::IdleShrink => {
-                if active_bytes_written == 0 {
-                    // Completely empty — jump to floor and free pool memory.
-                    inner.next_extent_capacity = inner.min_extent_capacity;
-                    inner.extent_pool.clear();
-                } else {
-                    // Partially filled — gradual halve (pool kept, resized on use).
-                    inner.next_extent_capacity =
-                        (inner.next_extent_capacity / 2).max(inner.min_extent_capacity);
-                }
-            }
-        }
+        // Capacity is fixed (self.extent_capacity); no adaptive scaling.
 
         // try_create_next_extent runs eviction first, then allocates.
         // Returns None on backpressure (S3 flush backlog blocking eviction).
@@ -812,14 +650,6 @@ impl Stream {
     pub(crate) fn set_downstream_txs(&self, txs: Vec<mpsc::Sender<Frame>>) {
         self.inner.write().downstream_txs = txs;
     }
-
-    // ── Test helpers ───────────────────────────────────────────────────
-
-    /// Set the active_extent_created_at timestamp (test only).
-    #[cfg(test)]
-    pub fn set_active_extent_created_at(&self, time: Option<Instant>) {
-        self.inner.write().active_extent_created_at = time;
-    }
 }
 
 /// Information about an extent that was sealed during an append.
@@ -829,7 +659,7 @@ pub struct SealNotification {
     pub end_offset: u64,
     pub new_extent_id: ExtentId,
     pub epoch: Epoch,
-    /// The actual capacity of the newly created extent (adaptive sizing).
+    /// The capacity of the newly created extent.
     pub new_extent_capacity: u32,
 }
 
@@ -841,10 +671,7 @@ impl std::fmt::Debug for Stream {
             .field("extents", &inner.extents)
             .field("epoch", &self.epoch.load(Ordering::Relaxed))
             .field("next_extent_id", &inner.next_extent_id)
-            .field("min_extent_capacity", &inner.min_extent_capacity)
-            .field("max_extent_capacity", &inner.max_extent_capacity)
-            .field("next_extent_capacity", &inner.next_extent_capacity)
-            .field("growth_factor", &inner.growth_factor)
+            .field("extent_capacity", &inner.extent_capacity)
             .field("max_extents", &inner.max_extents)
             .field("in_flight", &self.in_flight.load(Ordering::Relaxed))
             .field("has_ack_queue", &self.ack_queue.get().is_some())
@@ -855,7 +682,7 @@ impl std::fmt::Debug for Stream {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::config::DEFAULT_MIN_EXTENT_CAPACITY;
+    use common::config::DEFAULT_EXTENT_CAPACITY;
 
     /// Helper: create a stream with one active extent (simulating RegisterExtent from SM).
     fn new_stream_with_extent(id: StreamId) -> Stream {
@@ -863,7 +690,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(0),
             Offset(0),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         stream
@@ -982,7 +809,7 @@ mod tests {
         stream.register_extent_simple(
             second_extent_id,
             Offset(3),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         assert!(stream.is_mutable());
@@ -1018,7 +845,7 @@ mod tests {
         stream.register_extent_simple(
             second_extent_id,
             Offset(1),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         let r = stream
@@ -1038,7 +865,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(0),
             Offset(0),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         stream
@@ -1050,7 +877,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(1),
             Offset(1),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         // 2 extents (sealed + active) — at limit, no eviction.
@@ -1065,7 +892,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(2),
             Offset(2),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         assert!(
@@ -1085,7 +912,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(0),
             Offset(0),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         stream
@@ -1121,7 +948,7 @@ mod tests {
             stream.register_extent_simple(
                 ExtentId(i),
                 Offset(i as u64),
-                DEFAULT_MIN_EXTENT_CAPACITY,
+                DEFAULT_EXTENT_CAPACITY,
                 Epoch(0),
             );
             stream
@@ -1133,7 +960,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(5),
             Offset(5),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
 
@@ -1155,7 +982,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(0),
             Offset(0),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
 
@@ -1163,7 +990,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(1),
             Offset(100),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         assert!(stream.with_extent(ExtentId(0), |_| ()).is_some());
@@ -1174,7 +1001,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(2),
             Offset(200),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         assert!(
@@ -1197,7 +1024,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(0),
             Offset(0),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         stream
@@ -1208,7 +1035,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(1),
             Offset(1),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         stream
@@ -1219,7 +1046,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(2),
             Offset(2),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
 
@@ -1238,7 +1065,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(3),
             Offset(3),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
 
@@ -1268,7 +1095,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(0),
             Offset(0),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         stream
@@ -1280,7 +1107,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(1),
             Offset(1),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         stream
@@ -1312,7 +1139,7 @@ mod tests {
         stream.register_extent_simple(
             ExtentId(2),
             Offset(2),
-            DEFAULT_MIN_EXTENT_CAPACITY,
+            DEFAULT_EXTENT_CAPACITY,
             Epoch(0),
         );
         stream
@@ -1334,183 +1161,5 @@ mod tests {
             stream.with_extent(ExtentId(1), |_| ()).is_none(),
             "flushed extent 1 should be evicted"
         );
-    }
-
-    // ── Adaptive capacity tests ─────────────────────────────────────────
-
-    #[test]
-    fn adaptive_growth_on_extent_full() {
-        let min_cap: u32 = 256; // tiny for testing
-        let max_cap: u32 = 2048;
-        let stream = Stream::new(StreamId(1));
-        stream.set_max_extents(4);
-        stream.set_capacity_bounds(min_cap, max_cap, 2);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap);
-
-        // Fill extent to trigger extent-full on next append.
-        // Each record = 4 bytes header + payload. With 256 bytes, we can fit ~25 records of 6 bytes.
-        let mut offset = 0u64;
-        loop {
-            match stream.append(ExtentId(0), Bytes::from_static(b"xx")) {
-                Ok(r) => offset = r.offset.0 + 1,
-                Err(StorageError::ExtentFull { .. }) => break,
-                Err(e) => panic!("unexpected error: {e}"),
-            }
-        }
-        assert!(offset > 0);
-
-        // Seal with ExtentFull reason — should scale up by growth_factor (2x).
-        let notif = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
-        assert_eq!(notif.new_extent_capacity, min_cap * 2);
-
-        // Fill again and seal — should double again.
-        loop {
-            match stream.append(notif.new_extent_id, Bytes::from_static(b"xx")) {
-                Ok(_) => {}
-                Err(StorageError::ExtentFull { .. }) => break,
-                Err(e) => panic!("unexpected error: {e}"),
-            }
-        }
-        let notif2 = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
-        assert_eq!(notif2.new_extent_capacity, min_cap * 4);
-    }
-
-    #[test]
-    fn adaptive_cap_at_max() {
-        let min_cap: u32 = 256;
-        let max_cap: u32 = 512;
-        let stream = Stream::new(StreamId(1));
-        stream.set_max_extents(4);
-        stream.set_capacity_bounds(min_cap, max_cap, 2);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap);
-
-        // Fill and seal with ExtentFull — doubles to 512.
-        loop {
-            match stream.append(ExtentId(0), Bytes::from_static(b"xx")) {
-                Ok(_) => {}
-                Err(StorageError::ExtentFull { .. }) => break,
-                Err(e) => panic!("unexpected error: {e}"),
-            }
-        }
-        let notif = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
-        assert_eq!(notif.new_extent_capacity, max_cap);
-
-        // Fill and seal again — should stay at max.
-        loop {
-            match stream.append(notif.new_extent_id, Bytes::from_static(b"xx")) {
-                Ok(_) => {}
-                Err(StorageError::ExtentFull { .. }) => break,
-                Err(e) => panic!("unexpected error: {e}"),
-            }
-        }
-        let notif2 = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
-        assert_eq!(notif2.new_extent_capacity, max_cap);
-    }
-
-    #[test]
-    fn adaptive_shrink_on_idle_partial() {
-        let min_cap: u32 = 256;
-        let max_cap: u32 = 2048;
-        let stream = Stream::new(StreamId(1));
-        stream.set_max_extents(4);
-        stream.set_capacity_bounds(min_cap, max_cap, 2);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap);
-
-        // Fill extent to trigger growth (256 → 512 via ExtentFull).
-        loop {
-            match stream.append(ExtentId(0), Bytes::from_static(b"xx")) {
-                Ok(_) => {}
-                Err(StorageError::ExtentFull { .. }) => break,
-                Err(e) => panic!("unexpected error: {e}"),
-            }
-        }
-        let growth_notif = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
-        assert_eq!(growth_notif.new_extent_capacity, min_cap * 2); // 512
-
-        // Write a small amount to the new extent (less than half).
-        stream
-            .append(growth_notif.new_extent_id, Bytes::from_static(b"tiny"))
-            .unwrap();
-
-        // IdleShrink with partial fill — should halve (512 → 256).
-        let notif = stream.seal_and_create_next(SealReason::IdleShrink).unwrap();
-        assert_eq!(notif.new_extent_capacity, min_cap); // 256 (halved from 512, clamped to min)
-    }
-
-    #[test]
-    fn adaptive_shrink_empty_jumps_to_min() {
-        let min_cap: u32 = 256;
-        let max_cap: u32 = 2048;
-        let stream = Stream::new(StreamId(1));
-        stream.set_max_extents(4);
-        stream.set_capacity_bounds(min_cap, max_cap, 2);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap);
-        // Don't write anything — extent is completely empty.
-
-        let notif = stream.seal_and_create_next(SealReason::IdleShrink).unwrap();
-        assert_eq!(notif.new_extent_capacity, min_cap);
-    }
-
-    #[test]
-    fn adaptive_shrink_noop_at_min_empty() {
-        let min_cap: u32 = 256;
-        let max_cap: u32 = 2048;
-        let stream = Stream::new(StreamId(1));
-        stream.set_max_extents(4);
-        stream.set_capacity_bounds(min_cap, max_cap, 2);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap);
-        // Artificially set active_extent_created_at to the past.
-        stream.set_active_extent_created_at(Some(
-            Instant::now() - std::time::Duration::from_secs(600),
-        ));
-
-        // Already at min + empty -> should_idle_shrink returns false.
-        assert!(!stream.should_idle_shrink(std::time::Duration::from_secs(300)));
-    }
-
-    #[test]
-    fn adaptive_floor_at_min() {
-        let min_cap: u32 = 256;
-        let max_cap: u32 = 2048;
-        let stream = Stream::new(StreamId(1));
-        stream.set_max_extents(4);
-        stream.set_capacity_bounds(min_cap, max_cap, 2);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap);
-
-        // Write a small amount.
-        stream
-            .append(ExtentId(0), Bytes::from_static(b"x"))
-            .unwrap();
-
-        // IdleShrink — already at min, should stay at min.
-        let notif = stream.seal_and_create_next(SealReason::IdleShrink).unwrap();
-        assert_eq!(notif.new_extent_capacity, min_cap);
-    }
-
-    #[test]
-    fn extent_pool_resize_on_growth() {
-        let min_cap: u32 = 256;
-        let max_cap: u32 = 2048;
-        let stream = Stream::new(StreamId(1));
-        stream.set_max_extents(3);
-        stream.set_capacity_bounds(min_cap, max_cap, 2);
-        stream.register_extent(ExtentId(0), Offset(0), Epoch(0), min_cap);
-
-        // Fill and seal — creates extent at 512, evicts extent 0 into pool (capacity 256).
-        loop {
-            match stream.append(ExtentId(0), Bytes::from_static(b"xx")) {
-                Ok(_) => {}
-                Err(StorageError::ExtentFull { .. }) => break,
-                Err(e) => panic!("unexpected error: {e}"),
-            }
-        }
-        let notif = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
-        assert_eq!(notif.new_extent_capacity, min_cap * 2);
-
-        // The new extent should have capacity 512 regardless of pool recycling.
-        let capacity = stream
-            .with_extent(notif.new_extent_id, |e| e.capacity())
-            .unwrap();
-        assert_eq!(capacity, min_cap * 2);
     }
 }

@@ -360,10 +360,7 @@ impl Frame {
                     let name_len = body.get_u16() as usize;
                     let stream_name = body.split_to(name_len).freeze();
                     let replication_factor = body.get_u8();
-                    let min_capacity = body.get_u32();
-                    let max_capacity = body.get_u32();
                     let cache = body.get_u16();
-                    let scale_factor = body.get_u8();
                     let storage_class = StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
                         InvalidFrameSnafu {
                             message: "unknown storage class",
@@ -378,9 +375,6 @@ impl Frame {
                             storage_class,
                             policy: ExtentPolicy {
                                 cache,
-                                min_capacity,
-                                max_capacity,
-                                scale_factor,
                             },
                         },
                         None,
@@ -536,9 +530,6 @@ impl Frame {
                     let replication_factor = body.get_u8();
                     let epoch = Epoch(body.get_u32());
                     let cache = body.get_u16();
-                    let min_capacity = body.get_u32();
-                    let max_capacity = body.get_u32();
-                    let scale_factor = body.get_u8();
                     let storage_class = StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
                         InvalidFrameSnafu {
                             message: "unknown storage class",
@@ -558,9 +549,6 @@ impl Frame {
                                 storage_class,
                                 policy: ExtentPolicy {
                                     cache,
-                                    min_capacity,
-                                    max_capacity,
-                                    scale_factor,
                                 },
                             },
                         },
@@ -631,9 +619,6 @@ impl Frame {
                         let start_offset = Offset(body.get_u64());
                         let extent_capacity = body.get_u32();
                         let cache_extents = body.get_u16();
-                        let min_extent_capacity = body.get_u32();
-                        let max_extent_capacity = body.get_u32();
-                        let extent_growth_factor = body.get_u8();
                         let storage_class =
                             StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
                                 InvalidFrameSnafu {
@@ -649,9 +634,6 @@ impl Frame {
                                 start_offset,
                                 extent_capacity,
                                 cache_extents,
-                                min_extent_capacity,
-                                max_extent_capacity,
-                                extent_growth_factor,
                                 storage_class,
                             },
                             None,

@@ -3,10 +3,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::config::{
-    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
-    DEFAULT_MIN_EXTENT_CAPACITY,
-};
+use common::config::DEFAULT_CACHE_EXTENTS;
 use common::types::{
     Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
 };
@@ -25,9 +22,6 @@ fn test_config(stream_id: u32, replication_factor: u8) -> StreamConfig {
         storage_class: StorageClass::S3,
         policy: ExtentPolicy {
             cache: DEFAULT_CACHE_EXTENTS,
-            min_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-            max_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
-            scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
         },
     }
 }

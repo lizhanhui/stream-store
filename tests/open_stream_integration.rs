@@ -8,8 +8,7 @@
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{
-    DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
-    DEFAULT_MIN_EXTENT_CAPACITY, StreamManagerConfig,
+    DEFAULT_CACHE_EXTENTS, StreamManagerConfig,
 };
 use common::types::{Epoch, ExtentPolicy, ExtentState, NodeMetrics, StorageClass};
 use serial_test::serial;
@@ -118,10 +117,7 @@ async fn stream_client_open_integration() {
             1,
             StorageClass::S3,
             ExtentPolicy {
-                min_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                max_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                 cache: DEFAULT_CACHE_EXTENTS,
-                scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
             },
         )
         .await
@@ -147,10 +143,7 @@ async fn stream_client_open_integration() {
             1,
             StorageClass::S3,
             ExtentPolicy {
-                min_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                max_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                 cache: DEFAULT_CACHE_EXTENTS,
-                scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
             },
         )
         .await
@@ -171,10 +164,7 @@ async fn stream_client_open_integration() {
             1,
             StorageClass::S3,
             ExtentPolicy {
-                min_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
-                max_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
                 cache: DEFAULT_CACHE_EXTENTS,
-                scale_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
             },
         )
         .await

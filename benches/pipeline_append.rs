@@ -56,11 +56,8 @@ const REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const NUM_SENDERS: usize = 4;
 const PAYLOAD_SIZE: usize = 1024; // 1 KiB
 const REPLICATION_FACTOR: u8 = 2;
-const MIN_EXTENT_CAPACITY: u32 = 8 * 1024 * 1024; // 8 MiB
-const MAX_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024; // 256 MiB
 const PIPELINE_DEPTH: usize = 16; // max in-flight appends per sender
 const CACHE_EXTENTS: u16 = 4;
-const EXTENT_GROWTH_FACTOR: u8 = 8; // 8x growth: 8→64→256 MiB (2 transitions vs 5 with 2x)
 
 // -- Shared counters ----------------------------------------------------------
 
@@ -201,10 +198,7 @@ async fn main() {
             REPLICATION_FACTOR,
             StorageClass::Memory,
             ExtentPolicy {
-                min_capacity: MIN_EXTENT_CAPACITY,
-                max_capacity: MAX_EXTENT_CAPACITY,
                 cache: CACHE_EXTENTS,
-                scale_factor: EXTENT_GROWTH_FACTOR,
             },
         )
         .await
@@ -316,7 +310,7 @@ fn print_header() {
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"
     );
     eprintln!(
-        "  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  cache_extents={CACHE_EXTENTS}  growth={EXTENT_GROWTH_FACTOR}x"
+        "  Pipeline Append Benchmark  |  senders={NUM_SENDERS}  payload={PAYLOAD_SIZE}B  RF={REPLICATION_FACTOR}  pipeline={PIPELINE_DEPTH}  cache_extents={CACHE_EXTENTS}"
     );
     eprintln!(
         "═══════════════════════════════════════════════════════════════════════════════════════════════════════════════════════"

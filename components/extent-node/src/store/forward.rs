@@ -1,8 +1,5 @@
 use std::sync::atomic::Ordering;
 
-use common::config::{
-    DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY,
-};
 use common::errors::StorageError;
 use common::types::{Epoch, ExtentId, ExtentPolicy, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
@@ -39,7 +36,6 @@ impl ExtentNodeStore {
             _ => return None,
         };
 
-        let (min_cap, max_cap, growth) = stream.capacity_bounds();
         stream.with_extent(extent_id, |ext| {
             if !ext.take_init_forward() {
                 return None;
@@ -54,9 +50,6 @@ impl ExtentNodeStore {
                     start_offset: ext.start_offset,
                     extent_capacity: ext.capacity(),
                     cache_extents: stream.max_extents() as u16,
-                    min_extent_capacity: min_cap,
-                    max_extent_capacity: max_cap,
-                    extent_growth_factor: growth,
                     storage_class: stream.storage_class(),
                 },
                 None,
@@ -77,9 +70,6 @@ impl ExtentNodeStore {
             start_offset,
             extent_capacity,
             cache_extents,
-            min_extent_capacity,
-            max_extent_capacity,
-            extent_growth_factor,
             storage_class,
         ) = match &frame.variable_header {
             VariableHeader::ForwardInitExtent {
@@ -89,9 +79,6 @@ impl ExtentNodeStore {
                 start_offset,
                 extent_capacity,
                 cache_extents,
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
                 storage_class,
             } => (
                 *stream_id,
@@ -100,29 +87,9 @@ impl ExtentNodeStore {
                 *start_offset,
                 *extent_capacity,
                 *cache_extents,
-                *min_extent_capacity,
-                *max_extent_capacity,
-                *extent_growth_factor,
                 *storage_class,
             ),
             _ => return,
-        };
-
-        // Normalize: 0 means use default.
-        let min_extent_capacity = if min_extent_capacity == 0 {
-            DEFAULT_MIN_EXTENT_CAPACITY
-        } else {
-            min_extent_capacity
-        };
-        let max_extent_capacity = if max_extent_capacity == 0 {
-            DEFAULT_MAX_EXTENT_CAPACITY
-        } else {
-            max_extent_capacity
-        };
-        let extent_growth_factor = if extent_growth_factor == 0 {
-            DEFAULT_EXTENT_GROWTH_FACTOR
-        } else {
-            extent_growth_factor
         };
 
         let is_new = self.try_create_stream(
@@ -130,34 +97,19 @@ impl ExtentNodeStore {
             storage_class,
             &ExtentPolicy {
                 cache: cache_extents,
-                min_capacity: min_extent_capacity,
-                max_capacity: max_extent_capacity,
-                scale_factor: extent_growth_factor,
             },
         );
         self.try_register_extent(stream_id, extent_id, start_offset, epoch, extent_capacity);
 
         if is_new {
             info!(
-                "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
-                stream_id,
-                extent_id,
-                start_offset,
-                extent_capacity,
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
+                "ForwardInitExtent (new stream): stream={}, extent={}, start_offset={}, capacity={}",
+                stream_id, extent_id, start_offset, extent_capacity,
             );
         } else {
             info!(
-                "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}, min={}, max={}, gf={}",
-                stream_id,
-                extent_id,
-                start_offset,
-                extent_capacity,
-                min_extent_capacity,
-                max_extent_capacity,
-                extent_growth_factor,
+                "ForwardInitExtent: stream={}, extent={}, start_offset={}, capacity={}",
+                stream_id, extent_id, start_offset, extent_capacity,
             );
         }
     }
