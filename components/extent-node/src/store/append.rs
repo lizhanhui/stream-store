@@ -25,8 +25,8 @@ impl ExtentNodeStore {
     ///
     /// The active writer handles replication (Forward + PendingAck for RF≥2)
     /// or sends immediate AppendAck (RF=1/standalone) for each job.
-    /// On ExtentFull, the leader seals the active extent, creates a new one,
-    /// and retries — all transparently within the same leader tenure.
+    /// On EpochFull, the leader seals the active epoch and surfaces an error;
+    /// the client must reopen the stream to get the successor epoch.
     ///
     /// Pin guards are scoped in blocks so they're dropped before `.await` points
     /// (papaya pin guards are non-Send).
@@ -39,7 +39,7 @@ impl ExtentNodeStore {
         let client_epoch = frame.epoch();
 
         // ── Validation + leader election + own append (scoped pin guard) ──
-        let (epoch, own_result, extent_full, remaining, payload, request_id) = {
+        let (own_result, extent_full, remaining) = {
             let guard = self.streams.pin();
             let stream = match guard.get(&stream_id) {
                 Some(s) => s,
@@ -89,68 +89,23 @@ impl ExtentNodeStore {
             if extent_full {
                 // Don't decrement in_flight — we're still the leader.
                 // Will decrement after seal+create+retry below.
-                (epoch, own_result, true, 0, payload, request_id)
+                (own_result, true, 0)
             } else {
                 let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
-                (epoch, own_result, false, remaining, payload, request_id)
+                (own_result, false, remaining)
             }
         };
         // Pin guard dropped — safe to .await.
 
-        // ── Extent-full path: seal+create, retry, then drain ──
+        // ── Epoch-full path: seal current epoch, surface error, then drain ──
         if extent_full {
-            let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
-
-            // Backpressure: seal succeeded but no new extent could be created
-            // (S3 flush backlog blocking eviction). Return ExtentSealed to the
-            // client so it seals via SM and gets a new replica set.
-            if seal_notification.is_none() {
-                let remaining = {
-                    let guard = self.streams.pin();
-                    if let Some(stream) = guard.get(&stream_id) {
-                        stream.in_flight().fetch_sub(1, Ordering::Release)
-                    } else {
-                        0
-                    }
-                };
-                if remaining > 1 {
-                    let batch_seals = self.drain_follower_jobs(stream_id).await;
-                    for notification in &batch_seals {
-                        self.send_forward_checksum(stream_id, notification.sealed_extent_id);
-                        self.send_flush_request(stream_id, notification);
-                    }
-                }
-                let err = Frame::append_ack_error(
-                    request_id,
-                    stream_id,
-                    epoch,
-                    ErrorCode::ExtentSealed,
-                    "extent full: eviction blocked, seal required",
-                );
-                if let Some(tx) = response_tx {
-                    let _ = tx.try_send(err);
-                    return None;
-                }
-                return Some(err);
-            }
-
-            // Re-acquire pin guard for retry on the new extent.
-            let (retry_result, remaining) = {
+            let seal_notification = self.seal_current_epoch(stream_id, SealReason::EpochFull);
+            let remaining = {
                 let guard = self.streams.pin();
-                match guard.get(&stream_id) {
-                    Some(stream) => {
-                        let (retry_result, _) = self.do_append_and_respond(
-                            stream,
-                            request_id,
-                            stream_id,
-                            epoch,
-                            payload,
-                            response_tx.cloned(),
-                        );
-                        let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
-                        (retry_result, remaining)
-                    }
-                    None => return None,
+                if let Some(stream) = guard.get(&stream_id) {
+                    stream.in_flight().fetch_sub(1, Ordering::Release)
+                } else {
+                    0
                 }
             };
 
@@ -165,7 +120,7 @@ impl ExtentNodeStore {
                 self.send_forward_checksum(stream_id, notification.sealed_extent_id);
                 self.send_flush_request(stream_id, notification);
             }
-            return retry_result;
+            return own_result;
         }
 
         // ── Normal path: drain followers if any arrived ──
@@ -183,7 +138,7 @@ impl ExtentNodeStore {
     ///
     /// Returns `(Option<Frame>, bool)`:
     /// - Option<Frame>: response frame (None if deferred or sent via channel)
-    /// - bool: whether ExtentFull occurred (caller should trigger proactive seal)
+    /// - bool: whether EpochFull occurred (caller should seal current epoch)
     ///
     /// Forward frames are pushed **inline** into the stream's cached per-secondary
     /// mpsc channels, while the leader still holds `in_flight > 0`. This guarantees
@@ -222,9 +177,18 @@ impl ExtentNodeStore {
                 return (Some(err), false);
             }
             Err(StorageError::EpochFull { .. }) => {
-                // Don't send error to client — the caller will seal, create a new extent,
-                // and retry the append transparently. Return extent_full=true.
-                return (None, true);
+                    let err = Frame::append_ack_error(
+                    request_id,
+                    stream_id,
+                    epoch,
+                    ErrorCode::ExtentSealed,
+                    "epoch full: reopen stream",
+                );
+                if let Some(tx) = response_tx {
+                    let _ = tx.try_send(err);
+                    return (None, true);
+                }
+                return (Some(err), true);
             }
             Err(e) => {
                 let err = Frame::append_ack_error(
@@ -357,8 +321,8 @@ impl ExtentNodeStore {
     /// Forward frames are pushed inline by `do_append_and_respond` — this method
     /// only returns seal notifications for the caller to send SM updates.
     ///
-    /// On ExtentFull, this method calls `seal_and_create` (which manages its own
-    /// pin guard) and retries the remaining jobs on the new extent.
+    /// On EpochFull, this method seals the current epoch and surfaces errors for
+    /// the remaining jobs; the client must reopen on a new epoch.
     /// Pin guards are scoped in blocks so they're dropped before `yield_now().await`.
     async fn drain_follower_jobs(&self, stream_id: StreamId) -> SmallVec<[SealNotification; 1]> {
         let mut notifications = SmallVec::with_capacity(1);
@@ -430,7 +394,7 @@ impl ExtentNodeStore {
             // Pin guard dropped.
 
             if let Some(index) = extent_full_idx {
-                let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
+                let seal_notification = self.seal_current_epoch(stream_id, SealReason::EpochFull);
                 if let Some(ref notification) = seal_notification {
                     notifications.push(notification.clone());
                 }
@@ -462,7 +426,7 @@ impl ExtentNodeStore {
                     break;
                 }
             } else {
-                // All jobs processed without ExtentFull.
+                // All jobs processed without EpochFull.
                 let done = {
                     let guard = self.streams.pin();
                     if let Some(stream) = guard.get(&stream_id) {
@@ -488,22 +452,28 @@ impl ExtentNodeStore {
     ///
     /// Acquires write lock on the stream's inner RwLock. Returns the seal notification
     /// if a seal+create occurred, or None if already sealed / stream not found.
-    pub(crate) fn seal_and_create(
+    pub(crate) fn seal_current_epoch(
         &self,
         stream_id: StreamId,
         reason: SealReason,
     ) -> Option<SealNotification> {
         if let Some(stream) = self.streams.pin().get(&stream_id) {
             let t0 = std::time::Instant::now();
-            let notification = stream.seal_and_create_next(reason);
+            let sealed_extent_id = stream.active_extent_id()?;
+            let notification = stream.seal_current_epoch().map(|(sealed_epoch, end_offset)| {
+                SealNotification {
+                    sealed_extent_id,
+                    sealed_epoch,
+                    end_offset: end_offset.0,
+                }
+            });
             let seal_us = t0.elapsed().as_micros();
             if let Some(ref n) = notification {
                 info!(
-                    "seal_and_create: stream={}, sealed={}, new={}, capacity={}, reason={:?}, duration={}us",
+                    "seal_current_epoch: stream={}, sealed={}, epoch={}, reason={:?}, duration={}us",
                     stream_id,
                     n.sealed_extent_id,
-                    n.new_extent_id,
-                    n.new_extent_capacity,
+                    n.sealed_epoch,
                     reason,
                     seal_us,
                 );
@@ -635,18 +605,12 @@ impl ExtentNodeStore {
             payload_len: usize,
             extent_id: ExtentId,
         }
-        struct FailedFrame {
-            request_id: u32,
-            payload: Bytes,
-        }
-
         let mut responses = Vec::new();
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
-        let mut failed_frames: Vec<FailedFrame> = Vec::new();
         let mut extent_full = false;
 
         // ── Validation + leader election + batch appends (scoped pin guard) ──
-        let (epoch, batch_len) = {
+        let (_epoch, batch_len) = {
             let guard = self.streams.pin();
             let stream = match guard.get(&stream_id) {
                 Some(s) => s,
@@ -700,10 +664,18 @@ impl ExtentNodeStore {
                 let payload_for_forward = payload.clone();
 
                 if extent_full {
-                    failed_frames.push(FailedFrame {
+                    let err = Frame::append_ack_error(
                         request_id,
-                        payload,
-                    });
+                        stream_id,
+                        epoch,
+                        ErrorCode::ExtentSealed,
+                        "epoch full: reopen stream",
+                    );
+                    if let Some(tx) = response_tx {
+                        let _ = tx.try_send(err);
+                    } else {
+                        responses.push(err);
+                    }
                     continue;
                 }
 
@@ -733,10 +705,18 @@ impl ExtentNodeStore {
                     }
                     Err(StorageError::EpochFull { .. }) => {
                         extent_full = true;
-                        failed_frames.push(FailedFrame {
+                        let err = Frame::append_ack_error(
                             request_id,
-                            payload,
-                        });
+                            stream_id,
+                            epoch,
+                            ErrorCode::ExtentSealed,
+                            "epoch full: reopen stream",
+                        );
+                        if let Some(tx) = response_tx {
+                            let _ = tx.try_send(err);
+                        } else {
+                            responses.push(err);
+                        }
                     }
                     Err(e) => {
                         let err = Frame::append_ack_error(
@@ -869,24 +849,13 @@ impl ExtentNodeStore {
         };
         // Pin guard dropped — safe to .await.
 
-        // ── Extent-full: seal+create, retry failed frames, then drain ──
+        // ── Epoch-full: seal current epoch, surface errors, then drain ──
         if extent_full {
-            let seal_notification = self.seal_and_create(stream_id, SealReason::ExtentFull);
+            let seal_notification = self.seal_current_epoch(stream_id, SealReason::EpochFull);
 
-            // Retry failed frames on the new extent (scoped pin guard).
             let remaining = {
                 let guard = self.streams.pin();
                 if let Some(stream) = guard.get(&stream_id) {
-                    for ff in &failed_frames {
-                        let (_, _) = self.do_append_and_respond(
-                            stream,
-                            ff.request_id,
-                            stream_id,
-                            epoch,
-                            ff.payload.clone(),
-                            response_tx.cloned(),
-                        );
-                    }
                     stream.in_flight().fetch_sub(batch_len, Ordering::Release)
                 } else {
                     0

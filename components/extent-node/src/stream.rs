@@ -19,11 +19,11 @@ use crate::arena::{ArenaIdGenerator, ArenaPool};
 use crate::store::AppendJob;
 use crate::stream_epoch::{AppendResult, StreamEpoch};
 
-/// Reason for sealing the active extent and creating a new one.
+/// Reason for sealing the active extent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SealReason {
-    /// Extent arena is full — stream needs more space.
-    ExtentFull,
+    /// Epoch arena is full — client must reopen on a new epoch.
+    EpochFull,
 }
 
 /// Mutable state protected by `RwLock`. Grouped here so that a single
@@ -243,51 +243,6 @@ impl Stream {
         let start_offset = last.start_offset.0;
         let end_offset = last.seal(committed_offset);
         Some((start_offset, end_offset))
-    }
-
-    /// Allocate a new epoch (autonomous on Primary). Returns
-    /// `Some((new_id, start_offset))` on success, `None` on
-    /// S3-backpressure block.
-    fn try_create_next_epoch(&self, epoch: Epoch) -> Option<(ExtentId, Offset)> {
-        // S3 backpressure check: read the current snapshot + inner fields.
-        let (max_extents, is_s3) = {
-            let inner = self.inner.read();
-            (inner.max_extents, inner.storage_class == StorageClass::S3)
-        };
-        {
-            let snap = self.epochs.load();
-            if max_extents > 0
-                && snap.len() >= max_extents
-                && is_s3
-                && snap.first().is_some_and(|e| !e.is_flushed())
-            {
-                return None;
-            }
-        }
-
-        // Compute start_offset + next id; bump next_extent_id under the write lock.
-        let (new_id, start_offset) = {
-            let snap = self.epochs.load();
-            let start = snap
-                .last()
-                .map(|e| Offset(e.start_offset.0 + e.message_count()))
-                .unwrap_or(Offset(0));
-            let mut inner = self.inner.write();
-            let new_id = inner.next_extent_id;
-            inner.next_extent_id = ExtentId(new_id.0 + 1);
-            (new_id, start)
-        };
-
-        // Allocate + insert outside the write lock. Insert ordering is by
-        // epoch number, which is monotone, so the new entry appends at the
-        // tail.
-        let ep = self
-            .pool
-            .allocate_epoch(self.id, new_id, start_offset, epoch);
-        self.insert_epoch(ep);
-
-        self.evict_oldest_epochs();
-        Some((new_id, start_offset))
     }
 
     /// Evict oldest epochs when count exceeds max_extents.
@@ -686,41 +641,22 @@ impl Stream {
     /// via SM. The sealed extent will accept late forwarded appends up to that offset.
     /// If `None`, the extent uses its local record_count (primary sealing itself).
     ///
-    /// After seal, the stream has no active extent until SM sends a new `RegisterEpoch`
-    /// or the Primary autonomously creates one via `create_next_extent()`.
+    /// After seal, the stream has no active extent until SM sends a new `RegisterEpoch`.
     pub fn seal(&self, extent_id: ExtentId, committed_offset: Option<u64>) -> Option<(u64, u64)> {
         self.seal_epoch_by_id(extent_id, committed_offset)
     }
 
-    /// Autonomously create the next extent on extent-full (Primary only, within same epoch).
+    /// Seal the active epoch without creating a successor.
     ///
-    /// Uses `next_extent_capacity` for the new extent (adaptive sizing).
-    /// Extent ID is incremented locally — no SM round-trip needed.
-    ///
-    /// Returns `Some((new_extent_id, start_offset))` on success, `None` if
-    /// backpressure blocks creation (S3 flush backlog).
-    pub fn create_next_extent(&self) -> Option<(ExtentId, Offset)> {
-        let epoch = Epoch(self.epoch.load(Ordering::Acquire));
-        self.try_create_next_epoch(epoch)
-    }
-
-    /// Seal the active extent and create a new one.
-    ///
-    /// Acquires the write lock internally. Returns the seal notification
-    /// if a seal+create occurred, or None if already sealed / no active extent.
-    pub fn seal_and_create_next(&self, _reason: SealReason) -> Option<SealNotification> {
-        let active_id = self.active_epoch()?.id;
+    /// Returns `(sealed_epoch, end_offset)` if the active epoch was sealed, or `None`
+    /// if no active epoch exists or it was already sealed.
+    pub fn seal_current_epoch(&self) -> Option<(Epoch, Offset)> {
+        let active = self.active_epoch()?;
+        let active_id = active.id;
+        let epoch = active.epoch;
+        drop(active);
         let (_, end_offset) = self.seal_epoch_by_id(active_id, None)?;
-        let epoch = Epoch(self.epoch.load(Ordering::Acquire));
-        let (new_id, _) = self.try_create_next_epoch(epoch)?;
-        let new_capacity = self.active_epoch().map(|e| e.capacity()).unwrap_or(0);
-        Some(SealNotification {
-            sealed_extent_id: active_id,
-            end_offset,
-            new_extent_id: new_id,
-            epoch,
-            new_extent_capacity: new_capacity,
-        })
+        Some((epoch, Offset(end_offset)))
     }
 
     /// Set cached downstream senders (Primary only, called at RegisterEpoch time).
@@ -733,11 +669,8 @@ impl Stream {
 #[derive(Debug, Clone)]
 pub struct SealNotification {
     pub sealed_extent_id: ExtentId,
+    pub sealed_epoch: Epoch,
     pub end_offset: u64,
-    pub new_extent_id: ExtentId,
-    pub epoch: Epoch,
-    /// The capacity of the newly created extent.
-    pub new_extent_capacity: u32,
 }
 
 impl std::fmt::Debug for Stream {
@@ -913,29 +846,17 @@ mod tests {
     }
 
     #[test]
-    fn seal_already_sealed_returns_none() {
+    fn seal_current_epoch_returns_epoch_and_end_offset() {
         let stream = new_stream_with_extent(StreamId(1));
         let first_extent_id = ExtentId(0);
         let r = stream
             .append(first_extent_id, Bytes::from_static(b"a"))
             .unwrap();
         assert_eq!(r.offset, Offset(0));
-        stream.seal(first_extent_id, None); // seals extent with 1 msg
-        assert_eq!(stream.seal(first_extent_id, None), None); // already sealed, returns None
 
-        // Register a new extent and append.
-        let second_extent_id = ExtentId(1);
-        stream.register_extent_simple(
-            second_extent_id,
-            Offset(1),
-            DEFAULT_EPOCH_CAPACITY,
-            Epoch(0),
-        );
-        let r = stream
-            .append(second_extent_id, Bytes::from_static(b"b"))
-            .unwrap();
-        assert_eq!(r.offset, Offset(1));
-        assert_eq!(stream.max_offset(), Offset(2));
+        assert_eq!(stream.seal_current_epoch(), Some((Epoch(0), Offset(1))));
+        assert_eq!(stream.seal_current_epoch(), None); // already sealed, returns None
+        assert!(!stream.is_mutable());
     }
 
     #[test]
@@ -969,37 +890,6 @@ mod tests {
         );
         assert!(stream.with_extent(ExtentId(1), |_| ()).is_some());
         assert!(stream.with_extent(ExtentId(2), |_| ()).is_some());
-    }
-
-    #[test]
-    fn evict_via_create_next_extent() {
-        let stream = Stream::new(StreamId(1), test_pool(), test_arena_ids());
-        stream.set_storage_class(StorageClass::Memory);
-        stream.set_max_extents(2);
-
-        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
-        stream
-            .append(ExtentId(0), Bytes::from_static(b"a"))
-            .unwrap();
-
-        // seal_and_create_next triggers eviction via create_next_extent.
-        let notif = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
-        // 2 extents: sealed extent 0 + new active extent 1. At limit.
-        assert!(stream.with_extent(ExtentId(0), |_| ()).is_some());
-        assert!(stream.with_extent(notif.new_extent_id, |_| ()).is_some());
-
-        // Append to new extent, then seal_and_create again.
-        stream
-            .append(notif.new_extent_id, Bytes::from_static(b"b"))
-            .unwrap();
-        let notif2 = stream.seal_and_create_next(SealReason::ExtentFull).unwrap();
-        // 3 would exceed limit — extent 0 should be evicted.
-        assert!(
-            stream.with_extent(ExtentId(0), |_| ()).is_none(),
-            "extent 0 should be evicted"
-        );
-        assert!(stream.with_extent(notif.new_extent_id, |_| ()).is_some());
-        assert!(stream.with_extent(notif2.new_extent_id, |_| ()).is_some());
     }
 
     #[test]
@@ -1106,68 +996,4 @@ mod tests {
         assert!(stream.with_extent(ExtentId(3), |_| ()).is_some());
     }
 
-    #[test]
-    fn s3_backpressure_blocks_new_extent_creation() {
-        // S3-class stream: when eviction is blocked (unflushed extents),
-        // seal_and_create_next should return None (backpressure).
-        let stream = Stream::new(StreamId(1), test_pool(), test_arena_ids());
-        assert_eq!(stream.storage_class(), StorageClass::S3);
-        stream.set_max_extents(2);
-
-        // Create extent 0, append, seal it (but NOT flushed).
-        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
-        stream
-            .append(ExtentId(0), Bytes::from_static(b"a"))
-            .unwrap();
-        stream.seal(ExtentId(0), None);
-
-        // Create extent 1 (active) — 2 extents, at limit.
-        stream.register_extent_simple(ExtentId(1), Offset(1), DEFAULT_EPOCH_CAPACITY, Epoch(0));
-        stream
-            .append(ExtentId(1), Bytes::from_static(b"b"))
-            .unwrap();
-
-        // Try seal_and_create_next — should fail (extent 0 not flushed).
-        let result = stream.seal_and_create_next(SealReason::ExtentFull);
-        assert!(
-            result.is_none(),
-            "backpressure: should not create new extent when eviction is blocked"
-        );
-
-        // Extent 1 should be sealed (seal happened), but no new extent created.
-        assert!(
-            stream.with_extent(ExtentId(0), |_| ()).is_some(),
-            "extent 0 still present"
-        );
-        assert!(
-            stream.with_extent(ExtentId(1), |_| ()).is_some(),
-            "extent 1 still present"
-        );
-
-        // Flush both sealed extents (simulating S3 upload completing).
-        stream.with_extent(ExtentId(0), |ext| ext.mark_flushed());
-        stream.with_extent(ExtentId(1), |ext| ext.mark_flushed());
-
-        // Register a new active extent so we can seal+create again.
-        stream.register_extent_simple(ExtentId(2), Offset(2), DEFAULT_EPOCH_CAPACITY, Epoch(0));
-        stream
-            .append(ExtentId(2), Bytes::from_static(b"c"))
-            .unwrap();
-
-        // Now both old extents are flushed — eviction is unblocked.
-        let result = stream.seal_and_create_next(SealReason::ExtentFull);
-        assert!(
-            result.is_some(),
-            "after flush, seal_and_create_next should succeed"
-        );
-        // Both old extents should be evicted (flushed + over limit).
-        assert!(
-            stream.with_extent(ExtentId(0), |_| ()).is_none(),
-            "flushed extent 0 should be evicted"
-        );
-        assert!(
-            stream.with_extent(ExtentId(1), |_| ()).is_none(),
-            "flushed extent 1 should be evicted"
-        );
-    }
 }

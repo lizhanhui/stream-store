@@ -277,36 +277,6 @@ impl StreamEpoch {
         self.flags.load(Ordering::Acquire) & FLAG_FLUSHED != 0
     }
 
-    /// Whether this extent's arena buffer has no outstanding reader references
-    /// and can be safely recycled. Returns `false` if any `Bytes` slices from
-    /// `read()` or `committed_data()` are still alive.
-    pub fn can_recycle(&self) -> bool {
-        Arc::strong_count(&self.arena) == 1
-    }
-
-    /// Reset this extent for reuse with a new identity. O(1) cost — only
-    /// resets atomics and the CRC32 hasher; arena and index memory are reused
-    /// as-is (stale data is overwritten in order before it could be read).
-    ///
-    /// Requires `&mut self` — the extent must not be in the active extent list.
-    pub fn reset(&mut self, id: ExtentId, start_offset: Offset, epoch: Epoch) {
-        self.id = id;
-        self.start_offset = start_offset;
-        self.epoch = epoch;
-        self.write_cursor.store(0, Ordering::Relaxed);
-        self.record_count.store(0, Ordering::Relaxed);
-        self.committed_offset
-            .store(start_offset.0, Ordering::Relaxed);
-        self.committed_bytes.store(0, Ordering::Relaxed);
-        self.limit.store(LIMIT_OPEN, Ordering::Relaxed);
-        self.flags.store(FLAG_INIT_FORWARD, Ordering::Relaxed);
-        self.finalized_crc32.store(0, Ordering::Relaxed);
-        // SAFETY: exclusive access via &mut self — no concurrent readers/writers.
-        unsafe {
-            *self.hasher.get() = crc32fast::Hasher::new();
-        }
-    }
-
     /// Append a message. Returns the assigned logical offset and the byte
     /// position within the arena.
     ///
