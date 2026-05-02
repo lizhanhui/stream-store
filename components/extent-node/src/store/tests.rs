@@ -513,14 +513,14 @@ async fn cumulative_ack_drains_multiple_pending() {
     let ack_queue = AckQueue::new(1); // need 1 secondary ACK
 
     // Queue 3 pending ACKs at offsets 0, 1, 2.
-    for i in 0u64..3 {
+    for i in 0u32..3 {
         ack_queue.enqueue(PendingAck {
-            request_id: i as u32,
+            request_id: i,
             stream_id: StreamId(10),
             extent_id: ExtentId(0),
             epoch: Epoch(0),
             response_tx: resp_tx.clone(),
-            assigned_offset: i,
+            assigned_offset: i as u64,
             created_at: Instant::now(),
         });
     }
@@ -621,7 +621,7 @@ async fn concurrent_multi_stream_appends() {
 
     let mut stream_ids = Vec::new();
     for i in 0..NUM_STREAMS {
-        let sid = register_stream(&store, i + 1, i as u32).await;
+        let sid = register_stream(&store, i + 1, i).await;
         stream_ids.push(sid);
     }
 

@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 use crate::ack_queue::AckQueue;
-use crate::arena::{ArenaIdGenerator, ArenaPool};
+use crate::arena::ArenaIdGenerator;
 use crate::store::AppendJob;
 use crate::stream_epoch::{AppendResult, StreamEpoch};
 
@@ -99,10 +99,6 @@ pub struct Stream {
     /// register / arena roll / epoch death — rare.
     epochs: ArcSwap<SmallVec<[Arc<StreamEpoch>; 4]>>,
 
-    /// Allocator for new StreamEpochs. Dedicated in P2; Shared routing
-    /// lands in a later plan.
-    pool: Arc<dyn ArenaPool>,
-
     /// Mints ArenaIds for epochs registered directly (register_epoch path).
     /// Shared with the pool so that all extents for this stream draw from the
     /// same monotonic counter.
@@ -126,11 +122,7 @@ impl Stream {
     // ── Construction ────────────────────────────────────────────────────
 
     /// Create a new stream with no extents. Extents are added via `register_epoch()`.
-    pub(crate) fn new(
-        id: StreamId,
-        pool: Arc<dyn ArenaPool>,
-        arena_ids: Arc<ArenaIdGenerator>,
-    ) -> Self {
+    pub(crate) fn new(id: StreamId, arena_ids: Arc<ArenaIdGenerator>) -> Self {
         let (job_tx, job_rx) = unbounded();
         Self {
             id,
@@ -141,7 +133,6 @@ impl Stream {
             ack_queue: OnceLock::new(),
             flush_in_progress: papaya::HashMap::new(),
             epochs: ArcSwap::from_pointee(SmallVec::new()),
-            pool,
             arena_ids,
             inner: RwLock::new(StreamInner {
                 epoch_capacity: DEFAULT_EPOCH_CAPACITY,
@@ -682,19 +673,13 @@ mod tests {
     use super::*;
     use common::config::DEFAULT_EPOCH_CAPACITY;
 
-    fn test_pool() -> Arc<dyn ArenaPool> {
-        use crate::arena::{ArenaIdGenerator, DedicatedArenaPool};
-        let ids = Arc::new(ArenaIdGenerator::new(1));
-        Arc::new(DedicatedArenaPool::new(DEFAULT_EPOCH_CAPACITY, ids))
-    }
-
     fn test_arena_ids() -> Arc<ArenaIdGenerator> {
         Arc::new(crate::arena::ArenaIdGenerator::new(1))
     }
 
     /// Helper: create a stream with one active extent (simulating RegisterEpoch from SM).
     fn new_stream_with_epoch(id: StreamId) -> Stream {
-        let stream = Stream::new(id, test_pool(), test_arena_ids());
+        let stream = Stream::new(id, test_arena_ids());
         stream.register_epoch_simple(ExtentId(0), Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
         stream
     }
@@ -766,7 +751,7 @@ mod tests {
 
     #[test]
     fn read_empty_stream() {
-        let stream = Stream::new(StreamId(1), test_pool(), test_arena_ids());
+        let stream = Stream::new(StreamId(1), test_arena_ids());
         assert_eq!(stream.max_offset(), Offset(0));
 
         // Stream with no extents: read returns error (extent not found).
@@ -776,7 +761,7 @@ mod tests {
 
     #[test]
     fn empty_stream_properties() {
-        let stream = Stream::new(StreamId(1), test_pool(), test_arena_ids());
+        let stream = Stream::new(StreamId(1), test_arena_ids());
         assert_eq!(stream.max_offset(), Offset(0));
         assert!(!stream.is_mutable());
         assert_eq!(stream.active_epoch(), None);
@@ -848,7 +833,7 @@ mod tests {
 
     #[test]
     fn evict_oldest_sealed_extents() {
-        let stream = Stream::new(StreamId(1), test_pool(), test_arena_ids());
+        let stream = Stream::new(StreamId(1), test_arena_ids());
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_epochs(2);
 
@@ -881,7 +866,7 @@ mod tests {
 
     #[test]
     fn no_eviction_when_limit_is_zero() {
-        let stream = Stream::new(StreamId(1), test_pool(), test_arena_ids());
+        let stream = Stream::new(StreamId(1), test_arena_ids());
         stream.set_max_epochs(0); // 0 means no limit
 
         for i in 0..5u32 {
@@ -909,7 +894,7 @@ mod tests {
     fn evict_unsealed_extents_secondary_scenario() {
         // On secondaries, old extents may not be sealed (autonomous extent-full
         // only seals on the Primary). Eviction should still work for Memory-class streams.
-        let stream = Stream::new(StreamId(1), test_pool(), test_arena_ids());
+        let stream = Stream::new(StreamId(1), test_arena_ids());
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_epochs(2);
 
@@ -935,7 +920,7 @@ mod tests {
     #[test]
     fn s3_stream_skips_eviction_until_flushed() {
         // S3-class streams must NOT evict extents that haven't been flushed.
-        let stream = Stream::new(StreamId(1), test_pool(), test_arena_ids());
+        let stream = Stream::new(StreamId(1), test_arena_ids());
         // Default is StorageClass::S3, verify explicitly.
         assert_eq!(stream.storage_class(), StorageClass::S3);
         stream.set_max_epochs(2);

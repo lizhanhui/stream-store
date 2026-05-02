@@ -547,7 +547,7 @@ impl StreamEpoch {
     /// so the memory stays alive as long as any derived slice is held by a reader.
     fn arena_as_bytes(&self) -> Bytes {
         let arena = Arc::clone(&self.arena);
-        let ptr = arena.ptr() as *const u8;
+        let ptr = arena.ptr();
         let len = arena.capacity();
         Bytes::from_owner(OwnedArenaSlice {
             _arena: arena,

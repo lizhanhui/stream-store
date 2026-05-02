@@ -273,9 +273,10 @@ impl EpochState {
 ///   `shared_arena_size`. Not wired at runtime yet — every CreateStream
 ///   request currently uses `Dedicated` until a later plan introduces
 ///   Shared routing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ArenaClass {
+    #[default]
     Dedicated = 0,
     Shared = 1,
 }
@@ -291,12 +292,6 @@ impl ArenaClass {
 
     pub fn as_u8(self) -> u8 {
         self as u8
-    }
-}
-
-impl Default for ArenaClass {
-    fn default() -> Self {
-        ArenaClass::Dedicated
     }
 }
 

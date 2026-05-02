@@ -27,15 +27,6 @@ impl ArenaId {
         Self(((node_prefix as u64) << 48) | (counter & ((1u64 << 48) - 1)))
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn node_prefix(&self) -> u16 {
-        (self.0 >> 48) as u16
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn counter(&self) -> u64 {
-        self.0 & ((1u64 << 48) - 1)
-    }
 }
 
 impl std::fmt::Display for ArenaId {

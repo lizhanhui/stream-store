@@ -15,7 +15,6 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use common::config::DEFAULT_EPOCH_CAPACITY;
 use common::hasher::IdentityBuildHasher;
 use common::types::{Epoch, EpochPolicy, ErrorCode, ExtentId, Opcode, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
@@ -25,7 +24,7 @@ use tokio::sync::mpsc::Sender;
 use tracing::warn;
 
 use crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT;
-use crate::arena::{ArenaIdGenerator, ArenaPool, DedicatedArenaPool};
+use crate::arena::ArenaIdGenerator;
 use crate::downstream::DownstreamPool;
 use crate::s3::S3Client;
 use crate::s3_flusher::FlushRequest;
@@ -48,9 +47,7 @@ pub struct ExtentNodeStore {
     /// Uses `IdentityBuildHasher` — StreamId is a server-assigned u32, so the
     /// identity hash (no mixing) is safe and eliminates ~15 ns of SipHash per lookup.
     pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
-    /// Default arena pool for newly created streams (Dedicated: one arena per epoch).
-    pub(crate) default_pool: Arc<dyn ArenaPool>,
-    /// ArenaId generator shared between the pool and register_epoch paths.
+    /// ArenaId generator used by register_epoch paths.
     pub(crate) arena_ids: Arc<ArenaIdGenerator>,
     /// Replication info per stream_id (registered via RegisterEpoch).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
@@ -88,13 +85,8 @@ impl ExtentNodeStore {
     /// Create a new store with a caller-provided `ArenaIdGenerator`.
     /// Called by `ExtentNode::start` after resolving the node_id.
     pub(crate) fn new_with_ids(arena_ids: Arc<ArenaIdGenerator>) -> Self {
-        let default_pool = Arc::new(DedicatedArenaPool::new(
-            DEFAULT_EPOCH_CAPACITY,
-            Arc::clone(&arena_ids),
-        ));
         Self {
             streams: papaya::HashMap::with_hasher(IdentityBuildHasher),
-            default_pool,
             arena_ids,
 
             replicas: papaya::HashMap::with_hasher(IdentityBuildHasher),
@@ -139,11 +131,7 @@ impl ExtentNodeStore {
             stream.set_storage_class(storage_class);
             false
         } else {
-            let stream = Stream::new(
-                stream_id,
-                Arc::clone(&self.default_pool),
-                Arc::clone(&self.arena_ids),
-            );
+            let stream = Stream::new(stream_id, Arc::clone(&self.arena_ids));
             if policy.cache > 0 {
                 stream.set_max_epochs(policy.cache as usize);
             }
