@@ -5,12 +5,11 @@ use bytes::Buf;
 use crate::allocator::Allocator;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
-use common::bridge::synth_extent_id;
 use common::config::DEFAULT_CACHE_EPOCHS;
 use common::errors::{InternalSnafu, StorageError};
 use common::types::{
-    ArenaClass, Epoch, EpochPolicy, ErrorCode, ExtentId, Offset, Opcode, StorageClass,
-    StreamConfig, StreamId,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, Offset, Opcode, StorageClass, StreamConfig,
+    StreamId,
 };
 use futures_util::future;
 use rpc::frame::{Frame, VariableHeader};
@@ -24,15 +23,13 @@ use tracing::{error, info, warn};
 /// Seal an ExtentNode's extent and return the sealed extent info.
 ///
 /// Sends SealEpochPrepare to the EN and parses SealEpochResp.
-/// Returns (sealed_extent_id, start_offset, end_offset, optional payload with predecessor extents).
+/// Returns (start_offset, end_offset, optional payload with predecessor epochs).
 async fn seal_epoch_static(
     addr: &str,
     stream_id: StreamId,
     epoch: Epoch,
-    extent_id_from: ExtentId,
     start_offset: u64,
-) -> Result<(ExtentId, u64, u64, Option<Bytes>), StorageError> {
-    let _ = extent_id_from;
+) -> Result<(u64, u64, Option<Bytes>), StorageError> {
     let client = client::StreamClient::connect(addr).await.map_err(|e| {
         InternalSnafu {
             message: format!("connect to ExtentNode {addr} for Seal: {e}"),
@@ -72,7 +69,7 @@ async fn seal_epoch_static(
             start_offset: so,
             end_offset,
             ..
-        } => Ok((ExtentId(0), *so, *end_offset, resp.payload.clone())),
+        } => Ok((*so, *end_offset, resp.payload.clone())),
         _ => Err(InternalSnafu {
             message: format!(
                 "ExtentNode {addr} returned unexpected response: {:?}",
@@ -90,7 +87,7 @@ async fn seal_epoch_static(
 /// Same format as ReportExtentsResp: [num:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
 fn parse_seal_predecessor_payload(
     payload: &Bytes,
-) -> Option<Vec<(ExtentId, u64, u64, common::types::EpochState)>> {
+) -> Option<Vec<(u64, u64, common::types::EpochState)>> {
     let mut buf = &payload[..];
     if buf.len() < 4 {
         return None;
@@ -101,25 +98,25 @@ fn parse_seal_predecessor_payload(
         if buf.remaining() < 4 + 8 + 8 + 1 {
             return None;
         }
-        let eid = ExtentId(buf.get_u32());
+        let _legacy_extent_id = buf.get_u32();
         let start = buf.get_u64();
         let end = buf.get_u64();
         let state_val = buf.get_u8();
         let state = common::types::EpochState::from_u8(state_val)
             .unwrap_or(common::types::EpochState::Unspecified);
-        result.push((eid, start, end, state));
+        result.push((start, end, state));
     }
     Some(result)
 }
 
 /// Response format: [num_extents:u32] then for each extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
 ///
-/// Returns Vec of (ExtentId, start_offset, end_offset, EpochState) tuples.
+/// Returns Vec of (start_offset, end_offset, EpochState) tuples; legacy IDs are ignored.
 async fn report_extents_from_node_static(
     addr: &str,
     stream_id: StreamId,
     epoch: Epoch,
-) -> Result<Vec<(ExtentId, u64, u64, common::types::EpochState)>, StorageError> {
+) -> Result<Vec<(u64, u64, common::types::EpochState)>, StorageError> {
     use bytes::Buf;
 
     let client = client::StreamClient::connect(addr).await.map_err(|e| {
@@ -176,7 +173,7 @@ async fn report_extents_from_node_static(
             .build());
         }
 
-        let extent_id = ExtentId(buf.get_u32());
+        let _legacy_extent_id = buf.get_u32();
         let start_offset = buf.get_u64();
         let end_offset = buf.get_u64();
         let state_u8 = buf.get_u8();
@@ -184,7 +181,7 @@ async fn report_extents_from_node_static(
         let state = common::types::EpochState::from_u8(state_u8)
             .unwrap_or(common::types::EpochState::Unspecified);
 
-        extents.push((extent_id, start_offset, end_offset, state));
+        extents.push((start_offset, end_offset, state));
     }
 
     Ok(extents)
@@ -221,7 +218,7 @@ impl StreamManagerStore {
     ///
     /// Best-effort: failures for individual streams are logged and skipped.
     pub async fn reconcile_on_startup(&self) {
-        let streams = match self.store.get_streams_with_active_extents().await {
+        let streams = match self.store.get_streams_with_open_epochs().await {
             Ok(s) => s,
             Err(e) => {
                 warn!("startup reconciliation: failed to get active streams: {e}");
@@ -317,7 +314,7 @@ impl StreamManagerStore {
             // Reconcile: upsert any missing extents into MySQL, copy replicas.
             if let Err(e) = self
                 .store
-                .reconcile_extents(*stream_id, *epoch, &en_extents)
+                .reconcile_epochs(*stream_id, *epoch, &en_extents)
                 .await
             {
                 warn!(
@@ -353,13 +350,11 @@ impl StreamManagerStore {
     async fn register_primary(
         &self,
         config: StreamConfig,
-        extent_id: ExtentId,
         primary_addr: &str,
         secondary_addrs: &[&str],
     ) -> Result<(), StorageError> {
         let payload = build_register_extent_payload(secondary_addrs);
         let addr = primary_addr.to_string();
-        let _eid = extent_id;
 
         let result = tokio::time::timeout(Duration::from_millis(500), async {
             let client = client::StreamClient::connect(&addr).await.map_err(|e| {
@@ -402,9 +397,9 @@ impl StreamManagerStore {
         match result {
             Ok(Ok(())) => {
                 info!(
-                    "RegisterEpoch ACK from Primary {primary_addr}: stream={}, extent={}, rf={}, secondaries={}",
+                    "RegisterEpoch ACK from Primary {primary_addr}: stream={}, epoch={}, rf={}, secondaries={}",
                     config.stream_id,
-                    extent_id,
+                    config.epoch,
                     config.replication_factor,
                     secondary_addrs.join(", ")
                 );
@@ -426,14 +421,13 @@ impl StreamManagerStore {
     fn notify_secondaries(
         &self,
         config: StreamConfig,
-        extent_id: ExtentId,
         secondary_addrs: &[String],
     ) {
         for (i, addr) in secondary_addrs.iter().enumerate() {
             let role = (i + 1) as u8; // 1, 2, ...
             let addr = addr.clone();
-            let eid = extent_id;
             let sid = config.stream_id;
+            let epoch = config.epoch;
 
             tokio::spawn(async move {
                 let payload = build_register_extent_payload(&[]); // secondaries get no downstream addrs
@@ -455,14 +449,14 @@ impl StreamManagerStore {
                                     resp.payload.as_deref().unwrap_or_default(),
                                 );
                                 warn!(
-                                    "Secondary {addr} rejected RegisterEpoch for stream={} extent={}: {msg}",
-                                    sid, eid
+                                    "Secondary {addr} rejected RegisterEpoch for stream={} epoch={}: {msg}",
+                                    sid, epoch
                                 );
                             }
                             Ok(_) => {
                                 info!(
-                                    "RegisterEpoch sent to Secondary {addr}: stream={}, extent={}, role={role}",
-                                    sid, eid
+                                    "RegisterEpoch sent to Secondary {addr}: stream={}, epoch={}, role={role}",
+                                    sid, epoch
                                 );
                             }
                             Err(e) => {
@@ -482,8 +476,8 @@ impl StreamManagerStore {
         }
     }
 
-    /// Allocate a replica set for a new extent: pick nodes, store in DB, notify ExtentNodes.
-    /// Returns (ExtentId, primary node address).
+    /// Allocate a replica set for a new epoch: pick nodes, store in DB, notify ExtentNodes.
+    /// Returns the primary node address.
     ///
     /// `replication_factor` specifies how many replicas to create for this extent.
     /// The stream_replica table stores node *addresses* (not node IDs) so that the StreamManager
@@ -492,7 +486,7 @@ impl StreamManagerStore {
         &self,
         config: StreamConfig,
         start_offset: u64,
-    ) -> Result<(ExtentId, String), StorageError> {
+    ) -> Result<String, StorageError> {
         let replication_factor = config.replication_factor as usize;
         // Initial allocation: require full RF.
         let nodes = self
@@ -507,19 +501,19 @@ impl StreamManagerStore {
 
         let node_addrs: Vec<String> = replicas.iter().map(|(addr, _)| addr.clone()).collect();
 
-        let extent_id = self
+        let epoch = self
             .store
-            .allocate_extent(config.stream_id, start_offset, &replicas, config.epoch)
+            .allocate_epoch_row(config.stream_id, start_offset, &replicas, config.epoch)
             .await?;
 
         info!(
-            "extent {} allocated for stream {}: replicas={:?}",
-            extent_id, config.stream_id, node_addrs
+            "epoch {} allocated for stream {}: replicas={:?}",
+            epoch, config.stream_id, node_addrs
         );
 
         // Notify ExtentNodes of their replication roles.
         // Always send RegisterEpoch, even for replication_factor=1, so the ExtentNode knows
-        // the StreamManager-assigned stream_id and extent_id (required for seal coordination).
+        // the StreamManager-assigned stream_id and epoch (required for seal coordination).
         let primary_addr = &node_addrs[0];
         let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
         // Effective RF may be degraded below the requested count during failover
@@ -529,14 +523,14 @@ impl StreamManagerStore {
             ..config
         };
 
-        self.register_primary(effective_config, extent_id, primary_addr, &secondary_addrs)
+        self.register_primary(effective_config, primary_addr, &secondary_addrs)
             .await
             .unwrap_or_else(|e| {
-                warn!("register_primary failed for initial extent {}: {e}; client will discover on first append", extent_id);
+                warn!("register_primary failed for initial epoch {}: {e}; client will discover on first append", epoch);
             });
-        self.notify_secondaries(effective_config, extent_id, &node_addrs[1..]);
+        self.notify_secondaries(effective_config, &node_addrs[1..]);
 
-        Ok((extent_id, node_addrs[0].clone()))
+        Ok(node_addrs[0].clone())
     }
 }
 
@@ -744,21 +738,19 @@ impl StreamManagerStore {
                 policy,
                 arena_class: ArenaClass::Dedicated,
             };
-            let (extent_id, primary_addr) =
-                self.allocate_and_notify_replica_set(config, 0).await?;
+            let primary_addr = self.allocate_and_notify_replica_set(config, 0).await?;
 
             info!(
-                "stream {stream_name} created: stream_id={}, extent_id={}, primary={primary_addr}, cache={}",
-                stream_id, extent_id, policy.cache
+                "stream {stream_name} created: stream_id={}, epoch={}, primary={primary_addr}, cache={}",
+                stream_id, config.epoch, policy.cache
             );
 
-            Ok::<(StreamId, ExtentId, String), StorageError>((stream_id, extent_id, primary_addr))
+            Ok::<(StreamId, String), StorageError>((stream_id, primary_addr))
         }
         .await;
 
         match result {
-            Ok((stream_id, extent_id, primary_addr)) => {
-                let _ = extent_id;
+            Ok((stream_id, primary_addr)) => {
                 Frame::new(
                     VariableHeader::CreateStreamResp {
                         request_id: frame.request_id(),
@@ -813,13 +805,12 @@ impl StreamManagerStore {
     ///
     /// **Phase 2 — Seal all replicas (fire-and-forget).**
     /// After `seal_allocate_register`, all replicas are sealed. This is idempotent.
-    async fn seal_extent(
+    async fn seal_epoch(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
         committed_offset: Option<u64>,
         epoch: Epoch,
-    ) -> Result<(ExtentId, String), StorageError> {
+    ) -> Result<(Epoch, String), StorageError> {
         // Get extent metadata early — needed for start_offset in seal RPCs.
         let extent_row = self
             .store
@@ -828,7 +819,7 @@ impl StreamManagerStore {
             .ok_or_else(|| {
                 InternalSnafu {
                     message: format!(
-                        "no active extent found for stream {} during seal_extent",
+                        "no active epoch found for stream {} during seal_epoch",
                         stream_id
                     ),
                 }
@@ -839,27 +830,22 @@ impl StreamManagerStore {
         let end_offset = match committed_offset {
             Some(offset) => {
                 info!(
-                    "seal_extent: offset provided for extent {} stream {}: offset={offset}",
-                    extent_id, stream_id
+                    "seal_epoch: offset provided for stream {} epoch {}: offset={offset}",
+                    stream_id, extent_row.epoch
                 );
                 offset
             }
             None => {
                 // Query all EN replicas to determine committed offset via quorum.
                 // Use the extent's original epoch for replica lookup (not the bumped epoch).
-                self.resolve_committed_offset(
-                    stream_id,
-                    extent_id,
-                    extent_start_offset,
-                    extent_row.epoch,
-                )
-                .await?
+                self.resolve_committed_offset(stream_id, extent_start_offset, extent_row.epoch)
+                    .await?
             }
         };
 
         // Seal + allocate + notify new replica set.
         let result = self
-            .seal_allocate_register(stream_id, extent_id, end_offset, epoch)
+            .seal_allocate_register(stream_id, extent_row.epoch, end_offset, epoch)
             .await?;
 
         // Look up replicas once for both phase 2 commit and DR flush.
@@ -874,8 +860,6 @@ impl StreamManagerStore {
         for replica in &old_replicas {
             let addr = replica.node_addr.clone();
             let sid = stream_id;
-            let eid = extent_id;
-            let _ = eid;
             let ep = extent_row.epoch;
             let so = extent_start_offset;
             let eo = end_offset;
@@ -943,11 +927,10 @@ impl StreamManagerStore {
                     self.send_flush_extent_to_all_replicas(
                         &old_replicas,
                         stream_id,
-                        extent_id,
                         extent_row.epoch,
                         extent_start_offset,
                         end_offset,
-                        "seal_extent",
+                        "seal_epoch",
                     )
                     .await;
                 }
@@ -967,7 +950,6 @@ impl StreamManagerStore {
     pub async fn resolve_committed_offset(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
         start_offset: u64,
         epoch: Epoch,
     ) -> Result<u64, StorageError> {
@@ -975,8 +957,8 @@ impl StreamManagerStore {
         if replicas.is_empty() {
             return Err(InternalSnafu {
                 message: format!(
-                    "no replicas found for stream {} extent {}",
-                    stream_id, extent_id
+                    "no replicas found for stream {} epoch {}",
+                    stream_id, epoch
                 ),
             }
             .build());
@@ -998,15 +980,14 @@ impl StreamManagerStore {
             let addr = addr.clone();
             let sid = stream_id;
             let ep = epoch;
-            let eid = extent_id;
             let so = start_offset;
             match tokio::time::timeout(
                 Duration::from_millis(100),
-                seal_epoch_static(&addr, sid, ep, eid, so),
+                seal_epoch_static(&addr, sid, ep, so),
             )
             .await
             {
-                Ok(Ok((_sealed_eid, _start, end_offset, _payload))) => {
+                Ok(Ok((_start, end_offset, _payload))) => {
                     info!(
                         "Primary {addr} reports committed offset {end_offset} for stream {} (fast path)",
                         stream_id
@@ -1025,8 +1006,8 @@ impl StreamManagerStore {
             }
         } else {
             warn!(
-                "No primary replica found for stream {} extent {}",
-                stream_id, extent_id
+                "No primary replica found for stream {} epoch {}",
+                stream_id, epoch
             );
         }
 
@@ -1040,10 +1021,9 @@ impl StreamManagerStore {
             let role = replica.role;
             let sid = stream_id;
             let ep = epoch;
-            let eid = extent_id;
             let so = start_offset;
             seal_futures.push(async move {
-                let result = seal_epoch_static(&addr, sid, ep, eid, so).await;
+                let result = seal_epoch_static(&addr, sid, ep, so).await;
                 (addr, role, result)
             });
         }
@@ -1055,7 +1035,7 @@ impl StreamManagerStore {
 
         for (addr, role, result) in &seal_results {
             match result {
-                Ok((_sealed_eid, _start, end_offset, payload)) => {
+                Ok((_start, end_offset, payload)) => {
                     if *role == 0 {
                         info!(
                             "Primary {addr} reports committed offset {end_offset} for stream {:?} (fallback)",
@@ -1080,7 +1060,7 @@ impl StreamManagerStore {
                         );
                         let _ = self
                             .store
-                            .reconcile_extents(stream_id, epoch, &extents)
+                            .reconcile_epochs(stream_id, epoch, &extents)
                             .await;
                     }
                 }
@@ -1129,25 +1109,25 @@ impl StreamManagerStore {
         };
 
         info!(
-            "seal_extent: resolved committed offset for extent {} stream {}: committed={committed}",
-            extent_id, stream_id
+            "seal_epoch: resolved committed offset for stream {} epoch {}: committed={committed}",
+            stream_id, epoch
         );
         Ok(committed)
     }
 
     /// Shared logic for both seal paths: pick new nodes, seal-and-allocate in DB,
-    /// register new replica set, and return (new_extent_id, primary_addr).
+    /// register new replica set, and return (new_epoch, primary_addr).
     pub async fn seal_allocate_register(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
+        sealed_epoch: Epoch,
         end_offset: u64,
         epoch: Epoch,
-    ) -> Result<(ExtentId, String), StorageError> {
+    ) -> Result<(Epoch, String), StorageError> {
         // Pick nodes for new extent replica set using per-stream replication factor.
         let replication_factor =
             self.store.get_stream_replication_factor(stream_id).await? as usize;
-        let cache_extents = self.store.get_stream_cache_extents(stream_id).await?;
+        let cache_extents = self.store.get_stream_cache_epochs(stream_id).await?;
         let stream_row = self.store.get_stream(stream_id).await?;
         let (storage_class, arena_class) = stream_row
             .map(|r| (r.storage_class, r.arena_class))
@@ -1166,14 +1146,20 @@ impl StreamManagerStore {
             .map(|(i, n)| (n.addr.clone(), i as u8))
             .collect();
 
-        // Transactional seal + allocate (idempotent for already-sealed extents).
+        // Transactional seal + allocate (idempotent for already-sealed epochs).
         let seal_result = self
             .store
-            .seal_and_allocate_transaction(stream_id, extent_id, end_offset, &new_replicas, epoch)
+            .seal_and_allocate_next_epoch_transaction(
+                stream_id,
+                sealed_epoch,
+                epoch,
+                end_offset,
+                &new_replicas,
+            )
             .await?;
 
-        let (new_extent_id, primary_addr) = match seal_result {
-            SealResult::Sealed { new_extent_id } => {
+        let (new_epoch, primary_addr) = match seal_result {
+            SealResult::Sealed { new_epoch } => {
                 let primary_addr = new_replicas[0].0.clone();
                 let node_addrs: Vec<String> = new_replicas.iter().map(|(a, _)| a.clone()).collect();
                 let secondary_addrs: Vec<&str> =
@@ -1183,7 +1169,7 @@ impl StreamManagerStore {
                 let config = StreamConfig {
                     stream_id,
                     replication_factor: node_addrs.len() as u8,
-                    epoch,
+                    epoch: new_epoch,
                     storage_class,
                     arena_class,
                     policy: EpochPolicy {
@@ -1192,41 +1178,41 @@ impl StreamManagerStore {
                 };
 
                 info!(
-                    "new extent {} allocated for stream {}, primary={primary_addr}",
-                    new_extent_id, stream_id
+                    "new epoch {} allocated for stream {}, primary={primary_addr}",
+                    new_epoch, stream_id
                 );
 
                 // Register new extent: best-effort. If Primary is dead/slow,
                 // client will discover on first append and trigger another seal-and-new.
                 if let Err(e) = self
-                    .register_primary(config, new_extent_id, &primary_addr, &secondary_addrs)
+                    .register_primary(config, &primary_addr, &secondary_addrs)
                     .await
                 {
                     warn!(
-                        "register_primary failed for extent {:?}: {e}; client will discover on first append",
-                        new_extent_id
+                        "register_primary failed for epoch {:?}: {e}; client will discover on first append",
+                        new_epoch
                     );
                 }
 
                 // notify extent secondary nodes in fire-and-forget way
-                self.notify_secondaries(config, new_extent_id, &node_addrs[1..]);
+                self.notify_secondaries(config, &node_addrs[1..]);
 
-                (new_extent_id, primary_addr)
+                (new_epoch, primary_addr)
             }
             SealResult::AlreadySealed {
-                new_extent_id,
+                new_epoch,
                 new_start_offset: _,
                 primary_addr,
             } => {
                 info!(
-                    "extent {} already sealed for stream {}; returning successor {}",
-                    extent_id, stream_id, new_extent_id
+                    "epoch {} already sealed for stream {}; returning successor {}",
+                    sealed_epoch, stream_id, new_epoch
                 );
-                (new_extent_id, primary_addr)
+                (new_epoch, primary_addr)
             }
         };
 
-        Ok((new_extent_id, primary_addr))
+        Ok((new_epoch, primary_addr))
     }
 
     /// QueryOffset on StreamManager: return the total logical end offset for a stream.
@@ -1317,19 +1303,18 @@ impl StreamManagerStore {
         }
     }
 
-    /// DescribeExtent: return a single extent's metadata with replica info and node liveness.
-    ///
-    /// Payload: [extent_id:u32]
-    /// Response: DescribeExtentResp with encoded Vec<StreamEpochInfo> (length 1)
+    /// DescribeEpoch: return a single epoch's metadata with replica info and node liveness.
     async fn handle_describe_extent(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
-        // `extent_id` no longer travels on the wire for DescribeEpoch; identity
-        // is now (stream_id, epoch). For this commit we still look up by the
-        // stream's latest epoch — a later phase collapses the SM metadata row
-        // to a single per-(stream, epoch) lookup that matches this behaviour.
-        let extent_id = ExtentId(0);
+        let epoch = match self.store.get_stream_epoch(stream_id).await {
+            Ok(epoch) => epoch,
+            Err(e) => {
+                error!("get_stream_epoch for describe_epoch failed: {e}");
+                return Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string());
+            }
+        };
 
-        match self.store.describe_extent(stream_id, extent_id).await {
+        match self.store.describe_epoch(stream_id, epoch).await {
             Ok(Some(info)) => {
                 let payload = encode_extent_info_vec(&[info]);
                 Frame::new(
@@ -1343,13 +1328,10 @@ impl StreamManagerStore {
             Ok(None) => Frame::error_from_request(
                 &frame,
                 ErrorCode::UnknownStream,
-                &format!(
-                    "extent not found: stream={}, extent={}",
-                    stream_id, extent_id
-                ),
+                &format!("epoch not found: stream={}, epoch={}", stream_id, epoch),
             ),
             Err(e) => {
-                error!("describe_extent failed: {e}");
+                error!("describe_epoch failed: {e}");
                 Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
             }
         }
@@ -1502,12 +1484,11 @@ impl StreamManagerStore {
             &primary_addr,
             stream_id,
             active.epoch,
-            active.extent_id,
             active.start_offset,
         )
         .await
         {
-            Ok((_sealed_eid, _start, end, payload)) => {
+            Ok((_start, end, payload)) => {
                 // Reconcile predecessor extents from the primary's SealEpochResp.
                 if let Some(ref payload) = payload
                     && let Some(extents) = parse_seal_predecessor_payload(payload)
@@ -1520,7 +1501,7 @@ impl StreamManagerStore {
                     );
                     let _ = self
                         .store
-                        .reconcile_extents(stream_id, active.epoch, &extents)
+                        .reconcile_epochs(stream_id, active.epoch, &extents)
                         .await;
                 }
                 end
@@ -1568,14 +1549,12 @@ impl StreamManagerStore {
                     }
                 };
                 info!(
-                    "Epoch seal: reconciled, sealing extent {} at new epoch {} for stream {}",
-                    active.extent_id, new_epoch, stream_id
+                    "Epoch seal: reconciled, sealing epoch {} at new epoch {} for stream {}",
+                    active.epoch, new_epoch, stream_id
                 );
-                match self
-                    .seal_extent(stream_id, active.extent_id, None, new_epoch)
-                    .await
+                match self.seal_epoch(stream_id, None, new_epoch).await
                 {
-                    Ok((_new_extent_id, new_primary_addr)) => {
+                    Ok((_new_epoch, new_primary_addr)) => {
                         return Frame::new(
                             VariableHeader::SealStreamResp {
                                 request_id,
@@ -1603,15 +1582,15 @@ impl StreamManagerStore {
         // Re-read the active extent — it may have advanced after reconciliation.
         // If no active extent remains (primary already sealed the last one),
         // use the sealed extent from the SealEpochResp.
-        let sealed_extent_id = match self.store.get_active_extent(stream_id).await {
-            Ok(Some(ext)) => ext.extent_id,
+        let sealed_epoch = match self.store.get_active_extent(stream_id).await {
+            Ok(Some(ext)) => ext.epoch,
             Ok(None) => {
-                // Primary already sealed the last extent. Ensure it's sealed in DB too.
+                // Primary already sealed the last epoch. Ensure it's sealed in DB too.
                 let _ = self
                     .store
-                    .seal_extent(stream_id, active.extent_id, end_offset)
+                    .seal_epoch_row(stream_id, active.epoch, end_offset)
                     .await;
-                active.extent_id
+                active.epoch
             }
             Err(e) => {
                 return Frame::seal_stream_manager_resp_error(
@@ -1640,10 +1619,10 @@ impl StreamManagerStore {
         // Allocate new extent. The sealed extent is already sealed on the EN (and in DB
         // after reconciliation). We just need to allocate the successor.
         match self
-            .seal_allocate_register(stream_id, sealed_extent_id, end_offset, new_epoch)
+            .seal_allocate_register(stream_id, sealed_epoch, end_offset, new_epoch)
             .await
         {
-            Ok((_new_extent_id, new_primary_addr)) => Frame::new(
+            Ok((_new_epoch, new_primary_addr)) => Frame::new(
                 VariableHeader::SealStreamResp {
                     request_id,
                     stream_id,
@@ -1677,11 +1656,9 @@ impl StreamManagerStore {
                 epoch,
                 current_offset,
             } => {
-                // `extent_id` no longer travels on the wire; synthesize one from epoch.
-                let extent_id = synth_extent_id(*epoch);
                 if let Err(e) = self
                     .store
-                    .record_extent_progress(*stream_id, *epoch, extent_id, current_offset.0)
+                    .record_epoch_progress(*stream_id, *epoch, current_offset.0)
                     .await
                 {
                     warn!(
@@ -1695,22 +1672,22 @@ impl StreamManagerStore {
                 epoch,
                 start_offset,
                 end_offset,
+                s3_key,
             } => {
-                // `extent_id` no longer travels on the wire; synthesize one from epoch.
-                let extent_id = synth_extent_id(*epoch);
+                let s3_key = match std::str::from_utf8(s3_key.as_ref()) {
+                    Ok(s3_key) => s3_key,
+                    Err(e) => {
+                        warn!("UpdateEpochFlushed carried invalid UTF-8 S3 key: {e}");
+                        return;
+                    }
+                };
                 info!(
-                    "UpdateEpochFlushed: stream={}, epoch={}, extent={}, start_offset={}, end_offset={}",
-                    stream_id, epoch, extent_id, start_offset.0, end_offset.0
+                    "UpdateEpochFlushed: stream={}, epoch={}, start_offset={}, end_offset={}, s3_key={}",
+                    stream_id, epoch, start_offset.0, end_offset.0, s3_key
                 );
                 if let Err(e) = self
                     .store
-                    .record_extent_flushed(
-                        *stream_id,
-                        *epoch,
-                        extent_id,
-                        start_offset.0,
-                        end_offset.0,
-                    )
+                    .record_arena_flushed(*stream_id, *epoch, start_offset.0, end_offset.0, s3_key)
                     .await
                 {
                     warn!(
@@ -1721,8 +1698,7 @@ impl StreamManagerStore {
                     // Broadcast ForwardFlushed to all replicas so they can mark the
                     // extent eligible for eviction. Idempotent — safe even if the
                     // Primary already broadcast this notification.
-                    self.broadcast_forward_flushed(*stream_id, *epoch, extent_id)
-                        .await;
+                    self.broadcast_forward_flushed(*stream_id, *epoch).await;
                 }
             }
             _ => {
@@ -1735,12 +1711,7 @@ impl StreamManagerStore {
     }
 
     /// Send ForwardFlushed to all replicas for an extent (best-effort, fire-and-forget).
-    async fn broadcast_forward_flushed(
-        &self,
-        stream_id: StreamId,
-        epoch: Epoch,
-        extent_id: ExtentId,
-    ) {
+    async fn broadcast_forward_flushed(&self, stream_id: StreamId, epoch: Epoch) {
         let replicas = match self.store.get_replicas(stream_id, epoch).await {
             Ok(r) => r,
             Err(e) => {
@@ -1754,8 +1725,6 @@ impl StreamManagerStore {
         for replica in &replicas {
             let addr = replica.node_addr.clone();
             let sid = stream_id;
-            let eid = extent_id;
-            let _ = eid;
             let ep = epoch;
             tokio::spawn(async move {
                 match client::StreamClient::connect(&addr).await {
@@ -1826,7 +1795,6 @@ impl StreamManagerStore {
             self.send_flush_extent_to_all_replicas(
                 &replicas,
                 extent.stream_id,
-                extent.extent_id,
                 extent.epoch,
                 extent.start_offset,
                 extent.end_offset,
@@ -1848,7 +1816,6 @@ impl StreamManagerStore {
         &self,
         replicas: &[crate::metadata::StreamReplicaRow],
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         start_offset: u64,
         end_offset: u64,
@@ -1858,7 +1825,6 @@ impl StreamManagerStore {
         for replica in replicas {
             let addr = replica.node_addr.clone();
             let sid = stream_id;
-            let eid = extent_id;
             let ep = epoch;
             let so = start_offset;
             let eo = end_offset;
@@ -1879,7 +1845,7 @@ impl StreamManagerStore {
                         match c.send_frame(frame).await {
                             Ok(resp) => {
                                 tracing::info!(
-                                    "{tag}: FlushExtent to {addr} for stream={sid} extent={eid} responded: {:?}",
+                                    "{tag}: FlushEpoch to {addr} for stream={sid} epoch={ep} responded: {:?}",
                                     resp.opcode(),
                                 );
                             }
@@ -1897,11 +1863,11 @@ impl StreamManagerStore {
         }
         if sent_count > 0 {
             tracing::info!(
-                "{caller}: dispatched FlushExtent to {sent_count} replica(s) for stream={stream_id} extent={extent_id}",
+                "{caller}: dispatched FlushEpoch to {sent_count} replica(s) for stream={stream_id} epoch={epoch}",
             );
         } else {
             tracing::warn!(
-                "{caller}: no replicas available for stream={stream_id} extent={extent_id}",
+                "{caller}: no replicas available for stream={stream_id} epoch={epoch}",
             );
         }
     }

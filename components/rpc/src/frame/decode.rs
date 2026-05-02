@@ -774,12 +774,15 @@ impl Frame {
                     FLAG_EXTENT_FLUSHED => {
                         let start_offset = Offset(body.get_u64());
                         let end_offset = Offset(body.get_u64());
+                        let key_len = body.get_u16() as usize;
+                        let s3_key = body.split_to(key_len).freeze();
                         Ok((
                             VariableHeader::UpdateEpochFlushed {
                                 stream_id,
                                 epoch,
                                 start_offset,
                                 end_offset,
+                                s3_key,
                             },
                             None,
                         ))

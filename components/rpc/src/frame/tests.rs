@@ -634,6 +634,7 @@ fn update_epoch_flushed_round_trip() {
             epoch: Epoch(5),
             start_offset: Offset(1_234),
             end_offset: Offset(9_999),
+            s3_key: Bytes::from_static(b"streams/91/1234-9999.s3"),
         },
         None,
     );
@@ -650,11 +651,13 @@ fn update_epoch_flushed_round_trip() {
             epoch,
             start_offset,
             end_offset,
+            s3_key,
         } => {
             assert_eq!(*stream_id, StreamId(91));
             assert_eq!(*epoch, Epoch(5));
             assert_eq!(*start_offset, Offset(1_234));
             assert_eq!(*end_offset, Offset(9_999));
+            assert_eq!(s3_key, &Bytes::from_static(b"streams/91/1234-9999.s3"));
         }
         _ => panic!("expected UpdateEpochFlushed"),
     }

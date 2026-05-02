@@ -18,9 +18,9 @@ pub enum ExtentUpdate {
     },
     /// Extent was flushed to S3 (EN notifies SM after successful upload).
     ///
-    /// Carries `start_offset` and `end_offset` so SM can materialize a
-    /// `Flushed` row even when the preceding `Sealed` notification has not
-    /// yet arrived (the two notifications are independent fire-and-forget
+    /// Carries `start_offset`, `end_offset`, and `s3_key` so SM can materialize
+    /// the S3 object mapping even when the preceding `Sealed` notification has
+    /// not yet arrived (the two notifications are independent fire-and-forget
     /// frames whose relative ordering at SM is not guaranteed).
     Flushed {
         stream_id: StreamId,
@@ -28,6 +28,7 @@ pub enum ExtentUpdate {
         epoch: Epoch,
         start_offset: u64,
         end_offset: u64,
+        s3_key: Bytes,
     },
 }
 

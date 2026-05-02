@@ -532,6 +532,7 @@ impl StreamManagerClient {
                 epoch,
                 start_offset,
                 end_offset,
+                s3_key,
             } => (
                 Frame::new(
                     VariableHeader::UpdateEpochFlushed {
@@ -539,6 +540,7 @@ impl StreamManagerClient {
                         epoch,
                         start_offset: Offset(start_offset),
                         end_offset: Offset(end_offset),
+                        s3_key,
                     },
                     None,
                 ),

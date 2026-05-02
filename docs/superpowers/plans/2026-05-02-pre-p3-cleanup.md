@@ -89,7 +89,7 @@ Today `store/append.rs` catches `StorageError::ExtentFull`, calls `seal_and_crea
 | SealNotification | `{ sealed_extent_id, end_offset, new_extent_id, epoch, new_extent_capacity }` | `{ sealed_epoch, end_offset }` |
 | SM method | `MetadataStore::allocate_extent` | `MetadataStore::allocate_epoch_row` (no longer touches `stream_sequence`) |
 | SM method | `MetadataStore::seal_extent` | `MetadataStore::seal_epoch_row` |
-| SM method | `MetadataStore::record_extent_flushed` | `MetadataStore::record_epoch_flushed` |
+| SM method | `MetadataStore::record_extent_flushed` | `MetadataStore::record_arena_flushed` |
 | SM method | `MetadataStore::get_extents` | `MetadataStore::get_epochs` |
 | SM method | `MetadataStore::get_stream_with_active_extents` | `MetadataStore::get_streams_with_open_epochs` |
 | S3 codec fn | `s3_codec::encode_extent` | `s3_codec::encode_arena` — encodes one arena's sealed bytes (header + chunk index + compressed data) into an S3 object. The thing on disk *is* the arena's serialized form, not the epoch's abstract identity. In P3 this name becomes load-bearing: one `encode_arena` call maps to one S3 object regardless of how many streams share the arena. |
@@ -102,7 +102,7 @@ Today `store/append.rs` catches `StorageError::ExtentFull`, calls `seal_and_crea
 | MySQL PK | `PRIMARY KEY (stream_id, extent_id)` | `PRIMARY KEY (stream_id, epoch)` |
 | MySQL column | `stream.cache_extents` | `stream.cache_epochs` |
 | MySQL table | `stream_sequence` (all columns) | **dropped** |
-| Integration test file | `tests/record_extent_flushed_integration.rs` | `tests/record_epoch_flushed_integration.rs` |
+| Integration test file | `tests/record_extent_flushed_integration.rs` | `tests/record_arena_flushed_integration.rs` |
 
 ### Identifiers that stay (not renamed)
 - `ExtentNode` (the node type / binary / crate) — it's the product name; renaming breaks the `components/extent-node/` crate path, binary name, and every log message that refers to "ExtentNode".
@@ -239,7 +239,8 @@ With the wire types clean, `ExtentId` has no more users outside the EN + SM crat
 
 Delete V1..V7, write a single baseline. The baseline captures the post-cleanup schema:
 - `stream`: `stream_id`, `stream_name`, `replication_factor`, `cache_epochs`, `storage_class`, `arena_class`, `epoch`, `created_at`, `updated_at`
-- `stream_epochs`: `stream_id`, `epoch`, `start_offset`, `end_offset`, `state`, `s3_key`, `arena_class`, `created_at`, `sealed_at`, `flushed_at`, PK `(stream_id, epoch)`
+- `stream_epochs`: `stream_id`, `epoch`, `start_offset`, `end_offset`, `state`, `arena_class`, `created_at`, `sealed_at`, `flushed_at`, PK `(stream_id, epoch)`
+- `stream_epoch_s3`: `stream_id`, `epoch`, `start_offset`, `end_offset`, `s3_key` (one row per S3 arena file covering a range of a stream epoch)
 - `stream_replica`: unchanged shape
 - `node`, `node_metrics`, `stream_manager_leadership`: unchanged
 - **No `stream_sequence` table.**
@@ -257,7 +258,7 @@ Integration test setup files (`tests/*.rs`, `benches/*.rs`, `examples/client-exa
 **Subphase 3.2: MetadataStore method renames + body rewrites**
 - `allocate_extent` → `allocate_epoch_row`. Body no longer touches `stream_sequence`; it bumps `stream.epoch` and inserts a row keyed `(stream_id, epoch)`. Return type changes from `Result<ExtentId, StorageError>` to `Result<Epoch, StorageError>`.
 - `seal_extent` → `seal_epoch_row`. Body no longer mints a successor extent_id; it updates `state=Sealed` and returns a `SealResult` variant that drops the `new_extent_id` field.
-- `record_extent_flushed` → `record_epoch_flushed`.
+- `record_extent_flushed` → `record_arena_flushed`.
 - `get_extents` → `get_epochs`.
 - `get_stream_with_active_extents` → `get_streams_with_open_epochs`.
 - Drop the "update stream_sequence to max(extent_id+1)" branch in the reconciliation path (line ~1548) — this table no longer exists.
@@ -330,8 +331,8 @@ Rationale lives in the rename table: what `encode_extent` produces is **one aren
 
 ## Phase 6: Integration test file rename
 
-- `tests/record_extent_flushed_integration.rs` → `tests/record_epoch_flushed_integration.rs`
-- Update the test body to use `UpdateExtentFlushed`'s new (field-shrunk) shape and the renamed `record_epoch_flushed` SM method.
+- `tests/record_extent_flushed_integration.rs` → `tests/record_arena_flushed_integration.rs`
+- Update the test body to use `UpdateEpochFlushed`'s new shape and the renamed `record_arena_flushed` SM method.
 - Rewrite `tests/phase2_integration::extent_full_rotation` to `epoch_full_requires_reopen` — asserts `EpochFull` is surfaced and the client must reopen.
 
 **Commit 15:** `test: rename + rewrite integration tests for epoch-only identity`

@@ -7,6 +7,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use common::types::{ExtentId, StreamId};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
@@ -177,6 +178,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                 epoch,
                 start_offset: req.start_offset,
                 end_offset: req.end_offset,
+                s3_key: Bytes::from(key.clone()),
             });
         }
 
