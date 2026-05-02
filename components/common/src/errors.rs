@@ -1,7 +1,7 @@
 use snafu::prelude::*;
 use snafu_virtstack::stack_trace_debug;
 
-use crate::types::{Epoch, ExtentId, Offset, StreamId};
+use crate::types::{Epoch, Offset, StreamId};
 
 /// Errors returned by the storage system.
 ///
@@ -45,16 +45,18 @@ pub enum StorageError {
         location: snafu::Location,
     },
 
-    #[snafu(display("extent sealed: {extent_id}"))]
-    ExtentSealed {
-        extent_id: ExtentId,
+    #[snafu(display("epoch sealed: stream {stream_id}, epoch {epoch}"))]
+    EpochSealed {
+        stream_id: StreamId,
+        epoch: Epoch,
         #[snafu(implicit)]
         location: snafu::Location,
     },
 
-    #[snafu(display("extent full: {extent_id}"))]
-    ExtentFull {
-        extent_id: ExtentId,
+    #[snafu(display("epoch full: stream {stream_id}, epoch {epoch}"))]
+    EpochFull {
+        stream_id: StreamId,
+        epoch: Epoch,
         #[snafu(implicit)]
         location: snafu::Location,
     },

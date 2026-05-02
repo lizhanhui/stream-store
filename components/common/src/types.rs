@@ -377,7 +377,7 @@ pub struct ReplicaDetail {
 ///
 /// Note: `ExtentFull` (formerly 5) was removed from the wire protocol — in the
 /// epoch-based seal model the server handles extent rotation internally, so
-/// clients never observe that condition.  The internal `StorageError::ExtentFull`
+/// clients never observe that condition.  The internal `StorageError::EpochFull`
 /// still exists for extent-node-local use.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]

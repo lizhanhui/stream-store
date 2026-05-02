@@ -207,9 +207,7 @@ impl ExtentNodeStore {
         // Write locally via single-writer append on the active extent.
         let (append_result, extent_id) = match stream.try_append_active(payload) {
             Ok(r) => r,
-            Err(StorageError::ExtentSealed { extent_id, .. }) => {
-                // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
-                let _ = extent_id;
+            Err(StorageError::EpochSealed { .. }) => {
                 let err = Frame::append_ack_error(
                     request_id,
                     stream_id,
@@ -223,7 +221,7 @@ impl ExtentNodeStore {
                 }
                 return (Some(err), false);
             }
-            Err(StorageError::ExtentFull { .. }) => {
+            Err(StorageError::EpochFull { .. }) => {
                 // Don't send error to client — the caller will seal, create a new extent,
                 // and retry the append transparently. Return extent_full=true.
                 return (None, true);
@@ -719,9 +717,7 @@ impl ExtentNodeStore {
                             extent_id: eid,
                         });
                     }
-                    Err(StorageError::ExtentSealed { extent_id, .. }) => {
-                        // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
-                        let _ = extent_id;
+                    Err(StorageError::EpochSealed { .. }) => {
                         let err = Frame::append_ack_error(
                             request_id,
                             stream_id,
@@ -735,7 +731,7 @@ impl ExtentNodeStore {
                             responses.push(err);
                         }
                     }
-                    Err(StorageError::ExtentFull { .. }) => {
+                    Err(StorageError::EpochFull { .. }) => {
                         extent_full = true;
                         failed_frames.push(FailedFrame {
                             request_id,

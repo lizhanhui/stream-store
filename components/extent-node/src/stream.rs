@@ -652,6 +652,7 @@ impl Stream {
         let arena_id = self.arena_ids.next();
         let ep = Arc::new(StreamEpoch::with_capacity(
             id,
+            self.id,
             start_offset,
             extent_capacity,
             epoch,

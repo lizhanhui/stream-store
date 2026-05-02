@@ -134,7 +134,7 @@ fn is_connection_broken(err: &StorageError) -> bool {
 fn is_routing_error(err: &StorageError) -> bool {
     matches!(
         err,
-        StorageError::ExtentSealed { .. } | StorageError::EpochStale { .. }
+        StorageError::EpochSealed { .. } | StorageError::EpochStale { .. }
     )
 }
 

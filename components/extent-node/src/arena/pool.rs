@@ -47,7 +47,7 @@ impl DedicatedArenaPool {
 impl ArenaPool for DedicatedArenaPool {
     fn allocate_epoch(
         &self,
-        _stream_id: StreamId,
+        stream_id: StreamId,
         extent_id: ExtentId,
         start_offset: Offset,
         epoch: Epoch,
@@ -55,6 +55,7 @@ impl ArenaPool for DedicatedArenaPool {
         let arena_id = self.ids.next();
         Arc::new(StreamEpoch::with_capacity(
             extent_id,
+            stream_id,
             start_offset,
             self.arena_size,
             epoch,

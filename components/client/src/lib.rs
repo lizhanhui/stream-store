@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use common::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SM_REQUEST_TIMEOUT_MS};
 use common::errors::{
-    EpochStaleSnafu, ExtentSealedSnafu, InternalSnafu, NetworkSnafu, StorageError,
+    EpochSealedSnafu, EpochStaleSnafu, InternalSnafu, NetworkSnafu, StorageError,
     UnknownStreamSnafu,
 };
 use common::types::{
@@ -252,8 +252,9 @@ impl StreamClient {
                 stream_id: resp.stream_id(),
             }
             .build(),
-            Some(ErrorCode::ExtentSealed) => ExtentSealedSnafu {
-                extent_id: ExtentId(0),
+            Some(ErrorCode::ExtentSealed) => EpochSealedSnafu {
+                stream_id: resp.stream_id(),
+                epoch: resp.epoch(),
             }
             .build(),
             Some(ErrorCode::EpochStale) => EpochStaleSnafu {
