@@ -644,7 +644,7 @@ fn update_epoch_flushed_round_trip() {
 
     let decoded = Frame::decode(&mut buf).unwrap().unwrap();
     assert_eq!(decoded.opcode(), Opcode::UpdateEpoch);
-    assert_eq!(decoded.flags(), 0x02); // FLAG_EXTENT_FLUSHED
+    assert_eq!(decoded.flags(), 0x02); // FLAG_EPOCH_FLUSHED
     match &decoded.variable_header {
         VariableHeader::UpdateEpochFlushed {
             stream_id,

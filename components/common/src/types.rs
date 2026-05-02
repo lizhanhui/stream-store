@@ -16,10 +16,10 @@ pub const HEADER_LEN: usize = 8;
 /// Error responses use FLAG_RESPONSE_ERROR (0x80) instead.
 pub const FLAG_RESPONSE: u8 = 0x01;
 
-/// Flag on UPDATE_EXTENT: progress report for an active extent.
-pub const FLAG_EXTENT_PROGRESS: u8 = 0x01;
-/// Flag on UPDATE_EXTENT: extent was flushed to S3.
-pub const FLAG_EXTENT_FLUSHED: u8 = 0x02;
+/// Flag on UPDATE_EPOCH: progress report for an active epoch.
+pub const FLAG_EPOCH_PROGRESS: u8 = 0x01;
+/// Flag on UPDATE_EPOCH: epoch was flushed to S3.
+pub const FLAG_EPOCH_FLUSHED: u8 = 0x02;
 
 /// Flag on FORWARD: normal per-record replication.
 pub const FLAG_FORWARD_APPEND: u8 = 0x00;

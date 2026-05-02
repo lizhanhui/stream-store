@@ -1,8 +1,8 @@
 use bytes::{Buf, Bytes, BytesMut};
 use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpcodeSnafu};
 use common::types::{
-    ArenaClass, Epoch, EpochPolicy, ErrorCode, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
-    FLAG_EXTENT_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EPOCH_FLUSHED,
+    FLAG_EPOCH_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
     FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
     FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass,
     StreamConfig, StreamId,
@@ -760,7 +760,7 @@ impl Frame {
                 let stream_id = StreamId(body.get_u32());
                 let epoch = Epoch(body.get_u32());
                 match flags {
-                    FLAG_EXTENT_PROGRESS => {
+                    FLAG_EPOCH_PROGRESS => {
                         let current_offset = Offset(body.get_u64());
                         Ok((
                             VariableHeader::UpdateEpochProgress {
@@ -771,7 +771,7 @@ impl Frame {
                             None,
                         ))
                     }
-                    FLAG_EXTENT_FLUSHED => {
+                    FLAG_EPOCH_FLUSHED => {
                         let start_offset = Offset(body.get_u64());
                         let end_offset = Offset(body.get_u64());
                         let key_len = body.get_u16() as usize;

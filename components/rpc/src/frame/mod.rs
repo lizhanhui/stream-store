@@ -9,7 +9,7 @@ mod tests;
 
 use bytes::Bytes;
 use common::types::{
-    Epoch, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED, FLAG_EXTENT_PROGRESS,
+    Epoch, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EPOCH_FLUSHED, FLAG_EPOCH_PROGRESS,
     FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EPOCH,
     FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, Offset, Opcode,
     PROTOCOL_VERSION, StreamId,
@@ -303,8 +303,8 @@ impl Frame {
             | VariableHeader::SeekResp { .. }
             | VariableHeader::FlushEpochResp { .. } => FLAG_RESPONSE,
             // ── Per-opcode request-side flags ──
-            VariableHeader::UpdateEpochProgress { .. } => FLAG_EXTENT_PROGRESS,
-            VariableHeader::UpdateEpochFlushed { .. } => FLAG_EXTENT_FLUSHED,
+            VariableHeader::UpdateEpochProgress { .. } => FLAG_EPOCH_PROGRESS,
+            VariableHeader::UpdateEpochFlushed { .. } => FLAG_EPOCH_FLUSHED,
             VariableHeader::Forward { .. } => FLAG_FORWARD_APPEND,
             VariableHeader::ForwardInitEpoch { .. } => FLAG_FORWARD_INIT_EPOCH,
             VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,
