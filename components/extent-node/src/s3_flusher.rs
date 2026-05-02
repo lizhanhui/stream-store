@@ -1,8 +1,8 @@
-//! Background S3 flusher: uploads sealed extents to S3.
+//! Background S3 flusher: uploads sealed arena bytes to S3.
 //!
 //! Runs as a background tokio task, receiving [`FlushRequest`]s from the seal
-//! path. Each request triggers an encode + upload of the sealed extent data.
-//! On successful upload, notifies SM via `ExtentUpdate::Flushed`.
+//! path. Each request triggers an encode + upload of the sealed arena data.
+//! On successful canonical upload, notifies SM via `ExtentUpdate::Flushed`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,7 +14,7 @@ use tokio::time::sleep;
 use tracing::{info, warn};
 
 use crate::s3::S3Client;
-use crate::s3_codec::{encode_extent_range, s3_key};
+use crate::s3_codec::{encode_arena_range, s3_key};
 use crate::store::{ExtentNodeStore, ExtentUpdate};
 
 use rpc::frame::{Frame, VariableHeader};
@@ -25,7 +25,7 @@ const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 /// Initial backoff delay for S3 upload retries (200 milliseconds).
 const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(200);
 
-/// A request to flush a sealed extent to S3.
+/// A request to flush sealed arena bytes for an epoch to S3.
 #[derive(Debug, Clone)]
 pub struct FlushRequest {
     pub stream_id: StreamId,
@@ -36,7 +36,7 @@ pub struct FlushRequest {
 
 /// Background S3 flusher task.
 ///
-/// Receives sealed extent notifications and uploads them to S3 with retry.
+/// Receives sealed epoch notifications and uploads their arena bytes to S3 with retry.
 /// Runs until the channel is closed (shutdown).
 pub async fn run(
     s3_client: Arc<S3Client>,
@@ -52,9 +52,9 @@ pub async fn run(
     info!("S3 flusher stopped (channel closed)");
 }
 
-/// Encode and upload a single sealed extent to S3 with retry.
+/// Encode and upload one epoch's sealed arena bytes to S3 with retry.
 async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest) {
-    // Encode the sealed extent into S3 file format.
+    // Encode the sealed arena bytes into S3 object format.
     // Returns (encoded_bytes, actual_end_offset). When local data < requested
     // end_offset, actual_end_offset < req.end_offset and the S3 key uses the
     // actual range — a partial upload under a non-canonical key that won't
@@ -72,7 +72,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
             }
         };
         match stream.with_epoch_by_extent_id(req.extent_id, |ext| {
-            encode_extent_range(req.stream_id, ext, s3_client.compression(), req.end_offset)
+            encode_arena_range(req.stream_id, ext, s3_client.compression(), req.end_offset)
         }) {
             Some(result) => result,
             None => {
@@ -106,7 +106,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
     loop {
         attempt += 1;
 
-        // On retries, check if another replica already uploaded this extent.
+        // On retries, check if another replica already uploaded this arena object.
         if attempt > 1 && s3_client.exists(&key).await {
             info!(
                 "flush: extent {} for stream {} already exists at s3://{}/{}, skipping upload",
@@ -156,14 +156,14 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
     // Success bookkeeping. Only notify SM and mark flushed if the upload
     // was canonical (actual_end_offset == requested end_offset). A partial
     // upload preserves data in S3 but must not cause SM to transition the
-    // extent to Flushed — a replica with full data still needs to upload
+    // epoch to Flushed — a replica with full data still needs to upload
     // the canonical object.
     let is_canonical = actual_end_offset == req.end_offset;
 
     if is_canonical {
-        // Read the extent's own epoch — the immutable epoch assigned at extent
-        // creation time. This is distinct from the stream's current epoch which
-        // may have been bumped by RegisterEpoch for a successor extent.
+        // Read the sealed epoch's own epoch value. This is distinct from the
+        // stream's current epoch, which may have been bumped by RegisterEpoch
+        // for a successor epoch.
         let epoch = store
             .streams
             .pin()

@@ -24,7 +24,7 @@ use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::types::{Epoch, EpochPolicy, EpochState, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use extent_node::s3::S3Client;
-use extent_node::s3_codec::{S3ExtentHeader, s3_key};
+use extent_node::s3_codec::{S3ArenaHeader, s3_key};
 use stream_manager::StreamManager;
 use stream_manager::metadata::MetadataStore;
 use tokio::time::sleep;
@@ -277,7 +277,7 @@ async fn primary_flushes_sealed_extent_to_s3() {
 
     // Download and verify header.
     let data = s3.get_object(&key).await.expect("get_object");
-    let header = S3ExtentHeader::decode(&data).expect("decode header");
+    let header = S3ArenaHeader::decode(&data).expect("decode header");
     assert_eq!(header.record_count, 100);
     assert_eq!(header.start_offset, flushed_extent.start_offset);
     assert_eq!(header.end_offset, flushed_extent.end_offset);
@@ -352,7 +352,7 @@ async fn dr_flush_after_primary_killed() {
     assert!(s3.exists(&key).await, "S3 object should exist (DR flush)");
 
     let data = s3.get_object(&key).await.expect("get_object");
-    let header = S3ExtentHeader::decode(&data).expect("decode header");
+    let header = S3ArenaHeader::decode(&data).expect("decode header");
     assert!(
         header.record_count >= 50,
         "should have at least 50 records, got {}",
