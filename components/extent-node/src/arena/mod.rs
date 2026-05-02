@@ -14,8 +14,8 @@ mod write_batch;
 pub(crate) use buffer::{ArenaBuffer, OwnedArenaSlice};
 pub(crate) use directory::{ArenaDirectory, EpochArenaEntry, SLOT_UNSET};
 pub(crate) use id::{ArenaId, ArenaIdGenerator, node_prefix_from_id};
-pub(crate) use pool::{ArenaPool, DedicatedArenaPool};
 #[allow(unused_imports)]
 pub(crate) use pool::SharedArenaPool;
+pub(crate) use pool::{ArenaPool, DedicatedArenaPool};
 #[allow(unused_imports)]
 pub(crate) use write_batch::{JobResult, SharedAppendJob, WriteBatch, WriteBatchAck};

@@ -355,9 +355,7 @@ impl Frame {
                             stream_name,
                             replication_factor,
                             storage_class,
-                            policy: ExtentPolicy {
-                                cache,
-                            },
+                            policy: ExtentPolicy { cache },
                         },
                         None,
                     ))
@@ -532,9 +530,7 @@ impl Frame {
                                 epoch,
                                 storage_class,
                                 arena_class,
-                                policy: ExtentPolicy {
-                                    cache,
-                                },
+                                policy: ExtentPolicy { cache },
                             },
                         },
                         payload,
@@ -573,13 +569,9 @@ impl Frame {
                             None,
                         ))
                     }
-                    FLAG_FORWARD_FLUSHED => Ok((
-                        VariableHeader::ForwardFlushed {
-                            stream_id,
-                            epoch,
-                        },
-                        None,
-                    )),
+                    FLAG_FORWARD_FLUSHED => {
+                        Ok((VariableHeader::ForwardFlushed { stream_id, epoch }, None))
+                    }
                     FLAG_FORWARD_APPEND => {
                         let offset = Offset(body.get_u64());
                         let payload = Self::read_payload(body);
@@ -603,13 +595,12 @@ impl Frame {
                                 }
                                 .build()
                             })?;
-                        let arena_class =
-                            ArenaClass::from_u8(body.get_u8()).ok_or_else(|| {
-                                InvalidFrameSnafu {
-                                    message: "unknown arena class",
-                                }
-                                .build()
-                            })?;
+                        let arena_class = ArenaClass::from_u8(body.get_u8()).ok_or_else(|| {
+                            InvalidFrameSnafu {
+                                message: "unknown arena class",
+                            }
+                            .build()
+                        })?;
                         Ok((
                             VariableHeader::ForwardInitEpoch {
                                 stream_id,

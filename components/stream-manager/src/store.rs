@@ -5,6 +5,7 @@ use bytes::Buf;
 use crate::allocator::Allocator;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
+use common::bridge::synth_extent_id;
 use common::config::DEFAULT_CACHE_EXTENTS;
 use common::errors::{InternalSnafu, StorageError};
 use common::types::{
@@ -363,9 +364,7 @@ impl StreamManagerStore {
         let result = tokio::time::timeout(Duration::from_millis(500), async {
             let client = client::StreamClient::connect(&addr).await.map_err(|e| {
                 InternalSnafu {
-                    message: format!(
-                        "connect to Primary ExtentNode {addr} for RegisterEpoch: {e}"
-                    ),
+                    message: format!("connect to Primary ExtentNode {addr} for RegisterEpoch: {e}"),
                 }
                 .build()
             })?;
@@ -606,11 +605,7 @@ impl StreamManagerStore {
                     }
                     Err(e) => {
                         error!("register_node failed: {e}");
-                        Frame::error_from_request(
-                            &frame,
-                            ErrorCode::InternalError,
-                            &e.to_string(),
-                        )
+                        Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
                     }
                 }
             }
@@ -643,11 +638,7 @@ impl StreamManagerStore {
                     }
                     Err(e) => {
                         error!("update_heartbeat failed: {e}");
-                        Frame::error_from_request(
-                            &frame,
-                            ErrorCode::InternalError,
-                            &e.to_string(),
-                        )
+                        Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
                     }
                 }
             }
@@ -676,11 +667,7 @@ impl StreamManagerStore {
                 }
                 Err(e) => {
                     error!("mark_node_dead on disconnect failed: {e}");
-                    Frame::error_from_request(
-                        &frame,
-                        ErrorCode::InternalError,
-                        &e.to_string(),
-                    )
+                    Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
                 }
             },
             None => Frame::error_from_request(
@@ -784,11 +771,7 @@ impl StreamManagerStore {
             }
             Err(e) => {
                 error!("create_stream failed: {e}");
-                Frame::error_from_request(
-                    &frame,
-                    ErrorCode::InternalError,
-                    &e.to_string(),
-                )
+                Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
             }
         }
     }
@@ -1203,7 +1186,9 @@ impl StreamManagerStore {
                     epoch,
                     storage_class,
                     arena_class,
-                    policy: ExtentPolicy { cache: cache_extents },
+                    policy: ExtentPolicy {
+                        cache: cache_extents,
+                    },
                 };
 
                 info!(
@@ -1269,11 +1254,7 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("query_offset failed: {e}");
-                Frame::error_from_request(
-                    &frame,
-                    ErrorCode::InternalError,
-                    &e.to_string(),
-                )
+                Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
             }
         }
     }
@@ -1331,11 +1312,7 @@ impl StreamManagerStore {
             }
             Err(e) => {
                 error!("describe_stream failed: {e}");
-                Frame::error_from_request(
-                    &frame,
-                    ErrorCode::InternalError,
-                    &e.to_string(),
-                )
+                Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
             }
         }
     }
@@ -1373,11 +1350,7 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("describe_extent failed: {e}");
-                Frame::error_from_request(
-                    &frame,
-                    ErrorCode::InternalError,
-                    &e.to_string(),
-                )
+                Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
             }
         }
     }
@@ -1412,11 +1385,7 @@ impl StreamManagerStore {
             ),
             Err(e) => {
                 error!("seek failed: {e}");
-                Frame::error_from_request(
-                    &frame,
-                    ErrorCode::InternalError,
-                    &e.to_string(),
-                )
+                Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
             }
         }
     }
@@ -1709,7 +1678,7 @@ impl StreamManagerStore {
                 current_offset,
             } => {
                 // `extent_id` no longer travels on the wire; synthesize one from epoch.
-                let extent_id = ExtentId(epoch.0);
+                let extent_id = synth_extent_id(*epoch);
                 if let Err(e) = self
                     .store
                     .record_extent_progress(*stream_id, *epoch, extent_id, current_offset.0)
@@ -1728,7 +1697,7 @@ impl StreamManagerStore {
                 end_offset,
             } => {
                 // `extent_id` no longer travels on the wire; synthesize one from epoch.
-                let extent_id = ExtentId(epoch.0);
+                let extent_id = synth_extent_id(*epoch);
                 info!(
                     "UpdateEpochFlushed: stream={}, epoch={}, extent={}, start_offset={}, end_offset={}",
                     stream_id, epoch, extent_id, start_offset.0, end_offset.0

@@ -7,7 +7,9 @@
 
 use bytes::Bytes;
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, ExtentId, ExtentPolicy, ExtentState, NodeMetrics, Offset, StorageClass};
+use common::types::{
+    Epoch, ExtentId, ExtentPolicy, ExtentState, NodeMetrics, Offset, StorageClass,
+};
 
 use serial_test::serial;
 
@@ -150,14 +152,7 @@ async fn stream_manager_integration() {
         );
 
         let (stream_id, extent_id, _epoch, returned_addr) = stream_manager_client
-            .create_stream(
-                &stream_name,
-                1,
-                StorageClass::S3,
-                ExtentPolicy {
-                    cache: 4,
-                },
-            )
+            .create_stream(&stream_name, 1, StorageClass::S3, ExtentPolicy { cache: 4 })
             .await
             .unwrap();
 

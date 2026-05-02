@@ -512,6 +512,7 @@ impl StreamManagerClient {
                 current_offset,
                 epoch,
             } => {
+                // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
                 let _ = extent_id;
                 (
                     Frame::new(

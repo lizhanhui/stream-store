@@ -139,7 +139,11 @@ impl ExtentNodeStore {
             stream.set_storage_class(storage_class);
             false
         } else {
-            let stream = Stream::new(stream_id, Arc::clone(&self.default_pool), Arc::clone(&self.arena_ids));
+            let stream = Stream::new(
+                stream_id,
+                Arc::clone(&self.default_pool),
+                Arc::clone(&self.arena_ids),
+            );
             if policy.cache > 0 {
                 stream.set_max_extents(policy.cache as usize);
             }

@@ -39,14 +39,7 @@ impl ExtentNodeStore {
         let client_epoch = frame.epoch();
 
         // ── Validation + leader election + own append (scoped pin guard) ──
-        let (
-            epoch,
-            own_result,
-            extent_full,
-            remaining,
-            payload,
-            request_id,
-        ) = {
+        let (epoch, own_result, extent_full, remaining, payload, request_id) = {
             let guard = self.streams.pin();
             let stream = match guard.get(&stream_id) {
                 Some(s) => s,
@@ -96,14 +89,10 @@ impl ExtentNodeStore {
             if extent_full {
                 // Don't decrement in_flight — we're still the leader.
                 // Will decrement after seal+create+retry below.
-                (
-                    epoch, own_result, true, 0, payload, request_id,
-                )
+                (epoch, own_result, true, 0, payload, request_id)
             } else {
                 let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
-                (
-                    epoch, own_result, false, remaining, payload, request_id,
-                )
+                (epoch, own_result, false, remaining, payload, request_id)
             }
         };
         // Pin guard dropped — safe to .await.
@@ -219,6 +208,7 @@ impl ExtentNodeStore {
         let (append_result, extent_id) = match stream.try_append_active(payload) {
             Ok(r) => r,
             Err(StorageError::ExtentSealed { extent_id, .. }) => {
+                // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
                 let _ = extent_id;
                 let err = Frame::append_ack_error(
                     request_id,
@@ -730,6 +720,7 @@ impl ExtentNodeStore {
                         });
                     }
                     Err(StorageError::ExtentSealed { extent_id, .. }) => {
+                        // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
                         let _ = extent_id;
                         let err = Frame::append_ack_error(
                             request_id,

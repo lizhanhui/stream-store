@@ -211,7 +211,13 @@ unsafe impl Sync for StreamEpoch {}
 
 impl StreamEpoch {
     /// Create a new active extent with the specified capacity in bytes.
-    pub(crate) fn with_capacity(id: ExtentId, start_offset: Offset, capacity: u32, epoch: Epoch, arena_id: ArenaId) -> Self {
+    pub(crate) fn with_capacity(
+        id: ExtentId,
+        start_offset: Offset,
+        capacity: u32,
+        epoch: Epoch,
+        arena_id: ArenaId,
+    ) -> Self {
         let arena = ArenaBuffer::new(capacity);
         let buf = arena.ptr_mut();
 
@@ -220,12 +226,7 @@ impl StreamEpoch {
         // that caused ~80ms stalls. INDEX_UNSET == 0, so zeroed memory is correct.
         let record_cap = (capacity / MIN_RECORD_SIZE) as usize;
         // TODO(P3): fill in real stream_id when StreamEpoch is introduced.
-        let entry = EpochArenaEntry::with_capacity(
-            StreamId(0),
-            epoch,
-            start_offset,
-            record_cap,
-        );
+        let entry = EpochArenaEntry::with_capacity(StreamId(0), epoch, start_offset, record_cap);
         let directory = ArenaDirectory::new(entry);
 
         let (arena_job_tx, arena_job_rx) = unbounded();
@@ -422,11 +423,7 @@ impl StreamEpoch {
     /// matching `append_inner` semantics on the primary.
     ///
     /// Returns the logical offset on success.
-    pub fn replicate(
-        &self,
-        offset: Offset,
-        payload: Bytes,
-    ) -> Result<AppendResult, StorageError> {
+    pub fn replicate(&self, offset: Offset, payload: Bytes) -> Result<AppendResult, StorageError> {
         // Reject stale Forward frames from a previous extent (offset < start_offset).
         if offset.0 < self.start_offset.0 {
             return Err(InternalSnafu {
@@ -455,7 +452,8 @@ impl StreamEpoch {
             return Err(ExtentFullSnafu { extent_id: self.id }.build());
         }
         // Advance cursor.
-        self.write_cursor.store(byte_pos + record_len as u64, Ordering::Relaxed);
+        self.write_cursor
+            .store(byte_pos + record_len as u64, Ordering::Relaxed);
 
         // Write record at exact byte_pos (same layout as append).
         unsafe {
@@ -704,7 +702,10 @@ impl StreamEpoch {
             if (seq as usize) >= entry.record_capacity() {
                 break;
             }
-            let val = match entry.raw_slot(seq) { Some(v) => v, None => break };
+            let val = match entry.raw_slot(seq) {
+                Some(v) => v,
+                None => break,
+            };
             if val == crate::arena::SLOT_UNSET {
                 break; // gap — record not yet replicated
             }
@@ -1077,8 +1078,10 @@ mod tests {
     #[test]
     fn replicate_matches_append_layout() {
         // Prove that replicate() produces a bit-for-bit identical arena as append().
-        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
-        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let primary =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let secondary =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         let payloads: Vec<Bytes> = vec![
             Bytes::from_static(b"hello"),
@@ -1089,9 +1092,7 @@ mod tests {
         // Append on primary, replicate on secondary with same positions.
         for payload in &payloads {
             let result = primary.append(payload.clone()).unwrap();
-            secondary
-                .replicate(result.offset, payload.clone())
-                .unwrap();
+            secondary.replicate(result.offset, payload.clone()).unwrap();
         }
 
         // Arenas must be identical.
@@ -1223,14 +1224,16 @@ mod tests {
     #[test]
     fn incremental_crc32_via_replicate() {
         // Simulate primary appends to get reference data.
-        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let primary =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
         // Simulate secondary receiving the same records via replicate() IN ORDER.
-        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let secondary =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         secondary
             .replicate(Offset(0), Bytes::from_static(b"hello"))
             .unwrap();
@@ -1260,14 +1263,16 @@ mod tests {
     #[test]
     fn crc32_in_order_replicate() {
         // Simulate primary appends to get reference data.
-        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let primary =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.append(Bytes::from_static(b"!")).unwrap();
         primary.seal(None);
 
         // Simulate secondary receiving records IN ORDER (guaranteed by FIFO mpsc).
-        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let secondary =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         secondary
             .replicate(Offset(0), Bytes::from_static(b"hello"))
@@ -1291,12 +1296,14 @@ mod tests {
     #[test]
     fn crc32_forward_checksum_arrives_after_records() {
         // ForwardChecksum arrives after all records (normal case with FIFO channel).
-        let primary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let primary =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
         primary.append(Bytes::from_static(b"hello")).unwrap();
         primary.append(Bytes::from_static(b"world")).unwrap();
         primary.seal(None);
 
-        let secondary = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
+        let secondary =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0), ArenaId(0));
 
         // Records arrive in order.
         secondary
@@ -1315,14 +1322,11 @@ mod tests {
         assert_eq!(secondary.try_verify_checksum(), Some(true));
     }
 
-
-
-
-
     #[test]
     fn correct_seal_offset_lowers_limit() {
         // Sealed at 100 records, correct down to 80
-        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
+        let extent =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
         for i in 0..100u32 {
             extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
         }
@@ -1338,7 +1342,8 @@ mod tests {
     #[test]
     fn correct_seal_offset_noop_if_already_lower() {
         // Sealed at 50 records, try to "correct" to 80 → no-op
-        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
+        let extent =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
         for i in 0..50u32 {
             extent.append(Bytes::from(vec![i as u8; 10])).unwrap();
         }
@@ -1352,7 +1357,8 @@ mod tests {
     #[test]
     fn correct_seal_offset_noop_if_unsealed() {
         // Not sealed → correct_seal_offset is a no-op
-        let extent = StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
+        let extent =
+            StreamEpoch::with_capacity(ExtentId(1), Offset(0), 1024 * 1024, Epoch(0), ArenaId(0));
         extent.append(Bytes::from_static(b"hello")).unwrap();
 
         extent.correct_seal_offset(0); // should not seal or crash

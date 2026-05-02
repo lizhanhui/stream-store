@@ -53,7 +53,9 @@ impl Frame {
                 4 + 2 + stream_name.len() + 1 + 2 + 1
             }
             // request_id(4) + stream_id(4) + epoch(4) + addr_len(2) + addr(N)
-            VariableHeader::CreateStreamResp { primary_addr, .. } => 4 + 4 + 4 + 2 + primary_addr.len(),
+            VariableHeader::CreateStreamResp { primary_addr, .. } => {
+                4 + 4 + 4 + 2 + primary_addr.len()
+            }
             // request_id(4) + error_code(2)
             VariableHeader::CreateStreamRespError { .. } => 4 + 2,
             // request_id(4) + stream_id(4)
@@ -495,10 +497,7 @@ impl Frame {
                 dst.put_u32(*checksum);
                 dst.put_u64(*committed_bytes);
             }
-            VariableHeader::ForwardFlushed {
-                stream_id,
-                epoch,
-            } => {
+            VariableHeader::ForwardFlushed { stream_id, epoch } => {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
             }

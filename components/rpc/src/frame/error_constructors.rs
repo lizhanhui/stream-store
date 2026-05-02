@@ -232,35 +232,19 @@ impl Frame {
         )
     }
 
-    pub fn error_from_request(
-        request: &Frame,
-        error_code: ErrorCode,
-        message: &str,
-    ) -> Frame {
+    pub fn error_from_request(request: &Frame, error_code: ErrorCode, message: &str) -> Frame {
         match &request.variable_header {
             VariableHeader::Append {
                 request_id,
                 stream_id,
                 epoch,
-            } => Self::append_ack_error(
-                *request_id,
-                *stream_id,
-                *epoch,
-                error_code,
-                message,
-            ),
+            } => Self::append_ack_error(*request_id, *stream_id, *epoch, error_code, message),
             VariableHeader::Read {
                 request_id,
                 stream_id,
                 offset,
                 ..
-            } => Self::read_resp_error(
-                *request_id,
-                *stream_id,
-                *offset,
-                error_code,
-                message,
-            ),
+            } => Self::read_resp_error(*request_id, *stream_id, *offset, error_code, message),
             VariableHeader::SealStreamRequest {
                 request_id,
                 stream_id,
@@ -288,26 +272,15 @@ impl Frame {
                 Self::heartbeat_error(*request_id, error_code, message)
             }
             VariableHeader::RegisterEpoch {
-                request_id,
-                config,
-                ..
-            } => Self::register_epoch_ack_error(
-                *request_id,
-                config.stream_id,
-                error_code,
-                message,
-            ),
+                request_id, config, ..
+            } => Self::register_epoch_ack_error(*request_id, config.stream_id, error_code, message),
             VariableHeader::ReportEpoch {
                 request_id,
                 stream_id,
                 epoch,
-            } => Self::report_epoch_resp_error(
-                *request_id,
-                *stream_id,
-                *epoch,
-                error_code,
-                message,
-            ),
+            } => {
+                Self::report_epoch_resp_error(*request_id, *stream_id, *epoch, error_code, message)
+            }
             VariableHeader::DescribeStream {
                 request_id,
                 stream_id,
@@ -316,12 +289,7 @@ impl Frame {
             VariableHeader::DescribeEpoch {
                 request_id,
                 stream_id,
-            } => Self::describe_epoch_resp_error(
-                *request_id,
-                *stream_id,
-                error_code,
-                message,
-            ),
+            } => Self::describe_epoch_resp_error(*request_id, *stream_id, error_code, message),
             VariableHeader::Seek {
                 request_id,
                 stream_id,
@@ -331,12 +299,7 @@ impl Frame {
                 request_id,
                 stream_id,
                 ..
-            } => Self::flush_epoch_resp_error(
-                *request_id,
-                *stream_id,
-                error_code,
-                message,
-            ),
+            } => Self::flush_epoch_resp_error(*request_id, *stream_id, error_code, message),
             _ => panic!(
                 "no error response mapping for opcode {:?}",
                 request.opcode()

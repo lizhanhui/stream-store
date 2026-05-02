@@ -517,7 +517,8 @@ async fn cumulative_ack_drains_multiple_pending() {
         ack_queue.enqueue(PendingAck {
             request_id: i as u32,
             stream_id: StreamId(10),
-            extent_id: ExtentId(0),            epoch: Epoch(0),
+            extent_id: ExtentId(0),
+            epoch: Epoch(0),
             response_tx: resp_tx.clone(),
             assigned_offset: i,
             created_at: Instant::now(),
@@ -572,7 +573,8 @@ async fn pending_ack_timeout() {
     ack_queue.enqueue(PendingAck {
         request_id: 42,
         stream_id: StreamId(10),
-        extent_id: ExtentId(0),        epoch: Epoch(0),
+        extent_id: ExtentId(0),
+        epoch: Epoch(0),
         response_tx: resp_tx.clone(),
         assigned_offset: 0,
         created_at: Instant::now() - DEFAULT_REPLICATION_TIMEOUT - Duration::from_secs(1),
@@ -582,7 +584,8 @@ async fn pending_ack_timeout() {
     ack_queue.enqueue(PendingAck {
         request_id: 43,
         stream_id: StreamId(10),
-        extent_id: ExtentId(0),        epoch: Epoch(0),
+        extent_id: ExtentId(0),
+        epoch: Epoch(0),
         response_tx: resp_tx.clone(),
         assigned_offset: 1,
         created_at: Instant::now(),
@@ -1477,12 +1480,14 @@ async fn flush_extent_skips_flushed() {
 }
 
 #[tokio::test]
-async fn flush_extent_skips_missing_extent() {
-    // B9: FlushExtent for a non-existent extent → no FlushRequest, no panic.
-    // After wire-protocol collapse (stream_id, epoch) is the identity; we can
-    // no longer aim at a specific missing extent_id from the wire. This test
-    // is retained as a compile-only smoke; the "missing extent" case
-    // collapses into "missing stream" — covered by the next test.
+async fn flush_epoch_skips_when_no_matching_extent() {
+    // B9: FlushEpoch for a registered stream where no local extent matches the
+    // requested (epoch, offset) → no FlushRequest, no panic. After wire-protocol
+    // collapse (stream_id, epoch) is the identity; the EN synthesizes the
+    // extent id from the epoch, so the mismatch surfaces as "no extent found"
+    // on an otherwise present stream. This differs from
+    // `flush_extent_skips_missing_stream` below, which exercises the case
+    // where the stream itself is absent.
     let (flush_tx, _flush_rx) = mpsc::channel::<crate::s3_flusher::FlushRequest>(16);
     let mut store = test_store();
     store.set_flush_tx(flush_tx);
@@ -1507,6 +1512,12 @@ async fn flush_extent_skips_missing_extent() {
     let resp = result.expect("FlushExtent should return a response");
     assert_eq!(resp.opcode(), Opcode::FlushEpoch);
     assert!(!resp.is_error_response());
+    // Distinguish from `flush_extent_skips_missing_stream`: here the stream is
+    // still present; only the per-epoch extent lookup failed.
+    assert!(
+        store.streams.pin().get(&StreamId(1)).is_some(),
+        "stream should remain present after flush of non-matching extent"
+    );
 }
 
 #[tokio::test]

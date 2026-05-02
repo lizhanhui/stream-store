@@ -242,7 +242,11 @@ pub fn s3_key(namespace: &str, stream_id: StreamId, start_offset: u64, end_offse
 ///
 /// The extent must be sealed. Returns the complete file bytes
 /// (header + chunk index + compressed data).
-pub fn encode_extent(stream_id: StreamId, extent: &StreamEpoch, compression: Compression) -> Vec<u8> {
+pub fn encode_extent(
+    stream_id: StreamId,
+    extent: &StreamEpoch,
+    compression: Compression,
+) -> Vec<u8> {
     let data: Bytes = extent.committed_data();
     let record_count = extent.message_count() as u32;
     let start_offset = extent.start_offset.0;
@@ -526,8 +530,13 @@ mod tests {
 
     /// Helper: create a sealed extent with start_offset.
     fn sealed_extent_at(start_offset: u64, payloads: &[&[u8]]) -> StreamEpoch {
-        let extent =
-            StreamEpoch::with_capacity(ExtentId(1), Offset(start_offset), 1024 * 1024, Epoch(0), crate::arena::ArenaId(0));
+        let extent = StreamEpoch::with_capacity(
+            ExtentId(1),
+            Offset(start_offset),
+            1024 * 1024,
+            Epoch(0),
+            crate::arena::ArenaId(0),
+        );
         for payload in payloads {
             extent
                 .append(Bytes::copy_from_slice(payload))

@@ -48,11 +48,7 @@ impl ExtentNodeStore {
                     Some(payload.freeze()),
                 )
             }
-            Err(e) => Frame::error_from_request(
-                &frame,
-                ErrorCode::InternalError,
-                &e.to_string(),
-            ),
+            Err(e) => Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string()),
         }
     }
 

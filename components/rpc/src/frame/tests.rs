@@ -321,10 +321,7 @@ fn seal_epoch_request_round_trip() {
     assert_eq!(decoded.epoch(), Epoch(3));
     assert!(!decoded.is_error_response());
     match &decoded.variable_header {
-        VariableHeader::SealEpochPrepare {
-            start_offset,
-            ..
-        } => {
+        VariableHeader::SealEpochPrepare { start_offset, .. } => {
             assert_eq!(*start_offset, 100);
         }
         _ => panic!("expected SealEpochPrepare"),

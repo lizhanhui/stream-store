@@ -1,13 +1,14 @@
 use std::sync::atomic::Ordering;
 
+use common::bridge::synth_extent_id;
 use common::errors::StorageError;
 use common::types::{ArenaClass, Epoch, ExtentId, ExtentPolicy, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
 use super::ExtentNodeStore;
-use crate::stream_epoch::AppendResult;
 use crate::stream::Stream;
+use crate::stream_epoch::AppendResult;
 
 impl ExtentNodeStore {
     /// Check if a Forward or ForwardChecksum frame targets an extent that
@@ -23,15 +24,11 @@ impl ExtentNodeStore {
     pub(crate) fn maybe_build_init_forward(&self, stream: &Stream, frame: &Frame) -> Option<Frame> {
         let (stream_id, extent_id, epoch) = match &frame.variable_header {
             VariableHeader::Forward {
-                stream_id,
-                epoch,
-                ..
-            } => (*stream_id, ExtentId(epoch.0 + 1), Some(*epoch)),
+                stream_id, epoch, ..
+            } => (*stream_id, synth_extent_id(*epoch), Some(*epoch)),
             VariableHeader::ForwardChecksum {
-                stream_id,
-                epoch,
-                ..
-            } => (*stream_id, ExtentId(epoch.0 + 1), None),
+                stream_id, epoch, ..
+            } => (*stream_id, synth_extent_id(*epoch), None),
             _ => return None,
         };
 
@@ -92,7 +89,7 @@ impl ExtentNodeStore {
         };
 
         // Synthesize a local extent id from the epoch (one extent per epoch).
-        let extent_id = ExtentId(epoch.0 + 1);
+        let extent_id = synth_extent_id(epoch);
 
         tracing::debug!(
             arena_class = ?arena_class,
@@ -159,7 +156,7 @@ impl ExtentNodeStore {
         };
 
         // Synthesize a local extent id from the epoch (one extent per epoch).
-        let extent_id = ExtentId(epoch.0 + 1);
+        let extent_id = synth_extent_id(epoch);
 
         // Look up the stream — must exist (created by ForwardInitEpoch or RegisterEpoch).
         let streams = self.streams.pin();
@@ -174,11 +171,8 @@ impl ExtentNodeStore {
             }
         };
 
-        let replicate_result = stream.replicate(
-            extent_id,
-            offset,
-            frame.payload.clone().unwrap_or_default(),
-        );
+        let replicate_result =
+            stream.replicate(extent_id, offset, frame.payload.clone().unwrap_or_default());
 
         self.finish_forward(
             stream,
@@ -262,7 +256,7 @@ impl ExtentNodeStore {
                 } => (*stream_id, *epoch, *checksum, *committed_bytes),
                 _ => return,
             };
-        let extent_id = ExtentId(epoch.0 + 1);
+        let extent_id = synth_extent_id(epoch);
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
@@ -314,13 +308,11 @@ impl ExtentNodeStore {
     pub(crate) fn handle_forward_flushed(&self, frame: Frame) {
         let (stream_id, epoch) = match &frame.variable_header {
             VariableHeader::ForwardFlushed {
-                stream_id,
-                epoch,
-                ..
+                stream_id, epoch, ..
             } => (*stream_id, *epoch),
             _ => return,
         };
-        let extent_id = ExtentId(epoch.0 + 1);
+        let extent_id = synth_extent_id(epoch);
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {

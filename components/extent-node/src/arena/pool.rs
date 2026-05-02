@@ -25,10 +25,10 @@ pub(crate) trait ArenaPool: Send + Sync {
     /// ready to insert into `Stream::epochs` via `insert_epoch`.
     fn allocate_epoch(
         &self,
-        stream_id:    StreamId,
-        extent_id:    ExtentId,
+        stream_id: StreamId,
+        extent_id: ExtentId,
         start_offset: Offset,
-        epoch:        Epoch,
+        epoch: Epoch,
     ) -> Arc<StreamEpoch>;
 }
 
@@ -47,10 +47,10 @@ impl DedicatedArenaPool {
 impl ArenaPool for DedicatedArenaPool {
     fn allocate_epoch(
         &self,
-        _stream_id:   StreamId,
-        extent_id:    ExtentId,
+        _stream_id: StreamId,
+        extent_id: ExtentId,
         start_offset: Offset,
-        epoch:        Epoch,
+        epoch: Epoch,
     ) -> Arc<StreamEpoch> {
         let arena_id = self.ids.next();
         Arc::new(StreamEpoch::with_capacity(
@@ -74,18 +74,23 @@ pub(crate) struct SharedArenaPool {
 impl SharedArenaPool {
     #[allow(dead_code)]
     pub(crate) fn new(arena_size: u32, ids: Arc<ArenaIdGenerator>) -> Self {
-        Self { _arena_size: arena_size, _ids: ids }
+        Self {
+            _arena_size: arena_size,
+            _ids: ids,
+        }
     }
 }
 
 impl ArenaPool for SharedArenaPool {
     fn allocate_epoch(
         &self,
-        _stream_id:    StreamId,
-        _extent_id:    ExtentId,
+        _stream_id: StreamId,
+        _extent_id: ExtentId,
         _start_offset: Offset,
-        _epoch:        Epoch,
+        _epoch: Epoch,
     ) -> Arc<StreamEpoch> {
-        panic!("SharedArenaPool::allocate_epoch not wired yet; P2 routes every stream through DedicatedArenaPool")
+        panic!(
+            "SharedArenaPool::allocate_epoch not wired yet; P2 routes every stream through DedicatedArenaPool"
+        )
     }
 }

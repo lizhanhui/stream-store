@@ -64,28 +64,22 @@ impl ExtentNodeStore {
 
     pub(crate) fn handle_seal(&self, frame: Frame) -> Frame {
         // Parse SealEpochPrepare fields.
-        let (request_id, stream_id, epoch, req_start_offset) =
-            match &frame.variable_header {
-                VariableHeader::SealEpochPrepare {
-                    request_id,
-                    stream_id,
-                    epoch,
-                    start_offset,
-                } => (
-                    *request_id,
-                    *stream_id,
-                    *epoch,
-                    *start_offset,
-                ),
-                _ => {
-                    return Frame::seal_epoch_resp_error(
-                        frame.request_id(),
-                        frame.stream_id(),
-                        ErrorCode::InternalError,
-                        "invalid SealEpochPrepare frame",
-                    );
-                }
-            };
+        let (request_id, stream_id, epoch, req_start_offset) = match &frame.variable_header {
+            VariableHeader::SealEpochPrepare {
+                request_id,
+                stream_id,
+                epoch,
+                start_offset,
+            } => (*request_id, *stream_id, *epoch, *start_offset),
+            _ => {
+                return Frame::seal_epoch_resp_error(
+                    frame.request_id(),
+                    frame.stream_id(),
+                    ErrorCode::InternalError,
+                    "invalid SealEpochPrepare frame",
+                );
+            }
+        };
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
@@ -132,11 +126,13 @@ impl ExtentNodeStore {
             }
         }
 
-        // `extent_id_from` no longer travels on the wire; the SealEpoch identity
-        // is (stream_id, epoch). For now we derive a synthetic sentinel of 0 to
-        // keep the existing local sealing logic unchanged — the plan's later
-        // phases remove this threading entirely when the autonomous-create path
-        // is deleted.
+        // `extent_id_from` is an *iteration-start sentinel* only, not an
+        // identity. It's the lower bound passed to
+        // `build_seal_predecessor_payload` when walking predecessor extents
+        // within the stream; the SealEpoch identity itself is (stream_id,
+        // epoch). We keep it at 0 so the walk covers every extent < the
+        // sealed one. The plan's later phases remove this threading
+        // entirely when the autonomous-create path is deleted.
         let extent_id_from = ExtentId(0);
 
         // Find the LAST MUTABLE extent for (stream_id, epoch).
@@ -267,35 +263,12 @@ impl ExtentNodeStore {
         extent_id_from: ExtentId,
         sealed_extent_id: ExtentId,
     ) -> Option<Bytes> {
-        let guard = self.streams.pin();
-        let stream = guard.get(&stream_id)?;
-
-        let mut predecessors: Vec<(ExtentId, u64, u64)> = Vec::new();
-        // Iterate over all known extents to find predecessors.
-        let mut eid = extent_id_from;
-        while eid.0 < sealed_extent_id.0 {
-            if let Some((start, end)) = stream.with_extent(eid, |ext| {
-                let start = ext.start_offset.0;
-                let end = start + ext.message_count();
-                (start, end)
-            }) {
-                predecessors.push((eid, start, end));
-            }
-            eid = ExtentId(eid.0 + 1);
-        }
-
-        if predecessors.is_empty() {
-            return None;
-        }
-
-        let mut buf = BytesMut::with_capacity(4 + predecessors.len() * (4 + 8 + 8));
-        buf.put_u32(predecessors.len() as u32);
-        for (eid, start, end) in &predecessors {
-            buf.put_u32(eid.0);
-            buf.put_u64(*start);
-            buf.put_u64(*end);
-        }
-        Some(buf.freeze())
+        // TODO(pre-P3 Phase 4): delete this function entirely. After autonomous-create
+        // is removed there are no predecessor extents within an epoch — each epoch
+        // owns exactly one StreamEpoch, identified by the sealed_extent_id itself.
+        // The bridge-window short-circuit returns None unconditionally.
+        let _ = (stream_id, extent_id_from, sealed_extent_id);
+        None
     }
 
     /// Handle FLUSH_EPOCH (0x1B): SM commands this EN to upload a sealed epoch
@@ -303,29 +276,23 @@ impl ExtentNodeStore {
     ///
     /// Returns FlushEpochResp on success (accepted), FlushEpochRespError on skip/error.
     pub(crate) fn handle_flush_extent(&self, frame: Frame) -> Frame {
-        let (request_id, stream_id, epoch, start_offset, end_offset) =
-            match &frame.variable_header {
-                VariableHeader::FlushEpoch {
-                    request_id,
-                    stream_id,
-                    epoch,
-                    start_offset,
-                    end_offset,
-                } => (
-                    *request_id,
-                    *stream_id,
-                    *epoch,
-                    *start_offset,
-                    *end_offset,
-                ),
-                _ => {
-                    return Frame::error_from_request(
-                        &frame,
-                        ErrorCode::InternalError,
-                        "invalid FlushEpoch frame",
-                    );
-                }
-            };
+        let (request_id, stream_id, epoch, start_offset, end_offset) = match &frame.variable_header
+        {
+            VariableHeader::FlushEpoch {
+                request_id,
+                stream_id,
+                epoch,
+                start_offset,
+                end_offset,
+            } => (*request_id, *stream_id, *epoch, *start_offset, *end_offset),
+            _ => {
+                return Frame::error_from_request(
+                    &frame,
+                    ErrorCode::InternalError,
+                    "invalid FlushEpoch frame",
+                );
+            }
+        };
         let _ = epoch;
 
         // `extent_id` no longer travels on the wire for FlushEpoch. The EN's
@@ -340,6 +307,8 @@ impl ExtentNodeStore {
                     s.find_extent_for_offset(common::types::Offset(start_offset))
                         .or_else(|| s.active_extent_id())
                 })
+                // TODO(pre-P3 Phase 4): drop this fallback — every sealed epoch has a concrete
+                // StreamEpoch; the unwrap_or becomes unreachable once ExtentId is removed.
                 .unwrap_or(ExtentId(0))
         };
 
@@ -482,13 +451,7 @@ impl ExtentNodeStore {
                     epoch,
                     start_offset,
                     end_offset,
-                } => (
-                    *request_id,
-                    *stream_id,
-                    *epoch,
-                    *start_offset,
-                    *end_offset,
-                ),
+                } => (*request_id, *stream_id, *epoch, *start_offset, *end_offset),
                 _ => {
                     return Frame::error_from_request(
                         &frame,
@@ -509,6 +472,8 @@ impl ExtentNodeStore {
                     s.find_extent_for_offset(common::types::Offset(_start_offset))
                         .or_else(|| s.active_extent_id())
                 })
+                // TODO(pre-P3 Phase 4): drop this fallback — every sealed epoch has a concrete
+                // StreamEpoch; the unwrap_or becomes unreachable once ExtentId is removed.
                 .unwrap_or(ExtentId(0))
         };
 

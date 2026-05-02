@@ -1,7 +1,8 @@
 use std::sync::Arc;
 
+use common::bridge::synth_extent_id;
 use common::config::DEFAULT_EXTENT_CAPACITY;
-use common::types::{ErrorCode, ExtentId, ExtentPolicy};
+use common::types::{ErrorCode, ExtentPolicy};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use tracing::info;
@@ -32,7 +33,7 @@ impl ExtentNodeStore {
         // still identifies extents by id; later phases collapse that to
         // (stream_id, epoch). For now, synthesize a per-epoch extent id (the
         // old allocator produced 1-based ids, so we use `epoch + 1`).
-        let extent_id = ExtentId(epoch.0 + 1);
+        let extent_id = synth_extent_id(epoch);
 
         tracing::debug!(
             arena_class = ?config.arena_class,
@@ -67,7 +68,12 @@ impl ExtentNodeStore {
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
             if stream.with_extent(extent_id, |_| ()).is_none() {
-                stream.register_extent(extent_id, stream.max_offset(), epoch, DEFAULT_EXTENT_CAPACITY);
+                stream.register_extent(
+                    extent_id,
+                    stream.max_offset(),
+                    epoch,
+                    DEFAULT_EXTENT_CAPACITY,
+                );
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch
                 // from authoritative source (RegisterEpoch carries the real epoch).

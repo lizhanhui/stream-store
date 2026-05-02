@@ -352,6 +352,7 @@ impl StreamClient {
         offset: Offset,
         count: u16,
     ) -> Result<Vec<Bytes>, StorageError> {
+        // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
         let _ = extent_id;
         let req = Frame::new(
             VariableHeader::Read {
@@ -565,6 +566,7 @@ impl StreamClient {
         stream_id: StreamId,
         extent_id: ExtentId,
     ) -> Result<ExtentInfo, StorageError> {
+        // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
         let _ = extent_id;
         let req = Frame::new(
             VariableHeader::DescribeEpoch {

@@ -30,8 +30,8 @@ pub(crate) const SLOT_UNSET: u32 = 0;
 /// the entry (offset - start_offset). Entry i stores `byte_pos + 1`;
 /// slot == 0 is the unset sentinel.
 pub(crate) struct EpochArenaEntry {
-    pub(crate) stream_id:    StreamId,
-    pub(crate) epoch:        Epoch,
+    pub(crate) stream_id: StreamId,
+    pub(crate) epoch: Epoch,
     pub(crate) start_offset: Offset,
 
     // Capacity = arena_capacity / MIN_RECORD_SIZE (same value used by
@@ -43,10 +43,10 @@ pub(crate) struct EpochArenaEntry {
 impl EpochArenaEntry {
     /// Allocate a fresh entry with `record_cap` slots, all set to SLOT_UNSET.
     pub(crate) fn with_capacity(
-        stream_id:    StreamId,
-        epoch:        Epoch,
+        stream_id: StreamId,
+        epoch: Epoch,
         start_offset: Offset,
-        record_cap:   usize,
+        record_cap: usize,
     ) -> Self {
         // alloc_zeroed path, identical to today's Extent.index init.
         let byte_positions = {
@@ -64,10 +64,8 @@ impl EpochArenaEntry {
             // SAFETY: ptr points to record_cap * 4 zeroed bytes; we
             // reconstruct a Vec<AtomicU32> of exactly that capacity so
             // the Box<[AtomicU32]> conversion is well-formed.
-            unsafe {
-                Vec::from_raw_parts(ptr as *mut AtomicU32, record_cap, record_cap)
-            }
-            .into_boxed_slice()
+            unsafe { Vec::from_raw_parts(ptr as *mut AtomicU32, record_cap, record_cap) }
+                .into_boxed_slice()
         };
         Self {
             stream_id,

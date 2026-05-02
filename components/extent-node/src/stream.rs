@@ -1,5 +1,5 @@
-use std::sync::{Arc, OnceLock};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
@@ -16,8 +16,8 @@ use tracing::error;
 
 use crate::ack_queue::AckQueue;
 use crate::arena::{ArenaIdGenerator, ArenaPool};
-use crate::stream_epoch::{AppendResult, StreamEpoch};
 use crate::store::AppendJob;
+use crate::stream_epoch::{AppendResult, StreamEpoch};
 
 /// Reason for sealing the active extent and creating a new one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,7 +30,6 @@ pub enum SealReason {
 /// lock acquisition covers all fields that need coordinated mutation.
 struct StreamInner {
     // extents: Vec<StreamEpoch>,   // REMOVED — now on Stream as ArcSwap<SmallVec<...>>
-
     /// Next extent ID for autonomous creation within the current epoch.
     /// Initialized to `first_extent_id + 1` when SM sends RegisterEpoch.
     next_extent_id: ExtentId,
@@ -131,7 +130,11 @@ impl Stream {
     // ── Construction ────────────────────────────────────────────────────
 
     /// Create a new stream with no extents. Extents are added via `register_extent()`.
-    pub(crate) fn new(id: StreamId, pool: Arc<dyn ArenaPool>, arena_ids: Arc<ArenaIdGenerator>) -> Self {
+    pub(crate) fn new(
+        id: StreamId,
+        pool: Arc<dyn ArenaPool>,
+        arena_ids: Arc<ArenaIdGenerator>,
+    ) -> Self {
         let (job_tx, job_rx) = unbounded();
         Self {
             id,
@@ -159,9 +162,18 @@ impl Stream {
     /// Find the epoch by extent_id in the epochs vec. Used by
     /// with_extent and every internal find-by-id path.
     fn find_epoch(&self, extent_id: ExtentId) -> Option<Arc<StreamEpoch>> {
-        self.epochs.load().iter().find(|e| e.id == extent_id).cloned()
+        self.epochs
+            .load()
+            .iter()
+            .find(|e| e.id == extent_id)
+            .cloned()
     }
 
+    /// Bridge helper (pre-P3 Phase 4): look up the `StreamEpoch` covering a
+    /// given offset. Introduced when the wire protocol dropped `extent_id`
+    /// from read/seal/flush handlers; removed once `Stream::with_extent`
+    /// is rewritten to key on `Epoch`.
+    ///
     /// Find the extent whose range covers `offset`. Used by handlers that
     /// receive an offset on the wire without an extent_id.
     pub fn find_extent_for_offset(&self, offset: Offset) -> Option<ExtentId> {
@@ -269,7 +281,9 @@ impl Stream {
         // Allocate + insert outside the write lock. Insert ordering is by
         // epoch number, which is monotone, so the new entry appends at the
         // tail.
-        let ep = self.pool.allocate_epoch(self.id, new_id, start_offset, epoch);
+        let ep = self
+            .pool
+            .allocate_epoch(self.id, new_id, start_offset, epoch);
         self.insert_epoch(ep);
 
         self.evict_oldest_epochs();
@@ -760,12 +774,7 @@ mod tests {
     /// Helper: create a stream with one active extent (simulating RegisterEpoch from SM).
     fn new_stream_with_extent(id: StreamId) -> Stream {
         let stream = Stream::new(id, test_pool(), test_arena_ids());
-        stream.register_extent_simple(
-            ExtentId(0),
-            Offset(0),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
     }
 
@@ -935,24 +944,14 @@ mod tests {
         stream.set_max_extents(2);
 
         // Register extent 0 and append a message.
-        stream.register_extent_simple(
-            ExtentId(0),
-            Offset(0),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
             .append(ExtentId(0), Bytes::from_static(b"msg0"))
             .unwrap();
 
         // Seal extent 0, register extent 1.
         stream.seal(ExtentId(0), None);
-        stream.register_extent_simple(
-            ExtentId(1),
-            Offset(1),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(1), Offset(1), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         // 2 extents (sealed + active) — at limit, no eviction.
         assert!(stream.with_extent(ExtentId(0), |_| ()).is_some());
         assert!(stream.with_extent(ExtentId(1), |_| ()).is_some());
@@ -962,12 +961,7 @@ mod tests {
             .append(ExtentId(1), Bytes::from_static(b"msg1"))
             .unwrap();
         stream.seal(ExtentId(1), None);
-        stream.register_extent_simple(
-            ExtentId(2),
-            Offset(2),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(2), Offset(2), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         assert!(
             stream.with_extent(ExtentId(0), |_| ()).is_none(),
             "extent 0 should be evicted"
@@ -982,12 +976,7 @@ mod tests {
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_extents(2);
 
-        stream.register_extent_simple(
-            ExtentId(0),
-            Offset(0),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
             .append(ExtentId(0), Bytes::from_static(b"a"))
             .unwrap();
@@ -1030,12 +1019,7 @@ mod tests {
             stream.seal(ExtentId(i), None);
         }
         // Register one more active extent.
-        stream.register_extent_simple(
-            ExtentId(5),
-            Offset(5),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(5), Offset(5), DEFAULT_EXTENT_CAPACITY, Epoch(0));
 
         // All 6 extents should still be present.
         for i in 0..=5 {
@@ -1052,31 +1036,16 @@ mod tests {
         stream.set_max_extents(2);
 
         // Register extent 0 (not sealed — simulating secondary).
-        stream.register_extent_simple(
-            ExtentId(0),
-            Offset(0),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
 
         // Register extent 1 — 2 extents, at limit.
-        stream.register_extent_simple(
-            ExtentId(1),
-            Offset(100),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(1), Offset(100), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         assert!(stream.with_extent(ExtentId(0), |_| ()).is_some());
         assert!(stream.with_extent(ExtentId(1), |_| ()).is_some());
 
         // Register extent 2 — 3 extents, exceeds limit.
         // Extent 0 is NOT sealed, but should still be evicted.
-        stream.register_extent_simple(
-            ExtentId(2),
-            Offset(200),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(2), Offset(200), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         assert!(
             stream.with_extent(ExtentId(0), |_| ()).is_none(),
             "unsealed extent 0 should be evicted"
@@ -1094,34 +1063,19 @@ mod tests {
         stream.set_max_extents(2);
 
         // Create 3 extents: extent 0 (sealed), extent 1 (sealed), extent 2 (active).
-        stream.register_extent_simple(
-            ExtentId(0),
-            Offset(0),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
             .append(ExtentId(0), Bytes::from_static(b"a"))
             .unwrap();
         stream.seal(ExtentId(0), None);
 
-        stream.register_extent_simple(
-            ExtentId(1),
-            Offset(1),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(1), Offset(1), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
             .append(ExtentId(1), Bytes::from_static(b"b"))
             .unwrap();
         stream.seal(ExtentId(1), None);
 
-        stream.register_extent_simple(
-            ExtentId(2),
-            Offset(2),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(2), Offset(2), DEFAULT_EXTENT_CAPACITY, Epoch(0));
 
         // 3 extents exceed limit=2, but extent 0 is not flushed — no eviction.
         assert!(
@@ -1135,12 +1089,7 @@ mod tests {
             .append(ExtentId(2), Bytes::from_static(b"c"))
             .unwrap();
         stream.seal(ExtentId(2), None);
-        stream.register_extent_simple(
-            ExtentId(3),
-            Offset(3),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(3), Offset(3), DEFAULT_EXTENT_CAPACITY, Epoch(0));
 
         // Now extent 0 is flushed — should be evicted.
         assert!(
@@ -1165,24 +1114,14 @@ mod tests {
         stream.set_max_extents(2);
 
         // Create extent 0, append, seal it (but NOT flushed).
-        stream.register_extent_simple(
-            ExtentId(0),
-            Offset(0),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(0), Offset(0), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
             .append(ExtentId(0), Bytes::from_static(b"a"))
             .unwrap();
         stream.seal(ExtentId(0), None);
 
         // Create extent 1 (active) — 2 extents, at limit.
-        stream.register_extent_simple(
-            ExtentId(1),
-            Offset(1),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(1), Offset(1), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
             .append(ExtentId(1), Bytes::from_static(b"b"))
             .unwrap();
@@ -1209,12 +1148,7 @@ mod tests {
         stream.with_extent(ExtentId(1), |ext| ext.mark_flushed());
 
         // Register a new active extent so we can seal+create again.
-        stream.register_extent_simple(
-            ExtentId(2),
-            Offset(2),
-            DEFAULT_EXTENT_CAPACITY,
-            Epoch(0),
-        );
+        stream.register_extent_simple(ExtentId(2), Offset(2), DEFAULT_EXTENT_CAPACITY, Epoch(0));
         stream
             .append(ExtentId(2), Bytes::from_static(b"c"))
             .unwrap();

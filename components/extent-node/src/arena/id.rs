@@ -52,7 +52,10 @@ pub(crate) struct ArenaIdGenerator {
 
 impl ArenaIdGenerator {
     pub(crate) fn new(node_prefix: u16) -> Self {
-        Self { node_prefix, counter: AtomicU64::new(0) }
+        Self {
+            node_prefix,
+            counter: AtomicU64::new(0),
+        }
     }
 
     pub(crate) fn next(&self) -> ArenaId {

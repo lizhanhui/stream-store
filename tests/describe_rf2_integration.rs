@@ -151,14 +151,7 @@ async fn describe_stream_rf2_integration() {
     );
 
     let (stream_id, first_extent_id, _epoch, primary_addr) = stream_manager
-        .create_stream(
-            &stream_name,
-            2,
-            StorageClass::S3,
-            ExtentPolicy {
-                cache: 4,
-            },
-        )
+        .create_stream(&stream_name, 2, StorageClass::S3, ExtentPolicy { cache: 4 })
         .await
         .unwrap();
 

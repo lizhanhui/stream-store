@@ -7,9 +7,7 @@
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::{
-    DEFAULT_CACHE_EXTENTS, StreamManagerConfig,
-};
+use common::config::{DEFAULT_CACHE_EXTENTS, StreamManagerConfig};
 use common::types::{Epoch, ExtentPolicy, ExtentState, NodeMetrics, StorageClass};
 use serial_test::serial;
 

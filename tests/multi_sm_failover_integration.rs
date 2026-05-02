@@ -191,9 +191,7 @@ async fn multi_sm_leadership_failover() {
             "failover-test",
             2,
             StorageClass::S3,
-            ExtentPolicy {
-                cache: 4,
-            },
+            ExtentPolicy { cache: 4 },
         )
         .await
         .expect("create_stream");
