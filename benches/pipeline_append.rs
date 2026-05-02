@@ -656,7 +656,6 @@ async fn clean_database(mysql_url: &str) {
     for table in &[
         "stream_replica",
         "extent",
-        "stream_sequence",
         "stream",
         "node_metrics",
         "stream_manager_leadership",

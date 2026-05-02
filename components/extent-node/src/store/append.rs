@@ -4,7 +4,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use common::errors::StorageError;
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, StorageClass, StreamId};
+use common::types::{Epoch, ErrorCode, Offset, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use smallvec::SmallVec;
 use tokio::sync::mpsc::Sender;
@@ -112,12 +112,12 @@ impl ExtentNodeStore {
             if remaining > 1 {
                 let batch_seals = self.drain_follower_jobs(stream_id).await;
                 for notification in &batch_seals {
-                    self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                    self.send_forward_checksum(stream_id, notification.sealed_epoch);
                     self.send_flush_request(stream_id, notification);
                 }
             }
             if let Some(ref notification) = seal_notification {
-                self.send_forward_checksum(stream_id, notification.sealed_extent_id);
+                self.send_forward_checksum(stream_id, notification.sealed_epoch);
                 self.send_flush_request(stream_id, notification);
             }
             return own_result;
@@ -160,7 +160,7 @@ impl ExtentNodeStore {
         let payload_for_forward = payload.clone();
 
         // Write locally via single-writer append on the active extent.
-        let (append_result, extent_id) = match stream.try_append_active(payload) {
+        let append_result = match stream.try_append_active(payload) {
             Ok(r) => r,
             Err(StorageError::EpochSealed { .. }) => {
                 let err = Frame::append_ack_error(
@@ -208,7 +208,7 @@ impl ExtentNodeStore {
 
         let offset = append_result.offset;
         let _extent_start_offset = stream
-            .with_epoch_by_extent_id(extent_id, |e| e.start_offset.0)
+            .with_epoch(epoch, |e| e.start_offset.0)
             .unwrap_or(0);
 
         // Update metrics counters.
@@ -283,7 +283,6 @@ impl ExtentNodeStore {
                             stream_id,
                             response_tx: resp_tx.clone(),
                             assigned_offset: offset.0,
-                            extent_id,
                             epoch,
                             created_at: Instant::now(),
                         });
@@ -459,10 +458,8 @@ impl ExtentNodeStore {
     ) -> Option<SealNotification> {
         if let Some(stream) = self.streams.pin().get(&stream_id) {
             let t0 = std::time::Instant::now();
-            let sealed_extent_id = stream.extent_id_for_epoch(stream.active_epoch()?)?;
             let notification = stream.seal_current_epoch().map(|(sealed_epoch, end_offset)| {
                 SealNotification {
-                    sealed_extent_id,
                     sealed_epoch,
                     end_offset: end_offset.0,
                 }
@@ -470,9 +467,8 @@ impl ExtentNodeStore {
             let seal_us = t0.elapsed().as_micros();
             if let Some(ref n) = notification {
                 info!(
-                    "seal_current_epoch: stream={}, sealed={}, epoch={}, reason={:?}, duration={}us",
+                    "seal_current_epoch: stream={}, epoch={}, reason={:?}, duration={}us",
                     stream_id,
-                    n.sealed_extent_id,
                     n.sealed_epoch,
                     reason,
                     seal_us,
@@ -516,7 +512,7 @@ impl ExtentNodeStore {
             .streams
             .pin()
             .get(&stream_id)
-            .and_then(|s| s.with_epoch_by_extent_id(notification.sealed_extent_id, |e| e.start_offset.0))
+            .and_then(|s| s.with_epoch(notification.sealed_epoch, |e| e.start_offset.0))
             .unwrap_or(0);
 
         // Deduplicate: mark flush-in-progress before enqueuing.
@@ -524,7 +520,7 @@ impl ExtentNodeStore {
             .streams
             .pin()
             .get(&stream_id)
-            .map(|s| s.start_flush(notification.sealed_extent_id))
+            .map(|s| s.start_flush(notification.sealed_epoch))
             .unwrap_or(false);
         if !started {
             return; // Another path already enqueued a flush for this extent.
@@ -533,7 +529,7 @@ impl ExtentNodeStore {
         if tx
             .try_send(crate::s3_flusher::FlushRequest {
                 stream_id,
-                extent_id: notification.sealed_extent_id,
+                epoch: notification.sealed_epoch,
                 start_offset,
                 end_offset: notification.end_offset,
             })
@@ -541,7 +537,7 @@ impl ExtentNodeStore {
         {
             // Channel full — clear the marker so it can be retried.
             if let Some(s) = self.streams.pin().get(&stream_id) {
-                s.finish_flush(notification.sealed_extent_id);
+                s.finish_flush(notification.sealed_epoch);
             }
         }
     }
@@ -549,13 +545,13 @@ impl ExtentNodeStore {
     /// Send a ForwardChecksum for a sealed extent inline via per-stream channels.
     ///
     /// Fire-and-forget: the secondary defers verification via `try_verify_checksum()`.
-    pub(crate) fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
+    pub(crate) fn send_forward_checksum(&self, stream_id: StreamId, sealed_epoch: Epoch) {
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => return,
         };
-        let (checksum, committed_bytes) = match stream.with_epoch_by_extent_id(sealed_extent_id, |ext| {
+        let (checksum, committed_bytes) = match stream.with_epoch(sealed_epoch, |ext| {
             (
                 ext.finalized_crc32().unwrap_or(0),
                 ext.committed_data().len() as u64,
@@ -565,8 +561,8 @@ impl ExtentNodeStore {
             None => return,
         };
         debug!(
-            "ForwardChecksum sent: stream={}, extent={}, crc32={:#x}, bytes={}",
-            stream_id, sealed_extent_id, checksum, committed_bytes,
+            "ForwardChecksum sent: stream={}, epoch={}, crc32={:#x}, bytes={}",
+            stream_id, sealed_epoch, checksum, committed_bytes,
         );
         let frame = Frame::new(
             VariableHeader::ForwardChecksum {
@@ -603,7 +599,6 @@ impl ExtentNodeStore {
             payload_for_forward: Bytes,
             offset: Offset,
             payload_len: usize,
-            extent_id: ExtentId,
         }
         let mut responses = Vec::new();
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
@@ -680,13 +675,12 @@ impl ExtentNodeStore {
                 }
 
                 match stream.try_append_active(payload.clone()) {
-                    Ok((result, eid)) => {
+                    Ok(result) => {
                         entries.push(BatchEntry {
                             request_id,
                             payload_for_forward,
                             offset: result.offset,
                             payload_len,
-                            extent_id: eid,
                         });
                     }
                     Err(StorageError::EpochSealed { .. }) => {
@@ -737,10 +731,6 @@ impl ExtentNodeStore {
 
             // Process successful entries: metrics, replica info, forwards, ACKs.
             if !entries.is_empty() {
-                let _extent_start_offset = stream
-                    .with_epoch_by_extent_id(entries[0].extent_id, |e| e.start_offset.0)
-                    .unwrap_or(0);
-
                 let total_bytes: u64 = entries.iter().map(|e| e.payload_len as u64).sum();
                 self.append_count
                     .fetch_add(entries.len() as u64, Ordering::Relaxed);
@@ -816,8 +806,7 @@ impl ExtentNodeStore {
                                         stream_id,
                                         response_tx: resp_tx.clone(),
                                         assigned_offset: entry.offset.0,
-                                        extent_id: entry.extent_id,
-                                        epoch,
+                                                                                epoch,
                                         created_at: now,
                                     });
                                 }
@@ -865,12 +854,12 @@ impl ExtentNodeStore {
             if remaining > batch_len {
                 let batch_seals = self.drain_follower_jobs(stream_id).await;
                 for notif in &batch_seals {
-                    self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                    self.send_forward_checksum(stream_id, notif.sealed_epoch);
                     self.send_flush_request(stream_id, notif);
                 }
             }
             if let Some(ref notif) = seal_notification {
-                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                self.send_forward_checksum(stream_id, notif.sealed_epoch);
                 self.send_flush_request(stream_id, notif);
             }
             return responses;
@@ -889,7 +878,7 @@ impl ExtentNodeStore {
         if remaining > batch_len {
             let batch_seals = self.drain_follower_jobs(stream_id).await;
             for notif in &batch_seals {
-                self.send_forward_checksum(stream_id, notif.sealed_extent_id);
+                self.send_forward_checksum(stream_id, notif.sealed_epoch);
                 self.send_flush_request(stream_id, notif);
             }
         }

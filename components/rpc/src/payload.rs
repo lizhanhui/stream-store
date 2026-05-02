@@ -143,7 +143,7 @@ pub const ROLE_SECONDARY: u8 = 1;
 
 /// Build a RegisterEpoch payload containing the replica addresses.
 ///
-/// Wire format (payload only — stream_id, extent_id, role, replication_factor
+/// Wire format (payload only — stream_id, role, replication_factor
 /// are now in the variable header):
 /// `[num_addrs:u16][addr1_len:u16][addr1]...[addrN_len:u16][addrN]`
 ///
@@ -195,17 +195,17 @@ pub fn parse_register_extent_payload(payload: &[u8]) -> Option<Vec<String>> {
 /// ```text
 /// [num_extents:u32]
 ///   per extent:
-///     [extent_id:u32][start_offset:u64][end_offset:u64][state:u8][epoch:u32]
+///     [start_offset:u64][end_offset:u64][state:u8][epoch:u32]
 ///     [num_replicas:u16]
 ///       per replica:
 ///         [addr_len:u16][addr_bytes][role:u8][is_alive:u8]
 /// ```
 pub fn encode_extent_info_vec(extents: &[StreamEpochInfo]) -> Bytes {
-    // Pre-compute capacity: 4 (num_extents) + per extent: 4+8+8+1+4+2 = 27 + replica data
+    // Pre-compute capacity: 4 (num_extents) + per extent: 8+8+1+4+2 = 23 + replica data
     let extent_size: usize = extents
         .iter()
         .map(|ext| {
-            27 + ext
+            23 + ext
                 .replicas
                 .iter()
                 .map(|r| 2 + r.node_addr.len() + 1 + 1)
@@ -215,7 +215,6 @@ pub fn encode_extent_info_vec(extents: &[StreamEpochInfo]) -> Bytes {
     let mut buf = BytesMut::with_capacity(4 + extent_size);
     buf.put_u32(extents.len() as u32);
     for ext in extents {
-        buf.put_u32(ext.extent_id);
         buf.put_u64(ext.start_offset);
         buf.put_u64(ext.end_offset);
         buf.put_u8(ext.state.as_u8());
@@ -242,12 +241,10 @@ pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<StreamEpochInfo>> {
 
     let mut extents = Vec::with_capacity(num_extents);
     for _ in 0..num_extents {
-        // Need at least 4+8+8+1+4+2 = 27 bytes for extent header
-        if payload.len() < pos + 27 {
+        // Need at least 8+8+1+4+2 = 23 bytes for extent header
+        if payload.len() < pos + 23 {
             return None;
         }
-        let extent_id = u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?);
-        pos += 4;
         let start_offset = u64::from_be_bytes(payload[pos..pos + 8].try_into().ok()?);
         pos += 8;
         let end_offset = u64::from_be_bytes(payload[pos..pos + 8].try_into().ok()?);
@@ -283,7 +280,6 @@ pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<StreamEpochInfo>> {
         }
 
         extents.push(StreamEpochInfo {
-            extent_id,
             start_offset,
             end_offset,
             state,
@@ -401,7 +397,6 @@ mod tests {
     fn extent_info_vec_roundtrip_multiple() {
         let extents = vec![
             StreamEpochInfo {
-                extent_id: 3,
                 start_offset: 200,
                 end_offset: 300,
                 state: EpochState::Sealed,
@@ -420,7 +415,6 @@ mod tests {
                 ],
             },
             StreamEpochInfo {
-                extent_id: 4,
                 start_offset: 300,
                 end_offset: 300,
                 state: EpochState::Active,
@@ -441,7 +435,6 @@ mod tests {
     #[test]
     fn extent_info_vec_single_no_replicas() {
         let extents = vec![StreamEpochInfo {
-            extent_id: 1,
             start_offset: 0,
             end_offset: 50,
             state: EpochState::Flushed,

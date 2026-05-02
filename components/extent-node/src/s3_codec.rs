@@ -508,12 +508,11 @@ pub enum CodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use common::types::{Epoch, ExtentId, Offset, StreamId};
+    use common::types::{Epoch, Offset, StreamId};
 
     /// Helper: create a sealed epoch with N records of given payloads.
     fn sealed_extent(payloads: &[&[u8]]) -> StreamEpoch {
         let extent = StreamEpoch::with_capacity(
-            ExtentId(1),
             StreamId(0),
             Offset(0),
             1024 * 1024, // 1 MiB
@@ -532,7 +531,6 @@ mod tests {
     /// Helper: create a sealed epoch with start_offset.
     fn sealed_extent_at(start_offset: u64, payloads: &[&[u8]]) -> StreamEpoch {
         let extent = StreamEpoch::with_capacity(
-            ExtentId(1),
             StreamId(0),
             Offset(start_offset),
             1024 * 1024,

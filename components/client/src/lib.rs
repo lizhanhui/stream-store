@@ -10,7 +10,7 @@ use common::errors::{
     UnknownStreamSnafu,
 };
 use common::types::{
-    Epoch, EpochPolicy, EpochState, ErrorCode, ExtentId, NodeMetrics, Offset, Opcode, StorageClass,
+    Epoch, EpochPolicy, EpochState, ErrorCode, NodeMetrics, Offset, Opcode, StorageClass,
     StreamEpochInfo, StreamId,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -271,14 +271,14 @@ impl StreamClient {
     /// and the stream's extent-sizing policy.
     /// `replication_factor` must be >= 1; the server rejects `replication_factor = 0`.
     /// If any `policy` field is 0, the StreamManager substitutes its default.
-    /// Returns (StreamId, ExtentId, Epoch, ExtentNode address for the first extent).
+    /// Returns (StreamId, Epoch, ExtentNode address for the first epoch).
     pub async fn create_stream(
         &self,
         name: &str,
         replication_factor: u8,
         storage_class: StorageClass,
         policy: EpochPolicy,
-    ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
+    ) -> Result<(StreamId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
                 request_id: self.alloc_request_id(),
@@ -310,7 +310,7 @@ impl StreamClient {
 
         let stream_id = resp.stream_id();
         self.cache_primary(stream_id, &addr).await;
-        Ok((stream_id, ExtentId(0), resp.epoch(), addr))
+        Ok((stream_id, resp.epoch(), addr))
     }
 
     /// Append a message to a stream. Returns the assigned offset and diagnostics.
@@ -349,12 +349,9 @@ impl StreamClient {
     pub async fn read(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
         offset: Offset,
         count: u16,
     ) -> Result<Vec<Bytes>, StorageError> {
-        // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
-        let _ = extent_id;
         let req = Frame::new(
             VariableHeader::Read {
                 request_id: self.alloc_request_id(),
@@ -473,8 +470,7 @@ impl StreamClient {
     ///   provided offset without querying replicas. Used when the primary ExtentNode has
     ///   already sealed the extent locally (e.g. extent full).
     ///
-    /// Returns (new_extent_id, new_primary_addr).
-    /// Seal a stream by epoch on the StreamManager.
+        /// Seal a stream by epoch on the StreamManager.
     ///
     /// The SM looks up the active extent at this epoch, seals it via EN quorum,
     /// bumps epoch, and allocates a new extent on the surviving (or new) replica set.
@@ -561,18 +557,17 @@ impl StreamClient {
         Ok(extents)
     }
 
-    /// Describe a single extent (epoch) with replica info and node liveness.
-    pub async fn describe_extent(
+    /// Describe a single epoch with replica info and node liveness.
+    pub async fn describe_epoch(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
+        epoch: Epoch,
     ) -> Result<StreamEpochInfo, StorageError> {
-        // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
-        let _ = extent_id;
         let req = Frame::new(
             VariableHeader::DescribeEpoch {
                 request_id: self.alloc_request_id(),
                 stream_id,
+                epoch,
             },
             None,
         );
@@ -601,7 +596,7 @@ impl StreamClient {
 
     /// Seek: resolve a logical stream offset to the extent that contains it.
     ///
-    /// Returns the `StreamEpochInfo` for the extent covering `offset`, including replica
+    /// Returns the `StreamEpochInfo` for the epoch covering `offset`, including replica
     /// addresses so the caller knows which extent node(s) to read from.
     pub async fn seek(
         &self,
@@ -697,7 +692,7 @@ impl StreamClient {
                 Ok(stream_id)
             }
             Err(StorageError::UnknownStream { .. }) => {
-                let (stream_id, _, _, _) = self
+                let (stream_id, _, _) = self
                     .create_stream(stream_name, replication_factor, storage_class, policy)
                     .await?;
                 Ok(stream_id)

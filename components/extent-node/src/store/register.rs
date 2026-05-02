@@ -1,6 +1,5 @@
 use std::sync::Arc;
 
-use common::bridge::synth_extent_id;
 use common::config::DEFAULT_EPOCH_CAPACITY;
 use common::types::{EpochPolicy, ErrorCode};
 use rpc::frame::{Frame, VariableHeader};
@@ -28,12 +27,6 @@ impl ExtentNodeStore {
         let stream_id = config.stream_id;
         let epoch = config.epoch;
         let replication_factor = config.replication_factor;
-
-        // `extent_id` no longer travels on the wire. The EN's local bookkeeping
-        // still identifies extents by id; later phases collapse that to
-        // (stream_id, epoch). For now, synthesize a per-epoch extent id (the
-        // old allocator produced 1-based ids, so we use `epoch + 1`).
-        let extent_id = synth_extent_id(epoch);
 
         tracing::debug!(
             arena_class = ?config.arena_class,
@@ -67,15 +60,10 @@ impl ExtentNodeStore {
         // Register the extent (idempotent — skips if already exists).
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
-            if stream.with_epoch_by_extent_id(extent_id, |_| ()).is_none() {
-                stream.register_epoch(
-                    extent_id,
-                    stream.max_offset(),
-                    epoch,
-                    DEFAULT_EPOCH_CAPACITY,
-                );
+            if stream.with_epoch(epoch, |_| ()).is_none() {
+                stream.register_epoch(stream.max_offset(), epoch, DEFAULT_EPOCH_CAPACITY);
             } else {
-                // Extent already exists (lazy creation from Forward), but update epoch
+                // Epoch already exists (lazy creation from Forward), but update epoch
                 // from authoritative source (RegisterEpoch carries the real epoch).
                 stream.set_epoch(epoch);
             }
@@ -92,13 +80,12 @@ impl ExtentNodeStore {
             replica_addrs.join(", ")
         };
         info!(
-            "RegisterEpoch: stream={}, extent={}, role={role_name}, rf={}, secondaries=[{addrs_info}]",
-            stream_id, extent_id, replication_factor,
+            "RegisterEpoch: stream={}, epoch={}, role={role_name}, rf={}, secondaries=[{addrs_info}]",
+            stream_id, epoch, replication_factor,
         );
 
         let ri = ReplicaInfo {
             stream_id,
-            extent_id,
             role,
             replication_factor,
             replica_addrs,

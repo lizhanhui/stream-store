@@ -703,10 +703,12 @@ impl Frame {
                         payload,
                     ))
                 } else {
+                    let epoch = Epoch(body.get_u32());
                     Ok((
                         VariableHeader::DescribeEpoch {
                             request_id,
                             stream_id,
+                            epoch,
                         },
                         None,
                     ))

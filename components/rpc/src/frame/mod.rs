@@ -224,7 +224,8 @@ impl Frame {
             | VariableHeader::FlushEpoch { epoch, .. } => *epoch,
             VariableHeader::ReportEpoch { epoch, .. }
             | VariableHeader::ReportEpochResp { epoch, .. }
-            | VariableHeader::ReportEpochRespError { epoch, .. } => *epoch,
+            | VariableHeader::ReportEpochRespError { epoch, .. }
+            | VariableHeader::DescribeEpoch { epoch, .. } => *epoch,
             _ => Epoch(0),
         }
     }

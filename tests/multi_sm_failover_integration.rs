@@ -38,7 +38,6 @@ async fn clean_database(mysql_url: &str) {
     for table in &[
         "stream_replica",
         "extent",
-        "stream_sequence",
         "stream",
         "node_metrics",
         "stream_manager_leadership",
@@ -186,7 +185,7 @@ async fn multi_sm_leadership_failover() {
     let sm_client = StreamClient::connect(&sm1_addr)
         .await
         .expect("connect to SM-1");
-    let (stream_id, _extent_id, epoch, primary_addr) = sm_client
+    let (stream_id, epoch, primary_addr) = sm_client
         .create_stream(
             "failover-test",
             2,
@@ -253,7 +252,7 @@ async fn multi_sm_leadership_failover() {
     for ext in &extents {
         info!(
             "  extent={} state={:?} start={} end={} epoch={:?} replicas={}",
-            ext.extent_id,
+            ext.epoch.0,
             ext.state,
             ext.start_offset,
             ext.end_offset,
@@ -301,7 +300,6 @@ async fn multi_sm_leadership_failover() {
     let messages = reader
         .read(
             stream_id,
-            common::types::ExtentId(sealed_extent.extent_id),
             Offset(sealed_extent.start_offset),
             num_messages as u16,
         )

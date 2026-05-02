@@ -84,7 +84,7 @@ async fn seal_epoch_static(
 ///
 /// Sends a ReportExtents RPC and parses the ReportExtentsResp payload.
 /// Parse the predecessor extent payload from SealEpochResp.
-/// Same format as ReportExtentsResp: [num:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+/// Same format as ReportEpochResp: [num:u32] per epoch: [start_offset:u64][end_offset:u64][state:u8]
 fn parse_seal_predecessor_payload(
     payload: &Bytes,
 ) -> Option<Vec<(u64, u64, common::types::EpochState)>> {
@@ -95,10 +95,9 @@ fn parse_seal_predecessor_payload(
     let num = buf.get_u32() as usize;
     let mut result = Vec::with_capacity(num);
     for _ in 0..num {
-        if buf.remaining() < 4 + 8 + 8 + 1 {
+        if buf.remaining() < 8 + 8 + 1 {
             return None;
         }
-        let _legacy_extent_id = buf.get_u32();
         let start = buf.get_u64();
         let end = buf.get_u64();
         let state_val = buf.get_u8();
@@ -109,9 +108,9 @@ fn parse_seal_predecessor_payload(
     Some(result)
 }
 
-/// Response format: [num_extents:u32] then for each extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+/// Response format: [num_epochs:u32] then for each epoch: [start_offset:u64][end_offset:u64][state:u8]
 ///
-/// Returns Vec of (start_offset, end_offset, EpochState) tuples; legacy IDs are ignored.
+/// Returns Vec of (start_offset, end_offset, EpochState) tuples.
 async fn report_extents_from_node_static(
     addr: &str,
     stream_id: StreamId,
@@ -151,7 +150,7 @@ async fn report_extents_from_node_static(
         .build());
     }
 
-    // Parse ReportExtentsResp payload: [num_extents:u32] then for each: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+    // Parse ReportEpochResp payload: [num_epochs:u32] then for each: [start_offset:u64][end_offset:u64][state:u8]
     let payload = resp.payload.clone().unwrap_or_else(Bytes::new);
     let mut buf = &payload[..];
 
@@ -166,14 +165,13 @@ async fn report_extents_from_node_static(
     let mut extents = Vec::with_capacity(num_extents);
 
     for _ in 0..num_extents {
-        if buf.len() < 4 + 8 + 8 + 1 {
+        if buf.len() < 8 + 8 + 1 {
             return Err(InternalSnafu {
-                message: format!("ReportExtentsResp from {addr} has truncated extent record"),
+                message: format!("ReportEpochResp from {addr} has truncated epoch record"),
             }
             .build());
         }
 
-        let _legacy_extent_id = buf.get_u32();
         let start_offset = buf.get_u64();
         let end_offset = buf.get_u64();
         let state_u8 = buf.get_u8();
@@ -1306,13 +1304,7 @@ impl StreamManagerStore {
     /// DescribeEpoch: return a single epoch's metadata with replica info and node liveness.
     async fn handle_describe_extent(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
-        let epoch = match self.store.get_stream_epoch(stream_id).await {
-            Ok(epoch) => epoch,
-            Err(e) => {
-                error!("get_stream_epoch for describe_epoch failed: {e}");
-                return Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string());
-            }
-        };
+        let epoch = frame.epoch();
 
         match self.store.describe_epoch(stream_id, epoch).await {
             Ok(Some(info)) => {

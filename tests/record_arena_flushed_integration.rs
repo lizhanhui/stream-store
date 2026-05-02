@@ -27,7 +27,6 @@ async fn fresh_store() -> MetadataStore {
         "stream_epoch_s3",
         "stream_epochs",
         "extent",
-        "stream_sequence",
         "stream",
         "node_metrics",
         "stream_manager_leadership",

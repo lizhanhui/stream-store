@@ -47,7 +47,6 @@ async fn clean_database(mysql_url: &str) {
     for table in &[
         "stream_replica",
         "extent",
-        "stream_sequence",
         "stream",
         "node_metrics",
         "stream_manager_leadership",
@@ -239,7 +238,7 @@ async fn primary_flushes_sealed_extent_to_s3() {
 
     // Create stream RF=2, StorageClass::S3.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
-    let (stream_id, _eid, _epoch, primary_addr) = sm_client
+    let (stream_id, _epoch, primary_addr) = sm_client
         .create_stream("test-s3-flush", 2, StorageClass::S3, EpochPolicy::default())
         .await
         .expect("create_stream");
@@ -307,7 +306,7 @@ async fn dr_flush_after_primary_killed() {
 
     // Create stream RF=3.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
-    let (stream_id, _eid, _epoch, primary_addr) = sm_client
+    let (stream_id, _epoch, primary_addr) = sm_client
         .create_stream("test-dr-flush", 3, StorageClass::S3, EpochPolicy::default())
         .await
         .expect("create_stream");
@@ -382,7 +381,7 @@ async fn staleness_scan_triggers_dr_flush() {
 
     // Create stream RF=2 with tiny extent capacity to trigger extent-full quickly.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
-    let (stream_id, _eid, _epoch, primary_addr) = sm_client
+    let (stream_id, _epoch, primary_addr) = sm_client
         .create_stream(
             "test-staleness-flush",
             2,
@@ -442,7 +441,7 @@ async fn staleness_scan_triggers_dr_flush() {
         let _ = s3.delete_object(&key).await;
         info!(
             "[test] Staleness DR flush verified for extent {}",
-            ext.extent_id
+            ext.epoch.0
         );
     }
 

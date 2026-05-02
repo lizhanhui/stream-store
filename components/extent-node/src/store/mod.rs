@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use common::hasher::IdentityBuildHasher;
-use common::types::{Epoch, EpochPolicy, ErrorCode, ExtentId, Opcode, StorageClass, StreamId};
+use common::types::{Epoch, EpochPolicy, ErrorCode, Opcode, StorageClass, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use server::handler::RequestHandler;
 use std::sync::Arc;
@@ -222,16 +222,15 @@ impl ExtentNodeStore {
     }
 
     /// Snapshot active extent info for progress reporting to SM.
-    /// Returns (stream_id, extent_id, current_offset, epoch) for each active extent.
-    pub fn snapshot_active_extents(&self) -> Vec<(StreamId, ExtentId, u64, Epoch)> {
+    /// Returns (stream_id, current_offset, epoch) for each active epoch.
+    pub fn snapshot_active_extents(&self) -> Vec<(StreamId, u64, Epoch)> {
         let guard = self.streams.pin();
         guard
             .iter()
             .filter_map(|(k, stream)| {
                 if stream.is_mutable() {
-                    let extent_id = stream.extent_id_for_epoch(stream.active_epoch()?)?;
                     let offset = stream.max_offset().0;
-                    Some((*k, extent_id, offset, stream.epoch()))
+                    Some((*k, offset, stream.epoch()))
                 } else {
                     None
                 }
@@ -313,7 +312,7 @@ impl RequestHandler for ExtentNodeStore {
 
     /// Optimized batch append for consecutive same-epoch frames.
     ///
-    /// All frames in the batch share the same stream_id/extent_id, so we:
+    /// All frames in the batch share the same stream_id/epoch, so we:
     /// - Do a single streams.pin().get() instead of N
     /// - Do a single leader election (fetch_add(batch.len())) instead of N
     /// - Borrow ReplicaInfo once (no clone) instead of N clones

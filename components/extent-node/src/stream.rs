@@ -6,13 +6,12 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use common::config::{DEFAULT_CACHE_EPOCHS, DEFAULT_EPOCH_CAPACITY};
 use common::errors::{InternalSnafu, StorageError};
-use common::types::{Epoch, EpochState, ExtentId, Offset, StorageClass, StreamId};
+use common::types::{Epoch, EpochState, Offset, StorageClass, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::RwLock;
 use rpc::frame::Frame;
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
-use tracing::error;
 
 use crate::ack_queue::AckQueue;
 use crate::arena::ArenaIdGenerator;
@@ -90,7 +89,7 @@ pub struct Stream {
     /// Tracks epochs with an in-progress S3 flush (both Primary and DR paths).
     /// Used to deduplicate concurrent flush requests for the same epoch.
     /// Lock-free via papaya::HashMap.
-    flush_in_progress: papaya::HashMap<ExtentId, ()>,
+    flush_in_progress: papaya::HashMap<Epoch, ()>,
 
     /// All StreamEpochs this EN currently tracks for this stream,
     /// sorted by epoch number ascending. Copy-on-write via ArcSwap:
@@ -145,16 +144,6 @@ impl Stream {
 
     // ── Epoch vec helpers (lock-free reads, CoW writes) ──────────────
 
-    /// Transitional lookup by legacy extent_id for internal paths that still
-    /// carry ExtentId until StreamEpoch.id is removed.
-    fn find_epoch_by_extent_id(&self, extent_id: ExtentId) -> Option<Arc<StreamEpoch>> {
-        self.epochs
-            .load()
-            .iter()
-            .find(|e| e.id == extent_id)
-            .cloned()
-    }
-
     fn find_epoch_by_number(&self, epoch: Epoch) -> Option<Arc<StreamEpoch>> {
         self.epochs
             .load()
@@ -163,19 +152,13 @@ impl Stream {
             .cloned()
     }
 
-    /// Bridge helper (pre-P3 Phase 4): look up the `StreamEpoch` covering a
-    /// given offset. Introduced when the wire protocol dropped `extent_id`
-    /// from read/seal/flush handlers; removed once StreamEpoch.id
-    /// is rewritten to key on `Epoch`.
-    ///
-    /// Find the extent whose range covers `offset`. Used by handlers that
-    /// receive an offset on the wire without an extent_id.
-    pub fn find_extent_for_offset(&self, offset: Offset) -> Option<ExtentId> {
+    /// Find the epoch whose range covers `offset`.
+    pub fn find_epoch_for_offset(&self, offset: Offset) -> Option<Epoch> {
         self.epochs
             .load()
             .iter()
             .find(|e| offset.0 >= e.start_offset.0 && offset.0 < e.next_offset().0)
-            .map(|e| e.id)
+            .map(|e| e.epoch)
     }
 
     /// The currently-active (last, highest-epoch) StreamEpoch. None if none
@@ -219,16 +202,15 @@ impl Stream {
 
     // ── Epoch-list mutation methods (moved from StreamInner) ──────────
 
-    /// Find-by-id helper used by seal. Returns a clone of the last
-    /// epoch's Arc if and only if its id matches AND it's still Active.
-    fn seal_epoch_by_id(
+    /// Seal the active epoch if it matches the requested epoch.
+    fn seal_epoch_by_number(
         &self,
-        extent_id: ExtentId,
+        epoch: Epoch,
         committed_offset: Option<u64>,
     ) -> Option<(u64, u64)> {
         let snap = self.epochs.load();
         let last = snap.last()?;
-        if last.id != extent_id {
+        if last.epoch != epoch {
             return None;
         }
         if last.state() == EpochState::Sealed {
@@ -324,84 +306,52 @@ impl Stream {
 
     // ── Read-lock methods ──────────────────────────────────────────────
 
-    /// Append a message to the specified extent. Returns the assigned
-    /// offset and byte position within the extent arena.
-    ///
-    /// Lock-free on the hot path: reads the epoch snapshot via ArcSwap.
-    /// The byte_pos is recorded in the extent's internal index automatically.
-    ///
-    /// Returns an error if the extent doesn't exist.
-    pub fn append(
-        &self,
-        extent_id: ExtentId,
-        payload: Bytes,
-    ) -> Result<AppendResult, StorageError> {
-        let extent = self.find_epoch_by_extent_id(extent_id).ok_or_else(|| {
+    /// Append a message to the specified epoch.
+    pub fn append(&self, epoch: Epoch, payload: Bytes) -> Result<AppendResult, StorageError> {
+        let extent = self.find_epoch_by_number(epoch).ok_or_else(|| {
             InternalSnafu {
-                message: format!("stream {}: extent {} not found", self.id, extent_id),
+                message: format!("stream {}: epoch {} not found", self.id, epoch),
             }
             .build()
         })?;
         extent.append(payload)
     }
 
-    /// Append to the active extent (single-writer, called by stream-level leader).
-    ///
-    /// Returns `Ok((result, extent_id))` on success, or `Err(ExtentFull)` when the
-    /// caller should seal + create + retry.
-    pub fn try_append_active(
-        &self,
-        payload: Bytes,
-    ) -> Result<(AppendResult, ExtentId), StorageError> {
+    /// Append to the active epoch (single-writer, called by stream-level leader).
+    pub fn try_append_active(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
         let extent = self.active_epoch_ref().ok_or_else(|| {
             InternalSnafu {
-                message: format!("stream {}: no active extent", self.id),
+                message: format!("stream {}: no active epoch", self.id),
             }
             .build()
         })?;
-        let result = extent.append_inner(payload)?;
-        Ok((result, extent.id))
+        extent.append_inner(payload)
     }
 
-    /// Replicate a record; the secondary derives byte_pos from its own cursor.
-    ///
-    /// Delegates to `Extent::replicate()` for deterministic replication.
-    /// Lock-free on the hot path via ArcSwap epoch snapshot.
+    /// Replicate a record into the specified epoch.
     pub fn replicate(
         &self,
-        extent_id: ExtentId,
+        epoch: Epoch,
         offset: Offset,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
-        let extent = self.find_epoch_by_extent_id(extent_id).ok_or_else(|| {
-            error!("Stream: {}, Extent: {} is not found", self.id, extent_id);
+        let extent = self.find_epoch_by_number(epoch).ok_or_else(|| {
             InternalSnafu {
-                message: format!("stream {}: extent {} not found", self.id, extent_id),
+                message: format!("stream {}: epoch {} not found", self.id, epoch),
             }
             .build()
         })?;
         extent.replicate(offset, payload)
     }
 
-    /// Read `count` messages starting from the given logical `offset` within
-    /// the specified extent.
-    ///
-    /// The server resolves `offset -> byte_pos` internally via the index stream,
-    /// so callers only need to provide the logical offset. This keeps byte_pos
-    /// as an internal implementation detail invisible to clients.
-    pub fn read(
-        &self,
-        extent_id: ExtentId,
-        offset: Offset,
-        count: u32,
-    ) -> Result<Vec<Bytes>, StorageError> {
-        let extent = self.find_epoch_by_extent_id(extent_id).ok_or_else(|| {
+    /// Read `count` messages starting from the given logical `offset` within the specified epoch.
+    pub fn read(&self, epoch: Epoch, offset: Offset, count: u32) -> Result<Vec<Bytes>, StorageError> {
+        let extent = self.find_epoch_by_number(epoch).ok_or_else(|| {
             InternalSnafu {
-                message: format!("stream {}: extent {} not found", self.id, extent_id),
+                message: format!("stream {}: epoch {} not found", self.id, epoch),
             }
             .build()
         })?;
-        // Check offset is within this extent's range.
         if offset.0 < extent.start_offset.0 || offset.0 >= extent.next_offset().0 {
             return Ok(Vec::new());
         }
@@ -428,12 +378,6 @@ impl Stream {
         self.active_epoch_ref().map(|e| e.epoch)
     }
 
-    /// Transitional lookup for callers that still need the legacy ExtentId while
-    /// StreamEpoch.id exists.
-    pub(crate) fn extent_id_for_epoch(&self, epoch: Epoch) -> Option<ExtentId> {
-        self.find_epoch_by_number(epoch).map(|e| e.id)
-    }
-
     /// The sealed offset range for the given epoch.
     /// Returns `(start_offset, end_offset)` or None if the epoch is not sealed.
     pub fn sealed_epoch(&self, epoch: Epoch) -> Option<(Offset, Offset)> {
@@ -457,14 +401,6 @@ impl Stream {
         F: FnOnce(&StreamEpoch) -> R,
     {
         self.find_epoch_by_number(epoch).map(|ep| f(&ep))
-    }
-
-    /// Transitional lookup by legacy extent id while StreamEpoch.id still exists.
-    pub(crate) fn with_epoch_by_extent_id<F, R>(&self, extent_id: ExtentId, f: F) -> Option<R>
-    where
-        F: FnOnce(&StreamEpoch) -> R,
-    {
-        self.find_epoch_by_extent_id(extent_id).map(|ep| f(&ep))
     }
 
     /// Report this stream's state for the specified epoch.
@@ -537,21 +473,21 @@ impl Stream {
         self.inner.read().storage_class
     }
 
-    /// Try to mark an extent as flush-in-progress. Returns `true` if inserted
+    /// Try to mark an epoch as flush-in-progress. Returns `true` if inserted
     /// (caller should proceed with flush), `false` if already in progress (dedup).
-    pub fn start_flush(&self, extent_id: ExtentId) -> bool {
+    pub fn start_flush(&self, epoch: Epoch) -> bool {
         let guard = self.flush_in_progress.pin();
-        if guard.contains_key(&extent_id) {
+        if guard.contains_key(&epoch) {
             false
         } else {
-            guard.insert(extent_id, ());
+            guard.insert(epoch, ());
             true
         }
     }
 
-    /// Clear the flush-in-progress marker for an extent (flush completed or failed).
-    pub fn finish_flush(&self, extent_id: ExtentId) {
-        self.flush_in_progress.pin().remove(&extent_id);
+    /// Clear the flush-in-progress marker for an epoch (flush completed or failed).
+    pub fn finish_flush(&self, epoch: Epoch) {
+        self.flush_in_progress.pin().remove(&epoch);
     }
 
     // ── Write-lock methods ─────────────────────────────────────────────
@@ -573,7 +509,6 @@ impl Stream {
     /// `epoch_capacity` is the arena size for this specific epoch.
     pub fn register_epoch(
         &self,
-        id: ExtentId,
         start_offset: Offset,
         epoch: Epoch,
         epoch_capacity: u32,
@@ -585,7 +520,6 @@ impl Stream {
         }
         let arena_id = self.arena_ids.next();
         let ep = Arc::new(StreamEpoch::with_capacity(
-            id,
             self.id,
             start_offset,
             epoch_capacity,
@@ -600,29 +534,16 @@ impl Stream {
     #[cfg(test)]
     pub fn register_epoch_simple(
         &self,
-        id: ExtentId,
         start_offset: Offset,
         epoch_capacity: u32,
         epoch: Epoch,
     ) {
-        self.register_epoch(id, start_offset, epoch, epoch_capacity);
+        self.register_epoch(start_offset, epoch, epoch_capacity);
     }
 
-    /// Seal the extent identified by `extent_id`.
-    /// Returns `(start_offset, end_offset)` of the sealed extent, or `None` if:
-    /// - no extents exist
-    /// - the active extent doesn't match `extent_id`
-    /// - the extent is already sealed
-    ///
-    /// `end_offset` = `start_offset + message_count` (exclusive upper bound).
-    ///
-    /// If `committed_offset` is `Some`, it's the primary's committed offset propagated
-    /// via SM. The sealed extent will accept late forwarded appends up to that offset.
-    /// If `None`, the extent uses its local record_count (primary sealing itself).
-    ///
-    /// After seal, the stream has no active extent until SM sends a new `RegisterEpoch`.
-    pub fn seal(&self, extent_id: ExtentId, committed_offset: Option<u64>) -> Option<(u64, u64)> {
-        self.seal_epoch_by_id(extent_id, committed_offset)
+    /// Seal the active epoch if it matches `epoch`.
+    pub fn seal(&self, epoch: Epoch, committed_offset: Option<u64>) -> Option<(u64, u64)> {
+        self.seal_epoch_by_number(epoch, committed_offset)
     }
 
     /// Seal the active epoch without creating a successor.
@@ -630,11 +551,8 @@ impl Stream {
     /// Returns `(sealed_epoch, end_offset)` if the active epoch was sealed, or `None`
     /// if no active epoch exists or it was already sealed.
     pub fn seal_current_epoch(&self) -> Option<(Epoch, Offset)> {
-        let active = self.active_epoch_ref()?;
-        let active_id = active.id;
-        let epoch = active.epoch;
-        drop(active);
-        let (_, end_offset) = self.seal_epoch_by_id(active_id, None)?;
+        let epoch = self.active_epoch()?;
+        let (_, end_offset) = self.seal_epoch_by_number(epoch, None)?;
         Some((epoch, Offset(end_offset)))
     }
 
@@ -647,7 +565,6 @@ impl Stream {
 /// Information about an extent that was sealed during an append.
 #[derive(Debug, Clone)]
 pub struct SealNotification {
-    pub sealed_extent_id: ExtentId,
     pub sealed_epoch: Epoch,
     pub end_offset: u64,
 }
@@ -680,22 +597,22 @@ mod tests {
     /// Helper: create a stream with one active extent (simulating RegisterEpoch from SM).
     fn new_stream_with_epoch(id: StreamId) -> Stream {
         let stream = Stream::new(id, test_arena_ids());
-        stream.register_epoch_simple(ExtentId(0), Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.register_epoch_simple(Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
         stream
     }
 
     #[test]
     fn basic_append_and_read() {
         let stream = new_stream_with_epoch(StreamId(1));
-        let extent_id = ExtentId(0);
+        let epoch = Epoch(0);
         let r0 = stream
-            .append(extent_id, Bytes::from_static(b"msg0"))
+            .append(epoch, Bytes::from_static(b"msg0"))
             .unwrap();
         let r1 = stream
-            .append(extent_id, Bytes::from_static(b"msg1"))
+            .append(epoch, Bytes::from_static(b"msg1"))
             .unwrap();
         let r2 = stream
-            .append(extent_id, Bytes::from_static(b"msg2"))
+            .append(epoch, Bytes::from_static(b"msg2"))
             .unwrap();
 
         assert_eq!(r0.offset, Offset(0));
@@ -704,13 +621,13 @@ mod tests {
         assert_eq!(stream.max_offset(), Offset(3));
 
         // Read all 3 from offset 0.
-        let msgs = stream.read(extent_id, Offset(0), 3).unwrap();
+        let msgs = stream.read(epoch, Offset(0), 3).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0], Bytes::from_static(b"msg0"));
         assert_eq!(msgs[2], Bytes::from_static(b"msg2"));
 
         // Random access: read msg1 directly via its offset.
-        let msgs = stream.read(extent_id, r1.offset, 1).unwrap();
+        let msgs = stream.read(epoch, r1.offset, 1).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0], Bytes::from_static(b"msg1"));
     }
@@ -718,19 +635,19 @@ mod tests {
     #[test]
     fn read_from_offset() {
         let stream = new_stream_with_epoch(StreamId(1));
-        let extent_id = ExtentId(0);
+        let epoch = Epoch(0);
         let mut results = Vec::new();
         for i in 0..10 {
             results.push(
                 stream
-                    .append(extent_id, Bytes::from(format!("msg{i}")))
+                    .append(epoch, Bytes::from(format!("msg{i}")))
                     .unwrap(),
             );
         }
 
         // Read 3 messages starting at offset 5.
         let r5 = &results[5];
-        let msgs = stream.read(extent_id, r5.offset, 3).unwrap();
+        let msgs = stream.read(epoch, r5.offset, 3).unwrap();
         assert_eq!(msgs.len(), 3);
         assert_eq!(msgs[0], Bytes::from("msg5"));
         assert_eq!(msgs[1], Bytes::from("msg6"));
@@ -740,12 +657,12 @@ mod tests {
     #[test]
     fn read_beyond_end_returns_available() {
         let stream = new_stream_with_epoch(StreamId(1));
-        let extent_id = ExtentId(0);
+        let epoch = Epoch(0);
         let r = stream
-            .append(extent_id, Bytes::from_static(b"only"))
+            .append(epoch, Bytes::from_static(b"only"))
             .unwrap();
 
-        let msgs = stream.read(extent_id, r.offset, 100).unwrap();
+        let msgs = stream.read(epoch, r.offset, 100).unwrap();
         assert_eq!(msgs.len(), 1);
     }
 
@@ -755,7 +672,7 @@ mod tests {
         assert_eq!(stream.max_offset(), Offset(0));
 
         // Stream with no extents: read returns error (extent not found).
-        let result = stream.read(ExtentId(0), Offset(0), 10);
+        let result = stream.read(Epoch(0), Offset(0), 10);
         assert!(result.is_err());
     }
 
@@ -767,7 +684,7 @@ mod tests {
         assert_eq!(stream.active_epoch(), None);
         assert!(
             stream
-                .append(ExtentId(0), Bytes::from_static(b"fail"))
+                .append(Epoch(0), Bytes::from_static(b"fail"))
                 .is_err()
         );
     }
@@ -775,17 +692,17 @@ mod tests {
     #[test]
     fn seal_and_new() {
         let stream = new_stream_with_epoch(StreamId(1));
-        let first_extent_id = ExtentId(0);
+        let first_epoch = Epoch(0);
         // Append 3 messages to first extent.
         for i in 0..3 {
             stream
-                .append(first_extent_id, Bytes::from(format!("msg{i}")))
+                .append(first_epoch, Bytes::from(format!("msg{i}")))
                 .unwrap();
         }
         assert_eq!(stream.max_offset(), Offset(3));
 
         // Seal active extent.
-        let (start_offset, end_offset) = stream.seal(first_extent_id, None).unwrap();
+        let (start_offset, end_offset) = stream.seal(first_epoch, None).unwrap();
         assert_eq!(start_offset, 0);
         assert_eq!(end_offset, 3);
 
@@ -793,26 +710,21 @@ mod tests {
         assert!(!stream.is_mutable());
 
         // Register a new extent (simulating SM sending RegisterEpoch).
-        let second_extent_id = ExtentId(1);
-        stream.register_epoch_simple(
-            second_extent_id,
-            Offset(3),
-            DEFAULT_EPOCH_CAPACITY,
-            Epoch(0),
-        );
+        let second_epoch = Epoch(1);
+        stream.register_epoch_simple(Offset(3), DEFAULT_EPOCH_CAPACITY, second_epoch);
         assert!(stream.is_mutable());
         assert_eq!(stream.max_offset(), Offset(3)); // new extent is empty
 
         // Append to the new extent.
         let r = stream
-            .append(second_extent_id, Bytes::from_static(b"after-seal"))
+            .append(second_epoch, Bytes::from_static(b"after-seal"))
             .unwrap();
         assert_eq!(r.offset, Offset(3));
         assert_eq!(r.byte_pos, 0); // new extent, byte_pos starts at 0
         assert_eq!(stream.max_offset(), Offset(4));
 
         // Read from the new extent.
-        let msgs = stream.read(second_extent_id, r.offset, 1).unwrap();
+        let msgs = stream.read(second_epoch, r.offset, 1).unwrap();
         assert_eq!(msgs.len(), 1);
         assert_eq!(msgs[0], Bytes::from_static(b"after-seal"));
     }
@@ -820,9 +732,9 @@ mod tests {
     #[test]
     fn seal_current_epoch_returns_epoch_and_end_offset() {
         let stream = new_stream_with_epoch(StreamId(1));
-        let first_extent_id = ExtentId(0);
+        let first_epoch = Epoch(0);
         let r = stream
-            .append(first_extent_id, Bytes::from_static(b"a"))
+            .append(first_epoch, Bytes::from_static(b"a"))
             .unwrap();
         assert_eq!(r.offset, Offset(0));
 
@@ -838,30 +750,30 @@ mod tests {
         stream.set_max_epochs(2);
 
         // Register extent 0 and append a message.
-        stream.register_epoch_simple(ExtentId(0), Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.register_epoch_simple(Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
         stream
-            .append(ExtentId(0), Bytes::from_static(b"msg0"))
+            .append(Epoch(0), Bytes::from_static(b"msg0"))
             .unwrap();
 
         // Seal extent 0, register extent 1.
-        stream.seal(ExtentId(0), None);
-        stream.register_epoch_simple(ExtentId(1), Offset(1), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.seal(Epoch(0), None);
+        stream.register_epoch_simple(Offset(1), DEFAULT_EPOCH_CAPACITY, Epoch(1));
         // 2 extents (sealed + active) — at limit, no eviction.
-        assert!(stream.with_epoch_by_extent_id(ExtentId(0), |_| ()).is_some());
-        assert!(stream.with_epoch_by_extent_id(ExtentId(1), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(0), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(1), |_| ()).is_some());
 
         // Seal extent 1, register extent 2 — now 3 extents, should evict extent 0.
         stream
-            .append(ExtentId(1), Bytes::from_static(b"msg1"))
+            .append(Epoch(1), Bytes::from_static(b"msg1"))
             .unwrap();
-        stream.seal(ExtentId(1), None);
-        stream.register_epoch_simple(ExtentId(2), Offset(2), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.seal(Epoch(1), None);
+        stream.register_epoch_simple(Offset(2), DEFAULT_EPOCH_CAPACITY, Epoch(2));
         assert!(
-            stream.with_epoch_by_extent_id(ExtentId(0), |_| ()).is_none(),
+            stream.with_epoch(Epoch(0), |_| ()).is_none(),
             "extent 0 should be evicted"
         );
-        assert!(stream.with_epoch_by_extent_id(ExtentId(1), |_| ()).is_some());
-        assert!(stream.with_epoch_by_extent_id(ExtentId(2), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(1), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(2), |_| ()).is_some());
     }
 
     #[test]
@@ -870,23 +782,18 @@ mod tests {
         stream.set_max_epochs(0); // 0 means no limit
 
         for i in 0..5u32 {
-            stream.register_epoch_simple(
-                ExtentId(i),
-                Offset(i as u64),
-                DEFAULT_EPOCH_CAPACITY,
-                Epoch(0),
-            );
+            stream.register_epoch_simple(Offset(i as u64), DEFAULT_EPOCH_CAPACITY, Epoch(i));
             stream
-                .append(ExtentId(i), Bytes::from_static(b"x"))
+                .append(Epoch(i), Bytes::from_static(b"x"))
                 .unwrap();
-            stream.seal(ExtentId(i), None);
+            stream.seal(Epoch(i), None);
         }
         // Register one more active extent.
-        stream.register_epoch_simple(ExtentId(5), Offset(5), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.register_epoch_simple(Offset(5), DEFAULT_EPOCH_CAPACITY, Epoch(5));
 
         // All 6 extents should still be present.
         for i in 0..=5 {
-            assert!(stream.with_epoch_by_extent_id(ExtentId(i), |_| ()).is_some());
+            assert!(stream.with_epoch(Epoch(i), |_| ()).is_some());
         }
     }
 
@@ -899,22 +806,22 @@ mod tests {
         stream.set_max_epochs(2);
 
         // Register extent 0 (not sealed — simulating secondary).
-        stream.register_epoch_simple(ExtentId(0), Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.register_epoch_simple(Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
 
         // Register extent 1 — 2 extents, at limit.
-        stream.register_epoch_simple(ExtentId(1), Offset(100), DEFAULT_EPOCH_CAPACITY, Epoch(0));
-        assert!(stream.with_epoch_by_extent_id(ExtentId(0), |_| ()).is_some());
-        assert!(stream.with_epoch_by_extent_id(ExtentId(1), |_| ()).is_some());
+        stream.register_epoch_simple(Offset(100), DEFAULT_EPOCH_CAPACITY, Epoch(1));
+        assert!(stream.with_epoch(Epoch(0), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(1), |_| ()).is_some());
 
         // Register extent 2 — 3 extents, exceeds limit.
         // Extent 0 is NOT sealed, but should still be evicted.
-        stream.register_epoch_simple(ExtentId(2), Offset(200), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.register_epoch_simple(Offset(200), DEFAULT_EPOCH_CAPACITY, Epoch(2));
         assert!(
-            stream.with_epoch_by_extent_id(ExtentId(0), |_| ()).is_none(),
+            stream.with_epoch(Epoch(0), |_| ()).is_none(),
             "unsealed extent 0 should be evicted"
         );
-        assert!(stream.with_epoch_by_extent_id(ExtentId(1), |_| ()).is_some());
-        assert!(stream.with_epoch_by_extent_id(ExtentId(2), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(1), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(2), |_| ()).is_some());
     }
 
     #[test]
@@ -926,46 +833,46 @@ mod tests {
         stream.set_max_epochs(2);
 
         // Create 3 extents: extent 0 (sealed), extent 1 (sealed), extent 2 (active).
-        stream.register_epoch_simple(ExtentId(0), Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.register_epoch_simple(Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
         stream
-            .append(ExtentId(0), Bytes::from_static(b"a"))
+            .append(Epoch(0), Bytes::from_static(b"a"))
             .unwrap();
-        stream.seal(ExtentId(0), None);
+        stream.seal(Epoch(0), None);
 
-        stream.register_epoch_simple(ExtentId(1), Offset(1), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.register_epoch_simple(Offset(1), DEFAULT_EPOCH_CAPACITY, Epoch(1));
         stream
-            .append(ExtentId(1), Bytes::from_static(b"b"))
+            .append(Epoch(1), Bytes::from_static(b"b"))
             .unwrap();
-        stream.seal(ExtentId(1), None);
+        stream.seal(Epoch(1), None);
 
-        stream.register_epoch_simple(ExtentId(2), Offset(2), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.register_epoch_simple(Offset(2), DEFAULT_EPOCH_CAPACITY, Epoch(2));
 
         // 3 extents exceed limit=2, but extent 0 is not flushed — no eviction.
         assert!(
-            stream.with_epoch_by_extent_id(ExtentId(0), |_| ()).is_some(),
+            stream.with_epoch(Epoch(0), |_| ()).is_some(),
             "unflushed S3 extent 0 must NOT be evicted"
         );
 
         // Mark extent 0 as flushed, then trigger eviction by adding extent 3.
-        stream.with_epoch_by_extent_id(ExtentId(0), |ext| ext.mark_flushed());
+        stream.with_epoch(Epoch(0), |ext| ext.mark_flushed());
         stream
-            .append(ExtentId(2), Bytes::from_static(b"c"))
+            .append(Epoch(2), Bytes::from_static(b"c"))
             .unwrap();
-        stream.seal(ExtentId(2), None);
-        stream.register_epoch_simple(ExtentId(3), Offset(3), DEFAULT_EPOCH_CAPACITY, Epoch(0));
+        stream.seal(Epoch(2), None);
+        stream.register_epoch_simple(Offset(3), DEFAULT_EPOCH_CAPACITY, Epoch(3));
 
         // Now extent 0 is flushed — should be evicted.
         assert!(
-            stream.with_epoch_by_extent_id(ExtentId(0), |_| ()).is_none(),
+            stream.with_epoch(Epoch(0), |_| ()).is_none(),
             "flushed S3 extent 0 should be evicted"
         );
         // Extent 1 is still not flushed — should remain even though we're over limit.
         assert!(
-            stream.with_epoch_by_extent_id(ExtentId(1), |_| ()).is_some(),
+            stream.with_epoch(Epoch(1), |_| ()).is_some(),
             "unflushed S3 extent 1 must NOT be evicted"
         );
-        assert!(stream.with_epoch_by_extent_id(ExtentId(2), |_| ()).is_some());
-        assert!(stream.with_epoch_by_extent_id(ExtentId(3), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(2), |_| ()).is_some());
+        assert!(stream.with_epoch(Epoch(3), |_| ()).is_some());
     }
 
 }

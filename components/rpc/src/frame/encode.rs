@@ -122,7 +122,7 @@ impl Frame {
             // request_id(4) + stream_id(4) + error_code(2)
             VariableHeader::DescribeEpochRespError { .. } => 4 + 4 + 2,
             // request_id(4) + stream_id(4)
-            VariableHeader::DescribeEpoch { .. } => 4 + 4,
+            VariableHeader::DescribeEpoch { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + offset(8)
             VariableHeader::Seek { .. } | VariableHeader::SeekResp { .. } => 4 + 4 + 8,
             // request_id(4) + stream_id(4) + offset(8) + error_code(2)
@@ -579,9 +579,11 @@ impl Frame {
             VariableHeader::DescribeEpoch {
                 request_id,
                 stream_id,
+                epoch,
             } => {
                 dst.put_u32(*request_id);
                 dst.put_u32(stream_id.0);
+                dst.put_u32(epoch.0);
             }
             VariableHeader::Seek {
                 request_id,

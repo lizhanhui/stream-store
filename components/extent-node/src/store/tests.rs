@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::config::DEFAULT_CACHE_EPOCHS;
 use common::types::{
-    ArenaClass, Epoch, EpochPolicy, ErrorCode, ExtentId, Offset, Opcode, StorageClass,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, Offset, Opcode, StorageClass,
     StreamConfig, StreamId,
 };
 use rpc::frame::{Frame, VariableHeader};
@@ -103,14 +103,14 @@ async fn append_to_unknown_stream() {
 }
 
 #[tokio::test]
-async fn append_to_sealed_stream_reports_extent_id() {
+async fn append_to_sealed_stream_reports_epoch() {
     let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
 
     {
         let streams = store.streams.pin();
         let stream = streams.get(&sid).unwrap();
-        assert_eq!(stream.seal(ExtentId(1), None), Some((0, 0)));
+        assert_eq!(stream.seal(Epoch(0), None), Some((0, 0)));
     }
 
     let resp = store
@@ -263,9 +263,6 @@ async fn register_extent_creates_stream() {
     assert!(ri.is_primary());
     assert!(!ri.is_standalone());
     assert_eq!(ri.replica_addrs, vec!["127.0.0.1:9802"]);
-    // The extent_id is no longer transmitted on the wire; the EN synthesizes
-    // it from the epoch (epoch+1). Registered with epoch=0 → extent_id=1.
-    assert_eq!(ri.extent_id, ExtentId(1));
     assert_eq!(ri.replication_factor, 2);
 
     // AckQueue should be initialized for Primary.
@@ -517,7 +514,6 @@ async fn cumulative_ack_drains_multiple_pending() {
         ack_queue.enqueue(PendingAck {
             request_id: i,
             stream_id: StreamId(10),
-            extent_id: ExtentId(0),
             epoch: Epoch(0),
             response_tx: resp_tx.clone(),
             assigned_offset: i as u64,
@@ -573,7 +569,6 @@ async fn pending_ack_timeout() {
     ack_queue.enqueue(PendingAck {
         request_id: 42,
         stream_id: StreamId(10),
-        extent_id: ExtentId(0),
         epoch: Epoch(0),
         response_tx: resp_tx.clone(),
         assigned_offset: 0,
@@ -584,7 +579,6 @@ async fn pending_ack_timeout() {
     ack_queue.enqueue(PendingAck {
         request_id: 43,
         stream_id: StreamId(10),
-        extent_id: ExtentId(0),
         epoch: Epoch(0),
         response_tx: resp_tx.clone(),
         assigned_offset: 1,
@@ -1287,7 +1281,7 @@ async fn append_n(store: &ExtentNodeStore, sid: StreamId, n: u32) -> Offset {
 
 /// Seal an extent via SealEpochPrepare (the production RPC path).
 /// Returns the end_offset from the SealEpochResp.
-async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, _extent_id: ExtentId) -> u64 {
+async fn seal_via_rpc(store: &ExtentNodeStore, sid: StreamId, _epoch: Epoch) -> u64 {
     let resp = store
         .handle_frame(
             Frame::new(
@@ -1347,7 +1341,7 @@ async fn flush_extent_seals_active_extent() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let sealed = stream
-            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.is_sealed())
+            .with_epoch(Epoch(0), |ext| ext.is_sealed())
             .unwrap();
         assert!(sealed, "extent should be sealed after FlushExtent");
     }
@@ -1355,7 +1349,7 @@ async fn flush_extent_seals_active_extent() {
     // Verify FlushRequest was received.
     let req = flush_rx.try_recv().expect("expected FlushRequest");
     assert_eq!(req.stream_id, sid);
-    assert_eq!(req.extent_id, ExtentId(1));
+    assert_eq!(req.epoch, Epoch(0));
     assert_eq!(req.end_offset, 3);
 }
 
@@ -1369,7 +1363,7 @@ async fn flush_extent_corrects_sealed_extent() {
 
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 5).await;
-    let end = seal_via_rpc(&store, sid, ExtentId(1)).await;
+    let end = seal_via_rpc(&store, sid, Epoch(0)).await;
     assert_eq!(end, 5);
 
     // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
@@ -1382,7 +1376,7 @@ async fn flush_extent_corrects_sealed_extent() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        stream.finish_flush(ExtentId(1));
+        stream.finish_flush(Epoch(0));
     }
 
     // SM says quorum committed offset is 3 (lower than local 5).
@@ -1410,7 +1404,7 @@ async fn flush_extent_corrects_sealed_extent() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let sealed = stream
-            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.is_sealed())
+            .with_epoch(Epoch(0), |ext| ext.is_sealed())
             .unwrap();
         assert!(sealed, "extent should still be sealed after FlushExtent");
     }
@@ -1434,7 +1428,7 @@ async fn flush_extent_skips_flushed() {
 
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 2).await;
-    seal_via_rpc(&store, sid, ExtentId(1)).await;
+    seal_via_rpc(&store, sid, Epoch(0)).await;
 
     // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
     let _seal_req = flush_rx
@@ -1445,14 +1439,14 @@ async fn flush_extent_skips_flushed() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        stream.finish_flush(ExtentId(1));
+        stream.finish_flush(Epoch(0));
     }
 
     // Mark as flushed.
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        stream.with_epoch_by_extent_id(ExtentId(1), |ext| ext.mark_flushed());
+        stream.with_epoch(Epoch(0), |ext| ext.mark_flushed());
     }
 
     let result = store
@@ -1560,7 +1554,7 @@ async fn flush_extent_dedup() {
 
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 3).await;
-    seal_via_rpc(&store, sid, ExtentId(1)).await;
+    seal_via_rpc(&store, sid, Epoch(0)).await;
 
     // Drain the FlushRequest enqueued by handle_seal (Primary, RF=1 auto-flush).
     let _seal_req = flush_rx
@@ -1571,7 +1565,7 @@ async fn flush_extent_dedup() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        stream.finish_flush(ExtentId(1));
+        stream.finish_flush(Epoch(0));
     }
 
     let flush_frame = Frame::new(
@@ -1608,7 +1602,7 @@ async fn flush_extent_no_s3_configured() {
     let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 2).await;
-    seal_via_rpc(&store, sid, ExtentId(1)).await;
+    seal_via_rpc(&store, sid, Epoch(0)).await;
 
     // flush_tx is None — should return error response without panicking.
     let result = store
@@ -1640,7 +1634,7 @@ async fn seal_commit_corrects_higher_offset() {
     let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 5).await;
-    let end = seal_via_rpc(&store, sid, ExtentId(1)).await;
+    let end = seal_via_rpc(&store, sid, Epoch(0)).await;
     assert_eq!(end, 5);
 
     // SM says committed offset is 3 (quorum < local).
@@ -1671,12 +1665,12 @@ async fn seal_commit_corrects_higher_offset() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let sealed = stream
-            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.is_sealed())
+            .with_epoch(Epoch(0), |ext| ext.is_sealed())
             .unwrap();
         assert!(sealed, "extent should still be sealed after SealCommit");
         // committed_offset is unchanged (5 records were written).
         let count = stream
-            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.message_count())
+            .with_epoch(Epoch(0), |ext| ext.message_count())
             .unwrap();
         assert_eq!(
             count, 5,
@@ -1716,11 +1710,11 @@ async fn seal_commit_seals_active_extent() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let sealed = stream
-            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.is_sealed())
+            .with_epoch(Epoch(0), |ext| ext.is_sealed())
             .unwrap();
         assert!(sealed, "extent should be sealed after SealEpochCommit");
         let count = stream
-            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.message_count())
+            .with_epoch(Epoch(0), |ext| ext.message_count())
             .unwrap();
         assert_eq!(count, 3);
     }
@@ -1733,7 +1727,7 @@ async fn seal_commit_noop_lower_offset() {
     let store = test_store();
     let sid = register_stream(&store, 1, 1).await;
     append_n(&store, sid, 3).await;
-    let end = seal_via_rpc(&store, sid, ExtentId(1)).await;
+    let end = seal_via_rpc(&store, sid, Epoch(0)).await;
     assert_eq!(end, 3);
 
     // SM says end_offset=5 — higher than local 3 → no change.
@@ -1761,7 +1755,7 @@ async fn seal_commit_noop_lower_offset() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let count = stream
-            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.message_count())
+            .with_epoch(Epoch(0), |ext| ext.message_count())
             .unwrap();
         assert_eq!(
             count, 3,

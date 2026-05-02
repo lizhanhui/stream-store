@@ -36,7 +36,6 @@ async fn start_stream_manager_server() -> String {
     for table in &[
         "stream_replica",
         "extent",
-        "stream_sequence",
         "stream",
         "node_metrics",
         "stream_manager_leadership",

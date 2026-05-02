@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
-use common::types::{ExtentId, StreamId};
+use common::types::{Epoch, StreamId};
 use tokio::sync::mpsc;
 use tokio::time::sleep;
 use tracing::{info, warn};
@@ -29,7 +29,7 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(200);
 #[derive(Debug, Clone)]
 pub struct FlushRequest {
     pub stream_id: StreamId,
-    pub extent_id: ExtentId,
+    pub epoch: Epoch,
     pub start_offset: u64,
     pub end_offset: u64,
 }
@@ -65,23 +65,23 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
             Some(s) => s,
             None => {
                 warn!(
-                    "flush: stream {} not found, skipping extent {}",
-                    req.stream_id, req.extent_id,
+                    "flush: stream {} not found, skipping epoch {}",
+                    req.stream_id, req.epoch,
                 );
                 return;
             }
         };
-        match stream.with_epoch_by_extent_id(req.extent_id, |ext| {
+        match stream.with_epoch(req.epoch, |ext| {
             encode_arena_range(req.stream_id, ext, s3_client.compression(), req.end_offset)
         }) {
             Some(result) => result,
             None => {
                 warn!(
-                    "flush: extent {} not found on stream {}, may have been evicted",
-                    req.extent_id, req.stream_id,
+                    "flush: epoch {} not found on stream {}, may have been evicted",
+                    req.epoch, req.stream_id,
                 );
                 if let Some(s) = store.streams.pin().get(&req.stream_id) {
-                    s.finish_flush(req.extent_id);
+                    s.finish_flush(req.epoch);
                 }
                 return;
             }
@@ -109,8 +109,8 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
         // On retries, check if another replica already uploaded this arena object.
         if attempt > 1 && s3_client.exists(&key).await {
             info!(
-                "flush: extent {} for stream {} already exists at s3://{}/{}, skipping upload",
-                req.extent_id,
+                "flush: epoch {} for stream {} already exists at s3://{}/{}, skipping upload",
+                req.epoch,
                 req.stream_id,
                 s3_client.bucket(),
                 key,
@@ -122,8 +122,8 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
             Ok(()) => {
                 if attempt > 1 {
                     info!(
-                        "flushed extent {} for stream {} to s3://{}/{} ({} bytes, after {} attempts)",
-                        req.extent_id,
+                        "flushed epoch {} for stream {} to s3://{}/{} ({} bytes, after {} attempts)",
+                        req.epoch,
                         req.stream_id,
                         s3_client.bucket(),
                         key,
@@ -132,8 +132,8 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                     );
                 } else {
                     info!(
-                        "flushed extent {} for stream {} to s3://{}/{} ({} bytes)",
-                        req.extent_id,
+                        "flushed epoch {} for stream {} to s3://{}/{} ({} bytes)",
+                        req.epoch,
                         req.stream_id,
                         s3_client.bucket(),
                         key,
@@ -144,8 +144,8 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
             }
             Err(e) => {
                 warn!(
-                    "flush attempt {} failed for stream {} extent {}: {}, retrying in {:?}",
-                    attempt, req.stream_id, req.extent_id, e, delay,
+                    "flush attempt {} failed for stream {} epoch {}: {}, retrying in {:?}",
+                    attempt, req.stream_id, req.epoch, e, delay,
                 );
                 sleep(delay).await;
                 delay = (delay * 2).min(MAX_RETRY_DELAY);
@@ -168,14 +168,13 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
             .streams
             .pin()
             .get(&req.stream_id)
-            .and_then(|s| s.with_epoch_by_extent_id(req.extent_id, |ext| ext.epoch))
+            .and_then(|s| s.with_epoch(req.epoch, |ext| ext.epoch))
             .unwrap_or(common::types::Epoch(0));
 
         if let Some(ref tx) = store.update_tx {
             let _ = tx.try_send(ExtentUpdate::Flushed {
                 stream_id: req.stream_id,
-                extent_id: req.extent_id,
-                epoch,
+                                epoch,
                 start_offset: req.start_offset,
                 end_offset: req.end_offset,
                 s3_key: Bytes::from(key.clone()),
@@ -190,19 +189,19 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
             None,
         );
         if let Some(stream) = store.streams.pin().get(&req.stream_id) {
-            stream.with_epoch_by_extent_id(req.extent_id, |ext| ext.mark_flushed());
+            stream.with_epoch(req.epoch, |ext| ext.mark_flushed());
             stream.send_forward(flushed_frame);
         }
     } else {
         info!(
-            "flush: partial upload for stream {} extent {} (actual_end={}, requested_end={}), \
+            "flush: partial upload for stream {} epoch {} (actual_end={}, requested_end={}), \
              not marking as flushed — waiting for canonical upload",
-            req.stream_id, req.extent_id, actual_end_offset, req.end_offset,
+            req.stream_id, req.epoch, actual_end_offset, req.end_offset,
         );
     }
 
     // Clear DR flush dedup tracker (no-op if this was a Primary flush).
     if let Some(s) = store.streams.pin().get(&req.stream_id) {
-        s.finish_flush(req.extent_id);
+        s.finish_flush(req.epoch);
     }
 }

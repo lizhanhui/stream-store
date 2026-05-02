@@ -13,7 +13,7 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use common::config::{DEFAULT_REPLICATION_TIMEOUT_MS, MAX_REPLICATION_FACTOR};
-use common::types::{Epoch, ErrorCode, ExtentId, Offset, StreamId};
+use common::types::{Epoch, ErrorCode, Offset, StreamId};
 use crossbeam_channel::Receiver;
 use rpc::frame::{Frame, VariableHeader};
 use tokio::sync::mpsc::Sender;
@@ -37,8 +37,6 @@ pub struct PendingAck {
     pub response_tx: Sender<Frame>,
     /// The offset assigned to this append.
     pub assigned_offset: u64,
-    /// The extent the record landed on (for diagnostics in AppendAck).
-    pub extent_id: ExtentId,
     pub epoch: Epoch,
     /// When this PendingAck was created, for timeout expiry.
     pub created_at: Instant,
@@ -223,7 +221,6 @@ impl AckQueueInner {
                 warn!(
                     request_id = ack.request_id,
                     stream_id = %ack.stream_id,
-                    extent_id = %ack.extent_id,
                     offset = ack.assigned_offset,
                     "PendingAck expired after replication timeout",
                 );

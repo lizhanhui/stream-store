@@ -684,7 +684,7 @@ impl MetadataStore {
 
     /// Describe extents for a stream with full replica info and node liveness.
     ///
-    /// Returns extents ordered by extent_id **descending** (latest first).
+    /// Returns epochs ordered by epoch descending (latest first).
     /// - `count = 0`: return all extents.
     /// - `count = 1`: return just the latest (typically the active/mutable) extent.
     /// - `count = N`: return at most N extents from latest to earliest.
@@ -722,7 +722,6 @@ impl MetadataStore {
                 .get_replicas_with_liveness(stream_id, ext.epoch)
                 .await?;
             result.push(StreamEpochInfo {
-                extent_id: ext.epoch.0,
                 start_offset: ext.start_offset,
                 end_offset: ext.end_offset,
                 epoch: ext.epoch,
@@ -761,8 +760,7 @@ impl MetadataStore {
                     .get_replicas_with_liveness(stream_id, ext.epoch)
                     .await?;
                 Ok(Some(StreamEpochInfo {
-                    extent_id: ext.epoch.0,
-                    start_offset: ext.start_offset,
+                        start_offset: ext.start_offset,
                     end_offset: ext.end_offset,
                     epoch: ext.epoch,
                     state: ext.state,
@@ -811,7 +809,6 @@ impl MetadataStore {
                 .get_replicas_with_liveness(stream_id, ext.epoch)
                 .await?;
             return Ok(Some(StreamEpochInfo {
-                extent_id: ext.epoch.0,
                 start_offset: ext.start_offset,
                 end_offset: ext.end_offset,
                 epoch: ext.epoch,
@@ -844,8 +841,7 @@ impl MetadataStore {
                     .get_replicas_with_liveness(stream_id, ext.epoch)
                     .await?;
                 Ok(Some(StreamEpochInfo {
-                    extent_id: ext.epoch.0,
-                    start_offset: ext.start_offset,
+                        start_offset: ext.start_offset,
                     end_offset: ext.end_offset,
                     epoch: ext.epoch,
                     state: ext.state,

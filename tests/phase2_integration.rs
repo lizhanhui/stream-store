@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, EpochPolicy, EpochState, ExtentId, NodeMetrics, Offset, StorageClass};
+use common::types::{Epoch, EpochPolicy, EpochState, NodeMetrics, Offset, StorageClass};
 
 use serial_test::serial;
 
@@ -39,7 +39,6 @@ async fn start_stream_manager_server() -> String {
     for table in &[
         "stream_replica",
         "extent",
-        "stream_sequence",
         "stream",
         "node_metrics",
         "stream_manager_leadership",
@@ -149,7 +148,7 @@ async fn stream_manager_integration() {
                 .as_millis()
         );
 
-        let (stream_id, extent_id, _epoch, returned_addr) = stream_manager_client
+        let (stream_id, epoch, returned_addr) = stream_manager_client
             .create_stream(&stream_name, 1, StorageClass::S3, EpochPolicy { cache: 4 })
             .await
             .unwrap();
@@ -175,18 +174,18 @@ async fn stream_manager_integration() {
         assert_eq!(offset, Offset(0)); // active extent has 0 in metadata
 
         // Seal via StreamManager (epoch-based).
-        let (new_epoch, new_addr) = stream_manager_client
+        let (_sealed_new_epoch, new_addr) = stream_manager_client
             .seal(stream_id, Epoch(0))
             .await
             .unwrap();
         assert_eq!(new_addr, extent_node_addr); // only one ExtentNode, seal-and-new goes to same node
 
-        // Discover the new extent_id from describe_stream.
+        // Discover the new epoch from describe_stream.
         let post_seal_extents = stream_manager_client
             .describe_stream(stream_id, 1)
             .await
             .unwrap();
-        let new_extent_id = post_seal_extents[0].extent_id;
+        let new_epoch = post_seal_extents[0].epoch;
 
         // QueryOffset after seal.
         let offset = stream_manager_client.query_offset(stream_id).await.unwrap();
@@ -213,21 +212,21 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
 
-        // Discover the third extent_id from describe_stream.
+        // Discover the third epoch from describe_stream.
         let post_seal2_extents = stream_manager_client
             .describe_stream(stream_id, 1)
             .await
             .unwrap();
-        let third_extent_id = post_seal2_extents[0].extent_id;
+        let third_epoch = post_seal2_extents[0].epoch;
         let offset = stream_manager_client.query_offset(stream_id).await.unwrap();
         assert_eq!(offset, Offset(15)); // 5 + 10 = 15
 
-        // ── Part 3: describe_stream and describe_extent ──
+        // ── Part 3: describe_stream and describe_epoch ──
         //
         // At this point the stream has 3 extents:
-        //   extent_id=1  start_offset=0   end_offset=5    state=Sealed
-        //   extent_id=2  start_offset=5   end_offset=15   state=Sealed
-        //   extent_id=3  start_offset=15  end_offset=15   state=Active
+        //   epoch=1  start_offset=0   end_offset=5    state=Sealed
+        //   epoch=2  start_offset=5   end_offset=15   state=Sealed
+        //   epoch=3  start_offset=15  end_offset=15   state=Active
 
         // 3a. describe_stream(count=0) — all extents, latest first.
         let all_extents = stream_manager_client
@@ -235,18 +234,18 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(all_extents.len(), 3);
-        // Ordered by extent_id descending: 3, 2, 1.
-        assert_eq!(all_extents[0].extent_id, third_extent_id);
+        // Ordered by epoch descending: 3, 2, 1.
+        assert_eq!(all_extents[0].epoch, third_epoch);
         assert_eq!(all_extents[0].state, EpochState::Active);
         assert_eq!(all_extents[0].start_offset, 15);
         assert_eq!(all_extents[0].end_offset, 15);
 
-        assert_eq!(all_extents[1].extent_id, new_extent_id);
+        assert_eq!(all_extents[1].epoch, new_epoch);
         assert_eq!(all_extents[1].state, EpochState::Sealed);
         assert_eq!(all_extents[1].start_offset, 5);
         assert_eq!(all_extents[1].end_offset, 15);
 
-        assert_eq!(all_extents[2].extent_id, extent_id.0);
+        assert_eq!(all_extents[2].epoch.0, epoch.0);
         assert_eq!(all_extents[2].state, EpochState::Sealed);
         assert_eq!(all_extents[2].start_offset, 0);
         assert_eq!(all_extents[2].end_offset, 5);
@@ -269,7 +268,7 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(latest.len(), 1);
-        assert_eq!(latest[0].extent_id, third_extent_id);
+        assert_eq!(latest[0].epoch, third_epoch);
         assert_eq!(latest[0].state, EpochState::Active);
 
         // 3d. describe_stream(count=2) — latest 2 extents.
@@ -278,15 +277,15 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(top2.len(), 2);
-        assert_eq!(top2[0].extent_id, third_extent_id);
-        assert_eq!(top2[1].extent_id, new_extent_id);
+        assert_eq!(top2[0].epoch, third_epoch);
+        assert_eq!(top2[1].epoch, new_epoch);
 
-        // 3e. describe_extent — inspect a specific sealed extent.
+        // 3e. describe_epoch — inspect a specific sealed extent.
         let ext1 = stream_manager_client
-            .describe_extent(stream_id, extent_id)
+            .describe_epoch(stream_id, epoch)
             .await
             .unwrap();
-        assert_eq!(ext1.extent_id, extent_id.0);
+        assert_eq!(ext1.epoch.0, epoch.0);
         assert_eq!(ext1.state, EpochState::Sealed);
         assert_eq!(ext1.start_offset, 0);
         assert_eq!(ext1.end_offset, 5);
@@ -294,19 +293,19 @@ async fn stream_manager_integration() {
         assert_eq!(ext1.replicas[0].node_addr, extent_node_addr);
         assert!(ext1.replicas[0].is_alive);
 
-        // 3f. describe_extent — inspect the active extent.
+        // 3f. describe_epoch — inspect the active extent.
         let ext3 = stream_manager_client
-            .describe_extent(stream_id, ExtentId(third_extent_id))
+            .describe_epoch(stream_id, third_epoch)
             .await
             .unwrap();
-        assert_eq!(ext3.extent_id, (third_extent_id));
+        assert_eq!(ext3.epoch, third_epoch);
         assert_eq!(ext3.state, EpochState::Active);
         assert_eq!(ext3.start_offset, 15);
         assert_eq!(ext3.end_offset, 15);
 
-        // 3g. describe_extent for non-existent extent returns error.
+        // 3g. describe_epoch for non-existent extent returns error.
         let bad = stream_manager_client
-            .describe_extent(stream_id, ExtentId(9999u32))
+            .describe_epoch(stream_id, Epoch(9999))
             .await;
         assert!(bad.is_err(), "non-existent extent should return error");
 
@@ -321,19 +320,19 @@ async fn stream_manager_integration() {
         // ── Part 4: seek ──
         //
         // Stream layout (3 extents):
-        //   extent_id=first   start_offset=0   end_offset=5    Sealed   [offsets 0..4]
-        //   extent_id=second  start_offset=5   end_offset=15   Sealed   [offsets 5..14]
-        //   extent_id=third   start_offset=15  end_offset=15   Active   [offsets 15..)
-        let first_eid = extent_id.0;
-        let second_eid = new_extent_id;
-        let third_eid = third_extent_id;
+        //   epoch=first   start_offset=0   end_offset=5    Sealed   [offsets 0..4]
+        //   epoch=second  start_offset=5   end_offset=15   Sealed   [offsets 5..14]
+        //   epoch=third   start_offset=15  end_offset=15   Active   [offsets 15..)
+        let first_eid = epoch.0;
+        let second_eid = new_epoch.0;
+        let third_eid = third_epoch.0;
 
         // 4a. Seek offset=0 -> first sealed extent (start of first extent).
         let s = stream_manager_client
             .seek(stream_id, Offset(0))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, first_eid);
+        assert_eq!(s.epoch.0, first_eid);
         assert_eq!(s.state, EpochState::Sealed);
         assert_eq!(s.start_offset, 0);
         assert_eq!(s.end_offset, 5);
@@ -345,21 +344,21 @@ async fn stream_manager_integration() {
             .seek(stream_id, Offset(3))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, first_eid);
+        assert_eq!(s.epoch.0, first_eid);
 
         // 4c. Seek offset=4 -> first sealed extent (last message).
         let s = stream_manager_client
             .seek(stream_id, Offset(4))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, first_eid);
+        assert_eq!(s.epoch.0, first_eid);
 
         // 4d. Seek offset=5 -> second sealed extent (boundary = start of second).
         let s = stream_manager_client
             .seek(stream_id, Offset(5))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, second_eid);
+        assert_eq!(s.epoch.0, second_eid);
         assert_eq!(s.state, EpochState::Sealed);
         assert_eq!(s.start_offset, 5);
         assert_eq!(s.end_offset, 15);
@@ -369,21 +368,21 @@ async fn stream_manager_integration() {
             .seek(stream_id, Offset(12))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, second_eid);
+        assert_eq!(s.epoch.0, second_eid);
 
         // 4f. Seek offset=14 -> second sealed extent (last message).
         let s = stream_manager_client
             .seek(stream_id, Offset(14))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, second_eid);
+        assert_eq!(s.epoch.0, second_eid);
 
         // 4g. Seek offset=15 -> active (mutable) extent (boundary = start of active).
         let s = stream_manager_client
             .seek(stream_id, Offset(15))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, third_eid);
+        assert_eq!(s.epoch.0, third_eid);
         assert_eq!(s.state, EpochState::Active);
         assert_eq!(s.start_offset, 15);
 
@@ -392,7 +391,7 @@ async fn stream_manager_integration() {
             .seek(stream_id, Offset(999))
             .await
             .unwrap();
-        assert_eq!(s.extent_id, third_eid);
+        assert_eq!(s.epoch.0, third_eid);
         assert_eq!(s.state, EpochState::Active);
     }
 }

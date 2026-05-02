@@ -30,9 +30,9 @@ const PAYLOAD_SIZES: &[(usize, &str)] =
 /// Thread counts for concurrent benchmarks.
 const THREAD_COUNTS: &[usize] = &[1, 2, 4, 8];
 
-/// Register a stream+extent on the store, mirroring the test helper in store.rs.
-async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u32, extent_id: u32) {
-    let _ = extent_id;
+/// Register a stream epoch on the store, mirroring the test helper in store.rs.
+async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u32, epoch: u32) {
+    let _ = epoch;
     let payload = build_register_extent_payload(&[]);
     let _ = store
         .handle_frame(

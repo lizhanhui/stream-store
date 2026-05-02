@@ -24,7 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{Epoch, EpochPolicy, ExtentId, Offset, StorageClass};
+use common::types::{Epoch, EpochPolicy, Offset, StorageClass};
 use sqlx::mysql::MySqlPoolOptions;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -39,7 +39,6 @@ async fn clean_database(mysql_url: &str) {
     for table in &[
         "stream_replica",
         "extent",
-        "stream_sequence",
         "stream",
         "node",
         "refinery_schema_history",
@@ -102,7 +101,7 @@ async fn main() {
         .await
         .expect("failed to connect to StreamManager");
 
-    let (stream_id, extent_id, _epoch, primary_addr) = stream_manager_client
+    let (stream_id, epoch, primary_addr) = stream_manager_client
         .create_stream(
             "example-stream",
             2,
@@ -113,8 +112,8 @@ async fn main() {
         .expect("failed to create stream");
 
     info!(
-        "[4] Created stream \"example-stream\" (replication_factor=2): stream_id={}, extent_id={}, primary={primary_addr}",
-        stream_id, extent_id
+        "[4] Created stream \"example-stream\" (replication_factor=2): stream_id={}, epoch={}, primary={primary_addr}",
+        stream_id, epoch
     );
 
     // ── 6. Append records to the primary ExtentNode ──
@@ -144,7 +143,7 @@ async fn main() {
 
     // ── 8. Read all messages back ──
     let read_messages = extent_node_client
-        .read(stream_id, extent_id, Offset(0), messages.len() as u16)
+        .read(stream_id, Offset(0), messages.len() as u16)
         .await
         .expect("read failed");
 
@@ -161,24 +160,24 @@ async fn main() {
     info!("    (verified: all messages match)");
 
     // ── 9. Seal extent via StreamManager (epoch-based seal) ──
-    let (new_epoch, new_primary_addr) = stream_manager_client
+    let (_sealed_new_epoch, new_primary_addr) = stream_manager_client
         .seal(stream_id, Epoch(0))
         .await
         .expect("seal failed");
     let sealed_count = messages.len() as u32;
 
-    // Discover the new extent_id from describe_stream.
+    // Discover the new epoch from describe_stream.
     let post_seal_extents = stream_manager_client
         .describe_stream(stream_id, 1)
         .await
         .expect("describe_stream after seal");
-    let new_extent_id = ExtentId(post_seal_extents[0].extent_id);
+    let new_epoch = Epoch(post_seal_extents[0].epoch.0);
 
     info!(
         "[8] Sealed extent {:?} (messages={sealed_count})",
-        extent_id
+        epoch
     );
-    info!("    New epoch={new_epoch}, extent_id={new_extent_id:?}, primary={new_primary_addr}");
+    info!("    New epoch={new_epoch}, epoch={new_epoch:?}, primary={new_primary_addr}");
 
     // ── 10. Append more records to the new extent ──
     let extent_node_client_2 = StreamClient::connect(&new_primary_addr)
@@ -204,7 +203,6 @@ async fn main() {
     let read_new = extent_node_client_2
         .read(
             stream_id,
-            new_extent_id,
             Offset(start_offset),
             new_messages.len() as u16,
         )
@@ -244,7 +242,7 @@ async fn main() {
 
     info!(
         "[11] Sealed extent {:?} -> new epoch={final_epoch}, primary={final_addr}",
-        new_extent_id
+        new_epoch
     );
     info!(
         "     Total stream offset (from StreamManager): {}",

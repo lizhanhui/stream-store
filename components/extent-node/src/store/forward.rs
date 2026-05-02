@@ -1,8 +1,7 @@
 use std::sync::atomic::Ordering;
 
-use common::bridge::synth_extent_id;
 use common::errors::StorageError;
-use common::types::{ArenaClass, Epoch, EpochPolicy, ExtentId, Offset, StreamId};
+use common::types::{ArenaClass, Epoch, EpochPolicy, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
@@ -22,22 +21,17 @@ impl ExtentNodeStore {
     /// Accepts a `&Stream` reference to avoid re-acquiring the map pin
     /// (the caller already holds a guard).
     pub(crate) fn maybe_build_init_forward(&self, stream: &Stream, frame: &Frame) -> Option<Frame> {
-        let (stream_id, extent_id, epoch) = match &frame.variable_header {
-            VariableHeader::Forward {
-                stream_id, epoch, ..
-            } => (*stream_id, synth_extent_id(*epoch), Some(*epoch)),
-            VariableHeader::ForwardChecksum {
-                stream_id, epoch, ..
-            } => (*stream_id, synth_extent_id(*epoch), None),
+        let (stream_id, epoch) = match &frame.variable_header {
+            VariableHeader::Forward { stream_id, epoch, .. }
+            | VariableHeader::ForwardChecksum { stream_id, epoch, .. } => (*stream_id, *epoch),
             _ => return None,
         };
 
-        stream.with_epoch_by_extent_id(extent_id, |ext| {
+        stream.with_epoch(epoch, |ext| {
             if !ext.take_init_forward() {
                 return None;
             }
 
-            let epoch = epoch.unwrap_or(ext.epoch);
             Some(Frame::new(
                 VariableHeader::ForwardInitEpoch {
                     stream_id,
@@ -88,9 +82,6 @@ impl ExtentNodeStore {
             _ => return,
         };
 
-        // Synthesize a local extent id from the epoch (one extent per epoch).
-        let extent_id = synth_extent_id(epoch);
-
         tracing::debug!(
             arena_class = ?arena_class,
             stream_id = %stream_id,
@@ -104,17 +95,17 @@ impl ExtentNodeStore {
                 cache: cache_extents,
             },
         );
-        self.try_register_epoch(stream_id, extent_id, start_offset, epoch, extent_capacity);
+        self.try_register_epoch(stream_id, start_offset, epoch, extent_capacity);
 
         if is_new {
             info!(
-                "ForwardInitEpoch (new stream): stream={}, extent={}, start_offset={}, capacity={}",
-                stream_id, extent_id, start_offset, extent_capacity,
+                "ForwardInitEpoch (new stream): stream={}, epoch={}, start_offset={}, capacity={}",
+                stream_id, epoch, start_offset, extent_capacity,
             );
         } else {
             info!(
-                "ForwardInitEpoch: stream={}, extent={}, start_offset={}, capacity={}",
-                stream_id, extent_id, start_offset, extent_capacity,
+                "ForwardInitEpoch: stream={}, epoch={}, start_offset={}, capacity={}",
+                stream_id, epoch, start_offset, extent_capacity,
             );
         }
     }
@@ -123,22 +114,21 @@ impl ExtentNodeStore {
     fn try_register_epoch(
         &self,
         stream_id: StreamId,
-        extent_id: ExtentId,
         start_offset: Offset,
         epoch: Epoch,
         extent_capacity: u32,
     ) {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id)
-            && stream.with_epoch_by_extent_id(extent_id, |_| ()).is_none()
+            && stream.with_epoch(epoch, |_| ()).is_none()
         {
-            stream.register_epoch(extent_id, start_offset, epoch, extent_capacity);
+            stream.register_epoch(start_offset, epoch, extent_capacity);
         }
     }
 
     /// Handle Forward (0x0B, flag=0x00) — per-record primary→secondary replication.
     ///
-    /// The Forward frame carries (stream_id, extent_id, epoch, offset);
+    /// The Forward frame carries (stream_id, epoch, epoch, offset);
     /// the secondary derives byte_pos from its own write_cursor (strict-order
     /// TCP FIFO guarantees deterministic replay). The stream/extent must already
     /// exist (created by a prior ForwardInitEpoch or RegisterEpoch).
@@ -155,29 +145,25 @@ impl ExtentNodeStore {
             _ => return None,
         };
 
-        // Synthesize a local extent id from the epoch (one extent per epoch).
-        let extent_id = synth_extent_id(epoch);
-
         // Look up the stream — must exist (created by ForwardInitEpoch or RegisterEpoch).
         let streams = self.streams.pin();
         let stream = match streams.get(&stream_id) {
             Some(s) => s,
             None => {
                 warn!(
-                    "Forward for unknown stream {}, extent {} — missing ForwardInitEpoch?",
-                    stream_id, extent_id,
+                    "Forward for unknown stream {}, epoch {} — missing ForwardInitEpoch?",
+                    stream_id, epoch,
                 );
                 return None;
             }
         };
 
         let replicate_result =
-            stream.replicate(extent_id, offset, frame.payload.clone().unwrap_or_default());
+            stream.replicate(epoch, offset, frame.payload.clone().unwrap_or_default());
 
         self.finish_forward(
             stream,
             stream_id,
-            extent_id,
             epoch,
             replicate_result,
             &frame,
@@ -189,7 +175,6 @@ impl ExtentNodeStore {
         &self,
         stream: &Stream,
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         replicate_result: Result<AppendResult, StorageError>,
         frame: &Frame,
@@ -198,8 +183,8 @@ impl ExtentNodeStore {
             Ok(_r) => {}
             Err(e) => {
                 warn!(
-                    "Forward replicate failed for stream={}, extent={}: {}",
-                    stream_id, extent_id, e,
+                    "Forward replicate failed for stream={}, epoch={}: {}",
+                    stream_id, epoch, e,
                 );
                 return None;
             }
@@ -214,18 +199,18 @@ impl ExtentNodeStore {
 
         // Check if deferred CRC32 verification can now complete.
         // Also read the contiguous watermark for the response.
-        let watermark = stream.with_epoch_by_extent_id(extent_id, |extent| {
+        let watermark = stream.with_epoch(epoch, |extent| {
             match extent.try_verify_checksum() {
                 Some(true) => {
                     info!(
-                        "CRC32 checksum verified (deferred): stream={}, extent={}",
-                        stream_id, extent_id,
+                        "CRC32 checksum verified (deferred): stream={}, epoch={}",
+                        stream_id, epoch,
                     );
                 }
                 Some(false) => {
                     warn!(
-                        "CRC32 checksum mismatch (deferred): stream={}, extent={}",
-                        stream_id, extent_id,
+                        "CRC32 checksum mismatch (deferred): stream={}, epoch={}",
+                        stream_id, epoch,
                     );
                 }
                 None => {} // not ready yet
@@ -256,50 +241,48 @@ impl ExtentNodeStore {
                 } => (*stream_id, *epoch, *checksum, *committed_bytes),
                 _ => return,
             };
-        let extent_id = synth_extent_id(epoch);
-
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => {
                 warn!(
-                    "ForwardChecksum for unknown stream {}, extent {}",
-                    stream_id, extent_id,
+                    "ForwardChecksum for unknown stream {}, epoch {}",
+                    stream_id, epoch,
                 );
                 return;
             }
         };
 
-        let found = stream.with_epoch_by_extent_id(extent_id, |extent| {
+        let found = stream.with_epoch(epoch, |extent| {
             extent.store_primary_checksum(primary_crc32);
             extent.try_advance_committed();
             match extent.try_verify_checksum() {
                 Some(true) => {
                     info!(
-                        "CRC32 checksum verified: stream={}, extent={}, crc32={:#010x}, bytes={}",
-                        stream_id, extent_id, primary_crc32, primary_committed_bytes,
+                        "CRC32 checksum verified: stream={}, epoch={}, crc32={:#010x}, bytes={}",
+                        stream_id, epoch, primary_crc32, primary_committed_bytes,
                     );
                 }
                 Some(false) => {
                     warn!(
-                        "CRC32 checksum mismatch: stream={}, extent={}, \
+                        "CRC32 checksum mismatch: stream={}, epoch={}, \
                          primary_crc32={:#010x}, primary_bytes={}",
-                        stream_id, extent_id, primary_crc32, primary_committed_bytes,
+                        stream_id, epoch, primary_crc32, primary_committed_bytes,
                     );
                 }
                 None => {
                     info!(
-                        "ForwardChecksum stored (deferred): stream={}, extent={}, \
+                        "ForwardChecksum stored (deferred): stream={}, epoch={}, \
                          crc32={:#010x}, bytes={} — waiting for remaining records",
-                        stream_id, extent_id, primary_crc32, primary_committed_bytes,
+                        stream_id, epoch, primary_crc32, primary_committed_bytes,
                     );
                 }
             }
         });
         if found.is_none() {
             warn!(
-                "ForwardChecksum for unknown extent {} on stream {}",
-                extent_id, stream_id,
+                "ForwardChecksum for unknown epoch {} on stream {}",
+                epoch, stream_id,
             );
         }
     }
@@ -312,33 +295,31 @@ impl ExtentNodeStore {
             } => (*stream_id, *epoch),
             _ => return,
         };
-        let extent_id = synth_extent_id(epoch);
-
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => {
                 warn!(
-                    "ForwardFlushed for unknown stream {}, extent {}",
-                    stream_id, extent_id,
+                    "ForwardFlushed for unknown stream {}, epoch {}",
+                    stream_id, epoch,
                 );
                 return;
             }
         };
 
-        let found = stream.with_epoch_by_extent_id(extent_id, |ext| {
+        let found = stream.with_epoch(epoch, |ext| {
             ext.mark_flushed();
         });
 
         if found.is_some() {
             info!(
-                "ForwardFlushed: stream={}, extent={} — marked flushed, eligible for eviction",
-                stream_id, extent_id,
+                "ForwardFlushed: stream={}, epoch={} — marked flushed, eligible for eviction",
+                stream_id, epoch,
             );
         } else {
             warn!(
-                "ForwardFlushed for unknown extent {} on stream {}",
-                extent_id, stream_id,
+                "ForwardFlushed for unknown epoch {} on stream {}",
+                epoch, stream_id,
             );
         }
     }

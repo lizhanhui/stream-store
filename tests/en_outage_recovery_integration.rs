@@ -45,7 +45,6 @@ async fn clean_database(mysql_url: &str) {
     for table in &[
         "stream_replica",
         "extent",
-        "stream_sequence",
         "stream",
         "node_metrics",
         "stream_manager_leadership",
@@ -168,7 +167,7 @@ async fn client_recovers_after_primary_killed() {
     // Create stream with RF=3. When one node dies, SM should degrade to RF=2
     // (quorum=2 preserved) instead of failing allocation.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
-    let (stream_id, _extent_id, _epoch, primary_addr) = sm_client
+    let (stream_id, _epoch, primary_addr) = sm_client
         .create_stream(
             "test-primary-outage",
             3,
@@ -231,7 +230,7 @@ async fn client_recovers_after_primary_killed() {
         extents.len(),
         extents
             .iter()
-            .map(|e| (e.extent_id, e.state))
+            .map(|e| (e.epoch.0, e.state))
             .collect::<Vec<_>>()
     );
     let active = extents
@@ -246,7 +245,7 @@ async fn client_recovers_after_primary_killed() {
     info!(
         "[test] New primary={} for active extent {}, replicas={}",
         new_primary.node_addr,
-        active.extent_id,
+        active.epoch.0,
         active.replicas.len()
     );
     assert_ne!(
@@ -306,7 +305,6 @@ async fn client_recovers_after_primary_killed() {
     let messages = reader
         .read(
             stream_id,
-            common::types::ExtentId(sealed.extent_id),
             Offset(sealed.start_offset),
             100,
         )
@@ -315,7 +313,7 @@ async fn client_recovers_after_primary_killed() {
     info!(
         "[test] Read {} messages from sealed extent {} on {}",
         messages.len(),
-        sealed.extent_id,
+        sealed.epoch.0,
         live_replica.node_addr,
     );
     assert!(
@@ -341,7 +339,7 @@ async fn client_recovers_after_secondary_killed() {
     // Create stream with RF=3. When one node dies, SM should degrade to RF=2
     // (quorum=2 preserved) instead of failing allocation.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
-    let (stream_id, _extent_id, _epoch, primary_addr) = sm_client
+    let (stream_id, _epoch, primary_addr) = sm_client
         .create_stream(
             "test-secondary-outage",
             3,
@@ -397,7 +395,7 @@ async fn client_recovers_after_secondary_killed() {
     sleep(Duration::from_secs(6)).await;
 
     // SM should NOT seal when only a secondary dies — primary still has quorum.
-    // The extent should remain active with the same extent_id.
+    // The extent should remain active with the same epoch.
     let sm_client2 = StreamClient::connect(&sm_addr).await.unwrap();
     let extents = sm_client2.describe_stream(stream_id, 0).await.unwrap();
 
@@ -412,7 +410,7 @@ async fn client_recovers_after_secondary_killed() {
         .expect("extent should still be active");
     info!(
         "[test] After secondary outage: extent {} still active, replicas={}",
-        active.extent_id,
+        active.epoch.0,
         active.replicas.len()
     );
 

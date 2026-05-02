@@ -307,6 +307,7 @@ pub enum VariableHeader {
     DescribeEpoch {
         request_id: u32,
         stream_id: StreamId,
+        epoch: Epoch,
     },
     DescribeEpochResp {
         request_id: u32,

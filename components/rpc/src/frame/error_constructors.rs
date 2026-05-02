@@ -289,6 +289,7 @@ impl Frame {
             VariableHeader::DescribeEpoch {
                 request_id,
                 stream_id,
+                ..
             } => Self::describe_epoch_resp_error(*request_id, *stream_id, error_code, message),
             VariableHeader::Seek {
                 request_id,

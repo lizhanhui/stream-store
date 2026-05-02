@@ -404,12 +404,11 @@ impl StreamManagerClient {
                 }
                 _ = progress_interval.tick() => {
                     // Periodic progress updates for all active extents.
-                    for (stream_id, extent_id, current_offset, epoch) in store.snapshot_active_extents() {
+                    for (stream_id, current_offset, epoch) in store.snapshot_active_extents() {
                         Self::send_update_frame(
                             &mut framed,
                             ExtentUpdate::Progress {
                                 stream_id,
-                                extent_id,
                                 current_offset,
                                 epoch,
                             },
@@ -508,12 +507,9 @@ impl StreamManagerClient {
         let (frame, desc) = match update {
             ExtentUpdate::Progress {
                 stream_id,
-                extent_id,
                 current_offset,
                 epoch,
             } => {
-                // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
-                let _ = extent_id;
                 (
                     Frame::new(
                         VariableHeader::UpdateEpochProgress {
@@ -528,7 +524,6 @@ impl StreamManagerClient {
             }
             ExtentUpdate::Flushed {
                 stream_id,
-                extent_id,
                 epoch,
                 start_offset,
                 end_offset,
@@ -544,7 +539,7 @@ impl StreamManagerClient {
                     },
                     None,
                 ),
-                format!("UpdateEpochFlushed stream={stream_id} extent={extent_id}"),
+                format!("UpdateEpochFlushed stream={stream_id} epoch={epoch}"),
             ),
         };
         match tokio::time::timeout(rpc_request_timeout, framed.send(frame)).await {

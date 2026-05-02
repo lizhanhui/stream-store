@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use common::types::{Epoch, ExtentId, StreamId};
+use common::types::{Epoch, StreamId};
 use rpc::payload::ROLE_PRIMARY;
 use tokio::sync::mpsc::Sender;
 
@@ -12,7 +12,6 @@ pub enum ExtentUpdate {
     /// Periodic progress report for an active extent (observability).
     Progress {
         stream_id: StreamId,
-        extent_id: ExtentId,
         current_offset: u64,
         epoch: Epoch,
     },
@@ -24,7 +23,6 @@ pub enum ExtentUpdate {
     /// frames whose relative ordering at SM is not guaranteed).
     Flushed {
         stream_id: StreamId,
-        extent_id: ExtentId,
         epoch: Epoch,
         start_offset: u64,
         end_offset: u64,
@@ -39,8 +37,6 @@ pub enum ExtentUpdate {
 pub struct ReplicaInfo {
     /// Stream this extent belongs to.
     pub stream_id: StreamId,
-    /// Extent this replica assignment covers.
-    pub extent_id: ExtentId,
     /// 0 = Primary, 1+ = Secondary.
     pub role: u8,
     /// Total replication factor (used for quorum calculation).

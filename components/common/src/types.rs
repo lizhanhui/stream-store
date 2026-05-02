@@ -58,16 +58,6 @@ impl Display for StreamId {
     }
 }
 
-/// Unique identifier for an extent within a stream.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct ExtentId(pub u32);
-
-impl Display for ExtentId {
-    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
-        write!(f, "{}", self.0)
-    }
-}
-
 /// Stream epoch. Identifies a replica set assignment. Bumped by Stream Manager
 /// on node failure or rebalancing; within an epoch the Primary can autonomously
 /// create extents on extent-full without SM involvement.
@@ -114,7 +104,7 @@ pub enum Opcode {
     /// Append a message. Flags: 0x00=request, 0x01=ack, 0x80=error.
     Append = 0x03,
     /// Dedicated forward opcode for Primary→Secondary replication.
-    /// Carries (stream_id, extent_id, epoch, offset) so the secondary
+    /// Carries (stream_id, epoch, offset) so the secondary
     /// can replay each record in strict per-connection FIFO order.
     Forward = 0x05,
     /// Epoch-based seal: Client ↔ StreamManager.
@@ -349,7 +339,6 @@ pub struct NodeMetrics {
 /// Describes a single stream-epoch (one sealed or active segment) with its replica set — returned by management APIs.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamEpochInfo {
-    pub extent_id: u32,
     pub start_offset: u64,
     pub end_offset: u64,
     pub state: EpochState,

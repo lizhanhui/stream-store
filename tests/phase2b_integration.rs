@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use common::types::{
-    ArenaClass, Epoch, EpochPolicy, ExtentId, Offset, Opcode, StorageClass, StreamConfig, StreamId,
+    ArenaClass, Epoch, EpochPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
 };
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::build_register_extent_payload;
@@ -60,12 +60,12 @@ async fn start_extent_node() -> (String, Arc<ExtentNodeStore>) {
 async fn register_extent(
     addr: &str,
     stream_id: u32,
-    extent_id: u32,
+    epoch: u32,
     role: u8,
     replication_factor: u8,
     replica_addrs: &[&str],
 ) {
-    let _ = extent_id;
+    let _ = epoch;
     use futures_util::{SinkExt, StreamExt};
     use rpc::codec::FrameCodec;
     use tokio_util::codec::Framed;
@@ -114,15 +114,15 @@ async fn broadcast_replication_rf2() {
     let (secondary_addr, _secondary_store) = start_extent_node().await;
 
     let stream_id = 100;
-    let extent_id = 1u32;
+    let epoch = 1u32;
 
     // Register broadcast replication.
     // Secondary must be registered first so it's ready to accept forwarded appends.
-    register_extent(&secondary_addr, stream_id, extent_id, 1, 2, &[]).await;
+    register_extent(&secondary_addr, stream_id, epoch, 1, 2, &[]).await;
     register_extent(
         &primary_addr,
         stream_id,
-        extent_id,
+        epoch,
         0,
         2,
         &[&secondary_addr],
@@ -154,7 +154,7 @@ async fn broadcast_replication_rf2() {
 
     // Read messages from Primary (byte_pos removed, offset-only API).
     let msgs = client
-        .read(StreamId(stream_id), ExtentId(1), Offset(0), 10)
+        .read(StreamId(stream_id), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs.len(), 5);
@@ -173,7 +173,7 @@ async fn broadcast_replication_rf2() {
     assert_eq!(secondary_max, Offset(5));
 
     let secondary_msgs = secondary_client
-        .read(StreamId(stream_id), ExtentId(1), Offset(0), 10)
+        .read(StreamId(stream_id), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(secondary_msgs.len(), 5);
@@ -194,17 +194,17 @@ async fn broadcast_replication_rf3() {
     let (secondary2_addr, _) = start_extent_node().await;
 
     let stream_id = 200;
-    let extent_id = 1u32;
+    let epoch = 1u32;
 
     // Register broadcast replication.
     // Secondaries first so they're ready.
-    register_extent(&secondary1_addr, stream_id, extent_id, 1, 3, &[]).await;
-    register_extent(&secondary2_addr, stream_id, extent_id, 2, 3, &[]).await;
+    register_extent(&secondary1_addr, stream_id, epoch, 1, 3, &[]).await;
+    register_extent(&secondary2_addr, stream_id, epoch, 2, 3, &[]).await;
     // Primary knows about both secondaries.
     register_extent(
         &primary_addr,
         stream_id,
-        extent_id,
+        epoch,
         0,
         3,
         &[&secondary1_addr, &secondary2_addr],
@@ -239,7 +239,7 @@ async fn broadcast_replication_rf3() {
         assert_eq!(max, Offset(3), "{label} should have offset 3");
 
         let msgs = c
-            .read(StreamId(stream_id), ExtentId(1), Offset(0), 10)
+            .read(StreamId(stream_id), Offset(0), 10)
             .await
             .unwrap();
         assert_eq!(msgs.len(), 3, "{label} should have 3 messages");
@@ -303,14 +303,14 @@ async fn multi_stream_shared_downstream() {
 
     // Verify stream A.
     let msgs_a = client
-        .read(StreamId(stream_a), ExtentId(1), Offset(0), 10)
+        .read(StreamId(stream_a), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs_a.len(), 3);
 
     // Verify stream B.
     let msgs_b = client
-        .read(StreamId(stream_b), ExtentId(1), Offset(0), 10)
+        .read(StreamId(stream_b), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(msgs_b.len(), 2);
@@ -320,13 +320,13 @@ async fn multi_stream_shared_downstream() {
         .await
         .unwrap();
     let sec_a = sec_client
-        .read(StreamId(stream_a), ExtentId(1), Offset(0), 10)
+        .read(StreamId(stream_a), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(sec_a.len(), 3);
 
     let sec_b = sec_client
-        .read(StreamId(stream_b), ExtentId(1), Offset(0), 10)
+        .read(StreamId(stream_b), Offset(0), 10)
         .await
         .unwrap();
     assert_eq!(sec_b.len(), 2);
@@ -340,10 +340,10 @@ async fn broadcast_replication_rf1_immediate_ack() {
     let (primary_addr, _) = start_extent_node().await;
 
     let stream_id = 400;
-    let extent_id = 1u32;
+    let epoch = 1u32;
 
     // Register as Primary with RF=1, no secondaries.
-    register_extent(&primary_addr, stream_id, extent_id, 0, 1, &[]).await;
+    register_extent(&primary_addr, stream_id, epoch, 0, 1, &[]).await;
 
     let client = client::StreamClient::connect(&primary_addr).await.unwrap();
 
