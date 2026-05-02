@@ -751,7 +751,7 @@ async fn concurrent_multi_stream_appends() {
         "metrics: bytes_written mismatch"
     );
     assert_eq!(
-        active_count, NUM_STREAMS as u32,
+        active_count, NUM_STREAMS,
         "metrics: active extent count mismatch"
     );
 

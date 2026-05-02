@@ -13,15 +13,15 @@ use crate::arena::ArenaIdGenerator;
 #[allow(dead_code)]
 pub(crate) struct SharedArenaPool {
     _arena_size: u32,
-    _ids: Arc<ArenaIdGenerator>,
+    _generator: Arc<ArenaIdGenerator>,
 }
 
 impl SharedArenaPool {
     #[allow(dead_code)]
-    pub(crate) fn new(arena_size: u32, ids: Arc<ArenaIdGenerator>) -> Self {
+    pub(crate) fn new(arena_size: u32, generator: Arc<ArenaIdGenerator>) -> Self {
         Self {
             _arena_size: arena_size,
-            _ids: ids,
+            _generator: generator,
         }
     }
 }
