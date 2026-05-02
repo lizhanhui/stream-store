@@ -9,7 +9,7 @@
 //! tables (matches the pattern in `phase2_integration.rs`).
 
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, ExtentId, ExtentPolicy, ExtentState, StorageClass, StreamId};
+use common::types::{Epoch, EpochState, ExtentId, ExtentPolicy, StorageClass, StreamId};
 use serial_test::serial;
 use stream_manager::metadata::MetadataStore;
 
@@ -65,7 +65,7 @@ async fn get_extent(
 
 #[derive(Debug)]
 struct ExtentRowSnapshot {
-    state: ExtentState,
+    state: EpochState,
     end_offset: u64,
 }
 
@@ -114,7 +114,7 @@ async fn record_extent_flushed_ordering_variants() {
     let snap3 = get_extent(&store, s3, e3).await;
     assert_eq!(
         snap3.state,
-        ExtentState::Flushed,
+        EpochState::Flushed,
         "s3 still Flushed after double notification"
     );
     assert_eq!(snap3.end_offset, 512);
@@ -133,7 +133,7 @@ async fn record_extent_flushed_ordering_variants() {
     let snap4 = get_extent(&store, s4, e4).await;
     assert_eq!(
         snap4.state,
-        ExtentState::Active,
+        EpochState::Active,
         "s4 must remain Active under wrong epoch"
     );
     assert_eq!(

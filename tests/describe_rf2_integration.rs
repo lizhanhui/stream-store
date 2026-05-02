@@ -13,7 +13,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, ExtentPolicy, ExtentState, NodeMetrics, Offset, StorageClass};
+use common::types::{Epoch, EpochState, ExtentPolicy, NodeMetrics, Offset, StorageClass};
 
 use extent_node::downstream::DownstreamPool;
 use extent_node::store::ExtentNodeStore;
@@ -183,7 +183,7 @@ async fn describe_stream_rf2_integration() {
     assert_eq!(active.len(), 1);
     let ext = &active[0];
     assert_eq!(ext.extent_id, first_extent_id.0);
-    assert_eq!(ext.state, ExtentState::Active);
+    assert_eq!(ext.state, EpochState::Active);
     assert_eq!(ext.start_offset, 0);
     // Active extent end_offset equals start_offset in metadata (only updated on seal).
     assert_eq!(ext.end_offset, 0);
@@ -237,7 +237,7 @@ async fn describe_stream_rf2_integration() {
     let sealed_ext = &all[1];
 
     assert_eq!(new_ext.extent_id, second_extent_id);
-    assert_eq!(new_ext.state, ExtentState::Active);
+    assert_eq!(new_ext.state, EpochState::Active);
     assert_eq!(new_ext.start_offset, 5);
     assert_eq!(
         new_ext.replicas.len(),
@@ -246,7 +246,7 @@ async fn describe_stream_rf2_integration() {
     );
 
     assert_eq!(sealed_ext.extent_id, first_extent_id.0);
-    assert_eq!(sealed_ext.state, ExtentState::Sealed);
+    assert_eq!(sealed_ext.state, EpochState::Sealed);
     assert_eq!(sealed_ext.start_offset, 0);
     assert_eq!(sealed_ext.end_offset, 5);
     assert_eq!(
@@ -281,7 +281,7 @@ async fn describe_stream_rf2_integration() {
         .await
         .unwrap();
     assert_eq!(detail.extent_id, first_extent_id.0);
-    assert_eq!(detail.state, ExtentState::Sealed);
+    assert_eq!(detail.state, EpochState::Sealed);
     assert_eq!(detail.end_offset, 5);
     assert_eq!(detail.replicas.len(), 2);
 
@@ -357,7 +357,7 @@ async fn describe_stream_rf2_integration() {
     // 6a. Seek offset=0 -> sealed extent with 2 replicas.
     let s = stream_manager.seek(stream_id, Offset(0)).await.unwrap();
     assert_eq!(s.extent_id, first_extent_id.0);
-    assert_eq!(s.state, ExtentState::Sealed);
+    assert_eq!(s.state, EpochState::Sealed);
     assert_eq!(s.start_offset, 0);
     assert_eq!(s.end_offset, 5);
     assert_eq!(
@@ -382,14 +382,14 @@ async fn describe_stream_rf2_integration() {
     // 6c. Seek offset=5 -> active extent (at boundary).
     let s = stream_manager.seek(stream_id, Offset(5)).await.unwrap();
     assert_eq!(s.extent_id, second_extent_id);
-    assert_eq!(s.state, ExtentState::Active);
+    assert_eq!(s.state, EpochState::Active);
     assert_eq!(s.start_offset, 5);
     assert_eq!(s.replicas.len(), 2);
 
     // 6d. Seek offset=100 -> active extent (far beyond committed).
     let s = stream_manager.seek(stream_id, Offset(100)).await.unwrap();
     assert_eq!(s.extent_id, second_extent_id);
-    assert_eq!(s.state, ExtentState::Active);
+    assert_eq!(s.state, EpochState::Active);
 
     // 6e. Seek reflects node liveness: the dead node should show is_alive=false.
     let s = stream_manager.seek(stream_id, Offset(0)).await.unwrap();

@@ -10,7 +10,7 @@ use common::errors::{
     UnknownStreamSnafu,
 };
 use common::types::{
-    Epoch, ErrorCode, ExtentId, ExtentInfo, ExtentPolicy, ExtentState, NodeMetrics, Offset, Opcode,
+    Epoch, EpochState, ErrorCode, ExtentId, ExtentInfo, ExtentPolicy, NodeMetrics, Offset, Opcode,
     StorageClass, StreamId,
 };
 use futures_util::{SinkExt, StreamExt};
@@ -725,7 +725,7 @@ impl StreamClient {
     async fn cache_primary_from_extents(&self, stream_id: StreamId, extents: &[ExtentInfo]) {
         let target = extents
             .iter()
-            .find(|e| e.state == ExtentState::Active)
+            .find(|e| e.state == EpochState::Active)
             .or_else(|| extents.first());
         if let Some(ext) = target
             && let Some(primary) = ext.replicas.iter().find(|r| r.role == 0)

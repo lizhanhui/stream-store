@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
 use bytes::Bytes;
 use common::errors::StorageError;
 use common::errors::{ExtentFullSnafu, ExtentSealedSnafu, InternalSnafu};
-use common::types::{Epoch, ExtentId, ExtentState, Offset, StreamId};
+use common::types::{Epoch, EpochState, ExtentId, Offset, StreamId};
 
 /// Sentinel value for `limit`: extent is not sealed.
 const LIMIT_OPEN: u64 = u64::MAX;
@@ -795,11 +795,11 @@ impl StreamEpoch {
     }
 
     /// The extent state (Active or Sealed).
-    pub fn state(&self) -> ExtentState {
+    pub fn state(&self) -> EpochState {
         if self.is_sealed() {
-            ExtentState::Sealed
+            EpochState::Sealed
         } else {
-            ExtentState::Active
+            EpochState::Active
         }
     }
 

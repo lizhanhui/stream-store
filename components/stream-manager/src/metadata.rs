@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use common::errors::{DatabaseSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
-    ArenaClass, Epoch, ExtentId, ExtentInfo, ExtentPolicy, ExtentState, NodeMetrics, NodeState,
+    ArenaClass, Epoch, EpochState, ExtentId, ExtentInfo, ExtentPolicy, NodeMetrics, NodeState,
     ReplicaDetail, StorageClass, StreamId,
 };
 use snafu::ResultExt;
@@ -35,7 +35,7 @@ pub struct ExtentRow {
     pub stream_id: StreamId,
     pub start_offset: u64,
     pub end_offset: u64,
-    pub state: ExtentState,
+    pub state: EpochState,
     pub epoch: Epoch,
 }
 
@@ -245,7 +245,7 @@ impl MetadataStore {
              INNER JOIN stream s ON e.stream_id = s.stream_id \
              WHERE e.state = ?",
         )
-        .bind(ExtentState::Active.as_u8())
+        .bind(EpochState::Active.as_u8())
         .fetch_all(&self.pool)
         .await
         .context(DatabaseSnafu {
@@ -361,7 +361,7 @@ impl MetadataStore {
         .bind(extent_id.0 as i64)
         .bind(start_offset as i64)
         .bind(start_offset as i64) // end_offset = start_offset for new active extent
-        .bind(ExtentState::Active.as_u8())
+        .bind(EpochState::Active.as_u8())
         .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
@@ -400,7 +400,7 @@ impl MetadataStore {
             "UPDATE stream_epochs SET state = ?, end_offset = ?, sealed_at = NOW() \
              WHERE stream_id = ? AND extent_id = ?",
         )
-        .bind(ExtentState::Sealed.as_u8())
+        .bind(EpochState::Sealed.as_u8())
         .bind(end_offset as i64)
         .bind(stream_id.0)
         .bind(extent_id.0 as i64)
@@ -456,9 +456,9 @@ impl MetadataStore {
         })?;
 
         let state_val = row.get::<i8, _>("state") as u8;
-        let state = ExtentState::from_u8(state_val).unwrap_or(ExtentState::Unspecified);
+        let state = EpochState::from_u8(state_val).unwrap_or(EpochState::Unspecified);
 
-        if state == ExtentState::Sealed {
+        if state == EpochState::Sealed {
             // Already sealed — find the successor (next extent with higher extent_id).
             let successor = sqlx::query(
                 "SELECT extent_id, start_offset FROM stream_epochs \
@@ -514,11 +514,11 @@ impl MetadataStore {
             "UPDATE stream_epochs SET state = ?, end_offset = ?, sealed_at = NOW() \
              WHERE stream_id = ? AND extent_id = ? AND state = ?",
         )
-        .bind(ExtentState::Sealed.as_u8())
+        .bind(EpochState::Sealed.as_u8())
         .bind(end_offset as i64)
         .bind(stream_id.0)
         .bind(extent_id.0 as i64)
-        .bind(ExtentState::Active.as_u8())
+        .bind(EpochState::Active.as_u8())
         .execute(&mut *tx)
         .await
         .context(DatabaseSnafu {
@@ -555,7 +555,7 @@ impl MetadataStore {
         .bind(new_extent_id.0 as i64)
         .bind(new_start_offset as i64)
         .bind(new_start_offset as i64) // end_offset = start_offset for new active extent
-        .bind(ExtentState::Active.as_u8())
+        .bind(EpochState::Active.as_u8())
         .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
@@ -593,7 +593,7 @@ impl MetadataStore {
              FROM stream_epochs WHERE stream_id = ? AND state = ? LIMIT 1",
         )
         .bind(stream_id.0)
-        .bind(ExtentState::Active.as_u8())
+        .bind(EpochState::Active.as_u8())
         .fetch_optional(&self.pool)
         .await
         .context(DatabaseSnafu {
@@ -631,7 +631,7 @@ impl MetadataStore {
              WHERE r.node_addr = ? AND e.state = ?",
         )
         .bind(node_addr)
-        .bind(ExtentState::Active.as_u8())
+        .bind(EpochState::Active.as_u8())
         .fetch_all(&self.pool)
         .await
         .context(DatabaseSnafu {
@@ -679,7 +679,7 @@ impl MetadataStore {
             stream_id: StreamId(r.get::<u32, _>("stream_id")),
             start_offset: r.get::<i64, _>("start_offset") as u64,
             end_offset: r.get::<i64, _>("end_offset") as u64,
-            state: ExtentState::from_u8(state_val).unwrap_or(ExtentState::Unspecified),
+            state: EpochState::from_u8(state_val).unwrap_or(EpochState::Unspecified),
             epoch: Epoch(r.get::<i32, _>("epoch") as u32),
         }
     }
@@ -833,8 +833,8 @@ impl MetadataStore {
              ORDER BY extent_id ASC LIMIT 1",
         )
         .bind(stream_id.0)
-        .bind(ExtentState::Sealed.as_u8())
-        .bind(ExtentState::Flushed.as_u8())
+        .bind(EpochState::Sealed.as_u8())
+        .bind(EpochState::Flushed.as_u8())
         .bind(offset as i64)
         .bind(offset as i64)
         .fetch_optional(&self.pool)
@@ -866,7 +866,7 @@ impl MetadataStore {
              ORDER BY extent_id DESC LIMIT 1",
         )
         .bind(stream_id.0)
-        .bind(ExtentState::Active.as_u8())
+        .bind(EpochState::Active.as_u8())
         .bind(offset as i64)
         .fetch_optional(&self.pool)
         .await
@@ -1072,7 +1072,7 @@ impl MetadataStore {
                AND s.replication_factor > 1 \
              ORDER BY e.sealed_at ASC",
         )
-        .bind(ExtentState::Sealed.as_u8())
+        .bind(EpochState::Sealed.as_u8())
         .bind(threshold_secs as i64)
         .fetch_all(&self.pool)
         .await
@@ -1274,7 +1274,7 @@ impl MetadataStore {
         .bind(current_offset as i64)
         .bind(stream_id.0)
         .bind(extent_id.0 as i64)
-        .bind(ExtentState::Active.as_u8())
+        .bind(EpochState::Active.as_u8())
         .bind(current_offset as i64)
         .execute(&mut *tx)
         .await
@@ -1358,7 +1358,7 @@ impl MetadataStore {
         .bind(extent_id.0 as i64)
         .bind(start_offset as i64)
         .bind(end_offset as i64)
-        .bind(ExtentState::Flushed.as_u8())
+        .bind(EpochState::Flushed.as_u8())
         .bind(epoch.0 as i32)
         .execute(&mut *tx)
         .await
@@ -1382,12 +1382,12 @@ impl MetadataStore {
 
         let extent_epoch = Epoch(row.get::<i32, _>("epoch") as u32);
         let state_raw = row.get::<i8, _>("state") as u8;
-        let extent_state = ExtentState::from_u8(state_raw).unwrap_or_else(|| {
+        let extent_state = EpochState::from_u8(state_raw).unwrap_or_else(|| {
             tracing::error!(
                 "record_extent_flushed: unknown extent state {} for stream {} extent {}, treating as Active",
                 state_raw, stream_id, extent_id,
             );
-            ExtentState::Active
+            EpochState::Active
         });
 
         // Per-extent epoch sanity check: the row's stored epoch must match the
@@ -1411,7 +1411,7 @@ impl MetadataStore {
         }
 
         match extent_state {
-            ExtentState::Flushed => {
+            EpochState::Flushed => {
                 // Either we just inserted a terminal row, or a racing caller already
                 // finalized it. Either way: idempotent no-op.
                 tracing::debug!(
@@ -1422,16 +1422,16 @@ impl MetadataStore {
                     epoch.0,
                 );
             }
-            ExtentState::Sealed => {
+            EpochState::Sealed => {
                 // Normal in-order path: Sealed → Flushed.
                 sqlx::query(
                     "UPDATE stream_epochs SET state = ?, flushed_at = NOW(3) \
                      WHERE stream_id = ? AND extent_id = ? AND state = ?",
                 )
-                .bind(ExtentState::Flushed.as_u8())
+                .bind(EpochState::Flushed.as_u8())
                 .bind(stream_id.0)
                 .bind(extent_id.0 as i64)
-                .bind(ExtentState::Sealed.as_u8())
+                .bind(EpochState::Sealed.as_u8())
                 .execute(&mut *tx)
                 .await
                 .context(DatabaseSnafu {
@@ -1445,7 +1445,7 @@ impl MetadataStore {
                     epoch.0,
                 );
             }
-            ExtentState::Active => {
+            EpochState::Active => {
                 // Out-of-order: flushed notification beat the seal notification.
                 // Fold the transition into a single UPDATE: set state to Flushed,
                 // adopt the authoritative end_offset from the flush notification
@@ -1456,11 +1456,11 @@ impl MetadataStore {
                         sealed_at = IFNULL(sealed_at, NOW(3)) \
                      WHERE stream_id = ? AND extent_id = ? AND state = ?",
                 )
-                .bind(ExtentState::Flushed.as_u8())
+                .bind(EpochState::Flushed.as_u8())
                 .bind(end_offset as i64)
                 .bind(stream_id.0)
                 .bind(extent_id.0 as i64)
-                .bind(ExtentState::Active.as_u8())
+                .bind(EpochState::Active.as_u8())
                 .execute(&mut *tx)
                 .await
                 .context(DatabaseSnafu {
@@ -1475,7 +1475,7 @@ impl MetadataStore {
                     end_offset,
                 );
             }
-            ExtentState::Unspecified => {
+            EpochState::Unspecified => {
                 // Should be impossible — the INSERT IGNORE above can only land a
                 // Flushed row, and SM never persists Unspecified. Treat as skip.
                 tracing::warn!(
@@ -1503,7 +1503,7 @@ impl MetadataStore {
         &self,
         stream_id: StreamId,
         epoch: Epoch,
-        extents: &[(ExtentId, u64, u64, ExtentState)], // (extent_id, start_offset, end_offset, state)
+        extents: &[(ExtentId, u64, u64, EpochState)], // (extent_id, start_offset, end_offset, state)
     ) -> Result<(), StorageError> {
         let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
             message: "acquire connection",
@@ -1519,10 +1519,10 @@ impl MetadataStore {
                 max_extent_id = extent_id.0;
             }
 
-            let db_state = if *state == ExtentState::Active {
-                ExtentState::Active
+            let db_state = if *state == EpochState::Active {
+                EpochState::Active
             } else {
-                ExtentState::Sealed
+                EpochState::Sealed
             };
 
             // Insert if not exists; if exists and sealed, update end_offset.

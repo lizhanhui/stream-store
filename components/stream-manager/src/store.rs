@@ -90,7 +90,7 @@ async fn seal_epoch_static(
 /// Same format as ReportExtentsResp: [num:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
 fn parse_seal_predecessor_payload(
     payload: &Bytes,
-) -> Option<Vec<(ExtentId, u64, u64, common::types::ExtentState)>> {
+) -> Option<Vec<(ExtentId, u64, u64, common::types::EpochState)>> {
     let mut buf = &payload[..];
     if buf.len() < 4 {
         return None;
@@ -105,8 +105,8 @@ fn parse_seal_predecessor_payload(
         let start = buf.get_u64();
         let end = buf.get_u64();
         let state_val = buf.get_u8();
-        let state = common::types::ExtentState::from_u8(state_val)
-            .unwrap_or(common::types::ExtentState::Unspecified);
+        let state = common::types::EpochState::from_u8(state_val)
+            .unwrap_or(common::types::EpochState::Unspecified);
         result.push((eid, start, end, state));
     }
     Some(result)
@@ -114,12 +114,12 @@ fn parse_seal_predecessor_payload(
 
 /// Response format: [num_extents:u32] then for each extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
 ///
-/// Returns Vec of (ExtentId, start_offset, end_offset, ExtentState) tuples.
+/// Returns Vec of (ExtentId, start_offset, end_offset, EpochState) tuples.
 async fn report_extents_from_node_static(
     addr: &str,
     stream_id: StreamId,
     epoch: Epoch,
-) -> Result<Vec<(ExtentId, u64, u64, common::types::ExtentState)>, StorageError> {
+) -> Result<Vec<(ExtentId, u64, u64, common::types::EpochState)>, StorageError> {
     use bytes::Buf;
 
     let client = client::StreamClient::connect(addr).await.map_err(|e| {
@@ -181,8 +181,8 @@ async fn report_extents_from_node_static(
         let end_offset = buf.get_u64();
         let state_u8 = buf.get_u8();
 
-        let state = common::types::ExtentState::from_u8(state_u8)
-            .unwrap_or(common::types::ExtentState::Unspecified);
+        let state = common::types::EpochState::from_u8(state_u8)
+            .unwrap_or(common::types::EpochState::Unspecified);
 
         extents.push((extent_id, start_offset, end_offset, state));
     }

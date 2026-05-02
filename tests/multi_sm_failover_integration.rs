@@ -13,7 +13,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{Epoch, ExtentPolicy, ExtentState, Offset, StorageClass};
+use common::types::{Epoch, EpochState, ExtentPolicy, Offset, StorageClass};
 use extent_node::ExtentNode;
 use stream_manager::StreamManager;
 use stream_manager::metadata::MetadataStore;
@@ -265,11 +265,11 @@ async fn multi_sm_leadership_failover() {
     // Verify: at least one sealed extent and one active extent.
     let sealed_count = extents
         .iter()
-        .filter(|e| e.state == ExtentState::Sealed)
+        .filter(|e| e.state == EpochState::Sealed)
         .count();
     let active_count = extents
         .iter()
-        .filter(|e| e.state == ExtentState::Active)
+        .filter(|e| e.state == EpochState::Active)
         .count();
     assert!(
         sealed_count >= 1,
@@ -286,7 +286,7 @@ async fn multi_sm_leadership_failover() {
     // The sealed extent should still be readable from surviving replicas.
     let sealed_extent = extents
         .iter()
-        .find(|e| e.state == ExtentState::Sealed)
+        .find(|e| e.state == EpochState::Sealed)
         .expect("no sealed extent found");
     // Find a live replica for the sealed extent.
     let live_replica = sealed_extent

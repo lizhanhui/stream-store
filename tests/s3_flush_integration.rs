@@ -21,7 +21,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{Epoch, ExtentPolicy, ExtentState, StorageClass, StreamId};
+use common::types::{Epoch, EpochState, ExtentPolicy, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use extent_node::s3::S3Client;
 use extent_node::s3_codec::{S3ExtentHeader, s3_key};
@@ -144,7 +144,7 @@ async fn wait_for_flushed(
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         if let Ok(extents) = sm_client.describe_stream(stream_id, 0).await
-            && extents.iter().any(|e| e.state == ExtentState::Flushed)
+            && extents.iter().any(|e| e.state == EpochState::Flushed)
         {
             return true;
         }
@@ -268,7 +268,7 @@ async fn primary_flushes_sealed_extent_to_s3() {
     let extents = sm_client.describe_stream(stream_id, 0).await.unwrap();
     let flushed_extent = extents
         .iter()
-        .find(|e| e.state == ExtentState::Flushed)
+        .find(|e| e.state == EpochState::Flushed)
         .unwrap();
     let key = s3_key(
         &namespace,
@@ -351,7 +351,7 @@ async fn dr_flush_after_primary_killed() {
     let extents = sm_client2.describe_stream(stream_id, 0).await.unwrap();
     let flushed_extent = extents
         .iter()
-        .find(|e| e.state == ExtentState::Flushed)
+        .find(|e| e.state == EpochState::Flushed)
         .unwrap();
     let key = s3_key(
         &namespace,
@@ -442,7 +442,7 @@ async fn staleness_scan_triggers_dr_flush() {
 
     // Verify S3 object.
     let extents = sm_client2.describe_stream(stream_id, 0).await.unwrap();
-    let flushed_ext = extents.iter().find(|e| e.state == ExtentState::Flushed);
+    let flushed_ext = extents.iter().find(|e| e.state == EpochState::Flushed);
     if let Some(ext) = flushed_ext {
         let key = s3_key(&namespace, stream_id, ext.start_offset, ext.end_offset);
         assert!(

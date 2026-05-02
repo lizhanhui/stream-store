@@ -7,9 +7,7 @@
 
 use bytes::Bytes;
 use common::config::StreamManagerConfig;
-use common::types::{
-    Epoch, ExtentId, ExtentPolicy, ExtentState, NodeMetrics, Offset, StorageClass,
-};
+use common::types::{Epoch, EpochState, ExtentId, ExtentPolicy, NodeMetrics, Offset, StorageClass};
 
 use serial_test::serial;
 
@@ -239,17 +237,17 @@ async fn stream_manager_integration() {
         assert_eq!(all_extents.len(), 3);
         // Ordered by extent_id descending: 3, 2, 1.
         assert_eq!(all_extents[0].extent_id, third_extent_id);
-        assert_eq!(all_extents[0].state, ExtentState::Active);
+        assert_eq!(all_extents[0].state, EpochState::Active);
         assert_eq!(all_extents[0].start_offset, 15);
         assert_eq!(all_extents[0].end_offset, 15);
 
         assert_eq!(all_extents[1].extent_id, new_extent_id);
-        assert_eq!(all_extents[1].state, ExtentState::Sealed);
+        assert_eq!(all_extents[1].state, EpochState::Sealed);
         assert_eq!(all_extents[1].start_offset, 5);
         assert_eq!(all_extents[1].end_offset, 15);
 
         assert_eq!(all_extents[2].extent_id, extent_id.0);
-        assert_eq!(all_extents[2].state, ExtentState::Sealed);
+        assert_eq!(all_extents[2].state, EpochState::Sealed);
         assert_eq!(all_extents[2].start_offset, 0);
         assert_eq!(all_extents[2].end_offset, 5);
 
@@ -272,7 +270,7 @@ async fn stream_manager_integration() {
             .unwrap();
         assert_eq!(latest.len(), 1);
         assert_eq!(latest[0].extent_id, third_extent_id);
-        assert_eq!(latest[0].state, ExtentState::Active);
+        assert_eq!(latest[0].state, EpochState::Active);
 
         // 3d. describe_stream(count=2) — latest 2 extents.
         let top2 = stream_manager_client
@@ -289,7 +287,7 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(ext1.extent_id, extent_id.0);
-        assert_eq!(ext1.state, ExtentState::Sealed);
+        assert_eq!(ext1.state, EpochState::Sealed);
         assert_eq!(ext1.start_offset, 0);
         assert_eq!(ext1.end_offset, 5);
         assert_eq!(ext1.replicas.len(), 1);
@@ -302,7 +300,7 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(ext3.extent_id, (third_extent_id));
-        assert_eq!(ext3.state, ExtentState::Active);
+        assert_eq!(ext3.state, EpochState::Active);
         assert_eq!(ext3.start_offset, 15);
         assert_eq!(ext3.end_offset, 15);
 
@@ -336,7 +334,7 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(s.extent_id, first_eid);
-        assert_eq!(s.state, ExtentState::Sealed);
+        assert_eq!(s.state, EpochState::Sealed);
         assert_eq!(s.start_offset, 0);
         assert_eq!(s.end_offset, 5);
         assert_eq!(s.replicas.len(), 1);
@@ -362,7 +360,7 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(s.extent_id, second_eid);
-        assert_eq!(s.state, ExtentState::Sealed);
+        assert_eq!(s.state, EpochState::Sealed);
         assert_eq!(s.start_offset, 5);
         assert_eq!(s.end_offset, 15);
 
@@ -386,7 +384,7 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(s.extent_id, third_eid);
-        assert_eq!(s.state, ExtentState::Active);
+        assert_eq!(s.state, EpochState::Active);
         assert_eq!(s.start_offset, 15);
 
         // 4h. Seek offset=999 -> active extent (far beyond committed data, still the tail).
@@ -395,7 +393,7 @@ async fn stream_manager_integration() {
             .await
             .unwrap();
         assert_eq!(s.extent_id, third_eid);
-        assert_eq!(s.state, ExtentState::Active);
+        assert_eq!(s.state, EpochState::Active);
     }
 }
 

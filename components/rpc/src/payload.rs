@@ -1,7 +1,7 @@
 //! Wire-format payload encoding/decoding helpers used by ExtentNode, StreamManager, and clients.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::types::{Epoch, ExtentInfo, ExtentState, NodeMetrics, ReplicaDetail};
+use common::types::{Epoch, EpochState, ExtentInfo, NodeMetrics, ReplicaDetail};
 
 /// Build a Connect payload: [node_id_len:u16][node_id][addr_len:u16][addr][interval_ms:u32]
 pub fn build_connect_payload(node_id: &str, addr: &str, interval_ms: u32) -> Bytes {
@@ -252,7 +252,7 @@ pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<ExtentInfo>> {
         pos += 8;
         let end_offset = u64::from_be_bytes(payload[pos..pos + 8].try_into().ok()?);
         pos += 8;
-        let state = ExtentState::from_u8(payload[pos]).unwrap_or(ExtentState::Unspecified);
+        let state = EpochState::from_u8(payload[pos]).unwrap_or(EpochState::Unspecified);
         pos += 1;
         let epoch = Epoch(u32::from_be_bytes(payload[pos..pos + 4].try_into().ok()?));
         pos += 4;
@@ -404,7 +404,7 @@ mod tests {
                 extent_id: 3,
                 start_offset: 200,
                 end_offset: 300,
-                state: ExtentState::Sealed,
+                state: EpochState::Sealed,
                 epoch: Epoch(0),
                 replicas: vec![
                     ReplicaDetail {
@@ -423,7 +423,7 @@ mod tests {
                 extent_id: 4,
                 start_offset: 300,
                 end_offset: 300,
-                state: ExtentState::Active,
+                state: EpochState::Active,
                 epoch: Epoch(0),
                 replicas: vec![ReplicaDetail {
                     node_addr: "127.0.0.1:9803".to_string(),
@@ -444,7 +444,7 @@ mod tests {
             extent_id: 1,
             start_offset: 0,
             end_offset: 50,
-            state: ExtentState::Flushed,
+            state: EpochState::Flushed,
             epoch: Epoch(0),
             replicas: vec![],
         }];

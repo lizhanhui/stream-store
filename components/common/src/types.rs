@@ -238,23 +238,23 @@ pub struct StreamConfig {
     pub arena_class: ArenaClass,
 }
 
-/// State of an extent in metadata.
+/// State of a stream's epoch in metadata.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum ExtentState {
+pub enum EpochState {
     Unspecified = 0,
     Active = 1,
     Sealed = 2,
     Flushed = 3,
 }
 
-impl ExtentState {
-    pub fn from_u8(value: u8) -> Option<ExtentState> {
+impl EpochState {
+    pub fn from_u8(value: u8) -> Option<EpochState> {
         match value {
-            0 => Some(ExtentState::Unspecified),
-            1 => Some(ExtentState::Active),
-            2 => Some(ExtentState::Sealed),
-            3 => Some(ExtentState::Flushed),
+            0 => Some(EpochState::Unspecified),
+            1 => Some(EpochState::Active),
+            2 => Some(EpochState::Sealed),
+            3 => Some(EpochState::Flushed),
             _ => None,
         }
     }
@@ -357,7 +357,7 @@ pub struct ExtentInfo {
     pub extent_id: u32,
     pub start_offset: u64,
     pub end_offset: u64,
-    pub state: ExtentState,
+    pub state: EpochState,
     pub epoch: Epoch,
     pub replicas: Vec<ReplicaDetail>,
 }

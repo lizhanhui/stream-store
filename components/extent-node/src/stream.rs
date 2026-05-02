@@ -6,7 +6,7 @@ use arc_swap::ArcSwap;
 use bytes::Bytes;
 use common::config::{DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_CAPACITY};
 use common::errors::{InternalSnafu, StorageError};
-use common::types::{Epoch, ExtentId, ExtentState, Offset, StorageClass, StreamId};
+use common::types::{Epoch, EpochState, ExtentId, Offset, StorageClass, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::RwLock;
 use rpc::frame::Frame;
@@ -237,7 +237,7 @@ impl Stream {
         if last.id != extent_id {
             return None;
         }
-        if last.state() == ExtentState::Sealed {
+        if last.state() == EpochState::Sealed {
             return None;
         }
         let start_offset = last.start_offset.0;
@@ -471,7 +471,7 @@ impl Stream {
     /// Whether this stream can accept appends (its last extent is active/unsealed).
     pub fn is_mutable(&self) -> bool {
         self.active_epoch()
-            .map(|e| e.state() == ExtentState::Active)
+            .map(|e| e.state() == EpochState::Active)
             .unwrap_or(false)
     }
 
@@ -487,7 +487,7 @@ impl Stream {
             .load()
             .iter()
             .rev()
-            .find(|e| e.epoch == epoch && e.state() == ExtentState::Active)
+            .find(|e| e.epoch == epoch && e.state() == EpochState::Active)
             .map(|e| e.id)
     }
 
@@ -528,7 +528,7 @@ impl Stream {
     /// (extents from prior epochs are already reconciled in MySQL metadata).
     /// Filters by per-extent epoch, so only extents actually created under the
     /// requested epoch are returned.
-    pub fn report_extents(&self, epoch: Epoch) -> Vec<(ExtentId, Offset, u64, ExtentState)> {
+    pub fn report_extents(&self, epoch: Epoch) -> Vec<(ExtentId, Offset, u64, EpochState)> {
         self.epochs
             .load()
             .iter()

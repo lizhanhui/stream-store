@@ -8,7 +8,7 @@
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{DEFAULT_CACHE_EXTENTS, StreamManagerConfig};
-use common::types::{Epoch, ExtentPolicy, ExtentState, NodeMetrics, StorageClass};
+use common::types::{Epoch, EpochState, ExtentPolicy, NodeMetrics, StorageClass};
 use serial_test::serial;
 
 /// Initialize tracing for tests.
@@ -190,7 +190,7 @@ async fn stream_client_open_integration() {
     // Verify describe_stream shows the active extent.
     let extents = sm.describe_stream(stream_id, 0).await.unwrap();
     assert_eq!(extents.len(), 1);
-    assert_eq!(extents[0].state, ExtentState::Active);
+    assert_eq!(extents[0].state, EpochState::Active);
 
     // ── Part 5: describe_stream_by_name returns correct data ──
     let (resolved_id, extents) = sm.describe_stream_by_name("test-stream", 0).await.unwrap();

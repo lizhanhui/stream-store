@@ -21,7 +21,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{Epoch, ExtentPolicy, ExtentState, Offset, StorageClass, StreamId};
+use common::types::{Epoch, EpochState, ExtentPolicy, Offset, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use stream_manager::StreamManager;
 use stream_manager::metadata::MetadataStore;
@@ -236,7 +236,7 @@ async fn client_recovers_after_primary_killed() {
     );
     let active = extents
         .iter()
-        .find(|e| e.state == ExtentState::Active)
+        .find(|e| e.state == EpochState::Active)
         .expect("should have an active extent after recovery");
     let new_primary = active
         .replicas
@@ -292,7 +292,7 @@ async fn client_recovers_after_primary_killed() {
     // before our seal_by_epoch.
     let sealed = extents
         .iter()
-        .find(|e| e.state == ExtentState::Sealed && e.end_offset > e.start_offset)
+        .find(|e| e.state == EpochState::Sealed && e.end_offset > e.start_offset)
         .expect("should have a sealed extent with data");
     let live_replica = sealed
         .replicas
@@ -408,7 +408,7 @@ async fn client_recovers_after_secondary_killed() {
     );
     let active = extents
         .iter()
-        .find(|e| e.state == ExtentState::Active)
+        .find(|e| e.state == EpochState::Active)
         .expect("extent should still be active");
     info!(
         "[test] After secondary outage: extent {} still active, replicas={}",
