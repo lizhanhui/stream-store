@@ -11,7 +11,7 @@ use crate::s3_flusher::FlushRequest;
 impl ExtentNodeStore {
     /// Handle REPORT_EPOCH: SM queries this EN for the stream's current epoch state.
     /// Used during crash recovery so SM can discover epochs it doesn't know about.
-    pub(crate) fn handle_report_extents(&self, frame: Frame) -> Frame {
+    pub(crate) fn handle_report_epoch(&self, frame: Frame) -> Frame {
         let (stream_id, epoch) = match &frame.variable_header {
             VariableHeader::ReportEpoch {
                 stream_id, epoch, ..
@@ -41,14 +41,15 @@ impl ExtentNodeStore {
             }
         };
 
-        let report = stream.report_extents(epoch);
-        // Encode payload: [num_extents:u32] per extent: [extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
-        let mut buf = BytesMut::with_capacity(4 + report.len() * (4 + 8 + 8 + 1));
-        buf.put_u32(report.len() as u32);
-        for (eid, start, end, state) in &report {
-            buf.put_u32(eid.0);
+        let report = stream.report_epoch(epoch);
+        // Encode payload: [num_epochs:u32] per epoch: [legacy_extent_id:u32][start_offset:u64][end_offset:u64][state:u8]
+        let mut buf = BytesMut::with_capacity(4 + report.iter().len() * (4 + 8 + 8 + 1));
+        buf.put_u32(report.iter().len() as u32);
+        if let Some((reported_epoch, start, end, state)) = report {
+            let legacy_extent_id = stream.extent_id_for_epoch(reported_epoch).unwrap_or(ExtentId(0));
+            buf.put_u32(legacy_extent_id.0);
             buf.put_u64(start.0);
-            buf.put_u64(*end);
+            buf.put_u64(end.0);
             buf.put_u8(state.as_u8());
         }
 
@@ -135,16 +136,20 @@ impl ExtentNodeStore {
         // entirely when the autonomous-create path is deleted.
         let extent_id_from = ExtentId(0);
 
-        // Find the LAST MUTABLE extent for (stream_id, epoch).
-        // Only seal extents at the requested epoch — newer epochs are untouched.
-        let active_id = match stream.active_extent_at_epoch(epoch) {
+        // Find the mutable epoch for (stream_id, epoch).
+        // Only seal the requested epoch — newer epochs are untouched.
+        let active_id = match (stream.active_epoch() == Some(epoch))
+            .then(|| stream.extent_id_for_epoch(epoch))
+            .flatten()
+        {
             Some(id) => id,
             None => {
-                // No active extent — all extents already sealed.
-                // Return idempotent response with the actual sealed extent's offsets.
-                let (extent_id, start_offset, end_offset) = stream
-                    .last_sealed_extent_at_epoch(epoch)
-                    .unwrap_or((extent_id_from, req_start_offset, req_start_offset));
+                // No active epoch — it may already be sealed.
+                let (start_offset, end_offset) = stream
+                    .sealed_epoch(epoch)
+                    .map(|(start, end)| (start.0, end.0))
+                    .unwrap_or((req_start_offset, req_start_offset));
+                let extent_id = stream.extent_id_for_epoch(epoch).unwrap_or(extent_id_from);
                 let _ = stream;
                 let payload =
                     self.build_seal_predecessor_payload(stream_id, extent_id_from, extent_id);
@@ -226,9 +231,9 @@ impl ExtentNodeStore {
             }
             None => {
                 // Already sealed — return the sealed extent's end_offset idempotently.
-                let end_offset = stream.sealed_end_offset(active_id);
+                let end_offset = stream.sealed_end_offset(epoch);
                 let start_offset = stream
-                    .with_extent(active_id, |e| e.start_offset.0)
+                    .with_epoch_by_extent_id(active_id, |e| e.start_offset.0)
                     .unwrap_or(req_start_offset);
                 let _ = stream;
                 info!(
@@ -305,7 +310,7 @@ impl ExtentNodeStore {
                 .get(&stream_id)
                 .and_then(|s| {
                     s.find_extent_for_offset(common::types::Offset(start_offset))
-                        .or_else(|| s.active_extent_id())
+                        .or_else(|| s.active_epoch().and_then(|epoch| s.extent_id_for_epoch(epoch)))
                 })
                 // TODO(pre-P3 Phase 4): drop this fallback — every sealed epoch has a concrete
                 // StreamEpoch; the unwrap_or becomes unreachable once ExtentId is removed.
@@ -338,7 +343,7 @@ impl ExtentNodeStore {
             .pin()
             .get(&stream_id)
             .and_then(|s| {
-                s.with_extent(extent_id, |ext| {
+                s.with_epoch_by_extent_id(extent_id, |ext| {
                     if ext.is_flushed() {
                         return false;
                     }
@@ -470,7 +475,7 @@ impl ExtentNodeStore {
                 .get(&stream_id)
                 .and_then(|s| {
                     s.find_extent_for_offset(common::types::Offset(_start_offset))
-                        .or_else(|| s.active_extent_id())
+                        .or_else(|| s.active_epoch().and_then(|epoch| s.extent_id_for_epoch(epoch)))
                 })
                 // TODO(pre-P3 Phase 4): drop this fallback — every sealed epoch has a concrete
                 // StreamEpoch; the unwrap_or becomes unreachable once ExtentId is removed.
@@ -491,7 +496,7 @@ impl ExtentNodeStore {
             }
         };
 
-        stream.with_extent(extent_id, |ext| {
+        stream.with_epoch_by_extent_id(extent_id, |ext| {
             if !ext.is_sealed() {
                 // Not yet sealed — seal with SM's authoritative offset.
                 ext.seal(Some(end_offset));

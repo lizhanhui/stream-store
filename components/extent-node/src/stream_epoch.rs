@@ -97,7 +97,7 @@ pub struct StreamEpoch {
     pub start_offset: Offset,
 
     /// The epoch under which this extent was created (informational).
-    /// Used by `report_extents` to filter extents by epoch during SM recovery.
+    /// Used by `report_epoch` to filter extents by epoch during SM recovery.
     pub epoch: Epoch,
 
     /// Globally unique arena identifier. Stamped at allocation.

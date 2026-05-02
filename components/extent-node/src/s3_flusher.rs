@@ -71,7 +71,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
                 return;
             }
         };
-        match stream.with_extent(req.extent_id, |ext| {
+        match stream.with_epoch_by_extent_id(req.extent_id, |ext| {
             encode_extent_range(req.stream_id, ext, s3_client.compression(), req.end_offset)
         }) {
             Some(result) => result,
@@ -168,7 +168,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
             .streams
             .pin()
             .get(&req.stream_id)
-            .and_then(|s| s.with_extent(req.extent_id, |ext| ext.epoch))
+            .and_then(|s| s.with_epoch_by_extent_id(req.extent_id, |ext| ext.epoch))
             .unwrap_or(common::types::Epoch(0));
 
         if let Some(ref tx) = store.update_tx {
@@ -190,7 +190,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
             None,
         );
         if let Some(stream) = store.streams.pin().get(&req.stream_id) {
-            stream.with_extent(req.extent_id, |ext| ext.mark_flushed());
+            stream.with_epoch_by_extent_id(req.extent_id, |ext| ext.mark_flushed());
             stream.send_forward(flushed_frame);
         }
     } else {

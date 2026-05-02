@@ -50,7 +50,7 @@ pub struct ExtentNodeStore {
     pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
     /// Default arena pool for newly created streams (Dedicated: one arena per epoch).
     pub(crate) default_pool: Arc<dyn ArenaPool>,
-    /// ArenaId generator shared between the pool and register_extent paths.
+    /// ArenaId generator shared between the pool and register_epoch paths.
     pub(crate) arena_ids: Arc<ArenaIdGenerator>,
     /// Replication info per stream_id (registered via RegisterEpoch).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
@@ -134,7 +134,7 @@ impl ExtentNodeStore {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id) {
             if policy.cache > 0 {
-                stream.set_max_extents(policy.cache as usize);
+                stream.set_max_epochs(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
             false
@@ -145,7 +145,7 @@ impl ExtentNodeStore {
                 Arc::clone(&self.arena_ids),
             );
             if policy.cache > 0 {
-                stream.set_max_extents(policy.cache as usize);
+                stream.set_max_epochs(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
             guard.insert(stream_id, stream);
@@ -241,7 +241,7 @@ impl ExtentNodeStore {
             .iter()
             .filter_map(|(k, stream)| {
                 if stream.is_mutable() {
-                    let extent_id = stream.active_extent_id()?;
+                    let extent_id = stream.extent_id_for_epoch(stream.active_epoch()?)?;
                     let offset = stream.max_offset().0;
                     Some((*k, extent_id, offset, stream.epoch()))
                 } else {
@@ -303,7 +303,7 @@ impl RequestHandler for ExtentNodeStore {
                 },
                 None,
             )),
-            Opcode::ReportEpoch => Some(self.handle_report_extents(frame)),
+            Opcode::ReportEpoch => Some(self.handle_report_epoch(frame)),
             Opcode::FlushEpoch => Some(self.handle_flush_extent(frame)),
             Opcode::UpdateEpoch
             | Opcode::Watermark

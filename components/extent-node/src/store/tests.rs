@@ -1347,7 +1347,7 @@ async fn flush_extent_seals_active_extent() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let sealed = stream
-            .with_extent(ExtentId(1), |ext| ext.is_sealed())
+            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.is_sealed())
             .unwrap();
         assert!(sealed, "extent should be sealed after FlushExtent");
     }
@@ -1410,7 +1410,7 @@ async fn flush_extent_corrects_sealed_extent() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let sealed = stream
-            .with_extent(ExtentId(1), |ext| ext.is_sealed())
+            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.is_sealed())
             .unwrap();
         assert!(sealed, "extent should still be sealed after FlushExtent");
     }
@@ -1452,7 +1452,7 @@ async fn flush_extent_skips_flushed() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        stream.with_extent(ExtentId(1), |ext| ext.mark_flushed());
+        stream.with_epoch_by_extent_id(ExtentId(1), |ext| ext.mark_flushed());
     }
 
     let result = store
@@ -1671,12 +1671,12 @@ async fn seal_commit_corrects_higher_offset() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let sealed = stream
-            .with_extent(ExtentId(1), |ext| ext.is_sealed())
+            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.is_sealed())
             .unwrap();
         assert!(sealed, "extent should still be sealed after SealCommit");
         // committed_offset is unchanged (5 records were written).
         let count = stream
-            .with_extent(ExtentId(1), |ext| ext.message_count())
+            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.message_count())
             .unwrap();
         assert_eq!(
             count, 5,
@@ -1716,11 +1716,11 @@ async fn seal_commit_seals_active_extent() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let sealed = stream
-            .with_extent(ExtentId(1), |ext| ext.is_sealed())
+            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.is_sealed())
             .unwrap();
         assert!(sealed, "extent should be sealed after SealEpochCommit");
         let count = stream
-            .with_extent(ExtentId(1), |ext| ext.message_count())
+            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.message_count())
             .unwrap();
         assert_eq!(count, 3);
     }
@@ -1761,7 +1761,7 @@ async fn seal_commit_noop_lower_offset() {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
         let count = stream
-            .with_extent(ExtentId(1), |ext| ext.message_count())
+            .with_epoch_by_extent_id(ExtentId(1), |ext| ext.message_count())
             .unwrap();
         assert_eq!(
             count, 3,

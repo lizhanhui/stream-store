@@ -208,7 +208,7 @@ impl ExtentNodeStore {
 
         let offset = append_result.offset;
         let _extent_start_offset = stream
-            .with_extent(extent_id, |e| e.start_offset.0)
+            .with_epoch_by_extent_id(extent_id, |e| e.start_offset.0)
             .unwrap_or(0);
 
         // Update metrics counters.
@@ -459,7 +459,7 @@ impl ExtentNodeStore {
     ) -> Option<SealNotification> {
         if let Some(stream) = self.streams.pin().get(&stream_id) {
             let t0 = std::time::Instant::now();
-            let sealed_extent_id = stream.active_extent_id()?;
+            let sealed_extent_id = stream.extent_id_for_epoch(stream.active_epoch()?)?;
             let notification = stream.seal_current_epoch().map(|(sealed_epoch, end_offset)| {
                 SealNotification {
                     sealed_extent_id,
@@ -516,7 +516,7 @@ impl ExtentNodeStore {
             .streams
             .pin()
             .get(&stream_id)
-            .and_then(|s| s.with_extent(notification.sealed_extent_id, |e| e.start_offset.0))
+            .and_then(|s| s.with_epoch_by_extent_id(notification.sealed_extent_id, |e| e.start_offset.0))
             .unwrap_or(0);
 
         // Deduplicate: mark flush-in-progress before enqueuing.
@@ -555,7 +555,7 @@ impl ExtentNodeStore {
             Some(s) => s,
             None => return,
         };
-        let (checksum, committed_bytes) = match stream.with_extent(sealed_extent_id, |ext| {
+        let (checksum, committed_bytes) = match stream.with_epoch_by_extent_id(sealed_extent_id, |ext| {
             (
                 ext.finalized_crc32().unwrap_or(0),
                 ext.committed_data().len() as u64,
@@ -738,7 +738,7 @@ impl ExtentNodeStore {
             // Process successful entries: metrics, replica info, forwards, ACKs.
             if !entries.is_empty() {
                 let _extent_start_offset = stream
-                    .with_extent(entries[0].extent_id, |e| e.start_offset.0)
+                    .with_epoch_by_extent_id(entries[0].extent_id, |e| e.start_offset.0)
                     .unwrap_or(0);
 
                 let total_bytes: u64 = entries.iter().map(|e| e.payload_len as u64).sum();

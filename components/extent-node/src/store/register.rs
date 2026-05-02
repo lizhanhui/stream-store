@@ -67,8 +67,8 @@ impl ExtentNodeStore {
         // Register the extent (idempotent — skips if already exists).
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
-            if stream.with_extent(extent_id, |_| ()).is_none() {
-                stream.register_extent(
+            if stream.with_epoch_by_extent_id(extent_id, |_| ()).is_none() {
+                stream.register_epoch(
                     extent_id,
                     stream.max_offset(),
                     epoch,

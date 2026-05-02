@@ -27,7 +27,7 @@ impl ExtentNodeStore {
         let target_offset = frame.offset();
         let extent_id = stream
             .find_extent_for_offset(target_offset)
-            .or_else(|| stream.active_extent_id())
+            .or_else(|| stream.active_epoch().and_then(|epoch| stream.extent_id_for_epoch(epoch)))
             .unwrap_or(ExtentId(0));
 
         match stream.read(extent_id, target_offset, count) {

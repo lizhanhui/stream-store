@@ -32,7 +32,7 @@ impl ExtentNodeStore {
             _ => return None,
         };
 
-        stream.with_extent(extent_id, |ext| {
+        stream.with_epoch_by_extent_id(extent_id, |ext| {
             if !ext.take_init_forward() {
                 return None;
             }
@@ -44,7 +44,7 @@ impl ExtentNodeStore {
                     epoch,
                     start_offset: ext.start_offset,
                     extent_capacity: ext.capacity(),
-                    cache_extents: stream.max_extents() as u16,
+                    cache_extents: stream.max_epochs() as u16,
                     storage_class: stream.storage_class(),
                     arena_class: ArenaClass::Dedicated,
                 },
@@ -104,7 +104,7 @@ impl ExtentNodeStore {
                 cache: cache_extents,
             },
         );
-        self.try_register_extent(stream_id, extent_id, start_offset, epoch, extent_capacity);
+        self.try_register_epoch(stream_id, extent_id, start_offset, epoch, extent_capacity);
 
         if is_new {
             info!(
@@ -120,7 +120,7 @@ impl ExtentNodeStore {
     }
 
     /// Register an extent on a stream if it doesn't already exist.
-    fn try_register_extent(
+    fn try_register_epoch(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
@@ -130,9 +130,9 @@ impl ExtentNodeStore {
     ) {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id)
-            && stream.with_extent(extent_id, |_| ()).is_none()
+            && stream.with_epoch_by_extent_id(extent_id, |_| ()).is_none()
         {
-            stream.register_extent(extent_id, start_offset, epoch, extent_capacity);
+            stream.register_epoch(extent_id, start_offset, epoch, extent_capacity);
         }
     }
 
@@ -214,7 +214,7 @@ impl ExtentNodeStore {
 
         // Check if deferred CRC32 verification can now complete.
         // Also read the contiguous watermark for the response.
-        let watermark = stream.with_extent(extent_id, |extent| {
+        let watermark = stream.with_epoch_by_extent_id(extent_id, |extent| {
             match extent.try_verify_checksum() {
                 Some(true) => {
                     info!(
@@ -270,7 +270,7 @@ impl ExtentNodeStore {
             }
         };
 
-        let found = stream.with_extent(extent_id, |extent| {
+        let found = stream.with_epoch_by_extent_id(extent_id, |extent| {
             extent.store_primary_checksum(primary_crc32);
             extent.try_advance_committed();
             match extent.try_verify_checksum() {
@@ -326,7 +326,7 @@ impl ExtentNodeStore {
             }
         };
 
-        let found = stream.with_extent(extent_id, |ext| {
+        let found = stream.with_epoch_by_extent_id(extent_id, |ext| {
             ext.mark_flushed();
         });
 
