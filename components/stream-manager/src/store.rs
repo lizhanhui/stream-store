@@ -6,10 +6,10 @@ use crate::allocator::Allocator;
 use crate::metadata::{MetadataStore, SealResult};
 use bytes::Bytes;
 use common::bridge::synth_extent_id;
-use common::config::DEFAULT_CACHE_EXTENTS;
+use common::config::DEFAULT_CACHE_EPOCHS;
 use common::errors::{InternalSnafu, StorageError};
 use common::types::{
-    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, ExtentId, Offset, Opcode, StorageClass,
     StreamConfig, StreamId,
 };
 use futures_util::future;
@@ -720,9 +720,9 @@ impl StreamManagerStore {
         }
 
         // Use defaults if client sends 0 values.
-        let policy = ExtentPolicy {
+        let policy = EpochPolicy {
             cache: if policy.cache == 0 {
-                DEFAULT_CACHE_EXTENTS
+                DEFAULT_CACHE_EPOCHS
             } else {
                 policy.cache
             },
@@ -1186,7 +1186,7 @@ impl StreamManagerStore {
                     epoch,
                     storage_class,
                     arena_class,
-                    policy: ExtentPolicy {
+                    policy: EpochPolicy {
                         cache: cache_extents,
                     },
                 };

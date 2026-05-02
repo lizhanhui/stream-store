@@ -21,7 +21,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{Epoch, EpochState, ExtentPolicy, StorageClass, StreamId};
+use common::types::{Epoch, EpochPolicy, EpochState, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use extent_node::s3::S3Client;
 use extent_node::s3_codec::{S3ExtentHeader, s3_key};
@@ -240,12 +240,7 @@ async fn primary_flushes_sealed_extent_to_s3() {
     // Create stream RF=2, StorageClass::S3.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
     let (stream_id, _eid, _epoch, primary_addr) = sm_client
-        .create_stream(
-            "test-s3-flush",
-            2,
-            StorageClass::S3,
-            ExtentPolicy::default(),
-        )
+        .create_stream("test-s3-flush", 2, StorageClass::S3, EpochPolicy::default())
         .await
         .expect("create_stream");
     info!("[test] Stream {stream_id} created, primary={primary_addr}");
@@ -313,12 +308,7 @@ async fn dr_flush_after_primary_killed() {
     // Create stream RF=3.
     let sm_client = StreamClient::connect(&sm_addr).await.unwrap();
     let (stream_id, _eid, _epoch, primary_addr) = sm_client
-        .create_stream(
-            "test-dr-flush",
-            3,
-            StorageClass::S3,
-            ExtentPolicy::default(),
-        )
+        .create_stream("test-dr-flush", 3, StorageClass::S3, EpochPolicy::default())
         .await
         .expect("create_stream");
     info!("[test] Stream {stream_id}, RF=3, primary={primary_addr}");
@@ -397,7 +387,7 @@ async fn staleness_scan_triggers_dr_flush() {
             "test-staleness-flush",
             2,
             StorageClass::S3,
-            ExtentPolicy { cache: 0 },
+            EpochPolicy { cache: 0 },
         )
         .await
         .expect("create_stream");

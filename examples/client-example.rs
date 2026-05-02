@@ -24,7 +24,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{Epoch, ExtentId, ExtentPolicy, Offset, StorageClass};
+use common::types::{Epoch, EpochPolicy, ExtentId, Offset, StorageClass};
 use sqlx::mysql::MySqlPoolOptions;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -107,7 +107,7 @@ async fn main() {
             "example-stream",
             2,
             StorageClass::S3,
-            ExtentPolicy { cache: 4 },
+            EpochPolicy { cache: 4 },
         )
         .await
         .expect("failed to create stream");

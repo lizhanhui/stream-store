@@ -7,8 +7,8 @@
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::{DEFAULT_CACHE_EXTENTS, StreamManagerConfig};
-use common::types::{Epoch, EpochState, ExtentPolicy, NodeMetrics, StorageClass};
+use common::config::{DEFAULT_CACHE_EPOCHS, StreamManagerConfig};
+use common::types::{Epoch, EpochPolicy, EpochState, NodeMetrics, StorageClass};
 use serial_test::serial;
 
 /// Initialize tracing for tests.
@@ -114,8 +114,8 @@ async fn stream_client_open_integration() {
             "test-stream",
             1,
             StorageClass::S3,
-            ExtentPolicy {
-                cache: DEFAULT_CACHE_EXTENTS,
+            EpochPolicy {
+                cache: DEFAULT_CACHE_EPOCHS,
             },
         )
         .await
@@ -140,8 +140,8 @@ async fn stream_client_open_integration() {
             "test-stream",
             1,
             StorageClass::S3,
-            ExtentPolicy {
-                cache: DEFAULT_CACHE_EXTENTS,
+            EpochPolicy {
+                cache: DEFAULT_CACHE_EPOCHS,
             },
         )
         .await
@@ -161,8 +161,8 @@ async fn stream_client_open_integration() {
             "another-stream",
             1,
             StorageClass::S3,
-            ExtentPolicy {
-                cache: DEFAULT_CACHE_EXTENTS,
+            EpochPolicy {
+                cache: DEFAULT_CACHE_EPOCHS,
             },
         )
         .await

@@ -35,7 +35,7 @@ use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
 use common::errors::{InternalSnafu, StorageError};
-use common::types::{Epoch, ExtentPolicy, StorageClass, StreamId};
+use common::types::{Epoch, EpochPolicy, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
@@ -197,7 +197,7 @@ async fn main() {
             "bench-pipeline",
             REPLICATION_FACTOR,
             StorageClass::Memory,
-            ExtentPolicy {
+            EpochPolicy {
                 cache: CACHE_EXTENTS,
             },
         )

@@ -2,7 +2,7 @@ use super::*;
 use bytes::{BufMut, BytesMut};
 use common::errors::StorageError;
 use common::types::{
-    ArenaClass, Epoch, ErrorCode, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE,
     FLAG_SEAL_COMMIT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass,
     StreamConfig, StreamId,
 };
@@ -458,7 +458,7 @@ fn create_stream_round_trip() {
             stream_name: Bytes::from_static(b"my-stream"),
             replication_factor: 3,
             storage_class: StorageClass::S3,
-            policy: ExtentPolicy { cache: 4 },
+            policy: EpochPolicy { cache: 4 },
         },
         None,
     );
@@ -670,7 +670,7 @@ fn register_epoch_arena_class_round_trip() {
         epoch: Epoch(2),
         storage_class: StorageClass::S3,
         arena_class: ArenaClass::Shared,
-        policy: ExtentPolicy { cache: 4 },
+        policy: EpochPolicy { cache: 4 },
     };
     let frame = Frame::new(
         VariableHeader::RegisterEpoch {
@@ -758,7 +758,7 @@ fn register_epoch_unknown_arena_class_errors() {
         epoch: Epoch(0),
         storage_class: StorageClass::S3,
         arena_class: ArenaClass::Dedicated,
-        policy: ExtentPolicy { cache: 0 },
+        policy: EpochPolicy { cache: 0 },
     };
     let frame = Frame::new(
         VariableHeader::RegisterEpoch {

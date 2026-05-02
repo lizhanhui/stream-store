@@ -7,7 +7,7 @@
 
 use bytes::Bytes;
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, EpochState, ExtentId, ExtentPolicy, NodeMetrics, Offset, StorageClass};
+use common::types::{Epoch, EpochPolicy, EpochState, ExtentId, NodeMetrics, Offset, StorageClass};
 
 use serial_test::serial;
 
@@ -150,7 +150,7 @@ async fn stream_manager_integration() {
         );
 
         let (stream_id, extent_id, _epoch, returned_addr) = stream_manager_client
-            .create_stream(&stream_name, 1, StorageClass::S3, ExtentPolicy { cache: 4 })
+            .create_stream(&stream_name, 1, StorageClass::S3, EpochPolicy { cache: 4 })
             .await
             .unwrap();
 
@@ -421,7 +421,7 @@ async fn test_create_stream_rejects_rf_zero() {
             ),
             0, // <-- must be rejected
             StorageClass::S3,
-            ExtentPolicy::default(),
+            EpochPolicy::default(),
         )
         .await
         .expect_err("CreateStream with replication_factor=0 must fail");

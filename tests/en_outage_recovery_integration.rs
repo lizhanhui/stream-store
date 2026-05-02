@@ -21,7 +21,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{Epoch, EpochState, ExtentPolicy, Offset, StorageClass, StreamId};
+use common::types::{Epoch, EpochPolicy, EpochState, Offset, StorageClass, StreamId};
 use extent_node::ExtentNode;
 use stream_manager::StreamManager;
 use stream_manager::metadata::MetadataStore;
@@ -173,7 +173,7 @@ async fn client_recovers_after_primary_killed() {
             "test-primary-outage",
             3,
             StorageClass::S3,
-            ExtentPolicy::default(),
+            EpochPolicy::default(),
         )
         .await
         .expect("create_stream");
@@ -346,7 +346,7 @@ async fn client_recovers_after_secondary_killed() {
             "test-secondary-outage",
             3,
             StorageClass::S3,
-            ExtentPolicy::default(),
+            EpochPolicy::default(),
         )
         .await
         .expect("create_stream");

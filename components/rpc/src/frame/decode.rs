@@ -1,7 +1,7 @@
 use bytes::{Buf, Bytes, BytesMut};
 use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpcodeSnafu};
 use common::types::{
-    ArenaClass, Epoch, ErrorCode, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EXTENT_FLUSHED,
     FLAG_EXTENT_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
     FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
     FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass,
@@ -355,7 +355,7 @@ impl Frame {
                             stream_name,
                             replication_factor,
                             storage_class,
-                            policy: ExtentPolicy { cache },
+                            policy: EpochPolicy { cache },
                         },
                         None,
                     ))
@@ -530,7 +530,7 @@ impl Frame {
                                 epoch,
                                 storage_class,
                                 arena_class,
-                                policy: ExtentPolicy { cache },
+                                policy: EpochPolicy { cache },
                             },
                         },
                         payload,

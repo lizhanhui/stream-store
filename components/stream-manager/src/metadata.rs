@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use common::errors::{DatabaseSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
-    ArenaClass, Epoch, EpochState, ExtentId, ExtentPolicy, NodeMetrics, NodeState, ReplicaDetail,
+    ArenaClass, Epoch, EpochPolicy, EpochState, ExtentId, NodeMetrics, NodeState, ReplicaDetail,
     StorageClass, StreamEpochInfo, StreamId,
 };
 use snafu::ResultExt;
@@ -164,7 +164,7 @@ impl MetadataStore {
         name: &str,
         replication_factor: u8,
         storage_class: StorageClass,
-        policy: ExtentPolicy,
+        policy: EpochPolicy,
     ) -> Result<StreamId, StorageError> {
         let result = sqlx::query(
             "INSERT INTO stream (stream_name, replication_factor, cache_extents, storage_class) VALUES (?, ?, ?, ?)",

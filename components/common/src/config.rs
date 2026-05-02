@@ -14,11 +14,11 @@ pub const DEFAULT_SM_REQUEST_TIMEOUT_MS: u64 = 2000;
 /// Default timeout for replication quorum ACK (Primary waiting for Secondary watermarks).
 pub const DEFAULT_REPLICATION_TIMEOUT_MS: u64 = 500;
 
-/// Fixed capacity for all active extents, in bytes. 256 MiB.
-pub const DEFAULT_EXTENT_CAPACITY: u32 = 256 * 1024 * 1024;
+/// Fixed capacity for all active epochs, in bytes. 256 MiB.
+pub const DEFAULT_EPOCH_CAPACITY: u32 = 256 * 1024 * 1024;
 
-/// Default cache_extents: max extents to retain in memory per stream.
-pub const DEFAULT_CACHE_EXTENTS: u16 = 4;
+/// Default cache size: max epochs to retain in memory per stream.
+pub const DEFAULT_CACHE_EPOCHS: u16 = 4;
 
 /// Maximum supported replication factor (RF is normally 1-3).
 pub const MAX_REPLICATION_FACTOR: usize = 5;
@@ -129,7 +129,7 @@ impl Default for ExtentNodeConfig {
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
             worker_cores: Vec::new(),
-            extent_capacity: DEFAULT_EXTENT_CAPACITY,
+            extent_capacity: DEFAULT_EPOCH_CAPACITY,
             s3_profile: "dev".to_string(),
             s3_bucket: String::new(),
             s3_path_style: false,

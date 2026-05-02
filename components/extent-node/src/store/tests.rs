@@ -3,9 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use common::config::DEFAULT_CACHE_EXTENTS;
+use common::config::DEFAULT_CACHE_EPOCHS;
 use common::types::{
-    ArenaClass, Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, ExtentId, Offset, Opcode, StorageClass,
     StreamConfig, StreamId,
 };
 use rpc::frame::{Frame, VariableHeader};
@@ -26,8 +26,8 @@ fn test_config(stream_id: u32, replication_factor: u8) -> StreamConfig {
         epoch: Epoch(0),
         storage_class: StorageClass::S3,
         arena_class: ArenaClass::Dedicated,
-        policy: ExtentPolicy {
-            cache: DEFAULT_CACHE_EXTENTS,
+        policy: EpochPolicy {
+            cache: DEFAULT_CACHE_EPOCHS,
         },
     }
 }

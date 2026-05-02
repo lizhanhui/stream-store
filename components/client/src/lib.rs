@@ -10,8 +10,8 @@ use common::errors::{
     UnknownStreamSnafu,
 };
 use common::types::{
-    Epoch, EpochState, ErrorCode, ExtentId, ExtentPolicy, NodeMetrics, Offset, Opcode,
-    StorageClass, StreamEpochInfo, StreamId,
+    Epoch, EpochPolicy, EpochState, ErrorCode, ExtentId, NodeMetrics, Offset, Opcode, StorageClass,
+    StreamEpochInfo, StreamId,
 };
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
@@ -277,7 +277,7 @@ impl StreamClient {
         name: &str,
         replication_factor: u8,
         storage_class: StorageClass,
-        policy: ExtentPolicy,
+        policy: EpochPolicy,
     ) -> Result<(StreamId, ExtentId, Epoch, String), StorageError> {
         let req = Frame::new(
             VariableHeader::CreateStream {
@@ -686,7 +686,7 @@ impl StreamClient {
         stream_name: &str,
         replication_factor: u8,
         storage_class: StorageClass,
-        policy: ExtentPolicy,
+        policy: EpochPolicy,
     ) -> Result<StreamId, StorageError> {
         match self.describe_stream_by_name(stream_name, 1).await {
             Ok((stream_id, extents)) => {

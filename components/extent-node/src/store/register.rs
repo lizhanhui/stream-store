@@ -1,8 +1,8 @@
 use std::sync::Arc;
 
 use common::bridge::synth_extent_id;
-use common::config::DEFAULT_EXTENT_CAPACITY;
-use common::types::{ErrorCode, ExtentPolicy};
+use common::config::DEFAULT_EPOCH_CAPACITY;
+use common::types::{EpochPolicy, ErrorCode};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
 use tracing::info;
@@ -42,7 +42,7 @@ impl ExtentNodeStore {
         );
 
         // Normalize capacity bounds: 0 means use default.
-        let policy = ExtentPolicy {
+        let policy = EpochPolicy {
             cache: config.policy.cache,
         };
 
@@ -72,7 +72,7 @@ impl ExtentNodeStore {
                     extent_id,
                     stream.max_offset(),
                     epoch,
-                    DEFAULT_EXTENT_CAPACITY,
+                    DEFAULT_EPOCH_CAPACITY,
                 );
             } else {
                 // Extent already exists (lazy creation from Forward), but update epoch

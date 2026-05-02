@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use common::bridge::synth_extent_id;
 use common::errors::StorageError;
-use common::types::{ArenaClass, Epoch, ExtentId, ExtentPolicy, Offset, StreamId};
+use common::types::{ArenaClass, Epoch, EpochPolicy, ExtentId, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
@@ -100,7 +100,7 @@ impl ExtentNodeStore {
         let is_new = self.try_create_stream(
             stream_id,
             storage_class,
-            &ExtentPolicy {
+            &EpochPolicy {
                 cache: cache_extents,
             },
         );

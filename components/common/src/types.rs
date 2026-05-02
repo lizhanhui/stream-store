@@ -216,13 +216,13 @@ impl StorageClass {
     }
 }
 
-/// Capacity-scaling policy for extents within a stream. Describes only
+/// Capacity-scaling policy for epochs within a stream. Describes only
 /// sizing/caching — no durability or identity semantics.
 ///
 /// A zero on any field means "use the server default".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct ExtentPolicy {
-    /// Maximum extents to retain in memory for the stream (0 = default).
+pub struct EpochPolicy {
+    /// Maximum epochs to retain in memory for the stream (0 = default).
     pub cache: u16,
 }
 
@@ -234,7 +234,7 @@ pub struct StreamConfig {
     pub replication_factor: u8,
     pub epoch: Epoch,
     pub storage_class: StorageClass,
-    pub policy: ExtentPolicy,
+    pub policy: EpochPolicy,
     pub arena_class: ArenaClass,
 }
 

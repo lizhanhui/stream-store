@@ -9,7 +9,7 @@
 //! tables (matches the pattern in `phase2_integration.rs`).
 
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, EpochState, ExtentId, ExtentPolicy, StorageClass, StreamId};
+use common::types::{Epoch, EpochPolicy, EpochState, ExtentId, StorageClass, StreamId};
 use serial_test::serial;
 use stream_manager::metadata::MetadataStore;
 
@@ -76,7 +76,7 @@ async fn setup_stream_with_active_extent(
     name: &str,
 ) -> (StreamId, ExtentId, Epoch) {
     let stream_id = store
-        .create_stream(name, 1, StorageClass::S3, ExtentPolicy::default())
+        .create_stream(name, 1, StorageClass::S3, EpochPolicy::default())
         .await
         .expect("create_stream");
 

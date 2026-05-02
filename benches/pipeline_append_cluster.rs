@@ -38,9 +38,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use client::StreamClient;
-use common::config::DEFAULT_CACHE_EXTENTS;
+use common::config::DEFAULT_CACHE_EPOCHS;
 use common::errors::{InternalSnafu, StorageError};
-use common::types::{Epoch, ExtentPolicy, StorageClass, StreamId};
+use common::types::{Epoch, EpochPolicy, StorageClass, StreamId};
 use futures_util::StreamExt;
 use futures_util::stream::FuturesUnordered;
 use hdrhistogram::Histogram;
@@ -181,8 +181,8 @@ async fn main() {
             "bench-pipeline-cluster",
             REPLICATION_FACTOR,
             StorageClass::S3,
-            ExtentPolicy {
-                cache: DEFAULT_CACHE_EXTENTS,
+            EpochPolicy {
+                cache: DEFAULT_CACHE_EPOCHS,
             },
         )
         .await

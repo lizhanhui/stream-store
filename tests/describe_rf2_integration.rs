@@ -13,7 +13,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, EpochState, ExtentPolicy, NodeMetrics, Offset, StorageClass};
+use common::types::{Epoch, EpochPolicy, EpochState, NodeMetrics, Offset, StorageClass};
 
 use extent_node::downstream::DownstreamPool;
 use extent_node::store::ExtentNodeStore;
@@ -151,7 +151,7 @@ async fn describe_stream_rf2_integration() {
     );
 
     let (stream_id, first_extent_id, _epoch, primary_addr) = stream_manager
-        .create_stream(&stream_name, 2, StorageClass::S3, ExtentPolicy { cache: 4 })
+        .create_stream(&stream_name, 2, StorageClass::S3, EpochPolicy { cache: 4 })
         .await
         .unwrap();
 

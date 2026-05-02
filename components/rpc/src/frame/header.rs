@@ -1,7 +1,6 @@
 use bytes::Bytes;
 use common::types::{
-    ArenaClass, Epoch, ErrorCode, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig,
-    StreamId,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, Offset, Opcode, StorageClass, StreamConfig, StreamId,
 };
 
 /// Fixed header fields present in every frame on the wire.
@@ -116,7 +115,7 @@ pub enum VariableHeader {
         /// Storage class for sealed extents: S3 (0) or Memory (1).
         storage_class: StorageClass,
         /// Extent sizing/caching policy.
-        policy: ExtentPolicy,
+        policy: EpochPolicy,
     },
     CreateStreamResp {
         request_id: u32,

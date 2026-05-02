@@ -13,7 +13,7 @@ use serial_test::serial;
 use bytes::Bytes;
 use client::StreamClient;
 use common::config::{ExtentNodeConfig, StreamManagerConfig};
-use common::types::{Epoch, EpochState, ExtentPolicy, Offset, StorageClass};
+use common::types::{Epoch, EpochPolicy, EpochState, Offset, StorageClass};
 use extent_node::ExtentNode;
 use stream_manager::StreamManager;
 use stream_manager::metadata::MetadataStore;
@@ -191,7 +191,7 @@ async fn multi_sm_leadership_failover() {
             "failover-test",
             2,
             StorageClass::S3,
-            ExtentPolicy { cache: 4 },
+            EpochPolicy { cache: 4 },
         )
         .await
         .expect("create_stream");
