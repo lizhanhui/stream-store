@@ -10,8 +10,8 @@ use common::errors::{
     UnknownStreamSnafu,
 };
 use common::types::{
-    Epoch, EpochState, ErrorCode, ExtentId, ExtentInfo, ExtentPolicy, NodeMetrics, Offset, Opcode,
-    StorageClass, StreamId,
+    Epoch, EpochState, ErrorCode, ExtentId, ExtentPolicy, NodeMetrics, Offset, Opcode,
+    StorageClass, StreamEpochInfo, StreamId,
 };
 use futures_util::{SinkExt, StreamExt};
 use rpc::codec::FrameCodec;
@@ -531,7 +531,7 @@ impl StreamClient {
         &self,
         stream_id: StreamId,
         count: u32,
-    ) -> Result<Vec<ExtentInfo>, StorageError> {
+    ) -> Result<Vec<StreamEpochInfo>, StorageError> {
         let req = Frame::new(
             VariableHeader::DescribeStream {
                 request_id: self.alloc_request_id(),
@@ -565,7 +565,7 @@ impl StreamClient {
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
-    ) -> Result<ExtentInfo, StorageError> {
+    ) -> Result<StreamEpochInfo, StorageError> {
         // TODO(pre-P3 Phase 4): drop this bridge — the wire no longer carries extent_id; callers that still take it are transitional.
         let _ = extent_id;
         let req = Frame::new(
@@ -600,13 +600,13 @@ impl StreamClient {
 
     /// Seek: resolve a logical stream offset to the extent that contains it.
     ///
-    /// Returns the `ExtentInfo` for the extent covering `offset`, including replica
+    /// Returns the `StreamEpochInfo` for the extent covering `offset`, including replica
     /// addresses so the caller knows which extent node(s) to read from.
     pub async fn seek(
         &self,
         stream_id: StreamId,
         offset: Offset,
-    ) -> Result<ExtentInfo, StorageError> {
+    ) -> Result<StreamEpochInfo, StorageError> {
         let req = Frame::new(
             VariableHeader::Seek {
                 request_id: self.alloc_request_id(),
@@ -645,7 +645,7 @@ impl StreamClient {
         &self,
         name: &str,
         count: u32,
-    ) -> Result<(StreamId, Vec<ExtentInfo>), StorageError> {
+    ) -> Result<(StreamId, Vec<StreamEpochInfo>), StorageError> {
         let req = Frame::new(
             VariableHeader::DescribeStream {
                 request_id: self.alloc_request_id(),
@@ -722,7 +722,7 @@ impl StreamClient {
     ///
     /// Prefers the active extent's primary; falls back to any extent's primary
     /// since all extents within an epoch share the same replica set.
-    async fn cache_primary_from_extents(&self, stream_id: StreamId, extents: &[ExtentInfo]) {
+    async fn cache_primary_from_extents(&self, stream_id: StreamId, extents: &[StreamEpochInfo]) {
         let target = extents
             .iter()
             .find(|e| e.state == EpochState::Active)

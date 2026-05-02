@@ -351,9 +351,9 @@ pub struct NodeMetrics {
     pub bytes_written_per_sec: u64,
 }
 
-/// Describes a single extent with its replica set — returned by management APIs.
+/// Describes a single stream-epoch (one sealed or active segment) with its replica set — returned by management APIs.
 #[derive(Debug, Clone, PartialEq)]
-pub struct ExtentInfo {
+pub struct StreamEpochInfo {
     pub extent_id: u32,
     pub start_offset: u64,
     pub end_offset: u64,

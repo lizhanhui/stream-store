@@ -1266,7 +1266,7 @@ impl StreamManagerStore {
     /// When FLAG_DESCRIBE_STREAM_BY_NAME is set, resolves stream_name from the variable
     /// header to a StreamId first. Otherwise uses stream_id from the header directly.
     ///
-    /// Response: DescribeStreamResp with encoded Vec<ExtentInfo>
+    /// Response: DescribeStreamResp with encoded Vec<StreamEpochInfo>
     async fn handle_describe_stream(&self, frame: Frame) -> Frame {
         let count = frame.count();
 
@@ -1320,7 +1320,7 @@ impl StreamManagerStore {
     /// DescribeExtent: return a single extent's metadata with replica info and node liveness.
     ///
     /// Payload: [extent_id:u32]
-    /// Response: DescribeExtentResp with encoded Vec<ExtentInfo> (length 1)
+    /// Response: DescribeExtentResp with encoded Vec<StreamEpochInfo> (length 1)
     async fn handle_describe_extent(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
         // `extent_id` no longer travels on the wire for DescribeEpoch; identity
@@ -1358,7 +1358,7 @@ impl StreamManagerStore {
     /// Seek: resolve a logical offset to the extent that contains it.
     ///
     /// Uses the frame header's offset field as the target offset (no payload needed).
-    /// Response: SeekResp with encoded Vec<ExtentInfo> (length 1).
+    /// Response: SeekResp with encoded Vec<StreamEpochInfo> (length 1).
     async fn handle_seek(&self, frame: Frame) -> Frame {
         let stream_id = frame.stream_id();
         let offset = frame.offset().0;

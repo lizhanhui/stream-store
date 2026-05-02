@@ -1,7 +1,7 @@
 //! Wire-format payload encoding/decoding helpers used by ExtentNode, StreamManager, and clients.
 
 use bytes::{BufMut, Bytes, BytesMut};
-use common::types::{Epoch, EpochState, ExtentInfo, NodeMetrics, ReplicaDetail};
+use common::types::{Epoch, EpochState, NodeMetrics, ReplicaDetail, StreamEpochInfo};
 
 /// Build a Connect payload: [node_id_len:u16][node_id][addr_len:u16][addr][interval_ms:u32]
 pub fn build_connect_payload(node_id: &str, addr: &str, interval_ms: u32) -> Bytes {
@@ -189,7 +189,7 @@ pub fn parse_register_extent_payload(payload: &[u8]) -> Option<Vec<String>> {
     Some(replica_addrs)
 }
 
-/// Encode a Vec<ExtentInfo> into a response payload.
+/// Encode a Vec<StreamEpochInfo> into a response payload.
 ///
 /// Wire format:
 /// ```text
@@ -200,7 +200,7 @@ pub fn parse_register_extent_payload(payload: &[u8]) -> Option<Vec<String>> {
 ///       per replica:
 ///         [addr_len:u16][addr_bytes][role:u8][is_alive:u8]
 /// ```
-pub fn encode_extent_info_vec(extents: &[ExtentInfo]) -> Bytes {
+pub fn encode_extent_info_vec(extents: &[StreamEpochInfo]) -> Bytes {
     // Pre-compute capacity: 4 (num_extents) + per extent: 4+8+8+1+4+2 = 27 + replica data
     let extent_size: usize = extents
         .iter()
@@ -231,8 +231,8 @@ pub fn encode_extent_info_vec(extents: &[ExtentInfo]) -> Bytes {
     buf.freeze()
 }
 
-/// Decode a Vec<ExtentInfo> from a response payload.
-pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<ExtentInfo>> {
+/// Decode a Vec<StreamEpochInfo> from a response payload.
+pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<StreamEpochInfo>> {
     if payload.len() < 4 {
         return None;
     }
@@ -282,7 +282,7 @@ pub fn parse_extent_info_vec(payload: &[u8]) -> Option<Vec<ExtentInfo>> {
             });
         }
 
-        extents.push(ExtentInfo {
+        extents.push(StreamEpochInfo {
             extent_id,
             start_offset,
             end_offset,
@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn extent_info_vec_roundtrip_multiple() {
         let extents = vec![
-            ExtentInfo {
+            StreamEpochInfo {
                 extent_id: 3,
                 start_offset: 200,
                 end_offset: 300,
@@ -419,7 +419,7 @@ mod tests {
                     },
                 ],
             },
-            ExtentInfo {
+            StreamEpochInfo {
                 extent_id: 4,
                 start_offset: 300,
                 end_offset: 300,
@@ -440,7 +440,7 @@ mod tests {
 
     #[test]
     fn extent_info_vec_single_no_replicas() {
-        let extents = vec![ExtentInfo {
+        let extents = vec![StreamEpochInfo {
             extent_id: 1,
             start_offset: 0,
             end_offset: 50,

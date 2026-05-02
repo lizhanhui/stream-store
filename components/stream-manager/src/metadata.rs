@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use common::errors::{DatabaseSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
-    ArenaClass, Epoch, EpochState, ExtentId, ExtentInfo, ExtentPolicy, NodeMetrics, NodeState,
-    ReplicaDetail, StorageClass, StreamId,
+    ArenaClass, Epoch, EpochState, ExtentId, ExtentPolicy, NodeMetrics, NodeState, ReplicaDetail,
+    StorageClass, StreamEpochInfo, StreamId,
 };
 use snafu::ResultExt;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
@@ -730,7 +730,7 @@ impl MetadataStore {
         &self,
         stream_id: StreamId,
         count: u32,
-    ) -> Result<Vec<ExtentInfo>, StorageError> {
+    ) -> Result<Vec<StreamEpochInfo>, StorageError> {
         let extent_rows = if count == 0 {
             sqlx::query(
                 "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
@@ -759,7 +759,7 @@ impl MetadataStore {
             let replicas = self
                 .get_replicas_with_liveness(stream_id, ext.epoch)
                 .await?;
-            result.push(ExtentInfo {
+            result.push(StreamEpochInfo {
                 extent_id: ext.extent_id.0,
                 start_offset: ext.start_offset,
                 end_offset: ext.end_offset,
@@ -778,7 +778,7 @@ impl MetadataStore {
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
-    ) -> Result<Option<ExtentInfo>, StorageError> {
+    ) -> Result<Option<StreamEpochInfo>, StorageError> {
         let row = sqlx::query(
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
              FROM stream_epochs WHERE stream_id = ? AND extent_id = ?",
@@ -798,7 +798,7 @@ impl MetadataStore {
                 let replicas = self
                     .get_replicas_with_liveness(stream_id, ext.epoch)
                     .await?;
-                Ok(Some(ExtentInfo {
+                Ok(Some(StreamEpochInfo {
                     extent_id: ext.extent_id.0,
                     start_offset: ext.start_offset,
                     end_offset: ext.end_offset,
@@ -823,7 +823,7 @@ impl MetadataStore {
         &self,
         stream_id: StreamId,
         offset: u64,
-    ) -> Result<Option<ExtentInfo>, StorageError> {
+    ) -> Result<Option<StreamEpochInfo>, StorageError> {
         // Try sealed/flushed extents first: start_offset <= offset < end_offset.
         let row = sqlx::query(
             "SELECT extent_id, stream_id, start_offset, end_offset, state, epoch \
@@ -848,7 +848,7 @@ impl MetadataStore {
             let replicas = self
                 .get_replicas_with_liveness(stream_id, ext.epoch)
                 .await?;
-            return Ok(Some(ExtentInfo {
+            return Ok(Some(StreamEpochInfo {
                 extent_id: ext.extent_id.0,
                 start_offset: ext.start_offset,
                 end_offset: ext.end_offset,
@@ -881,7 +881,7 @@ impl MetadataStore {
                 let replicas = self
                     .get_replicas_with_liveness(stream_id, ext.epoch)
                     .await?;
-                Ok(Some(ExtentInfo {
+                Ok(Some(StreamEpochInfo {
                     extent_id: ext.extent_id.0,
                     start_offset: ext.start_offset,
                     end_offset: ext.end_offset,
