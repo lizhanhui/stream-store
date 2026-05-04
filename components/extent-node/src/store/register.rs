@@ -94,7 +94,7 @@ impl ExtentNodeStore {
         // If this node is Primary, initialize an AckQueue on the stream.
         if ri.is_primary() {
             if let Some(stream) = streams_guard.get(&stream_id) {
-                stream.init_ack_queue(ri.required_secondary_acks(), self.replication_timeout);
+                stream.init_ack_queue(ri.required_secondary_acks(), stream.replication_timeout());
             }
 
             // Cache per-secondary Sender handles in the Stream so the

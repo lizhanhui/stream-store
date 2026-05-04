@@ -229,7 +229,7 @@ impl ExtentNodeStore {
                     // Queue deferred ACK — lock-free, no contention with watermark readers.
                     if let Some(ref resp_tx) = response_tx {
                         let aq = stream
-                            .init_ack_queue(ri.required_secondary_acks(), self.replication_timeout);
+                            .init_ack_queue(ri.required_secondary_acks(), stream.replication_timeout());
                         aq.enqueue(PendingAck {
                             request_id,
                             stream_id,
@@ -575,7 +575,7 @@ impl ExtentNodeStore {
                             if let Some(resp_tx) = response_tx {
                                 let aq = stream.init_ack_queue(
                                     ri.required_secondary_acks(),
-                                    self.replication_timeout,
+                                    stream.replication_timeout(),
                                 );
                                 let now = Instant::now();
                                 for entry in &entries {

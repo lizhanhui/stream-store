@@ -171,6 +171,7 @@ impl ExtentNodeStore {
                 Arc::clone(&self.arena_ids),
                 pool,
                 Arc::clone(&self.metrics),
+                self.replication_timeout,
             );
             if policy.cache > 0 {
                 stream.set_max_epochs(policy.cache as usize);
