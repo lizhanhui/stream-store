@@ -100,6 +100,7 @@ impl EpochArenaEntry {
 
     /// Total slot capacity. Used by the secondary replay path in
     /// try_advance_committed to bound its seq iteration.
+    #[allow(dead_code)]
     pub(crate) fn record_capacity(&self) -> usize {
         self.byte_positions.len()
     }
@@ -109,6 +110,7 @@ impl EpochArenaEntry {
     /// Returns the raw u32 (the sentinel SLOT_UNSET or byte_pos + 1).
     /// Used by try_advance_committed where the decoded byte_pos is
     /// already needed plus a sentinel check in one read.
+    #[allow(dead_code)]
     pub(crate) fn raw_slot(&self, seq: u64) -> Option<u32> {
         let idx = seq as usize;
         Some(self.byte_positions.get(idx)?.load(Ordering::Acquire))

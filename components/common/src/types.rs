@@ -90,6 +90,29 @@ impl Display for NodeId {
     }
 }
 
+/// Globally-unique arena identifier.
+///
+/// Layout: `(node_prefix << 48) | counter`
+///   - 16-bit node_prefix: stable hash of the EN's node_id string.
+///   - 48-bit counter: monotonically increasing per EN.
+///
+/// Lives in `common` so that `StorageError::ArenaFull` can reference it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ArenaId(pub u64);
+
+impl ArenaId {
+    pub fn new(node_prefix: u16, counter: u64) -> Self {
+        debug_assert!(counter < (1u64 << 48), "ArenaId counter overflow");
+        Self(((node_prefix as u64) << 48) | (counter & ((1u64 << 48) - 1)))
+    }
+}
+
+impl Display for ArenaId {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
+        write!(f, "{:016x}", self.0)
+    }
+}
+
 /// Wire protocol operation codes, grouped by category with gaps for future growth.
 ///
 /// All request-response opcodes use a single opcode with flags to distinguish

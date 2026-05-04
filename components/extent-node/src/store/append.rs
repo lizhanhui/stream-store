@@ -4,15 +4,14 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use common::errors::StorageError;
-use common::types::{Epoch, ErrorCode, Offset, StorageClass, StreamId};
+use common::types::{Epoch, ErrorCode, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
-use smallvec::SmallVec;
 use tokio::sync::mpsc::Sender;
-use tracing::{debug, info};
+use tracing::debug;
 
 use super::{AppendJob, ExtentNodeStore};
 use crate::ack_queue::PendingAck;
-use crate::stream::{SealNotification, SealReason, Stream};
+use crate::stream::Stream;
 
 impl ExtentNodeStore {
     /// Handle Append — pipelined group commit with stream-level leader election.
@@ -25,8 +24,9 @@ impl ExtentNodeStore {
     ///
     /// The active writer handles replication (Forward + PendingAck for RF≥2)
     /// or sends immediate AppendAck (RF=1/standalone) for each job.
-    /// On EpochFull, the leader seals the active epoch and surfaces an error;
-    /// the client must reopen the stream to get the successor epoch.
+    ///
+    /// Arena-full is handled inside `StreamEpoch::write_batch` via internal
+    /// arena rotation; the store layer never sees it.
     ///
     /// Pin guards are scoped in blocks so they're dropped before `.await` points
     /// (papaya pin guards are non-Send).
@@ -39,7 +39,7 @@ impl ExtentNodeStore {
         let client_epoch = frame.epoch();
 
         // ── Validation + leader election + own append (scoped pin guard) ──
-        let (own_result, extent_full, remaining) = {
+        let (own_result, remaining) = {
             let guard = self.streams.pin();
             let stream = match guard.get(&stream_id) {
                 Some(s) => s,
@@ -75,60 +75,24 @@ impl ExtentNodeStore {
             }
 
             // FAST PATH: I'm the active writer (prev == 0).
-
             let payload = frame.payload.clone().unwrap_or_default();
             let request_id = frame.request_id();
-            let (own_result, extent_full) = self.do_append_and_respond(
+            let own_result = self.do_append_and_respond(
                 stream,
                 request_id,
                 stream_id,
                 epoch,
-                payload.clone(),
+                payload,
                 response_tx.cloned(),
             );
-            if extent_full {
-                // Don't decrement in_flight — we're still the leader.
-                // Will decrement after seal+create+retry below.
-                (own_result, true, 0)
-            } else {
-                let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
-                (own_result, false, remaining)
-            }
+            let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
+            (own_result, remaining)
         };
         // Pin guard dropped — safe to .await.
 
-        // ── Epoch-full path: seal current epoch, surface error, then drain ──
-        if extent_full {
-            let seal_notification = self.seal_current_epoch(stream_id, SealReason::EpochFull);
-            let remaining = {
-                let guard = self.streams.pin();
-                if let Some(stream) = guard.get(&stream_id) {
-                    stream.in_flight().fetch_sub(1, Ordering::Release)
-                } else {
-                    0
-                }
-            };
-
-            if remaining > 1 {
-                let batch_seals = self.drain_follower_jobs(stream_id).await;
-                for notification in &batch_seals {
-                    self.send_forward_checksum(stream_id, notification.sealed_epoch);
-                    self.send_flush_request(stream_id, notification);
-                }
-            }
-            if let Some(ref notification) = seal_notification {
-                self.send_forward_checksum(stream_id, notification.sealed_epoch);
-                self.send_flush_request(stream_id, notification);
-            }
-            return own_result;
-        }
-
         // ── Normal path: drain followers if any arrived ──
         if remaining > 1 {
-            let batch_seals = self.drain_follower_jobs(stream_id).await;
-            for notification in &batch_seals {
-                self.send_flush_request(stream_id, notification);
-            }
+            self.drain_follower_jobs(stream_id).await;
         }
 
         own_result
@@ -136,9 +100,7 @@ impl ExtentNodeStore {
 
     /// Perform a single append via the stream's active extent and handle replication / ACK.
     ///
-    /// Returns `(Option<Frame>, bool)`:
-    /// - Option<Frame>: response frame (None if deferred or sent via channel)
-    /// - bool: whether EpochFull occurred (caller should seal current epoch)
+    /// Returns the response frame or `None` if deferred via `response_tx`.
     ///
     /// Forward frames are pushed **inline** into the stream's cached per-secondary
     /// mpsc channels, while the leader still holds `in_flight > 0`. This guarantees
@@ -155,11 +117,13 @@ impl ExtentNodeStore {
         epoch: Epoch,
         payload: Bytes,
         response_tx: Option<Sender<Frame>>,
-    ) -> (Option<Frame>, bool) {
+    ) -> Option<Frame> {
         let payload_len = payload.len();
         let payload_for_forward = payload.clone();
 
         // Write locally via single-writer append on the active extent.
+        // Arena-full is handled transparently by the pool (rotation); any
+        // error that reaches us is a genuine per-job failure.
         let append_result = match stream.try_append_active(payload) {
             Ok(r) => r,
             Err(StorageError::EpochSealed { .. }) => {
@@ -172,23 +136,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(tx) = response_tx {
                     let _ = tx.try_send(err);
-                    return (None, false);
+                    return None;
                 }
-                return (Some(err), false);
-            }
-            Err(StorageError::EpochFull { .. }) => {
-                    let err = Frame::append_ack_error(
-                    request_id,
-                    stream_id,
-                    epoch,
-                    ErrorCode::ExtentSealed,
-                    "epoch full: reopen stream",
-                );
-                if let Some(tx) = response_tx {
-                    let _ = tx.try_send(err);
-                    return (None, true);
-                }
-                return (Some(err), true);
+                return Some(err);
             }
             Err(e) => {
                 let err = Frame::append_ack_error(
@@ -200,9 +150,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(tx) = response_tx {
                     let _ = tx.try_send(err);
-                    return (None, false);
+                    return None;
                 }
-                return (Some(err), false);
+                return Some(err);
             }
         };
 
@@ -233,9 +183,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(tx) = response_tx {
                     let _ = tx.try_send(ack);
-                    (None, false)
+                    None
                 } else {
-                    (Some(ack), false)
+                    Some(ack)
                 }
             }
             Some(ref ri) if ri.is_primary() => {
@@ -252,9 +202,9 @@ impl ExtentNodeStore {
                     );
                     if let Some(tx) = response_tx {
                         let _ = tx.try_send(ack);
-                        (None, false)
+                        None
                     } else {
-                        (Some(ack), false)
+                        Some(ack)
                     }
                 } else {
                     // RF≥2: push Forward frames inline into per-stream channels.
@@ -288,7 +238,7 @@ impl ExtentNodeStore {
                         });
                     }
 
-                    (None, false)
+                    None
                 }
             }
             Some(_) => {
@@ -304,9 +254,9 @@ impl ExtentNodeStore {
                 );
                 if let Some(tx) = response_tx {
                     let _ = tx.try_send(ack);
-                    (None, false)
+                    None
                 } else {
-                    (Some(ack), false)
+                    Some(ack)
                 }
             }
         }
@@ -315,17 +265,12 @@ impl ExtentNodeStore {
     /// Drain follower append jobs from the stream's channel and process them.
     ///
     /// Called by the active writer after its own append when `in_flight > 1`.
-    /// Loops until all followers have been processed.
+    /// Loops until all followers have been processed. Forward frames are
+    /// pushed inline by `do_append_and_respond`.
     ///
-    /// Forward frames are pushed inline by `do_append_and_respond` — this method
-    /// only returns seal notifications for the caller to send SM updates.
-    ///
-    /// On EpochFull, this method seals the current epoch and surfaces errors for
-    /// the remaining jobs; the client must reopen on a new epoch.
-    /// Pin guards are scoped in blocks so they're dropped before `yield_now().await`.
-    async fn drain_follower_jobs(&self, stream_id: StreamId) -> SmallVec<[SealNotification; 1]> {
-        let mut notifications = SmallVec::with_capacity(1);
-
+    /// Arena-full is handled below `StreamEpoch` (internal rotation); this
+    /// drain path only deals with per-job logical outcomes (seal, err, ok).
+    async fn drain_follower_jobs(&self, stream_id: StreamId) {
         loop {
             // ── Phase 1: Drain jobs from the channel ──
             let mut batch: Vec<AppendJob> = Vec::new();
@@ -336,7 +281,7 @@ impl ExtentNodeStore {
                     let guard = self.streams.pin();
                     let stream = match guard.get(&stream_id) {
                         Some(s) => s,
-                        None => return notifications,
+                        None => return,
                     };
                     if batch.is_empty() {
                         epoch = stream.epoch();
@@ -366,17 +311,14 @@ impl ExtentNodeStore {
 
             // ── Phase 2: Process the batch ──
             let batch_len = batch.len();
-            let mut extent_full_idx: Option<usize> = None;
-
-            // Process each job (scoped pin guard).
-            {
+            let done = {
                 let guard = self.streams.pin();
                 let stream = match guard.get(&stream_id) {
                     Some(s) => s,
                     None => break,
                 };
-                for (i, job) in batch.iter().enumerate() {
-                    let (_, extent_full) = self.do_append_and_respond(
+                for job in &batch {
+                    self.do_append_and_respond(
                         stream,
                         job.request_id,
                         job.stream_id,
@@ -384,161 +326,16 @@ impl ExtentNodeStore {
                         job.payload.clone(),
                         job.response_tx.clone(),
                     );
-                    if extent_full {
-                        extent_full_idx = Some(i);
-                        break;
-                    }
                 }
-            }
-            // Pin guard dropped.
-
-            if let Some(index) = extent_full_idx {
-                let seal_notification = self.seal_current_epoch(stream_id, SealReason::EpochFull);
-                if let Some(ref notification) = seal_notification {
-                    notifications.push(notification.clone());
-                }
-
-                // Retry the failed job and remaining jobs on the new extent.
-                let done = {
-                    let guard = self.streams.pin();
-                    if let Some(stream) = guard.get(&stream_id) {
-                        epoch = stream.epoch();
-                        for job in &batch[index..] {
-                            let (_, _) = self.do_append_and_respond(
-                                stream,
-                                job.request_id,
-                                job.stream_id,
-                                epoch,
-                                job.payload.clone(),
-                                job.response_tx.clone(),
-                            );
-                        }
-                        let remaining = stream
-                            .in_flight()
-                            .fetch_sub(batch_len as u64, Ordering::Release);
-                        remaining <= batch_len as u64
-                    } else {
-                        true
-                    }
-                };
-                if done {
-                    break;
-                }
-            } else {
-                // All jobs processed without EpochFull.
-                let done = {
-                    let guard = self.streams.pin();
-                    if let Some(stream) = guard.get(&stream_id) {
-                        let remaining = stream
-                            .in_flight()
-                            .fetch_sub(batch_len as u64, Ordering::Release);
-                        remaining <= batch_len as u64
-                    } else {
-                        true
-                    }
-                };
-                if done {
-                    break;
-                }
+                let remaining = stream
+                    .in_flight()
+                    .fetch_sub(batch_len as u64, Ordering::Release);
+                remaining <= batch_len as u64
+            };
+            if done {
+                break;
             }
             // More followers arrived during processing — loop again.
-        }
-
-        notifications
-    }
-
-    /// Seal the active extent and create a new one.
-    ///
-    /// Acquires write lock on the stream's inner RwLock. Returns the seal notification
-    /// if a seal+create occurred, or None if already sealed / stream not found.
-    pub(crate) fn seal_current_epoch(
-        &self,
-        stream_id: StreamId,
-        reason: SealReason,
-    ) -> Option<SealNotification> {
-        if let Some(stream) = self.streams.pin().get(&stream_id) {
-            let t0 = std::time::Instant::now();
-            let notification = stream.seal_current_epoch().map(|(sealed_epoch, end_offset)| {
-                SealNotification {
-                    sealed_epoch,
-                    end_offset: end_offset.0,
-                }
-            });
-            let seal_us = t0.elapsed().as_micros();
-            if let Some(ref n) = notification {
-                info!(
-                    "seal_current_epoch: stream={}, epoch={}, reason={:?}, duration={}us",
-                    stream_id,
-                    n.sealed_epoch,
-                    reason,
-                    seal_us,
-                );
-            }
-            notification
-        } else {
-            None
-        }
-    }
-
-    /// Queue a sealed extent for S3 flush (Primary only).
-    ///
-    /// The Primary uploads to S3 and broadcasts `ForwardFlushed` to secondaries
-    /// on completion, enabling eviction across all replicas without extra infra.
-    pub(crate) fn send_flush_request(&self, stream_id: StreamId, notification: &SealNotification) {
-        let tx = match self.flush_tx {
-            Some(ref tx) => tx,
-            None => return,
-        };
-        let is_primary = self
-            .replicas
-            .pin()
-            .get(&stream_id)
-            .map(|ri| ri.is_primary())
-            .unwrap_or(false);
-        if !is_primary {
-            return;
-        }
-        // Memory-only streams don't flush to S3.
-        let is_memory = self
-            .streams
-            .pin()
-            .get(&stream_id)
-            .map(|s| s.storage_class() == StorageClass::Memory)
-            .unwrap_or(false);
-        if is_memory {
-            return;
-        }
-        let start_offset = self
-            .streams
-            .pin()
-            .get(&stream_id)
-            .and_then(|s| s.with_epoch(notification.sealed_epoch, |e| e.start_offset.0))
-            .unwrap_or(0);
-
-        // Deduplicate: mark flush-in-progress before enqueuing.
-        let started = self
-            .streams
-            .pin()
-            .get(&stream_id)
-            .map(|s| s.start_flush(notification.sealed_epoch))
-            .unwrap_or(false);
-        if !started {
-            return; // Another path already enqueued a flush for this extent.
-        }
-
-        if tx
-            .try_send(crate::s3_flusher::FlushRequest {
-                stream_id,
-                epoch: notification.sealed_epoch,
-                start_offset,
-                end_offset: notification.end_offset,
-            })
-            .is_err()
-        {
-            // Channel full — clear the marker so it can be retried.
-            if let Some(s) = self.streams.pin().get(&stream_id) {
-                s.finish_flush(notification.sealed_epoch);
-            }
         }
     }
 
@@ -602,7 +399,6 @@ impl ExtentNodeStore {
         }
         let mut responses = Vec::new();
         let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
-        let mut extent_full = false;
 
         // ── Validation + leader election + batch appends (scoped pin guard) ──
         let (_epoch, batch_len) = {
@@ -658,22 +454,6 @@ impl ExtentNodeStore {
                 let payload_len = payload.len();
                 let payload_for_forward = payload.clone();
 
-                if extent_full {
-                    let err = Frame::append_ack_error(
-                        request_id,
-                        stream_id,
-                        epoch,
-                        ErrorCode::ExtentSealed,
-                        "epoch full: reopen stream",
-                    );
-                    if let Some(tx) = response_tx {
-                        let _ = tx.try_send(err);
-                    } else {
-                        responses.push(err);
-                    }
-                    continue;
-                }
-
                 match stream.try_append_active(payload.clone()) {
                     Ok(result) => {
                         entries.push(BatchEntry {
@@ -690,21 +470,6 @@ impl ExtentNodeStore {
                             epoch,
                             ErrorCode::ExtentSealed,
                             "extent is sealed",
-                        );
-                        if let Some(tx) = response_tx {
-                            let _ = tx.try_send(err);
-                        } else {
-                            responses.push(err);
-                        }
-                    }
-                    Err(StorageError::EpochFull { .. }) => {
-                        extent_full = true;
-                        let err = Frame::append_ack_error(
-                            request_id,
-                            stream_id,
-                            epoch,
-                            ErrorCode::ExtentSealed,
-                            "epoch full: reopen stream",
                         );
                         if let Some(tx) = response_tx {
                             let _ = tx.try_send(err);
@@ -838,33 +603,6 @@ impl ExtentNodeStore {
         };
         // Pin guard dropped — safe to .await.
 
-        // ── Epoch-full: seal current epoch, surface errors, then drain ──
-        if extent_full {
-            let seal_notification = self.seal_current_epoch(stream_id, SealReason::EpochFull);
-
-            let remaining = {
-                let guard = self.streams.pin();
-                if let Some(stream) = guard.get(&stream_id) {
-                    stream.in_flight().fetch_sub(batch_len, Ordering::Release)
-                } else {
-                    0
-                }
-            };
-
-            if remaining > batch_len {
-                let batch_seals = self.drain_follower_jobs(stream_id).await;
-                for notif in &batch_seals {
-                    self.send_forward_checksum(stream_id, notif.sealed_epoch);
-                    self.send_flush_request(stream_id, notif);
-                }
-            }
-            if let Some(ref notif) = seal_notification {
-                self.send_forward_checksum(stream_id, notif.sealed_epoch);
-                self.send_flush_request(stream_id, notif);
-            }
-            return responses;
-        }
-
         // ── Normal path: decrement in_flight and drain followers if any ──
         let remaining = {
             let guard = self.streams.pin();
@@ -876,11 +614,7 @@ impl ExtentNodeStore {
         };
 
         if remaining > batch_len {
-            let batch_seals = self.drain_follower_jobs(stream_id).await;
-            for notif in &batch_seals {
-                self.send_forward_checksum(stream_id, notif.sealed_epoch);
-                self.send_flush_request(stream_id, notif);
-            }
+            self.drain_follower_jobs(stream_id).await;
         }
 
         responses

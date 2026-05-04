@@ -14,7 +14,7 @@ use smallvec::SmallVec;
 use tokio::sync::mpsc;
 
 use crate::ack_queue::AckQueue;
-use crate::arena::ArenaIdGenerator;
+use crate::arena::{ArenaAppendResult, ArenaIdGenerator, ArenaPool, WriteBatchJob};
 use crate::store::AppendJob;
 use crate::stream_epoch::{AppendResult, StreamEpoch};
 
@@ -101,7 +101,16 @@ pub struct Stream {
     /// Mints ArenaIds for epochs registered directly (register_epoch path).
     /// Shared with the pool so that all extents for this stream draw from the
     /// same monotonic counter.
+    #[allow(dead_code)]
     arena_ids: Arc<ArenaIdGenerator>,
+
+    /// Arena pool factory. Chosen by `arena_class` at stream-creation
+    /// time: Dedicated streams own a per-stream `DedicatedArenaPool`;
+    /// Shared streams (P3) reference the EN-wide `SharedArenaPool`
+    /// singleton. `StreamEpoch::new` calls `pool.allocate(...)` once
+    /// at registration and again on every arena-full rotation within
+    /// the same epoch.
+    pool: Arc<dyn ArenaPool>,
 
     /// Mutable state protected by RwLock.
     inner: RwLock<StreamInner>,
@@ -121,7 +130,11 @@ impl Stream {
     // ── Construction ────────────────────────────────────────────────────
 
     /// Create a new stream with no extents. Extents are added via `register_epoch()`.
-    pub(crate) fn new(id: StreamId, arena_ids: Arc<ArenaIdGenerator>) -> Self {
+    pub(crate) fn new(
+        id: StreamId,
+        arena_ids: Arc<ArenaIdGenerator>,
+        pool: Arc<dyn ArenaPool>,
+    ) -> Self {
         let (job_tx, job_rx) = unbounded();
         Self {
             id,
@@ -133,6 +146,7 @@ impl Stream {
             flush_in_progress: papaya::HashMap::new(),
             epochs: ArcSwap::from_pointee(SmallVec::new()),
             arena_ids,
+            pool,
             inner: RwLock::new(StreamInner {
                 epoch_capacity: DEFAULT_EPOCH_CAPACITY,
                 max_epochs: DEFAULT_CACHE_EPOCHS as usize,
@@ -328,6 +342,39 @@ impl Stream {
         extent.append_inner(payload)
     }
 
+    /// Batch-append to the active epoch. Returns one result per input
+    /// job in 1:1 order. Arena-full rotations are handled internally
+    /// by `StreamEpoch::write_batch`; this method never escalates to
+    /// epoch-level seal.
+    ///
+    /// Successor to `try_append_active`. The two coexist while the
+    /// store-layer hot path still builds 1-record batches; a later
+    /// task will swap `do_append_and_respond` to call this directly
+    /// and drop the single-record shim.
+    #[allow(dead_code)]
+    pub(crate) fn write_batch_active(
+        &self,
+        jobs: &[WriteBatchJob],
+    ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
+        match self.active_epoch_ref() {
+            Some(ep) => ep.write_batch(jobs),
+            None => {
+                let err = InternalSnafu {
+                    message: format!("stream {}: no active epoch", self.id),
+                }
+                .build();
+                jobs.iter()
+                    .map(|_| {
+                        Err(InternalSnafu {
+                            message: err.to_string(),
+                        }
+                        .build())
+                    })
+                    .collect()
+            }
+        }
+    }
+
     /// Replicate a record into the specified epoch.
     pub fn replicate(
         &self,
@@ -355,15 +402,7 @@ impl Stream {
         if offset.0 < extent.start_offset.0 || offset.0 >= extent.next_offset().0 {
             return Ok(Vec::new());
         }
-
-        let seq = offset.0 - extent.start_offset.0;
-        let byte_pos = extent.index_lookup(seq).ok_or_else(|| {
-            InternalSnafu {
-                message: format!("index lookup failed for offset {}", offset.0),
-            }
-            .build()
-        })?;
-        extent.read(byte_pos, count)
+        extent.read_at_offset(offset, count)
     }
 
     /// Whether this stream can accept appends (its last epoch is active/unsealed).
@@ -518,13 +557,12 @@ impl Stream {
             let mut inner = self.inner.write();
             inner.epoch_capacity = epoch_capacity;
         }
-        let arena_id = self.arena_ids.next();
-        let ep = Arc::new(StreamEpoch::with_capacity(
+        let ep = Arc::new(StreamEpoch::new(
             self.id,
+            epoch,
             start_offset,
             epoch_capacity,
-            epoch,
-            arena_id,
+            Arc::clone(&self.pool),
         ));
         self.insert_epoch(ep);
         self.evict_oldest_epochs();
@@ -594,9 +632,14 @@ mod tests {
         Arc::new(crate::arena::ArenaIdGenerator::new(1))
     }
 
+    fn test_pool(ids: &Arc<ArenaIdGenerator>) -> Arc<dyn ArenaPool> {
+        Arc::new(crate::arena::DedicatedArenaPool::new(Arc::clone(ids)))
+    }
+
     /// Helper: create a stream with one active extent (simulating RegisterEpoch from SM).
     fn new_stream_with_epoch(id: StreamId) -> Stream {
-        let stream = Stream::new(id, test_arena_ids());
+        let ids = test_arena_ids();
+        let stream = Stream::new(id, Arc::clone(&ids), test_pool(&ids));
         stream.register_epoch_simple(Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
         stream
     }
@@ -668,7 +711,7 @@ mod tests {
 
     #[test]
     fn read_empty_stream() {
-        let stream = Stream::new(StreamId(1), test_arena_ids());
+        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
         assert_eq!(stream.max_offset(), Offset(0));
 
         // Stream with no extents: read returns error (extent not found).
@@ -678,7 +721,7 @@ mod tests {
 
     #[test]
     fn empty_stream_properties() {
-        let stream = Stream::new(StreamId(1), test_arena_ids());
+        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
         assert_eq!(stream.max_offset(), Offset(0));
         assert!(!stream.is_mutable());
         assert_eq!(stream.active_epoch(), None);
@@ -745,7 +788,7 @@ mod tests {
 
     #[test]
     fn evict_oldest_sealed_extents() {
-        let stream = Stream::new(StreamId(1), test_arena_ids());
+        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_epochs(2);
 
@@ -778,7 +821,7 @@ mod tests {
 
     #[test]
     fn no_eviction_when_limit_is_zero() {
-        let stream = Stream::new(StreamId(1), test_arena_ids());
+        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
         stream.set_max_epochs(0); // 0 means no limit
 
         for i in 0..5u32 {
@@ -801,7 +844,7 @@ mod tests {
     fn evict_unsealed_extents_secondary_scenario() {
         // On secondaries, old extents may not be sealed (autonomous extent-full
         // only seals on the Primary). Eviction should still work for Memory-class streams.
-        let stream = Stream::new(StreamId(1), test_arena_ids());
+        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_epochs(2);
 
@@ -827,7 +870,7 @@ mod tests {
     #[test]
     fn s3_stream_skips_eviction_until_flushed() {
         // S3-class streams must NOT evict extents that haven't been flushed.
-        let stream = Stream::new(StreamId(1), test_arena_ids());
+        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
         // Default is StorageClass::S3, verify explicitly.
         assert_eq!(stream.storage_class(), StorageClass::S3);
         stream.set_max_epochs(2);

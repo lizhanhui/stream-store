@@ -1,7 +1,7 @@
 use snafu::prelude::*;
 use snafu_virtstack::stack_trace_debug;
 
-use crate::types::{Epoch, Offset, StreamId};
+use crate::types::{ArenaId, Epoch, Offset, StreamId};
 
 /// Errors returned by the storage system.
 ///
@@ -53,10 +53,11 @@ pub enum StorageError {
         location: snafu::Location,
     },
 
-    #[snafu(display("epoch full: stream {stream_id}, epoch {epoch}"))]
-    EpochFull {
+    #[snafu(display("arena full: stream {stream_id}, epoch {epoch}, arena_id {arena_id}"))]
+    ArenaFull {
         stream_id: StreamId,
         epoch: Epoch,
+        arena_id: ArenaId,
         #[snafu(implicit)]
         location: snafu::Location,
     },

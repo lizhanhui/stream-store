@@ -508,16 +508,22 @@ pub enum CodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::arena::{ArenaIdGenerator, DedicatedArenaPool};
     use common::types::{Epoch, Offset, StreamId};
+    use std::sync::Arc;
+
+    fn test_pool() -> Arc<dyn crate::arena::ArenaPool> {
+        Arc::new(DedicatedArenaPool::new(Arc::new(ArenaIdGenerator::new(1))))
+    }
 
     /// Helper: create a sealed epoch with N records of given payloads.
     fn sealed_extent(payloads: &[&[u8]]) -> StreamEpoch {
-        let extent = StreamEpoch::with_capacity(
+        let extent = StreamEpoch::new(
             StreamId(0),
+            Epoch(0),
             Offset(0),
             1024 * 1024, // 1 MiB
-            Epoch(0),
-            crate::arena::ArenaId(0),
+            test_pool(),
         );
         for payload in payloads {
             extent
@@ -530,12 +536,12 @@ mod tests {
 
     /// Helper: create a sealed epoch with start_offset.
     fn sealed_extent_at(start_offset: u64, payloads: &[&[u8]]) -> StreamEpoch {
-        let extent = StreamEpoch::with_capacity(
+        let extent = StreamEpoch::new(
             StreamId(0),
+            Epoch(0),
             Offset(start_offset),
             1024 * 1024,
-            Epoch(0),
-            crate::arena::ArenaId(0),
+            test_pool(),
         );
         for payload in payloads {
             extent

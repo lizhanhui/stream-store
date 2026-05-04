@@ -1,65 +1,48 @@
-//! Arena pool abstraction.
+//! Arena pool factory traits.
 //!
-//! DedicatedArenaPool is one private arena ring per Stream. SharedArenaPool is
-//! intentionally a P2 stub; P3 wires the EN-wide shared implementation.
+//! `ArenaPool::allocate` mints a fresh `Arena` for a `(stream, epoch)`
+//! tuple. The returned `Arc<Arena>` is owned by `StreamEpoch`, which
+//! holds a `SmallVec<[Arc<Arena>; 4]>` and rotates to a new arena on
+//! `ArenaFull` by calling `allocate` again.
+//!
+//! - `DedicatedArenaPool`: stateless per-stream factory; each Dedicated
+//!   stream owns its own instance.
+//! - `SharedArenaPool`: EN-wide singleton; `allocate` panics until P3
+//!   wires the real multi-stream path.
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 
-use bytes::Bytes;
-use common::errors::StorageError;
 use common::types::{ArenaClass, Epoch, Offset, StreamId};
-use parking_lot::Mutex;
 
-use crate::arena::{Arena, ArenaIdGenerator, WriteBatch, WriteBatchAck};
+use crate::arena::{Arena, ArenaIdGenerator};
 
 pub(crate) trait ArenaPool: Send + Sync {
+    #[allow(dead_code)]
     fn class(&self) -> ArenaClass;
 
-    fn write_batch(&self, batch: WriteBatch) -> WriteBatchAck;
-
-    fn read(
+    /// Mint a fresh arena for the given `(stream, epoch)` placement,
+    /// sized to `capacity` bytes. Called by `StreamEpoch` on epoch
+    /// registration and on arena-full rotation.
+    fn allocate(
         &self,
         stream_id: StreamId,
         epoch: Epoch,
-        offset: Offset,
-        count: u32,
-    ) -> Result<Vec<Bytes>, StorageError>;
+        start_offset: Offset,
+        capacity: u32,
+    ) -> Arc<Arena>;
 }
 
+// ── Dedicated ───────────────────────────────────────────────────────
+
+/// Per-stream factory for Dedicated-class streams. Stateless except
+/// for its shared `ArenaIdGenerator`.
 pub(crate) struct DedicatedArenaPool {
     ids: Arc<ArenaIdGenerator>,
-    arena_capacity: u32,
-    active: Mutex<Option<Arc<Arena>>>,
-    arenas: Mutex<VecDeque<Arc<Arena>>>,
 }
 
 impl DedicatedArenaPool {
-    pub(crate) fn new(ids: Arc<ArenaIdGenerator>, arena_capacity: u32) -> Self {
-        Self {
-            ids,
-            arena_capacity,
-            active: Mutex::new(None),
-            arenas: Mutex::new(VecDeque::new()),
-        }
-    }
-
-    pub(crate) fn arena_count(&self) -> usize {
-        self.arenas.lock().len()
-    }
-
-    fn active_or_create(&self) -> Arc<Arena> {
-        if let Some(arena) = self.active.lock().as_ref().cloned() {
-            return arena;
-        }
-        self.rotate_arena()
-    }
-
-    fn rotate_arena(&self) -> Arc<Arena> {
-        let arena = Arc::new(Arena::new(self.ids.next(), self.arena_capacity));
-        self.arenas.lock().push_back(Arc::clone(&arena));
-        *self.active.lock() = Some(Arc::clone(&arena));
-        arena
+    pub(crate) fn new(ids: Arc<ArenaIdGenerator>) -> Self {
+        Self { ids }
     }
 }
 
@@ -68,78 +51,38 @@ impl ArenaPool for DedicatedArenaPool {
         ArenaClass::Dedicated
     }
 
-    fn write_batch(&self, batch: WriteBatch) -> WriteBatchAck {
-        let mut ack = WriteBatchAck::new();
-        for job in &batch.jobs {
-            let mut arena = self.active_or_create();
-            let mut single = arena.write_batch(batch.stream_id, batch.epoch, std::slice::from_ref(job));
-            let result = single.pop().expect("single-job write result");
-            match result {
-                Ok(result) => ack.push(Ok(result)),
-                Err(StorageError::EpochFull { .. }) => {
-                    arena = self.rotate_arena();
-                    let mut retry =
-                        arena.write_batch(batch.stream_id, batch.epoch, std::slice::from_ref(job));
-                    let retry_result = retry.pop().expect("single-job retry result");
-                    if retry_result.is_err() {
-                        ack.push(retry_result);
-                        break;
-                    }
-                    ack.push(retry_result);
-                }
-                Err(err) => {
-                    ack.push(Err(err));
-                    break;
-                }
-            }
-        }
-        ack
-    }
-
-    fn read(
+    fn allocate(
         &self,
         stream_id: StreamId,
         epoch: Epoch,
-        offset: Offset,
-        count: u32,
-    ) -> Result<Vec<Bytes>, StorageError> {
-        let mut out = Vec::with_capacity(count as usize);
-        let mut next = offset;
-        let arenas = self.arenas.lock();
-        while out.len() < count as usize {
-            let Some(arena) = arenas
-                .iter()
-                .find(|arena| arena.contains_offset(stream_id, epoch, next))
-            else {
-                break;
-            };
-            let remaining = count - out.len() as u32;
-            let mut records = arena.read(stream_id, epoch, next, remaining)?;
-            if records.is_empty() {
-                break;
-            }
-            next = Offset(next.0 + records.len() as u64);
-            out.append(&mut records);
-        }
-        Ok(out)
+        start_offset: Offset,
+        capacity: u32,
+    ) -> Arc<Arena> {
+        Arc::new(Arena::new(
+            self.ids.next(),
+            stream_id,
+            epoch,
+            start_offset,
+            capacity,
+        ))
     }
 }
 
-/// Stub for the future EN-wide shared-arena pool. Routing is not wired
-/// in P2; any caller that lands here signals a bug in stream setup.
+// ── Shared (stub) ───────────────────────────────────────────────────
+
+/// EN-wide singleton for Shared-class streams. `allocate` panics until
+/// P3 wires the multi-stream arena pool, the Shape A flush path, and
+/// the directory_ref_count bookkeeping.
 #[allow(dead_code)]
 pub(crate) struct SharedArenaPool {
-    _arena_size: u32,
-    _generator: Arc<ArenaIdGenerator>,
+    ids: Arc<ArenaIdGenerator>,
+    arena_size: u32,
 }
 
 impl SharedArenaPool {
     #[allow(dead_code)]
-    pub(crate) fn new(arena_size: u32, generator: Arc<ArenaIdGenerator>) -> Self {
-        Self {
-            _arena_size: arena_size,
-            _generator: generator,
-        }
+    pub(crate) fn new(ids: Arc<ArenaIdGenerator>, arena_size: u32) -> Self {
+        Self { ids, arena_size }
     }
 }
 
@@ -148,63 +91,40 @@ impl ArenaPool for SharedArenaPool {
         ArenaClass::Shared
     }
 
-    fn write_batch(&self, _batch: WriteBatch) -> WriteBatchAck {
-        panic!("SharedArenaPool not wired in P2; every stream is Dedicated")
-    }
-
-    fn read(
+    fn allocate(
         &self,
         _stream_id: StreamId,
         _epoch: Epoch,
-        _offset: Offset,
-        _count: u32,
-    ) -> Result<Vec<Bytes>, StorageError> {
-        panic!("SharedArenaPool not wired in P2; every stream is Dedicated")
+        _start_offset: Offset,
+        _capacity: u32,
+    ) -> Arc<Arena> {
+        panic!(
+            "SharedArenaPool::allocate not wired (ids node_prefix present, arena_size={}); \
+             P3 scope",
+            self.arena_size
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bytes::Bytes;
-    use smallvec::smallvec;
-
-    use crate::arena::WriteBatchJob;
 
     #[test]
-    fn dedicated_pool_writes_to_private_active_arena() {
-        let pool = DedicatedArenaPool::new(Arc::new(ArenaIdGenerator::new(1)), 4096);
-        let batch = WriteBatch::new(
-            StreamId(1),
-            Epoch(1),
-            smallvec![WriteBatchJob::new(Offset(0), Bytes::from_static(b"abc"))],
-        );
-
-        let ack = pool.write_batch(batch);
-        let result = ack.results[0].as_ref().unwrap();
-        assert_eq!(result.offset, Offset(0));
-        assert_eq!(result.byte_pos, 0);
-        assert_eq!(pool.arena_count(), 1);
+    fn dedicated_pool_allocate_mints_fresh_arena_each_call() {
+        let pool = DedicatedArenaPool::new(Arc::new(ArenaIdGenerator::new(1)));
+        let a = pool.allocate(StreamId(1), Epoch(1), Offset(0), 4096);
+        let b = pool.allocate(StreamId(1), Epoch(1), Offset(100), 4096);
+        assert_ne!(a.arena_id, b.arena_id);
+        assert_eq!(a.start_offset, Offset(0));
+        assert_eq!(b.start_offset, Offset(100));
+        assert_eq!(pool.class(), ArenaClass::Dedicated);
     }
 
     #[test]
-    fn dedicated_pool_rotates_arena_when_full_within_same_epoch() {
-        let pool = DedicatedArenaPool::new(Arc::new(ArenaIdGenerator::new(1)), 8);
-        let batch = WriteBatch::new(
-            StreamId(1),
-            Epoch(1),
-            smallvec![
-                WriteBatchJob::new(Offset(0), Bytes::from_static(b"abc")),
-                WriteBatchJob::new(Offset(1), Bytes::from_static(b"def")),
-            ],
-        );
-
-        let ack = pool.write_batch(batch);
-        assert!(ack.results.iter().all(|r| r.is_ok()));
-        assert_ne!(
-            ack.results[0].as_ref().unwrap().arena_id,
-            ack.results[1].as_ref().unwrap().arena_id,
-        );
-        assert_eq!(pool.arena_count(), 2);
+    #[should_panic(expected = "SharedArenaPool::allocate not wired")]
+    fn shared_pool_allocate_panics_until_p3() {
+        let pool = SharedArenaPool::new(Arc::new(ArenaIdGenerator::new(1)), 4096);
+        let _ = pool.allocate(StreamId(1), Epoch(1), Offset(0), 4096);
     }
 }

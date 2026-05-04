@@ -49,6 +49,10 @@ pub struct ExtentNodeStore {
     pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
     /// ArenaId generator used by register_epoch paths.
     pub(crate) arena_ids: Arc<ArenaIdGenerator>,
+    /// EN-wide singleton pool for Shared-class streams. All Shared
+    /// streams reference this `Arc` via `Stream.pool`. P2 ships a
+    /// panicking stub; P3 wires the real multi-stream path.
+    pub(crate) shared_pool: Arc<crate::arena::SharedArenaPool>,
     /// Replication info per stream_id (registered via RegisterEpoch).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
     pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>, IdentityBuildHasher>,
@@ -85,10 +89,14 @@ impl ExtentNodeStore {
     /// Create a new store with a caller-provided `ArenaIdGenerator`.
     /// Called by `ExtentNode::start` after resolving the node_id.
     pub(crate) fn new_with_ids(arena_ids: Arc<ArenaIdGenerator>) -> Self {
+        let shared_pool = Arc::new(crate::arena::SharedArenaPool::new(
+            Arc::clone(&arena_ids),
+            common::config::DEFAULT_EPOCH_CAPACITY,
+        ));
         Self {
             streams: papaya::HashMap::with_hasher(IdentityBuildHasher),
             arena_ids,
-
+            shared_pool,
             replicas: papaya::HashMap::with_hasher(IdentityBuildHasher),
             downstream: OnceLock::new(),
             s3_client: OnceLock::new(),
@@ -115,12 +123,16 @@ impl ExtentNodeStore {
     /// Ensure a stream exists, creating it if needed.
     ///
     /// Always applies all stream-level configs (cache, storage_class) to the
-    /// stream, whether existing or new.
+    /// stream, whether existing or new. On first creation the `arena_class`
+    /// picks the Stream's `pool`: Dedicated → a fresh per-stream
+    /// `DedicatedArenaPool`; Shared → the EN-wide `SharedArenaPool` singleton.
+    ///
     /// Returns `true` if the stream was just created.
     pub(crate) fn try_create_stream(
         &self,
         stream_id: StreamId,
         storage_class: StorageClass,
+        arena_class: common::types::ArenaClass,
         policy: &EpochPolicy,
     ) -> bool {
         let guard = self.streams.pin();
@@ -131,7 +143,15 @@ impl ExtentNodeStore {
             stream.set_storage_class(storage_class);
             false
         } else {
-            let stream = Stream::new(stream_id, Arc::clone(&self.arena_ids));
+            let pool: Arc<dyn crate::arena::ArenaPool> = match arena_class {
+                common::types::ArenaClass::Dedicated => Arc::new(
+                    crate::arena::DedicatedArenaPool::new(Arc::clone(&self.arena_ids)),
+                ),
+                common::types::ArenaClass::Shared => {
+                    Arc::clone(&self.shared_pool) as Arc<dyn crate::arena::ArenaPool>
+                }
+            };
+            let stream = Stream::new(stream_id, Arc::clone(&self.arena_ids), pool);
             if policy.cache > 0 {
                 stream.set_max_epochs(policy.cache as usize);
             }

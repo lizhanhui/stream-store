@@ -91,6 +91,7 @@ impl ExtentNodeStore {
         let is_new = self.try_create_stream(
             stream_id,
             storage_class,
+            arena_class,
             &EpochPolicy {
                 cache: cache_extents,
             },
