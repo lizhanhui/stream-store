@@ -122,32 +122,32 @@ impl Arena {
     /// Single-writer batch append.
     ///
     /// The caller owns the single-writer invariant (store-level
-    /// leader election for Dedicated, arena-level leader election for
+    /// leader election for Dedicated, arena-pool-level leader election for
     /// Shared — P3).
     ///
     /// On `ArenaFull` the caller is expected to rotate to a fresh
-    /// arena and retry the failing job; `Arena::write_batch_inline`
-    /// never rotates itself. Per-job results preserve 1:1 ordering
-    /// with `jobs`.
+    /// arena and retry the failing job; `Arena::write_batch`
+    /// never rotates itself. Per-arena-append results preserve 1:1 ordering
+    /// with `appends`.
     ///
-    /// On the Primary, `job.offset` is treated as an echo-back hint
+    /// On the Primary, `ArenaAppend.offset` is treated as an echo-back hint
     /// and the returned `ArenaAppendResult.offset` is authoritative
     /// (`start_offset + seq`). On a Secondary, the caller should
     /// verify that the returned offset matches the Forward frame's
     /// offset and treat a mismatch as a protocol-level error.
-    pub(crate) fn write_batch_inline(
+    pub(crate) fn write_batch(
         &self,
-        jobs: &[ArenaAppend],
+        appends: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
-        let mut out = SmallVec::with_capacity(jobs.len());
-        for job in jobs {
-            out.push(self.write_one(job));
+        let mut out = SmallVec::with_capacity(appends.len());
+        for append in appends {
+            out.push(self.write(append));
         }
         out
     }
 
-    fn write_one(&self, job: &ArenaAppend) -> Result<ArenaAppendResult, StorageError> {
-        let payload_len = job.payload.len();
+    fn write(&self, append: &ArenaAppend) -> Result<ArenaAppendResult, StorageError> {
+        let payload_len = append.payload.len();
         let record_len = 4 + payload_len as u64;
 
         let byte_pos = self.write_cursor.load(Ordering::Relaxed);
@@ -171,7 +171,7 @@ impl Arena {
             let dst = self.buf.add(byte_pos as usize);
             std::ptr::copy_nonoverlapping((payload_len as u32).to_be_bytes().as_ptr(), dst, 4);
             if payload_len > 0 {
-                std::ptr::copy_nonoverlapping(job.payload.as_ptr(), dst.add(4), payload_len);
+                std::ptr::copy_nonoverlapping(append.payload.as_ptr(), dst.add(4), payload_len);
             }
         }
 
@@ -273,12 +273,12 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_inline_single_record_round_trip() {
+    fn write_batch_single_record_round_trip() {
         let arena = mk(4096);
         let jobs: SmallVec<[ArenaAppend; 16]> =
             smallvec![ArenaAppend::new(Offset(100), Bytes::from_static(b"hello"))];
 
-        let results = arena.write_batch_inline(&jobs);
+        let results = arena.write_batch(&jobs);
 
         assert_eq!(results.len(), 1);
         let r = results[0].as_ref().unwrap();
@@ -289,14 +289,14 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_inline_multiple_records_advance_cursor() {
+    fn write_batch_multiple_records_advance_cursor() {
         let arena = mk(4096);
         let jobs: SmallVec<[ArenaAppend; 16]> = smallvec![
             ArenaAppend::new(Offset(100), Bytes::from_static(b"a")),
             ArenaAppend::new(Offset(101), Bytes::from_static(b"bb")),
             ArenaAppend::new(Offset(102), Bytes::from_static(b"ccc")),
         ];
-        let results = arena.write_batch_inline(&jobs);
+        let results = arena.write_batch(&jobs);
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].as_ref().unwrap().offset, Offset(100));
         assert_eq!(results[1].as_ref().unwrap().offset, Offset(101));
@@ -307,21 +307,21 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_inline_returns_arena_full_at_boundary() {
+    fn write_batch_returns_arena_full_at_boundary() {
         // Capacity 16 bytes: fits two 4+4-byte records exactly, third returns ArenaFull.
         let arena = mk(16);
         let jobs: SmallVec<[ArenaAppend; 16]> = smallvec![
             ArenaAppend::new(Offset(100), Bytes::from_static(b"xxxx")),
             ArenaAppend::new(Offset(101), Bytes::from_static(b"yyyy")),
         ];
-        let results = arena.write_batch_inline(&jobs);
+        let results = arena.write_batch(&jobs);
         assert!(results[0].is_ok());
         assert!(results[1].is_ok());
         assert_eq!(arena.bytes_written(), 16);
         // A third record is too large.
         let more: SmallVec<[ArenaAppend; 16]> =
             smallvec![ArenaAppend::new(Offset(102), Bytes::from_static(b"z"))];
-        let third = arena.write_batch_inline(&more);
+        let third = arena.write_batch(&more);
         assert!(matches!(third[0], Err(StorageError::ArenaFull { .. })));
         // Cursor unchanged after the failed attempt.
         assert_eq!(arena.bytes_written(), 16);
@@ -336,7 +336,7 @@ mod tests {
             ArenaAppend::new(Offset(101), Bytes::from_static(b"second")),
             ArenaAppend::new(Offset(102), Bytes::from_static(b"third")),
         ];
-        let _ = arena.write_batch_inline(&jobs);
+        let _ = arena.write_batch(&jobs);
 
         let msgs = arena.read(Offset(100), 3).unwrap();
         assert_eq!(msgs.len(), 3);
@@ -352,7 +352,7 @@ mod tests {
             ArenaAppend::new(Offset(100), Bytes::from_static(b"a")),
             ArenaAppend::new(Offset(101), Bytes::from_static(b"b")),
         ];
-        let _ = arena.write_batch_inline(&jobs);
+        let _ = arena.write_batch(&jobs);
         assert!(arena.contains_offset(Offset(100)));
         assert!(arena.contains_offset(Offset(101)));
         assert!(!arena.contains_offset(Offset(102)));

@@ -74,7 +74,7 @@ impl ArenaPool for SharedArenaPool {
         &self,
         _stream_id: StreamId,
         _epoch: Epoch,
-        _jobs: &[ArenaAppend],
+        _appends: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
         panic!("SharedArenaPool::write_batch not wired; P3 scope")
     }

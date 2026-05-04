@@ -83,13 +83,13 @@ impl ArenaPool for DedicatedArenaPool {
         &self,
         _stream_id: StreamId,
         epoch: Epoch,
-        jobs: &[ArenaAppend],
+        appends: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
         let mut out: SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> =
-            SmallVec::with_capacity(jobs.len());
+            SmallVec::with_capacity(appends.len());
 
         let mut idx: usize = 0;
-        while idx < jobs.len() {
+        while idx < appends.len() {
             let arena = {
                 let state = self.state.lock();
                 state
@@ -99,9 +99,9 @@ impl ArenaPool for DedicatedArenaPool {
                     .expect("DedicatedArenaPool must have at least one arena")
             };
             let was_fresh = arena.record_count() == 0;
-            let job = &jobs[idx];
+            let job = &appends[idx];
             let one: [ArenaAppend; 1] = [ArenaAppend::new(job.offset, job.payload.clone())];
-            let mut r = arena.write_batch_inline(&one);
+            let mut r = arena.write_batch(&one);
             match r.pop().expect("one result") {
                 Ok(ok) => {
                     out.push(Ok(ok));
@@ -120,7 +120,7 @@ impl ArenaPool for DedicatedArenaPool {
                             ),
                         }
                         .build();
-                        for _ in &jobs[idx..] {
+                        for _ in &appends[idx..] {
                             out.push(Err(err_clone(&err)));
                         }
                         return out;

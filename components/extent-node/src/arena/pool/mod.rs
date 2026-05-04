@@ -47,7 +47,7 @@ pub(crate) trait ArenaPool: Send + Sync {
         &self,
         stream_id: StreamId,
         epoch: Epoch,
-        jobs: &[ArenaAppend],
+        appends: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]>;
 
     /// Read up to `count` records starting at `offset`, spanning
