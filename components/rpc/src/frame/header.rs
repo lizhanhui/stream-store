@@ -238,13 +238,14 @@ pub enum VariableHeader {
     },
     /// Init-extent notification (Forward, flag=0x01). No payload, no response.
     /// Sent once by primary when it starts using a new extent,
-    /// before any Forward frames for that extent. Carries extent metadata
-    /// so the secondary can create the extent with the correct capacity.
+    /// before any Forward frames for that extent. Carries epoch
+    /// metadata so the secondary can create the epoch locally.
+    /// Per-arena capacity is an EN-local config; it is no longer
+    /// dictated by the primary on the wire.
     ForwardInitEpoch {
         stream_id: StreamId,
         epoch: Epoch,
         start_offset: Offset,
-        extent_capacity: u32,
         cache_extents: u16,
         /// Storage class for sealed extents: S3 (0) or Memory (1).
         storage_class: StorageClass,

@@ -586,7 +586,6 @@ impl Frame {
                     }
                     FLAG_FORWARD_INIT_EPOCH => {
                         let start_offset = Offset(body.get_u64());
-                        let extent_capacity = body.get_u32();
                         let cache_extents = body.get_u16();
                         let storage_class =
                             StorageClass::from_u8(body.get_u8()).ok_or_else(|| {
@@ -606,7 +605,6 @@ impl Frame {
                                 stream_id,
                                 epoch,
                                 start_offset,
-                                extent_capacity,
                                 cache_extents,
                                 storage_class,
                                 arena_class,

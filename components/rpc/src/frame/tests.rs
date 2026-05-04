@@ -714,7 +714,6 @@ fn forward_init_epoch_arena_class_round_trip() {
             stream_id: StreamId(42),
             epoch: Epoch(7),
             start_offset: Offset(0),
-            extent_capacity: 1024,
             cache_extents: 2,
             storage_class: StorageClass::S3,
             arena_class: ArenaClass::Shared,
@@ -732,7 +731,6 @@ fn forward_init_epoch_arena_class_round_trip() {
             stream_id,
             epoch,
             start_offset,
-            extent_capacity,
             cache_extents,
             storage_class,
             arena_class,
@@ -740,7 +738,6 @@ fn forward_init_epoch_arena_class_round_trip() {
             assert_eq!(*stream_id, StreamId(42));
             assert_eq!(*epoch, Epoch(7));
             assert_eq!(*start_offset, Offset(0));
-            assert_eq!(*extent_capacity, 1024);
             assert_eq!(*cache_extents, 2);
             assert_eq!(*storage_class, StorageClass::S3);
             assert_eq!(*arena_class, ArenaClass::Shared);
@@ -795,7 +792,6 @@ fn forward_init_epoch_unknown_arena_class_errors() {
             stream_id: StreamId(1),
             epoch: Epoch(0),
             start_offset: Offset(0),
-            extent_capacity: 1024,
             cache_extents: 1,
             storage_class: StorageClass::S3,
             arena_class: ArenaClass::Dedicated,

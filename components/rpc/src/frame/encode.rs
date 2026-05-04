@@ -94,8 +94,8 @@ impl Frame {
             VariableHeader::ReportEpochRespError { .. } => 4 + 4 + 4 + 2,
             // stream_id(4) + epoch(4) + offset(8)
             VariableHeader::Forward { .. } => 4 + 4 + 8,
-            // stream_id(4) + epoch(4) + start_offset(8) + extent_capacity(4) + cache_extents(2) + storage_class(1) + arena_class(1)
-            VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 8 + 4 + 2 + 1 + 1,
+            // stream_id(4) + epoch(4) + start_offset(8) + cache_extents(2) + storage_class(1) + arena_class(1)
+            VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 8 + 2 + 1 + 1,
             // stream_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
             VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 8,
             // stream_id(4) + epoch(4)
@@ -473,7 +473,6 @@ impl Frame {
                 stream_id,
                 epoch,
                 start_offset,
-                extent_capacity,
                 cache_extents,
                 storage_class,
                 arena_class,
@@ -481,7 +480,6 @@ impl Frame {
                 dst.put_u32(stream_id.0);
                 dst.put_u32(epoch.0);
                 dst.put_u64(start_offset.0);
-                dst.put_u32(*extent_capacity);
                 dst.put_u16(*cache_extents);
                 dst.put_u8(storage_class.as_u8());
                 dst.put_u8(arena_class.as_u8());

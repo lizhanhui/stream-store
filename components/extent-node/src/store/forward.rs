@@ -1,5 +1,6 @@
 use std::sync::atomic::Ordering;
 
+use common::config::DEFAULT_EPOCH_CAPACITY;
 use common::errors::StorageError;
 use common::types::{ArenaClass, Epoch, EpochPolicy, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
@@ -37,7 +38,6 @@ impl ExtentNodeStore {
                     stream_id,
                     epoch,
                     start_offset: ext.start_offset,
-                    extent_capacity: ext.capacity(),
                     cache_extents: stream.max_epochs() as u16,
                     storage_class: stream.storage_class(),
                     arena_class: ArenaClass::Dedicated,
@@ -50,37 +50,29 @@ impl ExtentNodeStore {
     /// Handle ForwardInitEpoch (0x0B, flag=0x01) — init-extent notification.
     ///
     /// Ensures the stream exists (creating it if needed), then registers the
-    /// extent with the primary's actual capacity and adaptive config.
+    /// epoch locally. Per-arena capacity is an EN-local config; the primary
+    /// no longer dictates sizing on the wire.
     /// Fire-and-forget: no response.
     pub(crate) fn handle_forward_init_epoch(&self, frame: Frame) {
-        let (
-            stream_id,
-            epoch,
-            start_offset,
-            extent_capacity,
-            cache_extents,
-            storage_class,
-            arena_class,
-        ) = match &frame.variable_header {
-            VariableHeader::ForwardInitEpoch {
-                stream_id,
-                epoch,
-                start_offset,
-                extent_capacity,
-                cache_extents,
-                storage_class,
-                arena_class,
-            } => (
-                *stream_id,
-                *epoch,
-                *start_offset,
-                *extent_capacity,
-                *cache_extents,
-                *storage_class,
-                *arena_class,
-            ),
-            _ => return,
-        };
+        let (stream_id, epoch, start_offset, cache_extents, storage_class, arena_class) =
+            match &frame.variable_header {
+                VariableHeader::ForwardInitEpoch {
+                    stream_id,
+                    epoch,
+                    start_offset,
+                    cache_extents,
+                    storage_class,
+                    arena_class,
+                } => (
+                    *stream_id,
+                    *epoch,
+                    *start_offset,
+                    *cache_extents,
+                    *storage_class,
+                    *arena_class,
+                ),
+                _ => return,
+            };
 
         tracing::debug!(
             arena_class = ?arena_class,
@@ -96,34 +88,30 @@ impl ExtentNodeStore {
                 cache: cache_extents,
             },
         );
-        self.try_register_epoch(stream_id, start_offset, epoch, extent_capacity);
+        self.try_register_epoch(stream_id, start_offset, epoch);
 
         if is_new {
             info!(
-                "ForwardInitEpoch (new stream): stream={}, epoch={}, start_offset={}, capacity={}",
-                stream_id, epoch, start_offset, extent_capacity,
+                "ForwardInitEpoch (new stream): stream={}, epoch={}, start_offset={}",
+                stream_id, epoch, start_offset,
             );
         } else {
             info!(
-                "ForwardInitEpoch: stream={}, epoch={}, start_offset={}, capacity={}",
-                stream_id, epoch, start_offset, extent_capacity,
+                "ForwardInitEpoch: stream={}, epoch={}, start_offset={}",
+                stream_id, epoch, start_offset,
             );
         }
     }
 
-    /// Register an extent on a stream if it doesn't already exist.
-    fn try_register_epoch(
-        &self,
-        stream_id: StreamId,
-        start_offset: Offset,
-        epoch: Epoch,
-        extent_capacity: u32,
-    ) {
+    /// Register an epoch on a stream if it doesn't already exist. Uses
+    /// the EN's configured default capacity — no longer plumbed from
+    /// the ForwardInitEpoch frame.
+    fn try_register_epoch(&self, stream_id: StreamId, start_offset: Offset, epoch: Epoch) {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id)
             && stream.with_epoch(epoch, |_| ()).is_none()
         {
-            stream.register_epoch(start_offset, epoch, extent_capacity);
+            stream.register_epoch(start_offset, epoch, DEFAULT_EPOCH_CAPACITY);
         }
     }
 
