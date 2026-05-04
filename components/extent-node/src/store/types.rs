@@ -72,6 +72,10 @@ impl ReplicaInfo {
 /// and returns immediately. The active writer drains these jobs as a batch.
 pub(crate) struct AppendJob {
     pub request_id: u32,
+    /// Retained for symmetry with the frame header; the Stream that
+    /// owns the channel queue is already known at dequeue time, so
+    /// `append_one` does not consult this field.
+    #[allow(dead_code)]
     pub stream_id: StreamId,
     pub payload: Bytes,
     /// Channel back to the client connection for sending response frames.

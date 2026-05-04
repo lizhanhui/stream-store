@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 
 use common::config::DEFAULT_EPOCH_CAPACITY;
 use common::errors::StorageError;
-use common::types::{ArenaClass, Epoch, EpochPolicy, Offset, StreamId};
+use common::types::{Epoch, EpochPolicy, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
@@ -11,45 +11,6 @@ use crate::stream::Stream;
 use crate::stream_epoch::AppendResult;
 
 impl ExtentNodeStore {
-    /// Check if a Forward or ForwardChecksum frame targets an extent that
-    /// needs ForwardInitEpoch. Returns the init frame if so.
-    ///
-    /// Called on the leader side before pushing to the channel. FIFO channel
-    /// ordering guarantees ForwardInitEpoch arrives before the Forward frame
-    /// on the wire. The atomic `take_init_forward()` ensures exactly-once
-    /// semantics — the init frame is built once and cloned to all secondaries.
-    ///
-    /// Accepts a `&Stream` reference to avoid re-acquiring the map pin
-    /// (the caller already holds a guard).
-    pub(crate) fn maybe_build_init_forward(&self, stream: &Stream, frame: &Frame) -> Option<Frame> {
-        let (stream_id, epoch) = match &frame.variable_header {
-            VariableHeader::Forward {
-                stream_id, epoch, ..
-            }
-            | VariableHeader::ForwardChecksum {
-                stream_id, epoch, ..
-            } => (*stream_id, *epoch),
-            _ => return None,
-        };
-
-        stream.with_epoch(epoch, |ext| {
-            if !ext.take_init_forward() {
-                return None;
-            }
-
-            Some(Frame::new(
-                VariableHeader::ForwardInitEpoch {
-                    stream_id,
-                    epoch,
-                    start_offset: ext.start_offset,
-                    cache_extents: stream.max_epochs() as u16,
-                    storage_class: stream.storage_class(),
-                    arena_class: ArenaClass::Dedicated,
-                },
-                None,
-            ))
-        })?
-    }
 
     /// Handle ForwardInitEpoch (0x0B, flag=0x01) — init-extent notification.
     ///

@@ -1,19 +1,20 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use common::config::{DEFAULT_CACHE_EPOCHS, DEFAULT_EPOCH_CAPACITY};
 use common::errors::{InternalSnafu, StorageError};
-use common::types::{Epoch, EpochState, Offset, StorageClass, StreamId};
+use common::types::{ArenaClass, Epoch, EpochState, ErrorCode, Offset, StorageClass, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::RwLock;
 use rpc::frame::Frame;
+use rpc::frame::VariableHeader;
 use smallvec::SmallVec;
 use tokio::sync::mpsc;
 
-use crate::ack_queue::AckQueue;
+use crate::ack_queue::{AckQueue, PendingAck};
 use crate::arena::{ArenaAppendResult, ArenaIdGenerator, ArenaPool, WriteBatchJob};
 use crate::store::{AppendJob, ReplicaInfo};
 use crate::stream_epoch::{AppendResult, StreamEpoch};
@@ -108,7 +109,6 @@ pub struct Stream {
     /// EN-wide counters shared by every Stream. Incremented on
     /// successful append/replicate; read and reset by the Store's
     /// heartbeat snapshot.
-    #[allow(dead_code)]
     metrics: Arc<crate::store::StoreMetrics>,
 
     /// ReplicaInfo for this stream's current epoch. `None` until
@@ -353,6 +353,13 @@ impl Stream {
         self.replication_timeout
     }
 
+    /// Shared EN-wide metrics counters. Exposed for store-layer code
+    /// paths that increment on the stream's behalf (e.g. the batch
+    /// append handler).
+    pub(crate) fn metrics_handle(&self) -> &Arc<crate::store::StoreMetrics> {
+        &self.metrics
+    }
+
     // ── Read-lock methods ──────────────────────────────────────────────
 
     /// Append a message to the specified epoch.
@@ -525,6 +532,43 @@ impl Stream {
         }
     }
 
+    /// Check whether `frame` is a Forward/ForwardChecksum targeting an
+    /// epoch on this stream that has not yet emitted its
+    /// ForwardInitEpoch. Returns the init frame if so (and clears the
+    /// flag atomically so exactly one init frame is emitted).
+    ///
+    /// Called on the leader side before pushing to the per-secondary
+    /// channel. FIFO channel ordering guarantees ForwardInitEpoch
+    /// arrives before the Forward frame on the wire.
+    pub(crate) fn maybe_build_init_forward(&self, frame: &Frame) -> Option<Frame> {
+        let (stream_id, epoch) = match &frame.variable_header {
+            VariableHeader::Forward {
+                stream_id, epoch, ..
+            }
+            | VariableHeader::ForwardChecksum {
+                stream_id, epoch, ..
+            } => (*stream_id, *epoch),
+            _ => return None,
+        };
+
+        self.with_epoch(epoch, |ext| {
+            if !ext.take_init_forward() {
+                return None;
+            }
+            Some(Frame::new(
+                VariableHeader::ForwardInitEpoch {
+                    stream_id,
+                    epoch,
+                    start_offset: ext.start_offset,
+                    cache_extents: self.max_epochs() as u16,
+                    storage_class: self.storage_class(),
+                    arena_class: ArenaClass::Dedicated,
+                },
+                None,
+            ))
+        })?
+    }
+
     /// Return the maximum number of epochs to retain (0 = no limit).
     pub fn max_epochs(&self) -> usize {
         self.inner.read().max_epochs
@@ -610,6 +654,227 @@ impl Stream {
     /// Set cached downstream senders (Primary only, called at RegisterEpoch time).
     pub(crate) fn set_downstream_txs(&self, txs: Vec<mpsc::Sender<Frame>>) {
         self.inner.write().downstream_txs = txs;
+    }
+
+    // ── Hot-path append ────────────────────────────────────────────────
+
+    /// Append a single record to the active epoch and handle replication
+    /// / ACK according to this stream's ReplicaInfo. Used by the store's
+    /// leader-election fast path and by `drain_follower_jobs`.
+    ///
+    /// Returns the response frame, or `None` when the response was
+    /// already delivered via `response_tx`.
+    ///
+    /// Arena-full is handled transparently inside
+    /// `StreamEpoch::write_batch`; any error surfaced here is a genuine
+    /// per-job failure (EpochSealed / internal).
+    pub(crate) fn append_one(
+        &self,
+        request_id: u32,
+        epoch: Epoch,
+        payload: Bytes,
+        response_tx: Option<mpsc::Sender<Frame>>,
+    ) -> Option<Frame> {
+        let payload_len = payload.len();
+        let payload_for_forward = payload.clone();
+
+        let hint_offset = self.max_offset();
+        let job = WriteBatchJob::new(hint_offset, payload);
+        let mut results = self.write_batch_active(std::slice::from_ref(&job));
+        let append_result = match results.pop().expect("one result per job") {
+            Ok(r) => r,
+            Err(StorageError::EpochSealed { .. }) => {
+                let err = Frame::append_ack_error(
+                    request_id,
+                    self.id,
+                    epoch,
+                    ErrorCode::ExtentSealed,
+                    "extent is sealed",
+                );
+                if let Some(tx) = response_tx {
+                    let _ = tx.try_send(err);
+                    return None;
+                }
+                return Some(err);
+            }
+            Err(e) => {
+                let err = Frame::append_ack_error(
+                    request_id,
+                    self.id,
+                    epoch,
+                    ErrorCode::InternalError,
+                    &e.to_string(),
+                );
+                if let Some(tx) = response_tx {
+                    let _ = tx.try_send(err);
+                    return None;
+                }
+                return Some(err);
+            }
+        };
+
+        let offset = append_result.offset;
+
+        // Update metrics counters.
+        self.metrics.append_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_written
+            .fetch_add(payload_len as u64, Ordering::Relaxed);
+
+        // Check replica info (one atomic load; no map lookup).
+        let replica = self.replica_info();
+
+        match replica {
+            None => {
+                // Standalone mode: immediate ACK.
+                let ack = Frame::new(
+                    VariableHeader::AppendAck {
+                        request_id,
+                        stream_id: self.id,
+                        epoch,
+                        offset,
+                    },
+                    None,
+                );
+                if let Some(tx) = response_tx {
+                    let _ = tx.try_send(ack);
+                    None
+                } else {
+                    Some(ack)
+                }
+            }
+            Some(ref ri) if ri.is_primary() => {
+                if ri.is_standalone() {
+                    // RF=1: no secondaries, ACK immediately.
+                    let ack = Frame::new(
+                        VariableHeader::AppendAck {
+                            request_id,
+                            stream_id: self.id,
+                            epoch,
+                            offset,
+                        },
+                        None,
+                    );
+                    if let Some(tx) = response_tx {
+                        let _ = tx.try_send(ack);
+                        None
+                    } else {
+                        Some(ack)
+                    }
+                } else {
+                    // RF≥2: push Forward frames inline into per-stream channels.
+                    if self.has_secondaries() {
+                        let forward_frame = Frame::new(
+                            VariableHeader::Forward {
+                                stream_id: self.id,
+                                epoch,
+                                offset,
+                            },
+                            Some(payload_for_forward),
+                        );
+                        // Inject ForwardInitEpoch if this is the first forward for the epoch.
+                        if let Some(init) = self.maybe_build_init_forward(&forward_frame) {
+                            self.send_forward(init);
+                        }
+                        self.send_forward(forward_frame);
+                    }
+
+                    // Queue deferred ACK — lock-free, no contention with watermark readers.
+                    if let Some(ref resp_tx) = response_tx {
+                        let aq = self
+                            .init_ack_queue(ri.required_secondary_acks(), self.replication_timeout());
+                        aq.enqueue(PendingAck {
+                            request_id,
+                            stream_id: self.id,
+                            response_tx: resp_tx.clone(),
+                            assigned_offset: offset.0,
+                            epoch,
+                            created_at: Instant::now(),
+                        });
+                    }
+
+                    None
+                }
+            }
+            Some(_) => {
+                // Secondary received normal Append (not Forward) — shouldn't normally happen.
+                let ack = Frame::new(
+                    VariableHeader::AppendAck {
+                        request_id,
+                        stream_id: self.id,
+                        epoch,
+                        offset,
+                    },
+                    None,
+                );
+                if let Some(tx) = response_tx {
+                    let _ = tx.try_send(ack);
+                    None
+                } else {
+                    Some(ack)
+                }
+            }
+        }
+    }
+
+    /// Drain follower append jobs from this stream's channel.
+    ///
+    /// Called by the active writer after its own append when
+    /// `in_flight > 1`. Loops until all followers have been processed.
+    /// Forward frames are pushed inline by `append_one`; this method
+    /// only deals with per-job logical outcomes (seal, err, ok).
+    ///
+    /// Holds `&self` across every `.await` — no papaya guard dance
+    /// required, because the caller already owns an `Arc<Stream>` that
+    /// outlives this loop.
+    pub(crate) async fn drain_follower_jobs(&self) {
+        loop {
+            // ── Phase 1: Drain jobs from the channel ──
+            let mut batch: Vec<AppendJob> = Vec::new();
+            let mut epoch = Epoch(0);
+            loop {
+                if batch.is_empty() {
+                    epoch = self.epoch();
+                }
+                match self.job_rx().try_recv() {
+                    Ok(job) => {
+                        batch.push(job);
+                        while let Ok(job) = self.job_rx().try_recv() {
+                            batch.push(job);
+                        }
+                        break;
+                    }
+                    Err(_) if !batch.is_empty() => break,
+                    Err(_) => {
+                        // Follower incremented in_flight but hasn't pushed yet.
+                        let delegated = self.in_flight.load(Ordering::Acquire);
+                        if delegated > 0 {
+                            tokio::task::yield_now().await;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // ── Phase 2: Process the batch ──
+            let batch_len = batch.len();
+            for job in &batch {
+                self.append_one(
+                    job.request_id,
+                    epoch,
+                    job.payload.clone(),
+                    job.response_tx.clone(),
+                );
+            }
+            let remaining = self
+                .in_flight
+                .fetch_sub(batch_len as u64, Ordering::Release);
+            if remaining <= batch_len as u64 {
+                break;
+            }
+            // More followers arrived during processing — loop again.
+        }
     }
 }
 
