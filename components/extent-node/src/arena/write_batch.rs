@@ -100,8 +100,8 @@ impl ArenaAppendResult {
 
 // ── WriteBatchResult ────────────────────────────────────────────────────────────
 
-/// The result of processing a [`WriteBatch`]: one result per input job,
-/// in the same order as `WriteBatch.jobs`.
+/// The result of processing a [`WriteBatch`]: one result per input append,
+/// in the same order as `WriteBatch.appends`.
 pub(crate) struct WriteBatchResult {
     pub(crate) results: SmallVec<[Result<ArenaAppendResult, StorageError>; 16]>,
 }
@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_ack_holds_per_job_results() {
+    fn write_batch_result_holds_per_append_results() {
         let mut ack = WriteBatchResult::new();
         ack.push(Ok(ArenaAppendResult {
             offset: Offset(1),

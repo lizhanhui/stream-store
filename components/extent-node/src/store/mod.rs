@@ -25,6 +25,7 @@ use tracing::warn;
 
 use crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT;
 use crate::arena::ArenaIdGenerator;
+use crate::arena::ArenaPool;
 use crate::downstream::DownstreamPool;
 use crate::s3::S3Client;
 use crate::s3_flusher::FlushRequest;
@@ -158,12 +159,12 @@ impl ExtentNodeStore {
             stream.set_storage_class(storage_class);
             false
         } else {
-            let pool: Arc<dyn crate::arena::ArenaPool> = match arena_class {
+            let pool: Arc<dyn ArenaPool> = match arena_class {
                 common::types::ArenaClass::Dedicated => Arc::new(
                     crate::arena::DedicatedArenaPool::new(Arc::clone(&self.arena_ids)),
                 ),
                 common::types::ArenaClass::Shared => {
-                    Arc::clone(&self.shared_pool) as Arc<dyn crate::arena::ArenaPool>
+                    Arc::clone(&self.shared_pool) as Arc<dyn ArenaPool>
                 }
             };
             let stream = Stream::new(

@@ -790,7 +790,7 @@ impl Stream {
         let hint_offset = self.max_offset();
         let append = ArenaAppend::new(hint_offset, payload);
         let mut results = self.write_batch_active(std::slice::from_ref(&append));
-        let append_result = match results.pop().expect("one result per job") {
+        let append_result = match results.pop().expect("one result per append") {
             Ok(r) => r,
             Err(StorageError::EpochSealed { .. }) => {
                 let err = Frame::append_ack_error(

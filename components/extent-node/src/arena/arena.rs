@@ -18,12 +18,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bytes::Bytes;
 use common::errors::{ArenaFullSnafu, InternalSnafu, StorageError};
 use common::types::{ArenaId, Epoch, Offset, StreamId};
-use crossbeam_channel::{Receiver, Sender, unbounded};
 use smallvec::SmallVec;
 
 use crate::arena::{
     ArenaAppend, ArenaAppendResult, ArenaBuffer, ArenaDirectory, EpochArenaEntry, OwnedArenaSlice,
-    WriteBatch,
 };
 
 /// Minimum record size (4-byte length prefix + 1-byte payload). Used to
@@ -50,20 +48,6 @@ pub(crate) struct Arena {
     record_count: AtomicU64,
     committed_bytes: AtomicU64,
     directory: ArenaDirectory,
-
-    /// Arena-level leader-election counter. Unused on Dedicated path
-    /// (the stream leader is always the arena leader); P3 wires this
-    /// for SharedArenaPool.
-    #[allow(dead_code)]
-    pub(crate) arena_in_flight: AtomicU64,
-
-    /// Delegation channel. Followers in a Shared arena (P3) submit
-    /// `WriteBatch`es via `arena_job_tx`; the arena leader drains from
-    /// `arena_job_rx`. Unused on Dedicated path.
-    #[allow(dead_code)]
-    pub(crate) arena_job_tx: Sender<WriteBatch>,
-    #[allow(dead_code)]
-    pub(crate) arena_job_rx: Receiver<WriteBatch>,
 }
 
 // SAFETY: `buf` aliases `buffer`'s allocation; single-writer invariant
@@ -84,7 +68,7 @@ impl Arena {
         let record_cap = (capacity / MIN_RECORD_SIZE) as usize;
         let entry = EpochArenaEntry::with_capacity(stream_id, epoch, start_offset, record_cap);
         let directory = ArenaDirectory::new(entry);
-        let (arena_job_tx, arena_job_rx) = unbounded();
+
         Self {
             arena_id,
             stream_id,
@@ -97,9 +81,6 @@ impl Arena {
             record_count: AtomicU64::new(0),
             committed_bytes: AtomicU64::new(0),
             directory,
-            arena_in_flight: AtomicU64::new(0),
-            arena_job_tx,
-            arena_job_rx,
         }
     }
 

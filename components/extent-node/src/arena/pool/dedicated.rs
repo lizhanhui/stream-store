@@ -1,15 +1,3 @@
-//! Arena pool: memory management for stream epochs.
-//!
-//! `ArenaPool` is the memory layer below `Stream`. It owns the arena
-//! ringbuffer and provides write, read, and data-access methods.
-//! `StreamEpoch` holds metadata only; all physical arena operations
-//! route through the pool.
-//!
-//! - `DedicatedArenaPool`: per-stream pool with a ringbuffer of arenas.
-//!   Active arena = `arenas.last()`, rotation = `arenas.push()`.
-//!   No HashMap — ringbuffer pattern, O(1) active-arena lookup.
-//! - `SharedArenaPool`: EN-wide singleton; stubs panic until P3.
-
 use std::sync::Arc;
 
 use bytes::{Bytes, BytesMut};
@@ -18,7 +6,8 @@ use common::types::{ArenaClass, Epoch, Offset, StreamId};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-use crate::arena::{Arena, ArenaAppend, ArenaAppendResult, ArenaIdGenerator};
+use crate::arena::Arena;
+use crate::arena::{ArenaAppend, ArenaAppendResult, ArenaIdGenerator, pool::ArenaPool};
 
 // ── PoolState (ringbuffer) ────────────────────────────────────────────
 
@@ -29,75 +18,6 @@ struct DedicatedPoolState {
     arenas: SmallVec<[Arc<Arena>; 4]>,
     /// Fixed per-arena capacity for this pool.
     arena_capacity: u32,
-}
-
-// ── Trait ─────────────────────────────────────────────────────────────
-
-#[allow(dead_code)] // P3/P4: class, bytes_written, register_arena, current_arena, release_epoch
-pub(crate) trait ArenaPool: Send + Sync {
-    fn class(&self) -> ArenaClass;
-
-    /// Mint a fresh arena for the given `(stream, epoch)` placement,
-    /// sized to `capacity` bytes. On DedicatedArenaPool, also
-    /// registers the arena in the internal ringbuffer (dual-store
-    /// during transition).
-    fn allocate(
-        &self,
-        stream_id: StreamId,
-        epoch: Epoch,
-        start_offset: Offset,
-        capacity: u32,
-    ) -> Arc<Arena>;
-
-    /// Write a batch of jobs to the active arena. On `ArenaFull`,
-    /// rotates to a fresh arena and retries. Does NOT check seal —
-    /// that is the caller's responsibility. Returns one result per
-    /// job in 1:1 order.
-    fn write_batch(
-        &self,
-        stream_id: StreamId,
-        epoch: Epoch,
-        jobs: &[ArenaAppend],
-    ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]>;
-
-    /// Read up to `count` records starting at `offset`, spanning
-    /// arena boundaries if needed.
-    fn read_at_offset(
-        &self,
-        stream_id: StreamId,
-        epoch: Epoch,
-        offset: Offset,
-        count: u32,
-    ) -> Result<Vec<Bytes>, StorageError>;
-
-    /// Concatenation of every resident arena's committed bytes.
-    /// Used by `ForwardChecksum` and S3 flush.
-    fn committed_data(&self, stream_id: StreamId, epoch: Epoch) -> Bytes;
-
-    /// Lookup the byte position of record `seq` (relative to the
-    /// epoch's `start_offset`) across the arena ring.
-    fn index_lookup(&self, stream_id: StreamId, epoch: Epoch, seq: u64) -> Option<u64>;
-
-    /// Total bytes written across every arena in the ring.
-    fn bytes_written(&self, stream_id: StreamId, epoch: Epoch) -> u64;
-
-    /// Register an existing arena into the pool's ringbuffer.
-    /// Used when StreamEpoch already holds an arena that needs to
-    /// be mirrored in the pool (dual-store during transition).
-    fn register_arena(
-        &self,
-        stream_id: StreamId,
-        epoch: Epoch,
-        arena: Arc<Arena>,
-        arena_capacity: u32,
-    );
-
-    /// Return the current active arena (last in the ring), if any.
-    fn current_arena(&self, stream_id: StreamId, epoch: Epoch) -> Option<Arc<Arena>>;
-
-    /// Release the epoch's arena list. Called after S3 flush completes
-    /// and the epoch is no longer resident in memory.
-    fn release_epoch(&self, stream_id: StreamId, epoch: Epoch);
 }
 
 // ── Dedicated ─────────────────────────────────────────────────────────
@@ -315,93 +235,6 @@ impl ArenaPool for DedicatedArenaPool {
     }
 }
 
-// ── Shared (stub) ─────────────────────────────────────────────────────
-
-/// EN-wide singleton for Shared-class streams. All methods panic until
-/// P3 wires the multi-stream arena pool, the Shape A flush path, and
-/// the directory_ref_count bookkeeping.
-#[allow(dead_code)]
-pub(crate) struct SharedArenaPool {
-    ids: Arc<ArenaIdGenerator>,
-    arena_size: u32,
-}
-
-impl SharedArenaPool {
-    #[allow(dead_code)]
-    pub(crate) fn new(ids: Arc<ArenaIdGenerator>, arena_size: u32) -> Self {
-        Self { ids, arena_size }
-    }
-}
-
-impl ArenaPool for SharedArenaPool {
-    fn class(&self) -> ArenaClass {
-        ArenaClass::Shared
-    }
-
-    fn allocate(
-        &self,
-        _stream_id: StreamId,
-        _epoch: Epoch,
-        _start_offset: Offset,
-        _capacity: u32,
-    ) -> Arc<Arena> {
-        panic!(
-            "SharedArenaPool::allocate not wired (ids node_prefix present, arena_size={}); \
-             P3 scope",
-            self.arena_size
-        )
-    }
-
-    fn write_batch(
-        &self,
-        _stream_id: StreamId,
-        _epoch: Epoch,
-        _jobs: &[ArenaAppend],
-    ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
-        panic!("SharedArenaPool::write_batch not wired; P3 scope")
-    }
-
-    fn read_at_offset(
-        &self,
-        _stream_id: StreamId,
-        _epoch: Epoch,
-        _offset: Offset,
-        _count: u32,
-    ) -> Result<Vec<Bytes>, StorageError> {
-        panic!("SharedArenaPool::read_at_offset not wired; P3 scope")
-    }
-
-    fn committed_data(&self, _stream_id: StreamId, _epoch: Epoch) -> Bytes {
-        panic!("SharedArenaPool::committed_data not wired; P3 scope")
-    }
-
-    fn index_lookup(&self, _stream_id: StreamId, _epoch: Epoch, _seq: u64) -> Option<u64> {
-        panic!("SharedArenaPool::index_lookup not wired; P3 scope")
-    }
-
-    fn bytes_written(&self, _stream_id: StreamId, _epoch: Epoch) -> u64 {
-        panic!("SharedArenaPool::bytes_written not wired; P3 scope")
-    }
-
-    fn register_arena(
-        &self,
-        _stream_id: StreamId,
-        _epoch: Epoch,
-        _arena: Arc<Arena>,
-        _arena_capacity: u32,
-    ) {
-        panic!("SharedArenaPool::register_arena not wired; P3 scope")
-    }
-
-    fn current_arena(&self, _stream_id: StreamId, _epoch: Epoch) -> Option<Arc<Arena>> {
-        panic!("SharedArenaPool::current_arena not wired; P3 scope")
-    }
-
-    fn release_epoch(&self, _stream_id: StreamId, _epoch: Epoch) {
-        panic!("SharedArenaPool::release_epoch not wired; P3 scope")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -546,12 +379,5 @@ mod tests {
 
         pool.release_epoch(sid, ep);
         assert!(pool.current_arena(sid, ep).is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "SharedArenaPool::allocate not wired")]
-    fn shared_pool_allocate_panics_until_p3() {
-        let pool = SharedArenaPool::new(Arc::new(ArenaIdGenerator::new(1)), 4096);
-        let _ = pool.allocate(StreamId(1), Epoch(1), Offset(0), 4096);
     }
 }
