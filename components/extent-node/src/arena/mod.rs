@@ -5,16 +5,19 @@
 //! (one stream per arena) and Shared (many streams per arena, added in
 //! a later plan) pools.
 
+mod arena;
 mod buffer;
 mod directory;
 mod id;
 mod pool;
 mod write_batch;
 
+#[allow(unused_imports)]
+pub(crate) use arena::Arena;
 pub(crate) use buffer::{ArenaBuffer, OwnedArenaSlice};
 pub(crate) use directory::{ArenaDirectory, EpochArenaEntry, SLOT_UNSET};
 pub(crate) use id::{ArenaId, ArenaIdGenerator, node_prefix_from_id};
 #[allow(unused_imports)]
-pub(crate) use pool::SharedArenaPool;
+pub(crate) use pool::{ArenaPool, DedicatedArenaPool, SharedArenaPool};
 #[allow(unused_imports)]
-pub(crate) use write_batch::{JobResult, SharedAppendJob, WriteBatch, WriteBatchAck};
+pub(crate) use write_batch::{ArenaAppendResult, WriteBatch, WriteBatchAck, WriteBatchJob};
