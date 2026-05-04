@@ -383,9 +383,10 @@ pub struct ReplicaDetail {
 /// Error codes sent in Error response frames.
 ///
 /// Note: `ExtentFull` (formerly 5) was removed from the wire protocol — in the
-/// epoch-based seal model the server handles extent rotation internally, so
-/// clients never observe that condition.  The internal `StorageError::EpochFull`
-/// still exists for extent-node-local use.
+/// epoch-based seal model the server handles arena rotation internally, so
+/// clients never observe that condition.  The internal
+/// `StorageError::ArenaFull` signals a pool-internal rotation event; it is
+/// caught below `StreamEpoch::write_batch` and never reaches the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u16)]
 pub enum ErrorCode {

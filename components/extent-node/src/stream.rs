@@ -18,13 +18,6 @@ use crate::arena::{ArenaAppendResult, ArenaIdGenerator, ArenaPool, WriteBatchJob
 use crate::store::AppendJob;
 use crate::stream_epoch::{AppendResult, StreamEpoch};
 
-/// Reason for sealing the active extent.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SealReason {
-    /// Epoch arena is full — client must reopen on a new epoch.
-    EpochFull,
-}
-
 /// Mutable state protected by `RwLock`. Grouped here so that a single
 /// lock acquisition covers all fields that need coordinated mutation.
 struct StreamInner {
@@ -50,7 +43,7 @@ struct StreamInner {
 ///
 /// Thread-safe (`Send + Sync`). All public methods take `&self`:
 /// - Hot-path reads (`epoch`, `in_flight`) use lock-free atomics.
-/// - Epoch reads (`append`, `read`, `try_append_active`, ...) use `self.epochs.load()` (lock-free).
+/// - Epoch reads (`append`, `read`, `write_batch_active`, ...) use `self.epochs.load()` (lock-free).
 /// - Mutations of inner fields (`seal`, `register_epoch`, etc.) use `inner.write()`.
 ///
 /// The active (last) extent is a lock-free arena. Multiple concurrent appenders
