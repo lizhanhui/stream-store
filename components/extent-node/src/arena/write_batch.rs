@@ -11,7 +11,7 @@ use common::types::{Epoch, Offset, StreamId};
 
 use crate::arena::ArenaId;
 
-// ── WriteBatchJob ────────────────────────────────────────────────────────────
+// ── ArenaAppend ────────────────────────────────────────────────────────────
 
 /// One record submitted inside a [`WriteBatch`] from a stream leader.
 ///
@@ -19,12 +19,12 @@ use crate::arena::ArenaId;
 /// write. ArenaPool echoes it back in [`ArenaAppendResult`] with local
 /// physical placement.
 #[derive(Debug)]
-pub(crate) struct WriteBatchJob {
+pub(crate) struct ArenaAppend {
     pub(crate) offset: Offset,
     pub(crate) payload: Bytes,
 }
 
-impl WriteBatchJob {
+impl ArenaAppend {
     pub(crate) fn new(offset: Offset, payload: Bytes) -> Self {
         Self { offset, payload }
     }
@@ -36,20 +36,20 @@ impl WriteBatchJob {
 pub(crate) struct WriteBatch {
     pub(crate) stream_id: StreamId,
     pub(crate) epoch: Epoch,
-    pub(crate) jobs: SmallVec<[WriteBatchJob; 16]>,
-    pub(crate) reply: Option<oneshot::Sender<WriteBatchAck>>,
+    pub(crate) appends: SmallVec<[ArenaAppend; 16]>,
+    pub(crate) reply: Option<oneshot::Sender<WriteBatchResult>>,
 }
 
 impl WriteBatch {
     pub(crate) fn new(
         stream_id: StreamId,
         epoch: Epoch,
-        jobs: SmallVec<[WriteBatchJob; 16]>,
+        appends: SmallVec<[ArenaAppend; 16]>,
     ) -> Self {
         Self {
             stream_id,
             epoch,
-            jobs,
+            appends,
             reply: None,
         }
     }
@@ -57,29 +57,29 @@ impl WriteBatch {
     pub(crate) fn with_reply(
         stream_id: StreamId,
         epoch: Epoch,
-        jobs: SmallVec<[WriteBatchJob; 16]>,
-        reply: oneshot::Sender<WriteBatchAck>,
+        appends: SmallVec<[ArenaAppend; 16]>,
+        reply: oneshot::Sender<WriteBatchResult>,
     ) -> Self {
         Self {
             stream_id,
             epoch,
-            jobs,
+            appends,
             reply: Some(reply),
         }
     }
 
     pub(crate) fn len(&self) -> usize {
-        self.jobs.len()
+        self.appends.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.jobs.is_empty()
+        self.appends.is_empty()
     }
 }
 
 // ── ArenaAppendResult ────────────────────────────────────────────────────────
 
-/// Per-job resolved placement within an arena after the arena writer
+/// Per-ArenaAppend resolved placement within an arena after the arena writer
 /// has performed the memcpy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ArenaAppendResult {
@@ -98,15 +98,15 @@ impl ArenaAppendResult {
     }
 }
 
-// ── WriteBatchAck ────────────────────────────────────────────────────────────
+// ── WriteBatchResult ────────────────────────────────────────────────────────────
 
 /// The result of processing a [`WriteBatch`]: one result per input job,
 /// in the same order as `WriteBatch.jobs`.
-pub(crate) struct WriteBatchAck {
+pub(crate) struct WriteBatchResult {
     pub(crate) results: SmallVec<[Result<ArenaAppendResult, StorageError>; 16]>,
 }
 
-impl WriteBatchAck {
+impl WriteBatchResult {
     pub(crate) fn new() -> Self {
         Self {
             results: SmallVec::new(),
@@ -122,7 +122,7 @@ impl WriteBatchAck {
     }
 }
 
-impl Default for WriteBatchAck {
+impl Default for WriteBatchResult {
     fn default() -> Self {
         Self::new()
     }
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn write_batch_ack_holds_per_job_results() {
-        let mut ack = WriteBatchAck::new();
+        let mut ack = WriteBatchResult::new();
         ack.push(Ok(ArenaAppendResult {
             offset: Offset(1),
             arena_id: ArenaId(1),

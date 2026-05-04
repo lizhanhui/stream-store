@@ -15,7 +15,7 @@ use smallvec::SmallVec;
 use tokio::sync::mpsc;
 
 use crate::ack_queue::{AckQueue, PendingAck};
-use crate::arena::{ArenaAppendResult, ArenaId, ArenaIdGenerator, ArenaPool, WriteBatchJob};
+use crate::arena::{ArenaAppend, ArenaAppendResult, ArenaId, ArenaIdGenerator, ArenaPool};
 use crate::store::{AppendRequest, ReplicaInfo};
 use crate::stream_epoch::{AppendResult, StreamEpoch};
 
@@ -63,7 +63,7 @@ struct StreamInner {
 /// append and used during read to resolve offsets without client-side byte_pos.
 ///
 /// Pipelined group commit is coordinated at the stream level via `in_flight`,
-/// `job_tx`, and `job_rx`. This ensures extent transitions (seal + create) are
+/// `request_tx`, and `request_rx`. This ensures extent transitions (seal + create) are
 /// handled transparently by the stream-level leader without callers needing to
 /// know about individual extent boundaries.
 pub struct Stream {
@@ -77,9 +77,9 @@ pub struct Stream {
     /// 0 = idle. The leader owns the entire stream, handling extent transitions inline.
     in_flight: AtomicU64,
 
-    /// Channel for followers to submit append jobs to the leader writer.
-    job_tx: Sender<AppendRequest>,
-    job_rx: Receiver<AppendRequest>,
+    /// Channel for followers to submit append requests to the leader writer.
+    request_tx: Sender<AppendRequest>,
+    request_rx: Receiver<AppendRequest>,
 
     /// Per-stream ACK queue for quorum-based replication (Primary only).
     /// `None` on Secondaries. Initialized once at RegisterEpoch time via `OnceLock`.
@@ -147,13 +147,13 @@ impl Stream {
         metrics: Arc<crate::store::StoreMetrics>,
         replication_timeout: Duration,
     ) -> Self {
-        let (job_tx, job_rx) = unbounded();
+        let (request_tx, request_rx) = unbounded();
         Self {
             id,
             epoch: AtomicU32::new(0),
             in_flight: AtomicU64::new(0),
-            job_tx,
-            job_rx,
+            request_tx,
+            request_rx,
             ack_queue: OnceLock::new(),
             flush_in_progress: papaya::HashMap::new(),
             epochs: ArcSwap::from_pointee(SmallVec::new()),
@@ -310,14 +310,14 @@ impl Stream {
         &self.in_flight
     }
 
-    /// Return a reference to the job sender channel.
-    pub(crate) fn job_tx(&self) -> &Sender<AppendRequest> {
-        &self.job_tx
+    /// Return a reference to the request sender channel.
+    pub(crate) fn request_tx(&self) -> &Sender<AppendRequest> {
+        &self.request_tx
     }
 
-    /// Return a reference to the job receiver channel.
-    pub(crate) fn job_rx(&self) -> &Receiver<AppendRequest> {
-        &self.job_rx
+    /// Return a reference to the request receiver channel.
+    pub(crate) fn request_rx(&self) -> &Receiver<AppendRequest> {
+        &self.request_rx
     }
 
     /// Get the AckQueue for this stream (Primary only). Returns `None` on Secondaries.
@@ -379,11 +379,11 @@ impl Stream {
             .build()
         })?;
         let hint_offset = Offset(extent.committed_offset());
-        let job = WriteBatchJob::new(hint_offset, payload.clone());
+        let append = ArenaAppend::new(hint_offset, payload.clone());
         let mut results = self
             .pool
-            .write_batch(self.id, epoch, std::slice::from_ref(&job));
-        match results.pop().expect("one result per job") {
+            .write_batch(self.id, epoch, std::slice::from_ref(&append));
+        match results.pop().expect("one result per arena append") {
             Ok(r) => {
                 extent.update_crc(&payload);
                 extent.advance_committed(1);
@@ -404,34 +404,35 @@ impl Stream {
     /// Does NOT check seal — that is the caller's responsibility.
     pub(crate) fn write_batch_active(
         &self,
-        jobs: &[WriteBatchJob],
+        batch: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
         match self.active_epoch() {
-            Some(ep) => {
-                if ep.is_sealed() {
-                    let committed = ep.committed_offset() - ep.start_offset.0;
-                    let limit = ep.limit_hint();
+            Some(stream_epoch) => {
+                if stream_epoch.is_sealed() {
+                    let committed = stream_epoch.committed_offset() - stream_epoch.start_offset.0;
+                    let limit = stream_epoch.limit_hint();
                     if committed >= limit {
-                        return jobs
+                        return batch
                             .iter()
                             .map(|_| {
                                 Err(EpochSealedSnafu {
                                     stream_id: self.id,
-                                    epoch: ep.epoch,
+                                    epoch: stream_epoch.epoch,
                                 }
                                 .build())
                             })
                             .collect();
                     }
                 }
-                self.pool.write_batch(self.id, ep.epoch, jobs)
+                self.pool.write_batch(self.id, stream_epoch.epoch, batch)
             }
             None => {
                 let err = InternalSnafu {
                     message: format!("stream {}: no active epoch", self.id),
                 }
                 .build();
-                jobs.iter()
+                batch
+                    .iter()
                     .map(|_| {
                         Err(InternalSnafu {
                             message: err.to_string(),
@@ -490,10 +491,10 @@ impl Stream {
             }
             .build());
         }
-        let job = WriteBatchJob::new(offset, payload.clone());
+        let append = ArenaAppend::new(offset, payload.clone());
         let mut results = self
             .pool
-            .write_batch(self.id, epoch, std::slice::from_ref(&job));
+            .write_batch(self.id, epoch, std::slice::from_ref(&append));
         match results.pop().expect("one result") {
             Ok(r) => {
                 // Sanity: arena-assigned offset must match the primary's.
@@ -768,14 +769,14 @@ impl Stream {
 
     /// Append a single record to the active epoch and handle replication
     /// / ACK according to this stream's ReplicaInfo. Used by the store's
-    /// leader-election fast path and by `drain_follower_jobs`.
+    /// leader-election fast path and by `drain_delegated_requests`.
     ///
     /// Returns the response frame, or `None` when the response was
     /// already delivered via `response_tx`.
     ///
     /// Arena-full is handled transparently inside
     /// `StreamEpoch::write_batch`; any error surfaced here is a genuine
-    /// per-job failure (EpochSealed / internal).
+    /// per-append failure (EpochSealed / internal).
     pub(crate) fn append_one(
         &self,
         request_id: u32,
@@ -787,8 +788,8 @@ impl Stream {
         let payload_for_forward = payload.clone();
 
         let hint_offset = self.max_offset();
-        let job = WriteBatchJob::new(hint_offset, payload);
-        let mut results = self.write_batch_active(std::slice::from_ref(&job));
+        let append = ArenaAppend::new(hint_offset, payload);
+        let mut results = self.write_batch_active(std::slice::from_ref(&append));
         let append_result = match results.pop().expect("one result per job") {
             Ok(r) => r,
             Err(StorageError::EpochSealed { .. }) => {
@@ -1115,7 +1116,7 @@ impl Stream {
         responses
     }
 
-    /// Batch-append leader: builds WriteBatchJob array, calls pool.write_batch,
+    /// Batch-append leader: builds ArenaAppend array, calls pool.write_batch,
     /// processes errors, calls epoch.update_crc/advance_committed per success,
     /// then dispatch_results.
     pub(crate) fn append_batch_leader(
@@ -1126,13 +1127,13 @@ impl Stream {
     ) -> Vec<Frame> {
         let mut responses = Vec::new();
 
-        let mut jobs: SmallVec<[WriteBatchJob; 16]> = SmallVec::with_capacity(frames.len());
+        let mut batch: SmallVec<[ArenaAppend; 16]> = SmallVec::with_capacity(frames.len());
         let hint = self.max_offset();
         for (i, frame) in frames.iter().enumerate() {
             let payload = frame.payload.clone().unwrap_or_default();
-            jobs.push(WriteBatchJob::new(Offset(hint.0 + i as u64), payload));
+            batch.push(ArenaAppend::new(Offset(hint.0 + i as u64), payload));
         }
-        let results = self.write_batch_active(&jobs);
+        let results = self.write_batch_active(&batch);
 
         let mut entries: Vec<BatchResultEntry> = Vec::with_capacity(frames.len());
 
@@ -1194,30 +1195,30 @@ impl Stream {
         responses
     }
 
-    /// Drain follower append jobs from this stream's channel.
+    /// Drain delegated append requests from this stream's channel.
     ///
     /// Called by the leader writer after its own append when
-    /// `in_flight > 1`. Loops until all followers have been processed.
+    /// `in_flight > 1`. Loops until all delegated requests have been processed.
     /// Forward frames are pushed inline by `append_one`; this method
-    /// only deals with per-job logical outcomes (seal, err, ok).
+    /// only deals with per-request logical outcomes (seal, err, ok).
     ///
     /// Holds `&self` across every `.await` — no papaya guard dance
     /// required, because the caller already owns an `Arc<Stream>` that
     /// outlives this loop.
-    pub(crate) async fn drain_follower_jobs(&self) {
+    pub(crate) async fn drain_delegated_requests(&self) {
         loop {
-            // ── Phase 1: Drain jobs from the channel ──
+            // ── Phase 1: Drain requests from the channel ──
             let mut batch: Vec<AppendRequest> = Vec::new();
             let mut epoch = Epoch(0);
             loop {
                 if batch.is_empty() {
                     epoch = self.epoch();
                 }
-                match self.job_rx().try_recv() {
-                    Ok(job) => {
-                        batch.push(job);
-                        while let Ok(job) = self.job_rx().try_recv() {
-                            batch.push(job);
+                match self.request_rx().try_recv() {
+                    Ok(request) => {
+                        batch.push(request);
+                        while let Ok(request) = self.request_rx().try_recv() {
+                            batch.push(request);
                         }
                         break;
                     }
@@ -1236,12 +1237,12 @@ impl Stream {
 
             // ── Phase 2: Process the batch ──
             let batch_len = batch.len();
-            for job in &batch {
+            for request in &batch {
                 self.append_one(
-                    job.request_id,
+                    request.request_id,
                     epoch,
-                    job.payload.clone(),
-                    job.response_tx.clone(),
+                    request.payload.clone(),
+                    request.response_tx.clone(),
                 );
             }
             let remaining = self

@@ -17,7 +17,7 @@ impl ExtentNodeStore {
     /// drain happens on the Stream itself (no further map lookups).
     ///
     /// - `prev == 0`: this task becomes the leader writer.
-    ///   Calls `stream.append_one(...)`, then `stream.drain_follower_jobs()`
+    ///   Calls `stream.append_one(...)`, then `stream.drain_delegated_requests()`
     ///   if followers arrived.
     /// - `prev > 0`: pushes an `AppendRequest` to the channel and returns.
     ///
@@ -65,7 +65,7 @@ impl ExtentNodeStore {
                 payload: frame.payload.clone().unwrap_or_default(),
                 response_tx: response_tx.cloned(),
             };
-            let _ = stream.job_tx().send(job);
+            let _ = stream.request_tx().send(job);
             return None;
         }
 
@@ -76,7 +76,7 @@ impl ExtentNodeStore {
         let remaining = stream.in_flight().fetch_sub(1, Ordering::Release);
 
         if remaining > 1 {
-            stream.drain_follower_jobs().await;
+            stream.drain_delegated_requests().await;
         }
 
         own_result
@@ -182,7 +182,7 @@ impl ExtentNodeStore {
                     payload: frame.payload.clone().unwrap_or_default(),
                     response_tx: response_tx.cloned(),
                 };
-                let _ = stream.job_tx().send(job);
+                let _ = stream.request_tx().send(job);
             }
             return Vec::new(); // All deferred — empty responses.
         }
@@ -193,7 +193,7 @@ impl ExtentNodeStore {
         let remaining = stream.in_flight().fetch_sub(batch_len, Ordering::Release);
 
         if remaining > batch_len {
-            stream.drain_follower_jobs().await;
+            stream.drain_delegated_requests().await;
         }
 
         responses

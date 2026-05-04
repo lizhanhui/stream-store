@@ -460,7 +460,7 @@ impl std::fmt::Debug for StreamEpoch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::{ArenaIdGenerator, ArenaPool, DedicatedArenaPool, WriteBatchJob};
+    use crate::arena::{ArenaAppend, ArenaIdGenerator, ArenaPool, DedicatedArenaPool};
     use bytes::Bytes;
     use common::errors::StorageError;
 
@@ -478,23 +478,29 @@ mod tests {
     /// Helper: write one record via pool, then update epoch metadata.
     /// Also syncs resident_arenas when arena rotation occurs.
     fn write_one(
-        ep: &StreamEpoch,
+        stream_epoch: &StreamEpoch,
         pool: &dyn ArenaPool,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
-        let hint = Offset(ep.committed_offset());
-        let job = WriteBatchJob::new(hint, payload.clone());
-        let mut results = pool.write_batch(ep.stream_id, ep.epoch, std::slice::from_ref(&job));
+        let hint = Offset(stream_epoch.committed_offset());
+        let append = ArenaAppend::new(hint, payload.clone());
+        let mut results = pool.write_batch(
+            stream_epoch.stream_id,
+            stream_epoch.epoch,
+            std::slice::from_ref(&append),
+        );
         match results.pop().expect("one result") {
             Ok(r) => {
                 // Sync resident_arenas if the arena was rotated (new arena_id).
-                let known: SmallVec<[ArenaId; 4]> = ep.resident_arenas.lock().clone();
+                let known: SmallVec<[ArenaId; 4]> = stream_epoch.resident_arenas.lock().clone();
                 if !known.contains(&r.arena_id) {
-                    ep.resident_arenas.lock().push(r.arena_id);
-                    ep.directory_ref_count.fetch_add(1, Ordering::Release);
+                    stream_epoch.resident_arenas.lock().push(r.arena_id);
+                    stream_epoch
+                        .directory_ref_count
+                        .fetch_add(1, Ordering::Release);
                 }
-                ep.update_crc(&payload);
-                ep.advance_committed(1);
+                stream_epoch.update_crc(&payload);
+                stream_epoch.advance_committed(1);
                 Ok(AppendResult {
                     offset: r.offset,
                     byte_pos: r.byte_pos as u64,

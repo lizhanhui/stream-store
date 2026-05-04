@@ -17,4 +17,4 @@ pub(crate) use buffer::{ArenaBuffer, OwnedArenaSlice};
 pub(crate) use directory::{ArenaDirectory, EpochArenaEntry};
 pub(crate) use id::{ArenaId, ArenaIdGenerator, node_prefix_from_id};
 pub(crate) use pool::{ArenaPool, DedicatedArenaPool, SharedArenaPool};
-pub(crate) use write_batch::{ArenaAppendResult, WriteBatch, WriteBatchJob};
+pub(crate) use write_batch::{ArenaAppend, ArenaAppendResult, WriteBatch};

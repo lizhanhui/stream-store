@@ -18,7 +18,7 @@ use common::types::{ArenaClass, Epoch, Offset, StreamId};
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-use crate::arena::{Arena, ArenaAppendResult, ArenaIdGenerator, WriteBatchJob};
+use crate::arena::{Arena, ArenaAppend, ArenaAppendResult, ArenaIdGenerator};
 
 // ── PoolState (ringbuffer) ────────────────────────────────────────────
 
@@ -57,7 +57,7 @@ pub(crate) trait ArenaPool: Send + Sync {
         &self,
         stream_id: StreamId,
         epoch: Epoch,
-        jobs: &[WriteBatchJob],
+        jobs: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]>;
 
     /// Read up to `count` records starting at `offset`, spanning
@@ -163,7 +163,7 @@ impl ArenaPool for DedicatedArenaPool {
         &self,
         _stream_id: StreamId,
         epoch: Epoch,
-        jobs: &[WriteBatchJob],
+        jobs: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
         let mut out: SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> =
             SmallVec::with_capacity(jobs.len());
@@ -180,7 +180,7 @@ impl ArenaPool for DedicatedArenaPool {
             };
             let was_fresh = arena.record_count() == 0;
             let job = &jobs[idx];
-            let one: [WriteBatchJob; 1] = [WriteBatchJob::new(job.offset, job.payload.clone())];
+            let one: [ArenaAppend; 1] = [ArenaAppend::new(job.offset, job.payload.clone())];
             let mut r = arena.write_batch_inline(&one);
             match r.pop().expect("one result") {
                 Ok(ok) => {
@@ -356,7 +356,7 @@ impl ArenaPool for SharedArenaPool {
         &self,
         _stream_id: StreamId,
         _epoch: Epoch,
-        _jobs: &[WriteBatchJob],
+        _jobs: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
         panic!("SharedArenaPool::write_batch not wired; P3 scope")
     }
@@ -440,7 +440,7 @@ mod tests {
         let ep = Epoch(1);
         pool.allocate(sid, ep, Offset(0), 4096);
 
-        let jobs = [WriteBatchJob::new(Offset(0), Bytes::from_static(b"hello"))];
+        let jobs = [ArenaAppend::new(Offset(0), Bytes::from_static(b"hello"))];
         let results = pool.write_batch(sid, ep, &jobs);
         assert_eq!(results.len(), 1);
         assert!(results[0].is_ok());
@@ -459,7 +459,7 @@ mod tests {
             .write_batch(
                 sid,
                 ep,
-                &[WriteBatchJob::new(Offset(0), Bytes::from_static(b"aaaa"))],
+                &[ArenaAppend::new(Offset(0), Bytes::from_static(b"aaaa"))],
             )
             .pop()
             .unwrap();
@@ -468,7 +468,7 @@ mod tests {
             .write_batch(
                 sid,
                 ep,
-                &[WriteBatchJob::new(Offset(1), Bytes::from_static(b"bbbb"))],
+                &[ArenaAppend::new(Offset(1), Bytes::from_static(b"bbbb"))],
             )
             .pop()
             .unwrap();
@@ -479,7 +479,7 @@ mod tests {
             .write_batch(
                 sid,
                 ep,
-                &[WriteBatchJob::new(Offset(2), Bytes::from_static(b"cccc"))],
+                &[ArenaAppend::new(Offset(2), Bytes::from_static(b"cccc"))],
             )
             .pop()
             .unwrap();
@@ -504,7 +504,7 @@ mod tests {
 
         // Write 5 records (triggers rotation).
         for i in 0..5u32 {
-            let jobs = [WriteBatchJob::new(
+            let jobs = [ArenaAppend::new(
                 Offset(i as u64),
                 Bytes::copy_from_slice(&i.to_be_bytes()),
             )];
@@ -526,7 +526,7 @@ mod tests {
         let ep = Epoch(1);
         pool.allocate(sid, ep, Offset(0), 4096);
 
-        let jobs = [WriteBatchJob::new(Offset(0), Bytes::from_static(b"hello"))];
+        let jobs = [ArenaAppend::new(Offset(0), Bytes::from_static(b"hello"))];
         let _ = pool.write_batch(sid, ep, &jobs);
 
         let data = pool.committed_data(sid, ep);

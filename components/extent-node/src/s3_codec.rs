@@ -515,7 +515,7 @@ pub enum CodecError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::{ArenaIdGenerator, DedicatedArenaPool};
+    use crate::arena::{ArenaAppend, ArenaIdGenerator, DedicatedArenaPool};
     use common::types::{Epoch, Offset, StreamId};
     use std::sync::Arc;
 
@@ -539,9 +539,12 @@ mod tests {
         for payload in payloads {
             let p = Bytes::copy_from_slice(payload);
             let hint = Offset(extent.committed_offset());
-            let job = crate::arena::WriteBatchJob::new(hint, p.clone());
-            let mut results =
-                pool.write_batch(extent.stream_id, extent.epoch, std::slice::from_ref(&job));
+            let append = ArenaAppend::new(hint, p.clone());
+            let mut results = pool.write_batch(
+                extent.stream_id,
+                extent.epoch,
+                std::slice::from_ref(&append),
+            );
             match results.pop().expect("one result") {
                 Ok(_) => {
                     extent.update_crc(&p);
@@ -574,9 +577,12 @@ mod tests {
         for payload in payloads {
             let p = Bytes::copy_from_slice(payload);
             let hint = Offset(extent.committed_offset());
-            let job = crate::arena::WriteBatchJob::new(hint, p.clone());
-            let mut results =
-                pool.write_batch(extent.stream_id, extent.epoch, std::slice::from_ref(&job));
+            let append = ArenaAppend::new(hint, p.clone());
+            let mut results = pool.write_batch(
+                extent.stream_id,
+                extent.epoch,
+                std::slice::from_ref(&append),
+            );
             match results.pop().expect("one result") {
                 Ok(_) => {
                     extent.update_crc(&p);
