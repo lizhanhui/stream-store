@@ -30,6 +30,27 @@ use crate::s3::S3Client;
 use crate::s3_flusher::FlushRequest;
 use crate::stream::Stream;
 
+// ── StoreMetrics ─────────────────────────────────────────────────────────────
+
+/// EN-wide metrics counters, shared by every Stream.
+///
+/// Streams increment on each successful append/replicate; the Store
+/// reads on heartbeat and resets via `swap`. Held behind `Arc` so the
+/// hot path can mutate without routing through a Store lookup.
+pub(crate) struct StoreMetrics {
+    pub(crate) append_count: AtomicU64,
+    pub(crate) bytes_written: AtomicU64,
+}
+
+impl StoreMetrics {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            append_count: AtomicU64::new(0),
+            bytes_written: AtomicU64::new(0),
+        })
+    }
+}
+
 // ── ExtentNodeStore ──────────────────────────────────────────────────────────
 
 /// The ExtentNode's in-memory store: holds all streams and their extents.
@@ -67,11 +88,10 @@ pub struct ExtentNodeStore {
     pub(crate) update_tx: Option<Sender<ExtentUpdate>>,
     /// Configurable timeout for replication quorum ACK expiry.
     pub(crate) replication_timeout: Duration,
-    // -- Metrics counters (reset on each heartbeat snapshot) --
-    /// Total appends since last snapshot (atomic, no lock needed).
-    pub(crate) append_count: AtomicU64,
-    /// Total bytes written since last snapshot (atomic, no lock needed).
-    pub(crate) bytes_written: AtomicU64,
+    /// EN-wide counters shared by every Stream. Streams increment on
+    /// successful append/replicate; heartbeat reads and resets via
+    /// `swap`.
+    pub(crate) metrics: Arc<StoreMetrics>,
     /// Channel to send sealed extent flush requests to the S3 flusher task.
     /// None when S3 is not configured.
     pub(crate) flush_tx: Option<Sender<FlushRequest>>,
@@ -102,8 +122,7 @@ impl ExtentNodeStore {
             s3_client: OnceLock::new(),
             update_tx: None,
             replication_timeout: DEFAULT_REPLICATION_TIMEOUT,
-            append_count: AtomicU64::new(0),
-            bytes_written: AtomicU64::new(0),
+            metrics: StoreMetrics::new(),
             flush_tx: None,
         }
     }
@@ -151,7 +170,12 @@ impl ExtentNodeStore {
                     Arc::clone(&self.shared_pool) as Arc<dyn crate::arena::ArenaPool>
                 }
             };
-            let stream = Stream::new(stream_id, Arc::clone(&self.arena_ids), pool);
+            let stream = Stream::new(
+                stream_id,
+                Arc::clone(&self.arena_ids),
+                pool,
+                Arc::clone(&self.metrics),
+            );
             if policy.cache > 0 {
                 stream.set_max_epochs(policy.cache as usize);
             }
@@ -227,8 +251,8 @@ impl ExtentNodeStore {
     /// Snapshot current metrics and reset counters.
     /// Returns (appends_since_last, bytes_written_since_last, active_extent_count).
     pub fn snapshot_metrics(&self) -> (u64, u64, u32) {
-        let appends = self.append_count.swap(0, Ordering::Relaxed);
-        let bytes = self.bytes_written.swap(0, Ordering::Relaxed);
+        let appends = self.metrics.append_count.swap(0, Ordering::Relaxed);
+        let bytes = self.metrics.bytes_written.swap(0, Ordering::Relaxed);
 
         // Count active extents: streams whose last extent is active (mutable).
         let active_count = self

@@ -165,8 +165,8 @@ impl ExtentNodeStore {
         let _extent_start_offset = stream.with_epoch(epoch, |e| e.start_offset.0).unwrap_or(0);
 
         // Update metrics counters.
-        self.append_count.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written
+        self.metrics.append_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_written
             .fetch_add(payload_len as u64, Ordering::Relaxed);
 
         // Check replica info for this stream (Arc clone — one atomic, no deep copy).
@@ -511,9 +511,9 @@ impl ExtentNodeStore {
             // Process successful entries: metrics, replica info, forwards, ACKs.
             if !entries.is_empty() {
                 let total_bytes: u64 = entries.iter().map(|e| e.payload_len as u64).sum();
-                self.append_count
+                self.metrics.append_count
                     .fetch_add(entries.len() as u64, Ordering::Relaxed);
-                self.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
+                self.metrics.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
 
                 let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
 

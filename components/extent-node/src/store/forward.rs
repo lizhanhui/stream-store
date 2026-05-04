@@ -178,8 +178,8 @@ impl ExtentNodeStore {
         };
 
         // Update metrics counters.
-        self.append_count.fetch_add(1, Ordering::Relaxed);
-        self.bytes_written.fetch_add(
+        self.metrics.append_count.fetch_add(1, Ordering::Relaxed);
+        self.metrics.bytes_written.fetch_add(
             frame.payload.as_ref().map_or(0, |p| p.len()) as u64,
             Ordering::Relaxed,
         );
