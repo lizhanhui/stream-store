@@ -314,8 +314,7 @@ impl ExtentNodeStore {
                                     },
                                     Some(entry.payload_for_forward.clone()),
                                 );
-                                if let Some(init) =
-                                    stream.maybe_build_init_forward(&forward_frame)
+                                if let Some(init) = stream.maybe_build_init_forward(&forward_frame)
                                 {
                                     stream.send_forward(init);
                                 }

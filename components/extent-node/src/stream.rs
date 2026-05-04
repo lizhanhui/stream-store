@@ -781,8 +781,10 @@ impl Stream {
 
                     // Queue deferred ACK — lock-free, no contention with watermark readers.
                     if let Some(ref resp_tx) = response_tx {
-                        let aq = self
-                            .init_ack_queue(ri.required_secondary_acks(), self.replication_timeout());
+                        let aq = self.init_ack_queue(
+                            ri.required_secondary_acks(),
+                            self.replication_timeout(),
+                        );
                         aq.enqueue(PendingAck {
                             request_id,
                             stream_id: self.id,
@@ -921,7 +923,13 @@ mod tests {
     /// Helper: create a stream with one active extent (simulating RegisterEpoch from SM).
     fn new_stream_with_epoch(id: StreamId) -> Stream {
         let ids = test_arena_ids();
-        let stream = Stream::new(id, Arc::clone(&ids), test_pool(&ids), test_metrics(), crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT);
+        let stream = Stream::new(
+            id,
+            Arc::clone(&ids),
+            test_pool(&ids),
+            test_metrics(),
+            crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT,
+        );
         stream.register_epoch_simple(Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
         stream
     }
@@ -987,7 +995,13 @@ mod tests {
     fn read_empty_stream() {
         let stream = {
             let ids = test_arena_ids();
-            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids), test_metrics(), crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT)
+            Stream::new(
+                StreamId(1),
+                Arc::clone(&ids),
+                test_pool(&ids),
+                test_metrics(),
+                crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT,
+            )
         };
         assert_eq!(stream.max_offset(), Offset(0));
 
@@ -1000,7 +1014,13 @@ mod tests {
     fn empty_stream_properties() {
         let stream = {
             let ids = test_arena_ids();
-            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids), test_metrics(), crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT)
+            Stream::new(
+                StreamId(1),
+                Arc::clone(&ids),
+                test_pool(&ids),
+                test_metrics(),
+                crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT,
+            )
         };
         assert_eq!(stream.max_offset(), Offset(0));
         assert!(!stream.is_mutable());
@@ -1070,7 +1090,13 @@ mod tests {
     fn evict_oldest_sealed_extents() {
         let stream = {
             let ids = test_arena_ids();
-            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids), test_metrics(), crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT)
+            Stream::new(
+                StreamId(1),
+                Arc::clone(&ids),
+                test_pool(&ids),
+                test_metrics(),
+                crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT,
+            )
         };
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_epochs(2);
@@ -1106,7 +1132,13 @@ mod tests {
     fn no_eviction_when_limit_is_zero() {
         let stream = {
             let ids = test_arena_ids();
-            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids), test_metrics(), crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT)
+            Stream::new(
+                StreamId(1),
+                Arc::clone(&ids),
+                test_pool(&ids),
+                test_metrics(),
+                crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT,
+            )
         };
         stream.set_max_epochs(0); // 0 means no limit
 
@@ -1130,7 +1162,13 @@ mod tests {
         // only seals on the Primary). Eviction should still work for Memory-class streams.
         let stream = {
             let ids = test_arena_ids();
-            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids), test_metrics(), crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT)
+            Stream::new(
+                StreamId(1),
+                Arc::clone(&ids),
+                test_pool(&ids),
+                test_metrics(),
+                crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT,
+            )
         };
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_epochs(2);
@@ -1159,7 +1197,13 @@ mod tests {
         // S3-class streams must NOT evict extents that haven't been flushed.
         let stream = {
             let ids = test_arena_ids();
-            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids), test_metrics(), crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT)
+            Stream::new(
+                StreamId(1),
+                Arc::clone(&ids),
+                test_pool(&ids),
+                test_metrics(),
+                crate::ack_queue::DEFAULT_REPLICATION_TIMEOUT,
+            )
         };
         // Default is StorageClass::S3, verify explicitly.
         assert_eq!(stream.storage_class(), StorageClass::S3);

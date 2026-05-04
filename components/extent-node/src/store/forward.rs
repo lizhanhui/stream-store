@@ -11,7 +11,6 @@ use crate::stream::Stream;
 use crate::stream_epoch::AppendResult;
 
 impl ExtentNodeStore {
-
     /// Handle ForwardInitEpoch (0x0B, flag=0x01) — init-extent notification.
     ///
     /// Ensures the stream exists (creating it if needed), then registers the
