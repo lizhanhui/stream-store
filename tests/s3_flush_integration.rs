@@ -46,7 +46,8 @@ async fn clean_database(mysql_url: &str) {
         .expect("failed to connect for cleanup");
     for table in &[
         "stream_replica",
-        "extent",
+        "stream_epochs",
+        "stream_epoch_s3",
         "stream",
         "node_metrics",
         "stream_manager_leadership",
