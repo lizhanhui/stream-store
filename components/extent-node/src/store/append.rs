@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
@@ -170,7 +169,7 @@ impl ExtentNodeStore {
             .fetch_add(payload_len as u64, Ordering::Relaxed);
 
         // Check replica info for this stream (Arc clone — one atomic, no deep copy).
-        let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
+        let replica = stream.replica_info();
 
         match replica {
             None => {
@@ -515,7 +514,7 @@ impl ExtentNodeStore {
                     .fetch_add(entries.len() as u64, Ordering::Relaxed);
                 self.metrics.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
 
-                let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
+                let replica = stream.replica_info();
 
                 match replica.as_ref() {
                     None => {

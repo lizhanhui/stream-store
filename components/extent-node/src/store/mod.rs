@@ -74,9 +74,6 @@ pub struct ExtentNodeStore {
     /// streams reference this `Arc` via `Stream.pool`. P2 ships a
     /// panicking stub; P3 wires the real multi-stream path.
     pub(crate) shared_pool: Arc<crate::arena::SharedArenaPool>,
-    /// Replication info per stream_id (registered via RegisterEpoch).
-    /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
-    pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>, IdentityBuildHasher>,
     /// Direct TCP connection pool for broadcast replication (None for standalone/test mode).
     /// Initialized via `set_downstream()` after construction (OnceLock breaks circular dep).
     pub(crate) downstream: OnceLock<Arc<DownstreamPool>>,
@@ -117,7 +114,6 @@ impl ExtentNodeStore {
             streams: papaya::HashMap::with_hasher(IdentityBuildHasher),
             arena_ids,
             shared_pool,
-            replicas: papaya::HashMap::with_hasher(IdentityBuildHasher),
             downstream: OnceLock::new(),
             s3_client: OnceLock::new(),
             update_tx: None,
@@ -208,10 +204,11 @@ impl ExtentNodeStore {
 
     /// Get the replication info for a stream, if registered via RegisterEpoch.
     pub fn get_replica_info(&self, stream_id: StreamId) -> Option<ReplicaInfo> {
-        self.replicas
+        self.streams
             .pin()
             .get(&stream_id)
-            .map(|arc| (**arc).clone())
+            .and_then(|s| s.replica_info())
+            .map(|arc| (*arc).clone())
     }
 
     /// Expire stale PendingAcks across all streams by running the timeout sweep.
@@ -240,8 +237,11 @@ impl ExtentNodeStore {
     /// Callers should cache the result per `(stream_id, addr)` pair — the mapping
     /// is immutable within an epoch.
     pub fn secondary_index(&self, stream_id: StreamId, addr: &str) -> Option<u8> {
-        let guard = self.replicas.pin();
-        let ri = guard.get(&stream_id)?;
+        let ri = self
+            .streams
+            .pin()
+            .get(&stream_id)
+            .and_then(|s| s.replica_info())?;
         ri.replica_addrs
             .iter()
             .position(|a| a == addr)

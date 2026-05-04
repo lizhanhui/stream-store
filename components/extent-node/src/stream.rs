@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use bytes::Bytes;
 use common::config::{DEFAULT_CACHE_EPOCHS, DEFAULT_EPOCH_CAPACITY};
 use common::errors::{InternalSnafu, StorageError};
@@ -15,7 +15,7 @@ use tokio::sync::mpsc;
 
 use crate::ack_queue::AckQueue;
 use crate::arena::{ArenaAppendResult, ArenaIdGenerator, ArenaPool, WriteBatchJob};
-use crate::store::AppendJob;
+use crate::store::{AppendJob, ReplicaInfo};
 use crate::stream_epoch::{AppendResult, StreamEpoch};
 
 /// Mutable state protected by `RwLock`. Grouped here so that a single
@@ -111,6 +111,13 @@ pub struct Stream {
     #[allow(dead_code)]
     metrics: Arc<crate::store::StoreMetrics>,
 
+    /// ReplicaInfo for this stream's current epoch. `None` until
+    /// `RegisterEpoch` arrives (or for streams created lazily by a
+    /// Forward frame arriving before RegisterEpoch). Immutable within
+    /// an epoch; overwritten wholesale on RegisterEpoch via
+    /// `set_replica_info`.
+    replica_info: ArcSwapOption<ReplicaInfo>,
+
     /// Mutable state protected by RwLock.
     inner: RwLock<StreamInner>,
 }
@@ -148,6 +155,7 @@ impl Stream {
             arena_ids,
             pool,
             metrics,
+            replica_info: ArcSwapOption::from(None),
             inner: RwLock::new(StreamInner {
                 epoch_capacity: DEFAULT_EPOCH_CAPACITY,
                 max_epochs: DEFAULT_CACHE_EPOCHS as usize,
@@ -317,6 +325,19 @@ impl Stream {
     pub(crate) fn init_ack_queue(&self, required_acks: u32, timeout: Duration) -> &AckQueue {
         self.ack_queue
             .get_or_init(|| AckQueue::with_timeout(required_acks, timeout))
+    }
+
+    /// Current replica info for this stream's epoch, or `None` if
+    /// `RegisterEpoch` has not landed yet. Cheap atomic load.
+    pub(crate) fn replica_info(&self) -> Option<Arc<ReplicaInfo>> {
+        self.replica_info.load_full()
+    }
+
+    /// Install (or replace) the stream's replica info. Called at
+    /// `RegisterEpoch` time; `ReplicaInfo` is immutable within an
+    /// epoch, so a later epoch overwrites wholesale.
+    pub(crate) fn set_replica_info(&self, info: Arc<ReplicaInfo>) {
+        self.replica_info.store(Some(info));
     }
 
     // ── Read-lock methods ──────────────────────────────────────────────

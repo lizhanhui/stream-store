@@ -124,9 +124,10 @@ impl ExtentNodeStore {
 
                 if let Some(ref tx) = self.flush_tx {
                     let is_primary = self
-                        .replicas
+                        .streams
                         .pin()
                         .get(&stream_id)
+                        .and_then(|s| s.replica_info())
                         .map(|ri| ri.is_primary())
                         .unwrap_or(false);
                     if is_primary {

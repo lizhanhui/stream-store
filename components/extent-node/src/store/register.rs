@@ -84,12 +84,12 @@ impl ExtentNodeStore {
             stream_id, epoch, replication_factor,
         );
 
-        let ri = ReplicaInfo {
+        let ri = Arc::new(ReplicaInfo {
             stream_id,
             role,
             replication_factor,
             replica_addrs,
-        };
+        });
 
         // If this node is Primary, initialize an AckQueue on the stream.
         if ri.is_primary() {
@@ -113,7 +113,11 @@ impl ExtentNodeStore {
             }
         }
 
-        self.replicas.pin().insert(stream_id, Arc::new(ri));
+        // Install replica info on the Stream itself. Immutable within an
+        // epoch; any later epoch overwrites wholesale via ArcSwapOption.
+        if let Some(stream) = streams_guard.get(&stream_id) {
+            stream.set_replica_info(Arc::clone(&ri));
+        }
 
         Frame::new(
             VariableHeader::RegisterEpochAck {
