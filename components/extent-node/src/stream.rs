@@ -380,7 +380,9 @@ impl Stream {
         })?;
         let hint_offset = Offset(extent.committed_offset());
         let job = WriteBatchJob::new(hint_offset, payload.clone());
-        let mut results = self.pool.write_batch(self.id, epoch, std::slice::from_ref(&job));
+        let mut results = self
+            .pool
+            .write_batch(self.id, epoch, std::slice::from_ref(&job));
         match results.pop().expect("one result per job") {
             Ok(r) => {
                 extent.update_crc(&payload);
@@ -489,7 +491,9 @@ impl Stream {
             .build());
         }
         let job = WriteBatchJob::new(offset, payload.clone());
-        let mut results = self.pool.write_batch(self.id, epoch, std::slice::from_ref(&job));
+        let mut results = self
+            .pool
+            .write_batch(self.id, epoch, std::slice::from_ref(&job));
         match results.pop().expect("one result") {
             Ok(r) => {
                 // Sanity: arena-assigned offset must match the primary's.
@@ -725,7 +729,9 @@ impl Stream {
         }
         let ep = Arc::new(StreamEpoch::new(self.id, epoch, start_offset));
         // Allocate the first arena through the pool.
-        let first_arena = self.pool.allocate(self.id, epoch, start_offset, epoch_capacity);
+        let first_arena = self
+            .pool
+            .allocate(self.id, epoch, start_offset, epoch_capacity);
         ep.resident_arenas.lock().push(first_arena.arena_id);
         ep.directory_ref_count.fetch_add(1, Ordering::Release);
         self.insert_epoch(ep);
@@ -975,9 +981,16 @@ impl Stream {
             return responses;
         }
 
-        let total_bytes: u64 = entries.iter().map(|e| e.payload_for_forward.len() as u64).sum();
-        self.metrics.append_count.fetch_add(entries.len() as u64, Ordering::Relaxed);
-        self.metrics.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
+        let total_bytes: u64 = entries
+            .iter()
+            .map(|e| e.payload_for_forward.len() as u64)
+            .sum();
+        self.metrics
+            .append_count
+            .fetch_add(entries.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .bytes_written
+            .fetch_add(total_bytes, Ordering::Relaxed);
 
         // Track records for periodic CRC checkpoint.
         if let Some(ep) = self.active_epoch() {

@@ -318,7 +318,10 @@ impl ExtentNodeStore {
                     tracing::debug!(
                         "Periodic CRC checkpoint stored (not caught up yet): \
                          stream={}, epoch={}, checksum={:#010x}, up_to_offset={}",
-                        stream_id, epoch, checksum, up_to_offset,
+                        stream_id,
+                        epoch,
+                        checksum,
+                        up_to_offset,
                     );
                 }
             }

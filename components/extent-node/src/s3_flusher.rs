@@ -73,7 +73,13 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
         };
         match stream.with_epoch(req.epoch, |ext| {
             let pool = stream.pool();
-            encode_arena_range(req.stream_id, ext, &**pool, s3_client.compression(), req.end_offset)
+            encode_arena_range(
+                req.stream_id,
+                ext,
+                &**pool,
+                s3_client.compression(),
+                req.end_offset,
+            )
         }) {
             Some(result) => result,
             None => {

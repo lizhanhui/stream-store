@@ -279,10 +279,7 @@ impl ArenaPool for DedicatedArenaPool {
     fn index_lookup(&self, _stream_id: StreamId, _epoch: Epoch, seq: u64) -> Option<u64> {
         let state = self.state.lock();
         let offset = Offset(state.arenas.first()?.start_offset.0 + seq);
-        let arena = state
-            .arenas
-            .iter()
-            .find(|a| a.contains_offset(offset))?;
+        let arena = state.arenas.iter().find(|a| a.contains_offset(offset))?;
         let local_seq = offset.0 - arena.start_offset.0;
         arena.directory().single_entry().lookup(local_seq)
     }
@@ -459,19 +456,31 @@ mod tests {
 
         // Two 4-byte payloads = 8+8=16 bytes, fills the arena.
         let r0 = pool
-            .write_batch(sid, ep, &[WriteBatchJob::new(Offset(0), Bytes::from_static(b"aaaa"))])
+            .write_batch(
+                sid,
+                ep,
+                &[WriteBatchJob::new(Offset(0), Bytes::from_static(b"aaaa"))],
+            )
             .pop()
             .unwrap();
         assert!(r0.is_ok());
         let r1 = pool
-            .write_batch(sid, ep, &[WriteBatchJob::new(Offset(1), Bytes::from_static(b"bbbb"))])
+            .write_batch(
+                sid,
+                ep,
+                &[WriteBatchJob::new(Offset(1), Bytes::from_static(b"bbbb"))],
+            )
             .pop()
             .unwrap();
         assert!(r1.is_ok());
 
         // Third write triggers rotation.
         let r2 = pool
-            .write_batch(sid, ep, &[WriteBatchJob::new(Offset(2), Bytes::from_static(b"cccc"))])
+            .write_batch(
+                sid,
+                ep,
+                &[WriteBatchJob::new(Offset(2), Bytes::from_static(b"cccc"))],
+            )
             .pop()
             .unwrap();
         assert!(r2.is_ok());

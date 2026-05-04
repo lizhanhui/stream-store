@@ -123,11 +123,7 @@ unsafe impl Sync for StreamEpoch {}
 impl StreamEpoch {
     /// Create a new metadata-only epoch. The first arena is allocated
     /// and registered by `Stream::register_epoch`, not here.
-    pub(crate) fn new(
-        stream_id: StreamId,
-        epoch: Epoch,
-        start_offset: Offset,
-    ) -> Self {
+    pub(crate) fn new(stream_id: StreamId, epoch: Epoch, start_offset: Offset) -> Self {
         Self {
             stream_id,
             start_offset,
@@ -362,7 +358,8 @@ impl StreamEpoch {
     /// Advance `committed_offset` by `count` records. Called by
     /// Stream AFTER `pool.write_batch` returns.
     pub(crate) fn advance_committed(&self, count: u32) {
-        self.committed_offset.fetch_add(count as u64, Ordering::Release);
+        self.committed_offset
+            .fetch_add(count as u64, Ordering::Release);
     }
 
     // ── Periodic CRC checksum (ForwardCrcChecksum) ─────────────────
@@ -371,7 +368,8 @@ impl StreamEpoch {
     /// Called by the secondary's forward handler.
     pub(crate) fn store_crc_checksum(&self, checksum: u32, up_to_offset: u64) {
         self.last_crc_checksum.store(checksum, Ordering::Release);
-        self.last_crc_checksum_offset.store(up_to_offset, Ordering::Release);
+        self.last_crc_checksum_offset
+            .store(up_to_offset, Ordering::Release);
     }
 
     /// Verify the local CRC up to `last_crc_checksum_offset` against
@@ -438,7 +436,8 @@ impl StreamEpoch {
     /// Increment the count of records written since last checksum.
     /// Called by Stream after each write.
     pub(crate) fn incr_records_since_checksum(&self, count: u32) {
-        self.records_since_checksum.fetch_add(count as u64, Ordering::Release);
+        self.records_since_checksum
+            .fetch_add(count as u64, Ordering::Release);
     }
 }
 
@@ -543,14 +542,18 @@ mod tests {
         // Pool should have rotated.
         assert!(ep.resident_arenas().len() >= 2);
 
-        let msgs = pool.read_at_offset(ep.stream_id, ep.epoch, Offset(0), 5).unwrap();
+        let msgs = pool
+            .read_at_offset(ep.stream_id, ep.epoch, Offset(0), 5)
+            .unwrap();
         assert_eq!(msgs.len(), 5);
         for (i, msg) in msgs.iter().enumerate() {
             assert_eq!(msg.as_ref(), (i as u32).to_be_bytes());
         }
 
         // Partial read starting mid-stream.
-        let tail = pool.read_at_offset(ep.stream_id, ep.epoch, Offset(3), 10).unwrap();
+        let tail = pool
+            .read_at_offset(ep.stream_id, ep.epoch, Offset(3), 10)
+            .unwrap();
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].as_ref(), 3u32.to_be_bytes());
         assert_eq!(tail[1].as_ref(), 4u32.to_be_bytes());
