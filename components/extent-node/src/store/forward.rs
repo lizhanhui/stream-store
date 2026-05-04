@@ -270,4 +270,65 @@ impl ExtentNodeStore {
             );
         }
     }
+
+    /// Handle ForwardCrcChecksum (0x0B, flag=0x04) — periodic CRC
+    /// checkpoint from primary (advisory). Secondary stores the
+    /// checkpoint and verifies when caught up.
+    pub(crate) fn handle_forward_crc_checksum(&self, frame: Frame) {
+        let (stream_id, epoch, checksum, up_to_offset) = match &frame.variable_header {
+            VariableHeader::ForwardCrcChecksum {
+                stream_id,
+                epoch,
+                checksum,
+                up_to_offset,
+            } => (*stream_id, *epoch, *checksum, *up_to_offset),
+            _ => return,
+        };
+
+        let guard = self.streams.pin();
+        let stream = match guard.get(&stream_id) {
+            Some(s) => s,
+            None => {
+                warn!(
+                    "ForwardCrcChecksum for unknown stream {}, epoch {}",
+                    stream_id, epoch,
+                );
+                return;
+            }
+        };
+
+        let found = stream.with_epoch(epoch, |extent| {
+            extent.store_crc_checksum(checksum, up_to_offset);
+            match extent.verify_crc_checksum() {
+                Some(true) => {
+                    info!(
+                        "Periodic CRC checksum verified: stream={}, epoch={}, \
+                         checksum={:#010x}, up_to_offset={}",
+                        stream_id, epoch, checksum, up_to_offset,
+                    );
+                }
+                Some(false) => {
+                    warn!(
+                        "Periodic CRC checksum mismatch: stream={}, epoch={}, \
+                         primary_checksum={:#010x}, up_to_offset={}",
+                        stream_id, epoch, checksum, up_to_offset,
+                    );
+                }
+                None => {
+                    tracing::debug!(
+                        "Periodic CRC checkpoint stored (not caught up yet): \
+                         stream={}, epoch={}, checksum={:#010x}, up_to_offset={}",
+                        stream_id, epoch, checksum, up_to_offset,
+                    );
+                }
+            }
+        });
+
+        if found.is_none() {
+            warn!(
+                "ForwardCrcChecksum for unknown epoch {} on stream {}",
+                epoch, stream_id,
+            );
+        }
+    }
 }

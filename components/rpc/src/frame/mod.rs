@@ -10,7 +10,7 @@ mod tests;
 use bytes::Bytes;
 use common::types::{
     Epoch, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EPOCH_FLUSHED, FLAG_EPOCH_PROGRESS,
-    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EPOCH,
+    FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_CRC_CHECKSUM, FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EPOCH,
     FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, Offset, Opcode,
     PROTOCOL_VERSION, StreamId,
 };
@@ -127,6 +127,7 @@ impl Frame {
             | VariableHeader::ForwardInitEpoch { .. }
             | VariableHeader::ForwardChecksum { .. }
             | VariableHeader::ForwardFlushed { .. }
+            | VariableHeader::ForwardCrcChecksum { .. }
             | VariableHeader::UpdateEpochProgress { .. }
             | VariableHeader::UpdateEpochFlushed { .. }
             | VariableHeader::StreamManagerMembershipChange => 0,
@@ -159,6 +160,7 @@ impl Frame {
             | VariableHeader::ForwardInitEpoch { stream_id, .. }
             | VariableHeader::ForwardChecksum { stream_id, .. }
             | VariableHeader::ForwardFlushed { stream_id, .. }
+            | VariableHeader::ForwardCrcChecksum { stream_id, .. }
             | VariableHeader::FlushEpoch { stream_id, .. }
             | VariableHeader::FlushEpochResp { stream_id, .. }
             | VariableHeader::FlushEpochRespError { stream_id, .. }
@@ -221,6 +223,7 @@ impl Frame {
             | VariableHeader::ForwardInitEpoch { epoch, .. }
             | VariableHeader::ForwardChecksum { epoch, .. }
             | VariableHeader::ForwardFlushed { epoch, .. }
+            | VariableHeader::ForwardCrcChecksum { epoch, .. }
             | VariableHeader::FlushEpoch { epoch, .. } => *epoch,
             VariableHeader::ReportEpoch { epoch, .. }
             | VariableHeader::ReportEpochResp { epoch, .. }
@@ -310,6 +313,7 @@ impl Frame {
             VariableHeader::ForwardInitEpoch { .. } => FLAG_FORWARD_INIT_EPOCH,
             VariableHeader::ForwardChecksum { .. } => FLAG_FORWARD_CHECKSUM,
             VariableHeader::ForwardFlushed { .. } => FLAG_FORWARD_FLUSHED,
+            VariableHeader::ForwardCrcChecksum { .. } => FLAG_FORWARD_CRC_CHECKSUM,
             VariableHeader::DescribeStream {
                 stream_name: Some(_),
                 ..

@@ -29,6 +29,8 @@ pub const FLAG_FORWARD_INIT_EPOCH: u8 = 0x01;
 pub const FLAG_FORWARD_CHECKSUM: u8 = 0x02;
 /// Flag on FORWARD: extent flushed to S3 notification.
 pub const FLAG_FORWARD_FLUSHED: u8 = 0x03;
+/// Flag on FORWARD: periodic CRC checksum from primary (advisory).
+pub const FLAG_FORWARD_CRC_CHECKSUM: u8 = 0x04;
 
 /// Flag on DESCRIBE_STREAM: lookup by stream name instead of stream_id.
 /// When set, variable header carries [name_len:u16][name_bytes] after count.

@@ -25,6 +25,7 @@
 use bytes::Bytes;
 use common::types::StreamId;
 
+use crate::arena::ArenaPool;
 use crate::stream_epoch::StreamEpoch;
 
 /// Magic bytes identifying an S3 arena object: "SEXT" in ASCII.
@@ -148,6 +149,7 @@ pub struct S3ArenaHeader {
     pub compression: Compression,
 }
 
+#[allow(dead_code)] // P3/P4: decode, index_offset, data_offset for S3 read path
 impl S3ArenaHeader {
     /// Encode this header into a fixed 64-byte array.
     pub fn encode(&self) -> [u8; S3_ARENA_HEADER_SIZE] {
@@ -242,12 +244,15 @@ pub fn s3_key(namespace: &str, stream_id: StreamId, start_offset: u64, end_offse
 ///
 /// The epoch must be sealed. Returns the complete object bytes
 /// (header + chunk index + compressed data).
+#[cfg(test)]
+#[allow(private_interfaces)] // ArenaPool is pub(crate); encode_arena is pub for test access
 pub fn encode_arena(
     stream_id: StreamId,
     extent: &StreamEpoch,
+    pool: &dyn ArenaPool,
     compression: Compression,
 ) -> Vec<u8> {
-    let data: Bytes = extent.committed_data();
+    let data: Bytes = pool.committed_data(stream_id, extent.epoch);
     let record_count = extent.message_count() as u32;
     let start_offset = extent.start_offset.0;
     let end_offset = start_offset + record_count as u64;
@@ -272,15 +277,14 @@ pub fn encode_arena(
         let byte_start = if chunk_start_seq == 0 {
             0usize
         } else {
-            extent.index_lookup(chunk_start_seq).unwrap_or(0) as usize
+            pool.index_lookup(stream_id, extent.epoch, chunk_start_seq).unwrap_or(0) as usize
         };
 
         let byte_end = if chunk_end_seq >= record_count as u64 {
             // Last chunk: goes to the end of committed data.
             data.len()
         } else {
-            extent
-                .index_lookup(chunk_end_seq)
+            pool.index_lookup(stream_id, extent.epoch, chunk_end_seq)
                 .unwrap_or(data.len() as u64) as usize
         };
 
@@ -344,9 +348,11 @@ pub fn encode_arena(
 /// Returns `(encoded_bytes, actual_end_offset)`. The caller must use
 /// `actual_end_offset` (not the requested `end_offset`) to build the S3 key.
 /// When `actual_end_offset == end_offset`, the upload uses the canonical key.
-pub fn encode_arena_range(
+#[allow(dead_code)] // used by s3_flusher via crate-internal call
+pub(crate) fn encode_arena_range(
     stream_id: StreamId,
     extent: &StreamEpoch,
+    pool: &dyn ArenaPool,
     compression: Compression,
     end_offset: u64,
 ) -> (Vec<u8>, u64) {
@@ -372,10 +378,10 @@ pub fn encode_arena_range(
     let data: Bytes = if record_count == 0 {
         Bytes::new()
     } else {
-        let full_data = extent.committed_data();
+        let full_data = pool.committed_data(stream_id, extent.epoch);
         let local_end_seq = record_count as u64;
-        let byte_end = extent
-            .index_lookup(local_end_seq)
+        let byte_end = pool
+            .index_lookup(stream_id, extent.epoch, local_end_seq)
             .map(|bp| bp as usize)
             .unwrap_or(full_data.len());
         full_data.slice(0..byte_end)
@@ -400,14 +406,13 @@ pub fn encode_arena_range(
         let byte_start = if chunk_start_seq == 0 {
             0usize
         } else {
-            extent.index_lookup(chunk_start_seq).unwrap_or(0) as usize
+            pool.index_lookup(stream_id, extent.epoch, chunk_start_seq).unwrap_or(0) as usize
         };
 
         let byte_end = if chunk_end_seq >= record_count as u64 {
             data.len()
         } else {
-            extent
-                .index_lookup(chunk_end_seq)
+            pool.index_lookup(stream_id, extent.epoch, chunk_end_seq)
                 .unwrap_or(data.len() as u64) as usize
         };
 
@@ -517,39 +522,53 @@ mod tests {
     }
 
     /// Helper: create a sealed epoch with N records of given payloads.
-    fn sealed_extent(payloads: &[&[u8]]) -> StreamEpoch {
-        let extent = StreamEpoch::new(
-            StreamId(0),
-            Epoch(0),
-            Offset(0),
-            1024 * 1024, // 1 MiB
-            test_pool(),
-        );
+    /// Returns (StreamEpoch, pool) so the pool can be passed to encode_arena.
+    fn sealed_extent_with_pool(payloads: &[&[u8]]) -> (StreamEpoch, Arc<dyn crate::arena::ArenaPool>) {
+        let pool = test_pool();
+        let extent = StreamEpoch::new(StreamId(0), Epoch(0), Offset(0));
+        // Allocate first arena in the pool (as Stream::register_epoch does).
+        let arena = pool.allocate(extent.stream_id, extent.epoch, Offset(0), 1024 * 1024);
+        extent.resident_arenas.lock().push(arena.arena_id);
+        extent.directory_ref_count.fetch_add(1, std::sync::atomic::Ordering::Release);
         for payload in payloads {
-            extent
-                .append(Bytes::copy_from_slice(payload))
-                .expect("append should succeed");
+            let p = Bytes::copy_from_slice(payload);
+            let hint = Offset(extent.committed_offset());
+            let job = crate::arena::WriteBatchJob::new(hint, p.clone());
+            let mut results = pool.write_batch(extent.stream_id, extent.epoch, std::slice::from_ref(&job));
+            match results.pop().expect("one result") {
+                Ok(_) => {
+                    extent.update_crc(&p);
+                    extent.advance_committed(1);
+                }
+                Err(e) => panic!("append should succeed: {e}"),
+            }
         }
         extent.seal(None);
-        extent
+        (extent, pool)
     }
 
     /// Helper: create a sealed epoch with start_offset.
-    fn sealed_extent_at(start_offset: u64, payloads: &[&[u8]]) -> StreamEpoch {
-        let extent = StreamEpoch::new(
-            StreamId(0),
-            Epoch(0),
-            Offset(start_offset),
-            1024 * 1024,
-            test_pool(),
-        );
+    fn sealed_extent_at_with_pool(start_offset: u64, payloads: &[&[u8]]) -> (StreamEpoch, Arc<dyn crate::arena::ArenaPool>) {
+        let pool = test_pool();
+        let extent = StreamEpoch::new(StreamId(0), Epoch(0), Offset(start_offset));
+        let arena = pool.allocate(extent.stream_id, extent.epoch, Offset(start_offset), 1024 * 1024);
+        extent.resident_arenas.lock().push(arena.arena_id);
+        extent.directory_ref_count.fetch_add(1, std::sync::atomic::Ordering::Release);
         for payload in payloads {
-            extent
-                .append(Bytes::copy_from_slice(payload))
-                .expect("append should succeed");
+            let p = Bytes::copy_from_slice(payload);
+            let hint = Offset(extent.committed_offset());
+            let job = crate::arena::WriteBatchJob::new(hint, p.clone());
+            let mut results = pool.write_batch(extent.stream_id, extent.epoch, std::slice::from_ref(&job));
+            match results.pop().expect("one result") {
+                Ok(_) => {
+                    extent.update_crc(&p);
+                    extent.advance_committed(1);
+                }
+                Err(e) => panic!("append should succeed: {e}"),
+            }
         }
         extent.seal(None);
-        extent
+        (extent, pool)
     }
 
     /// Verify CRC32 over index + data in encoded bytes.
@@ -660,8 +679,8 @@ mod tests {
 
     #[test]
     fn encode_empty_extent_no_compression() {
-        let extent = sealed_extent(&[]);
-        let encoded = encode_arena(StreamId(1), &extent, Compression::None);
+        let (extent, pool) = sealed_extent_with_pool(&[]);
+        let encoded = encode_arena(StreamId(1), &extent, &*pool, Compression::None);
 
         // Should be just the header (no index, no data).
         assert_eq!(encoded.len(), S3_ARENA_HEADER_SIZE);
@@ -678,8 +697,8 @@ mod tests {
     #[test]
     fn encode_small_extent_no_compression() {
         // 3 records — fewer than index_interval (64), so 1 chunk.
-        let extent = sealed_extent(&[b"aaa", b"bbb", b"ccc"]);
-        let encoded = encode_arena(StreamId(5), &extent, Compression::None);
+        let (extent, pool) = sealed_extent_with_pool(&[b"aaa", b"bbb", b"ccc"]);
+        let encoded = encode_arena(StreamId(5), &extent, &*pool, Compression::None);
 
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.stream_id, 5);
@@ -714,8 +733,8 @@ mod tests {
             .map(|i| format!("record-{i:04}").into_bytes())
             .collect();
         let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
-        let extent = sealed_extent(&payload_refs);
-        let encoded = encode_arena(StreamId(10), &extent, Compression::None);
+        let (extent, pool) = sealed_extent_with_pool(&payload_refs);
+        let encoded = encode_arena(StreamId(10), &extent, &*pool, Compression::None);
 
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.record_count, 200);
@@ -744,8 +763,8 @@ mod tests {
 
     #[test]
     fn encode_arena_with_nonzero_start_offset() {
-        let extent = sealed_extent_at(500, &[b"hello", b"world"]);
-        let encoded = encode_arena(StreamId(7), &extent, Compression::None);
+        let (extent, pool) = sealed_extent_at_with_pool(500, &[b"hello", b"world"]);
+        let encoded = encode_arena(StreamId(7), &extent, &*pool, Compression::None);
 
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.start_offset, 500);
@@ -782,9 +801,9 @@ mod tests {
             .map(|i| format!("record-{i:04}-padding-data-for-compression").into_bytes())
             .collect();
         let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
-        let extent = sealed_extent(&payload_refs);
+        let (extent, pool) = sealed_extent_with_pool(&payload_refs);
 
-        let encoded = encode_arena(StreamId(20), &extent, Compression::Zstd);
+        let encoded = encode_arena(StreamId(20), &extent, &*pool, Compression::Zstd);
         let header = S3ArenaHeader::decode(&encoded).unwrap();
 
         assert_eq!(header.record_count, 200);
@@ -792,7 +811,7 @@ mod tests {
         assert_eq!(header.compression, Compression::Zstd);
 
         // Compressed data should be smaller than raw.
-        let raw_encoded = encode_arena(StreamId(20), &extent, Compression::None);
+        let raw_encoded = encode_arena(StreamId(20), &extent, &*pool, Compression::None);
         let raw_header = S3ArenaHeader::decode(&raw_encoded).unwrap();
         assert!(
             header.data_size < raw_header.data_size,
@@ -820,9 +839,9 @@ mod tests {
             .map(|i| format!("record-{i:04}-padding-data-for-compression").into_bytes())
             .collect();
         let payload_refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
-        let extent = sealed_extent(&payload_refs);
+        let (extent, pool) = sealed_extent_with_pool(&payload_refs);
 
-        let encoded = encode_arena(StreamId(30), &extent, Compression::Lz4);
+        let encoded = encode_arena(StreamId(30), &extent, &*pool, Compression::Lz4);
         let header = S3ArenaHeader::decode(&encoded).unwrap();
 
         assert_eq!(header.record_count, 200);
@@ -830,7 +849,7 @@ mod tests {
         assert_eq!(header.compression, Compression::Lz4);
 
         // Compressed should be smaller than raw.
-        let raw_encoded = encode_arena(StreamId(30), &extent, Compression::None);
+        let raw_encoded = encode_arena(StreamId(30), &extent, &*pool, Compression::None);
         let raw_header = S3ArenaHeader::decode(&raw_encoded).unwrap();
         assert!(
             header.data_size < raw_header.data_size,
@@ -855,8 +874,8 @@ mod tests {
     #[test]
     fn encode_small_extent_zstd() {
         // 3 records, single chunk — should still compress/decompress correctly.
-        let extent = sealed_extent(&[b"aaa", b"bbb", b"ccc"]);
-        let encoded = encode_arena(StreamId(5), &extent, Compression::Zstd);
+        let (extent, pool) = sealed_extent_with_pool(&[b"aaa", b"bbb", b"ccc"]);
+        let encoded = encode_arena(StreamId(5), &extent, &*pool, Compression::Zstd);
 
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.record_count, 3);
@@ -896,8 +915,8 @@ mod tests {
     #[test]
     fn encode_arena_range_full_data() {
         // Extent has exactly end_offset - start_offset records → canonical
-        let extent = sealed_extent(&[b"aaa", b"bbb", b"ccc"]);
-        let (encoded, actual_end) = encode_arena_range(StreamId(1), &extent, Compression::None, 3);
+        let (extent, pool) = sealed_extent_with_pool(&[b"aaa", b"bbb", b"ccc"]);
+        let (encoded, actual_end) = encode_arena_range(StreamId(1), &extent, &*pool, Compression::None, 3);
         assert_eq!(actual_end, 3); // canonical
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.start_offset, 0);
@@ -909,8 +928,8 @@ mod tests {
     #[test]
     fn encode_arena_range_more_local_data() {
         // Extent has 5 records, request only 3 → trims, canonical
-        let extent = sealed_extent(&[b"a", b"b", b"c", b"d", b"e"]);
-        let (encoded, actual_end) = encode_arena_range(StreamId(1), &extent, Compression::None, 3);
+        let (extent, pool) = sealed_extent_with_pool(&[b"a", b"b", b"c", b"d", b"e"]);
+        let (encoded, actual_end) = encode_arena_range(StreamId(1), &extent, &*pool, Compression::None, 3);
         assert_eq!(actual_end, 3);
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.record_count, 3);
@@ -921,8 +940,8 @@ mod tests {
     #[test]
     fn encode_arena_range_less_local_data() {
         // Extent has 3 records, request 5 → partial, actual_end < requested
-        let extent = sealed_extent(&[b"a", b"b", b"c"]);
-        let (encoded, actual_end) = encode_arena_range(StreamId(1), &extent, Compression::None, 5);
+        let (extent, pool) = sealed_extent_with_pool(&[b"a", b"b", b"c"]);
+        let (encoded, actual_end) = encode_arena_range(StreamId(1), &extent, &*pool, Compression::None, 5);
         assert_eq!(actual_end, 3); // partial: only 3 records available
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.record_count, 3);
@@ -933,8 +952,8 @@ mod tests {
     #[test]
     fn encode_arena_range_zero_records() {
         // end_offset == start_offset → empty
-        let extent = sealed_extent(&[b"a", b"b"]);
-        let (encoded, actual_end) = encode_arena_range(StreamId(1), &extent, Compression::None, 0);
+        let (extent, pool) = sealed_extent_with_pool(&[b"a", b"b"]);
+        let (encoded, actual_end) = encode_arena_range(StreamId(1), &extent, &*pool, Compression::None, 0);
         assert_eq!(actual_end, 0);
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.record_count, 0);
@@ -944,9 +963,9 @@ mod tests {
     #[test]
     fn encode_arena_range_nonzero_start() {
         // start_offset=100, 3 records, request end_offset=103 → canonical
-        let extent = sealed_extent_at(100, &[b"x", b"y", b"z"]);
+        let (extent, pool) = sealed_extent_at_with_pool(100, &[b"x", b"y", b"z"]);
         let (encoded, actual_end) =
-            encode_arena_range(StreamId(5), &extent, Compression::None, 103);
+            encode_arena_range(StreamId(5), &extent, &*pool, Compression::None, 103);
         assert_eq!(actual_end, 103);
         let header = S3ArenaHeader::decode(&encoded).unwrap();
         assert_eq!(header.start_offset, 100);
@@ -959,8 +978,8 @@ mod tests {
     fn encode_arena_range_partial_key_differs() {
         // When local < requested, S3 key uses actual_end (partial key)
         // which differs from the canonical key using requested end
-        let extent = sealed_extent(&[b"a", b"b"]);
-        let (_, actual_end) = encode_arena_range(StreamId(42), &extent, Compression::None, 5);
+        let (extent, pool) = sealed_extent_with_pool(&[b"a", b"b"]);
+        let (_, actual_end) = encode_arena_range(StreamId(42), &extent, &*pool, Compression::None, 5);
         let canonical_key = s3_key("ns", StreamId(42), 0, 5);
         let partial_key = s3_key("ns", StreamId(42), 0, actual_end);
         assert_ne!(canonical_key, partial_key);

@@ -268,6 +268,15 @@ pub enum VariableHeader {
         stream_id: StreamId,
         epoch: Epoch,
     },
+    /// Periodic CRC checksum from primary (advisory, FLAG_FORWARD_CRC_CHECKSUM).
+    /// Primary sends when 4096 records written OR 10 seconds elapsed.
+    /// Secondary stores the checksum and verifies when caught up.
+    ForwardCrcChecksum {
+        stream_id: StreamId,
+        epoch: Epoch,
+        checksum: u32,
+        up_to_offset: u64,
+    },
     /// SM commands EN to flush a sealed extent to S3 (disaster recovery, 0x1B).
     /// Request-response: SM sends request, EN responds with Resp or RespError.
     FlushEpoch {
@@ -385,6 +394,7 @@ impl VariableHeader {
             VariableHeader::Forward { .. }
             | VariableHeader::ForwardInitEpoch { .. }
             | VariableHeader::ForwardChecksum { .. }
+            | VariableHeader::ForwardCrcChecksum { .. }
             | VariableHeader::ForwardFlushed { .. } => Opcode::Forward,
             VariableHeader::FlushEpoch { .. }
             | VariableHeader::FlushEpochResp { .. }

@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 use bytes::Bytes;
 use common::config::{DEFAULT_CACHE_EPOCHS, DEFAULT_EPOCH_CAPACITY};
-use common::errors::{InternalSnafu, StorageError};
+use common::errors::{EpochSealedSnafu, InternalSnafu, StorageError};
 use common::types::{ArenaClass, Epoch, EpochState, ErrorCode, Offset, StorageClass, StreamId};
 use crossbeam_channel::{Receiver, Sender, unbounded};
 use parking_lot::RwLock;
@@ -15,9 +15,16 @@ use smallvec::SmallVec;
 use tokio::sync::mpsc;
 
 use crate::ack_queue::{AckQueue, PendingAck};
-use crate::arena::{ArenaAppendResult, ArenaIdGenerator, ArenaPool, WriteBatchJob};
+use crate::arena::{ArenaAppendResult, ArenaId, ArenaIdGenerator, ArenaPool, WriteBatchJob};
 use crate::store::{AppendJob, ReplicaInfo};
 use crate::stream_epoch::{AppendResult, StreamEpoch};
+
+/// Entry for a successful append within a batch, used by `dispatch_results`.
+struct BatchResultEntry {
+    request_id: u32,
+    offset: Offset,
+    payload_for_forward: Bytes,
+}
 
 /// Mutable state protected by `RwLock`. Grouped here so that a single
 /// lock acquisition covers all fields that need coordinated mutation.
@@ -98,25 +105,17 @@ pub struct Stream {
     #[allow(dead_code)]
     arena_ids: Arc<ArenaIdGenerator>,
 
-    /// Arena pool factory. Chosen by `arena_class` at stream-creation
+    /// Arena pool. Chosen by `arena_class` at stream-creation
     /// time: Dedicated streams own a per-stream `DedicatedArenaPool`;
     /// Shared streams (P3) reference the EN-wide `SharedArenaPool`
-    /// singleton. `StreamEpoch::new` calls `pool.allocate(...)` once
-    /// at registration and again on every arena-full rotation within
-    /// the same epoch.
+    /// singleton. `Stream::register_epoch` calls `pool.allocate(...)`
+    /// to create the first arena for each epoch.
     pool: Arc<dyn ArenaPool>,
 
     /// EN-wide counters shared by every Stream. Incremented on
     /// successful append/replicate; read and reset by the Store's
     /// heartbeat snapshot.
     metrics: Arc<crate::store::StoreMetrics>,
-
-    /// ReplicaInfo for this stream's current epoch. `None` until
-    /// `RegisterEpoch` arrives (or for streams created lazily by a
-    /// Forward frame arriving before RegisterEpoch). Immutable within
-    /// an epoch; overwritten wholesale on RegisterEpoch via
-    /// `set_replica_info`.
-    replica_info: ArcSwapOption<ReplicaInfo>,
 
     /// Replication timeout: how long a `PendingAck` can wait for
     /// quorum before being expired. Set at stream creation from the
@@ -161,7 +160,6 @@ impl Stream {
             arena_ids,
             pool,
             metrics,
-            replica_info: ArcSwapOption::from(None),
             replication_timeout,
             inner: RwLock::new(StreamInner {
                 epoch_capacity: DEFAULT_EPOCH_CAPACITY,
@@ -337,14 +335,15 @@ impl Stream {
     /// Current replica info for this stream's epoch, or `None` if
     /// `RegisterEpoch` has not landed yet. Cheap atomic load.
     pub(crate) fn replica_info(&self) -> Option<Arc<ReplicaInfo>> {
-        self.replica_info.load_full()
+        self.active_epoch().and_then(|ep| ep.replica_info())
     }
 
-    /// Install (or replace) the stream's replica info. Called at
-    /// `RegisterEpoch` time; `ReplicaInfo` is immutable within an
-    /// epoch, so a later epoch overwrites wholesale.
+    /// Install (or replace) the active epoch's replica info. Called at
+    /// `RegisterEpoch` time; sets the replica info on the epoch itself.
     pub(crate) fn set_replica_info(&self, info: Arc<ReplicaInfo>) {
-        self.replica_info.store(Some(info));
+        if let Some(ep) = self.active_epoch() {
+            ep.set_replica_info(info);
+        }
     }
 
     /// Timeout for quorum-ACK expiry. Set once at stream construction
@@ -356,13 +355,22 @@ impl Stream {
     /// Shared EN-wide metrics counters. Exposed for store-layer code
     /// paths that increment on the stream's behalf (e.g. the batch
     /// append handler).
+    #[allow(dead_code)] // future: metrics introspection
     pub(crate) fn metrics_handle(&self) -> &Arc<crate::store::StoreMetrics> {
         &self.metrics
     }
 
+    /// Arena pool accessor. Used by s3_codec, send_forward_checksum,
+    /// and future write/read path routing through the pool.
+    pub(crate) fn pool(&self) -> &Arc<dyn ArenaPool> {
+        &self.pool
+    }
+
     // ── Read-lock methods ──────────────────────────────────────────────
 
-    /// Append a message to the specified epoch.
+    /// Append a message to the specified epoch. Routes through the
+    /// ArenaPool for the physical write, then updates CRC and
+    /// committed_offset on the StreamEpoch.
     pub fn append(&self, epoch: Epoch, payload: Bytes) -> Result<AppendResult, StorageError> {
         let extent = self.find_epoch_by_number(epoch).ok_or_else(|| {
             InternalSnafu {
@@ -370,19 +378,52 @@ impl Stream {
             }
             .build()
         })?;
-        extent.append(payload)
+        let hint_offset = Offset(extent.committed_offset());
+        let job = WriteBatchJob::new(hint_offset, payload.clone());
+        let mut results = self.pool.write_batch(self.id, epoch, std::slice::from_ref(&job));
+        match results.pop().expect("one result per job") {
+            Ok(r) => {
+                extent.update_crc(&payload);
+                extent.advance_committed(1);
+                Ok(AppendResult {
+                    offset: r.offset,
+                    byte_pos: r.byte_pos as u64,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
-    /// Batch-append to the active epoch. Returns one result per input
-    /// job in 1:1 order. Arena-full rotations are handled internally
-    /// by `StreamEpoch::write_batch`; this method never escalates to
-    /// epoch-level seal.
+    /// Batch-append to the active epoch. Routes through the ArenaPool
+    /// for the physical write. Does NOT update CRC or committed_offset —
+    /// the caller (append_one, append_batch_leader) is responsible for
+    /// those metadata updates after processing the results.
+    ///
+    /// Does NOT check seal — that is the caller's responsibility.
     pub(crate) fn write_batch_active(
         &self,
         jobs: &[WriteBatchJob],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
         match self.active_epoch() {
-            Some(ep) => ep.write_batch(jobs),
+            Some(ep) => {
+                if ep.is_sealed() {
+                    let committed = ep.committed_offset() - ep.start_offset.0;
+                    let limit = ep.limit_hint();
+                    if committed >= limit {
+                        return jobs
+                            .iter()
+                            .map(|_| {
+                                Err(EpochSealedSnafu {
+                                    stream_id: self.id,
+                                    epoch: ep.epoch,
+                                }
+                                .build())
+                            })
+                            .collect();
+                    }
+                }
+                self.pool.write_batch(self.id, ep.epoch, jobs)
+            }
             None => {
                 let err = InternalSnafu {
                     message: format!("stream {}: no active epoch", self.id),
@@ -400,7 +441,9 @@ impl Stream {
         }
     }
 
-    /// Replicate a record into the specified epoch.
+    /// Replicate a record into the specified epoch. Routes through
+    /// the ArenaPool for the physical write, then updates CRC and
+    /// committed_offset on the StreamEpoch.
     pub fn replicate(
         &self,
         epoch: Epoch,
@@ -413,10 +456,71 @@ impl Stream {
             }
             .build()
         })?;
-        extent.replicate(offset, payload)
+        // Seal check: reject post-seal writes on the secondary too.
+        if extent.is_sealed() {
+            let committed = extent.committed_offset() - extent.start_offset.0;
+            let limit = extent.limit_hint();
+            if committed >= limit {
+                return Err(EpochSealedSnafu {
+                    stream_id: self.id,
+                    epoch: extent.epoch,
+                }
+                .build());
+            }
+        }
+        // Offset validation (was in StreamEpoch::replicate).
+        if offset.0 < extent.start_offset.0 {
+            return Err(InternalSnafu {
+                message: format!(
+                    "stale forward: offset {} < start_offset {}",
+                    offset.0, extent.start_offset.0
+                ),
+            }
+            .build());
+        }
+        let expected = extent.committed_offset();
+        if offset.0 != expected {
+            return Err(InternalSnafu {
+                message: format!(
+                    "out-of-order forward: got {} expected {}",
+                    offset.0, expected
+                ),
+            }
+            .build());
+        }
+        let job = WriteBatchJob::new(offset, payload.clone());
+        let mut results = self.pool.write_batch(self.id, epoch, std::slice::from_ref(&job));
+        match results.pop().expect("one result") {
+            Ok(r) => {
+                // Sanity: arena-assigned offset must match the primary's.
+                if r.offset != offset {
+                    return Err(InternalSnafu {
+                        message: format!(
+                            "arena assigned offset {} but primary said {}",
+                            r.offset.0, offset.0
+                        ),
+                    }
+                    .build());
+                }
+                // Sync resident_arenas if arena was rotated.
+                let known: SmallVec<[ArenaId; 4]> = extent.resident_arenas.lock().clone();
+                if !known.contains(&r.arena_id) {
+                    extent.resident_arenas.lock().push(r.arena_id);
+                    extent.directory_ref_count.fetch_add(1, Ordering::Release);
+                }
+                extent.update_crc(&payload);
+                extent.advance_committed(1);
+                Ok(AppendResult {
+                    offset: r.offset,
+                    byte_pos: r.byte_pos as u64,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Read `count` messages starting from the given logical `offset` within the specified epoch.
+    /// Routes through the ArenaPool for the physical read.
     pub fn read(
         &self,
         epoch: Epoch,
@@ -432,7 +536,7 @@ impl Stream {
         if offset.0 < extent.start_offset.0 || offset.0 >= extent.next_offset().0 {
             return Ok(Vec::new());
         }
-        extent.read_at_offset(offset, count)
+        self.pool.read_at_offset(self.id, epoch, offset, count)
     }
 
     /// Whether this stream can accept appends (its last epoch is active/unsealed).
@@ -619,13 +723,11 @@ impl Stream {
             let mut inner = self.inner.write();
             inner.epoch_capacity = epoch_capacity;
         }
-        let ep = Arc::new(StreamEpoch::new(
-            self.id,
-            epoch,
-            start_offset,
-            epoch_capacity,
-            Arc::clone(&self.pool),
-        ));
+        let ep = Arc::new(StreamEpoch::new(self.id, epoch, start_offset));
+        // Allocate the first arena through the pool.
+        let first_arena = self.pool.allocate(self.id, epoch, start_offset, epoch_capacity);
+        ep.resident_arenas.lock().push(first_arena.arena_id);
+        ep.directory_ref_count.fetch_add(1, Ordering::Release);
         self.insert_epoch(ep);
         self.evict_oldest_epochs();
     }
@@ -715,11 +817,30 @@ impl Stream {
 
         let offset = append_result.offset;
 
+        // Update epoch metadata: CRC and committed_offset.
+        // (Previously done inside StreamEpoch::write_batch; now the
+        // pool does the physical write and Stream updates metadata.)
+        if let Some(ep) = self.active_epoch() {
+            // Sync resident_arenas if arena was rotated.
+            let known: SmallVec<[ArenaId; 4]> = ep.resident_arenas.lock().clone();
+            if !known.contains(&append_result.arena_id) {
+                ep.resident_arenas.lock().push(append_result.arena_id);
+                ep.directory_ref_count.fetch_add(1, Ordering::Release);
+            }
+            ep.update_crc(&payload_for_forward);
+            ep.advance_committed(1);
+        }
+
         // Update metrics counters.
         self.metrics.append_count.fetch_add(1, Ordering::Relaxed);
         self.metrics
             .bytes_written
             .fetch_add(payload_len as u64, Ordering::Relaxed);
+
+        // Track records for periodic CRC checkpoint.
+        if let Some(ep) = self.active_epoch() {
+            ep.incr_records_since_checksum(1);
+        }
 
         // Check replica info (one atomic load; no map lookup).
         let replica = self.replica_info();
@@ -777,6 +898,26 @@ impl Stream {
                             self.send_forward(init);
                         }
                         self.send_forward(forward_frame);
+
+                        // Send periodic CRC checkpoint if threshold reached.
+                        if let Some(ep) = self.active_epoch()
+                            && ep.should_send_crc_checksum()
+                        {
+                            let (checksum, up_to) = ep.snapshot_crc();
+                            let crc_frame = Frame::new(
+                                VariableHeader::ForwardCrcChecksum {
+                                    stream_id: self.id,
+                                    epoch,
+                                    checksum,
+                                    up_to_offset: up_to.0,
+                                },
+                                None,
+                            );
+                            if let Some(init) = self.maybe_build_init_forward(&crc_frame) {
+                                self.send_forward(init);
+                            }
+                            self.send_forward(crc_frame);
+                        }
                     }
 
                     // Queue deferred ACK — lock-free, no contention with watermark readers.
@@ -817,6 +958,227 @@ impl Stream {
                 }
             }
         }
+    }
+
+    /// Shared ACK/forward/replica-info logic used by both `append_one` and
+    /// `append_batch_leader`. Processes a batch of successful append entries:
+    /// updates metrics, builds Forward frames, enqueues pending ACKs, and
+    /// sends immediate ACKs for standalone mode.
+    fn dispatch_results(
+        &self,
+        entries: &[BatchResultEntry],
+        epoch: Epoch,
+        response_tx: Option<&mpsc::Sender<Frame>>,
+    ) -> Vec<Frame> {
+        let mut responses = Vec::new();
+        if entries.is_empty() {
+            return responses;
+        }
+
+        let total_bytes: u64 = entries.iter().map(|e| e.payload_for_forward.len() as u64).sum();
+        self.metrics.append_count.fetch_add(entries.len() as u64, Ordering::Relaxed);
+        self.metrics.bytes_written.fetch_add(total_bytes, Ordering::Relaxed);
+
+        // Track records for periodic CRC checkpoint.
+        if let Some(ep) = self.active_epoch() {
+            ep.incr_records_since_checksum(entries.len() as u32);
+        }
+
+        let replica = self.replica_info();
+
+        match replica.as_ref() {
+            None => {
+                for entry in entries {
+                    let ack = Frame::new(
+                        VariableHeader::AppendAck {
+                            request_id: entry.request_id,
+                            stream_id: self.id,
+                            epoch,
+                            offset: entry.offset,
+                        },
+                        None,
+                    );
+                    if let Some(tx) = response_tx {
+                        let _ = tx.try_send(ack);
+                    } else {
+                        responses.push(ack);
+                    }
+                }
+            }
+            Some(ri) if ri.is_primary() => {
+                if ri.is_standalone() {
+                    for entry in entries {
+                        let ack = Frame::new(
+                            VariableHeader::AppendAck {
+                                request_id: entry.request_id,
+                                stream_id: self.id,
+                                epoch,
+                                offset: entry.offset,
+                            },
+                            None,
+                        );
+                        if let Some(tx) = response_tx {
+                            let _ = tx.try_send(ack);
+                        } else {
+                            responses.push(ack);
+                        }
+                    }
+                } else {
+                    if self.has_secondaries() {
+                        for entry in entries {
+                            let forward_frame = Frame::new(
+                                VariableHeader::Forward {
+                                    stream_id: self.id,
+                                    epoch,
+                                    offset: entry.offset,
+                                },
+                                Some(entry.payload_for_forward.clone()),
+                            );
+                            if let Some(init) = self.maybe_build_init_forward(&forward_frame) {
+                                self.send_forward(init);
+                            }
+                            self.send_forward(forward_frame);
+                        }
+
+                        // Send periodic CRC checkpoint if threshold reached.
+                        if let Some(ep) = self.active_epoch()
+                            && ep.should_send_crc_checksum()
+                        {
+                            let (checksum, up_to) = ep.snapshot_crc();
+                            let crc_frame = Frame::new(
+                                VariableHeader::ForwardCrcChecksum {
+                                    stream_id: self.id,
+                                    epoch,
+                                    checksum,
+                                    up_to_offset: up_to.0,
+                                },
+                                None,
+                            );
+                            if let Some(init) = self.maybe_build_init_forward(&crc_frame) {
+                                self.send_forward(init);
+                            }
+                            self.send_forward(crc_frame);
+                        }
+                    }
+                    if let Some(resp_tx) = response_tx {
+                        let aq = self.init_ack_queue(
+                            ri.required_secondary_acks(),
+                            self.replication_timeout(),
+                        );
+                        let now = Instant::now();
+                        for entry in entries {
+                            aq.enqueue(PendingAck {
+                                request_id: entry.request_id,
+                                stream_id: self.id,
+                                response_tx: resp_tx.clone(),
+                                assigned_offset: entry.offset.0,
+                                epoch,
+                                created_at: now,
+                            });
+                        }
+                    }
+                }
+            }
+            Some(_) => {
+                for entry in entries {
+                    let ack = Frame::new(
+                        VariableHeader::AppendAck {
+                            request_id: entry.request_id,
+                            stream_id: self.id,
+                            epoch,
+                            offset: entry.offset,
+                        },
+                        None,
+                    );
+                    if let Some(tx) = response_tx {
+                        let _ = tx.try_send(ack);
+                    } else {
+                        responses.push(ack);
+                    }
+                }
+            }
+        }
+
+        responses
+    }
+
+    /// Batch-append leader: builds WriteBatchJob array, calls pool.write_batch,
+    /// processes errors, calls epoch.update_crc/advance_committed per success,
+    /// then dispatch_results.
+    pub(crate) fn append_batch_leader(
+        &self,
+        epoch: Epoch,
+        frames: &[Frame],
+        response_tx: Option<&mpsc::Sender<Frame>>,
+    ) -> Vec<Frame> {
+        let mut responses = Vec::new();
+
+        let mut jobs: SmallVec<[WriteBatchJob; 16]> = SmallVec::with_capacity(frames.len());
+        let hint = self.max_offset();
+        for (i, frame) in frames.iter().enumerate() {
+            let payload = frame.payload.clone().unwrap_or_default();
+            jobs.push(WriteBatchJob::new(Offset(hint.0 + i as u64), payload));
+        }
+        let results = self.write_batch_active(&jobs);
+
+        let mut entries: Vec<BatchResultEntry> = Vec::with_capacity(frames.len());
+
+        for (i, res) in results.into_iter().enumerate() {
+            let request_id = frames[i].request_id();
+            let payload = frames[i].payload.clone().unwrap_or_default();
+            match res {
+                Ok(result) => {
+                    // Update epoch metadata: CRC, committed_offset, and arena tracking.
+                    if let Some(ep) = self.active_epoch() {
+                        let known: SmallVec<[ArenaId; 4]> = ep.resident_arenas.lock().clone();
+                        if !known.contains(&result.arena_id) {
+                            ep.resident_arenas.lock().push(result.arena_id);
+                            ep.directory_ref_count.fetch_add(1, Ordering::Release);
+                        }
+                        ep.update_crc(&payload);
+                        ep.advance_committed(1);
+                    }
+                    entries.push(BatchResultEntry {
+                        request_id,
+                        offset: result.offset,
+                        payload_for_forward: payload,
+                    });
+                }
+                Err(StorageError::EpochSealed { .. }) => {
+                    let err = Frame::append_ack_error(
+                        request_id,
+                        self.id,
+                        epoch,
+                        ErrorCode::ExtentSealed,
+                        "extent is sealed",
+                    );
+                    if let Some(tx) = response_tx {
+                        let _ = tx.try_send(err);
+                    } else {
+                        responses.push(err);
+                    }
+                }
+                Err(e) => {
+                    let err = Frame::append_ack_error(
+                        request_id,
+                        self.id,
+                        epoch,
+                        ErrorCode::InternalError,
+                        &e.to_string(),
+                    );
+                    if let Some(tx) = response_tx {
+                        let _ = tx.try_send(err);
+                    } else {
+                        responses.push(err);
+                    }
+                }
+            }
+        }
+
+        let dispatch_responses = self.dispatch_results(&entries, epoch, response_tx);
+        responses.extend(dispatch_responses);
+
+        responses
     }
 
     /// Drain follower append jobs from this stream's channel.

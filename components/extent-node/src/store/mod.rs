@@ -313,6 +313,10 @@ impl RequestHandler for ExtentNodeStore {
                         self.handle_forward_flushed(frame);
                         None // fire-and-forget, no response
                     }
+                    VariableHeader::ForwardCrcChecksum { .. } => {
+                        self.handle_forward_crc_checksum(frame);
+                        None // fire-and-forget, no response
+                    }
                     _ => self.handle_forward(frame),
                 }
             }

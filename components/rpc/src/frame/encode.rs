@@ -98,6 +98,8 @@ impl Frame {
             VariableHeader::ForwardInitEpoch { .. } => 4 + 4 + 8 + 2 + 1 + 1,
             // stream_id(4) + epoch(4) + checksum(4) + committed_bytes(8)
             VariableHeader::ForwardChecksum { .. } => 4 + 4 + 4 + 8,
+            // stream_id(4) + epoch(4) + checksum(4) + up_to_offset(8)
+            VariableHeader::ForwardCrcChecksum { .. } => 4 + 4 + 4 + 8,
             // stream_id(4) + epoch(4)
             VariableHeader::ForwardFlushed { .. } => 4 + 4,
             // request_id(4) + stream_id(4) + epoch(4) + start_offset(8) + end_offset(8)
@@ -494,6 +496,17 @@ impl Frame {
                 dst.put_u32(epoch.0);
                 dst.put_u32(*checksum);
                 dst.put_u64(*committed_bytes);
+            }
+            VariableHeader::ForwardCrcChecksum {
+                stream_id,
+                epoch,
+                checksum,
+                up_to_offset,
+            } => {
+                dst.put_u32(stream_id.0);
+                dst.put_u32(epoch.0);
+                dst.put_u32(*checksum);
+                dst.put_u64(*up_to_offset);
             }
             VariableHeader::ForwardFlushed { stream_id, epoch } => {
                 dst.put_u32(stream_id.0);

@@ -2,10 +2,10 @@ use bytes::{Buf, Bytes, BytesMut};
 use common::errors::{InternalSnafu, InvalidFrameSnafu, StorageError, UnknownOpcodeSnafu};
 use common::types::{
     ArenaClass, Epoch, EpochPolicy, ErrorCode, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_EPOCH_FLUSHED,
-    FLAG_EPOCH_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_FLUSHED,
-    FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR, FLAG_SEAL_COMMIT,
-    FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass,
-    StreamConfig, StreamId,
+    FLAG_EPOCH_PROGRESS, FLAG_FORWARD_APPEND, FLAG_FORWARD_CHECKSUM, FLAG_FORWARD_CRC_CHECKSUM,
+    FLAG_FORWARD_FLUSHED, FLAG_FORWARD_INIT_EPOCH, FLAG_RESPONSE, FLAG_RESPONSE_ERROR,
+    FLAG_SEAL_COMMIT, FLAG_SEAL_COMMIT_RESP, HEADER_LEN, MAGIC, Offset, Opcode,
+    PROTOCOL_VERSION, StorageClass, StreamConfig, StreamId,
 };
 
 use super::{FixedHeader, Frame, VariableHeader};
@@ -608,6 +608,19 @@ impl Frame {
                                 cache_extents,
                                 storage_class,
                                 arena_class,
+                            },
+                            None,
+                        ))
+                    }
+                    FLAG_FORWARD_CRC_CHECKSUM => {
+                        let checksum = body.get_u32();
+                        let up_to_offset = body.get_u64();
+                        Ok((
+                            VariableHeader::ForwardCrcChecksum {
+                                stream_id,
+                                epoch,
+                                checksum,
+                                up_to_offset,
                             },
                             None,
                         ))

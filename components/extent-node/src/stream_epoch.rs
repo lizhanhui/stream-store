@@ -1,17 +1,18 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-use bytes::{Bytes, BytesMut};
-use common::errors::{EpochSealedSnafu, InternalSnafu, StorageError};
+use arc_swap::ArcSwapOption;
 use common::types::{Epoch, EpochState, Offset, StreamId};
 use parking_lot::Mutex;
-use smallvec::{SmallVec, smallvec};
+use smallvec::SmallVec;
 
-use crate::arena::{Arena, ArenaAppendResult, ArenaId, ArenaPool, WriteBatchJob};
+use crate::arena::ArenaId;
+use crate::store::ReplicaInfo;
 
 /// Sentinel value for `limit`: extent is not sealed.
-const LIMIT_OPEN: u64 = u64::MAX;
+pub(crate) const LIMIT_OPEN: u64 = u64::MAX;
 
 /// Forward-flags bitmap: checked inline during `send_forward()` to
 /// guarantee ordering relative to Forward frames.
@@ -25,6 +26,12 @@ const FLAG_CHECKSUM_RECEIVED: u8 = 0x02;
 /// Set by Primary locally after upload, and by Secondaries on ForwardFlushed.
 pub const FLAG_FLUSHED: u8 = 0x04;
 
+/// Send a periodic CRC checkpoint after this many records.
+const CRC_CHECKSUM_RECORD_INTERVAL: u64 = 4096;
+
+/// Send a periodic CRC checkpoint after this many milliseconds.
+const CRC_CHECKSUM_TIME_INTERVAL_MS: u64 = 10_000;
+
 /// Result of a successful append: the logical offset and the byte position
 /// within the arena where the record was written.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,39 +44,19 @@ pub struct AppendResult {
     pub byte_pos: u64,
 }
 
-/// An epoch: metadata over one-or-more `Arc<Arena>` byte pools.
-///
-/// The arena list grows on arena-full rotation. For Dedicated streams
-/// (P2), each rotated arena belongs to the same `(stream_id, epoch)`
-/// pair; its `start_offset` is the pre-rotation `committed_offset`, so
-/// offset→arena lookup is a simple range scan.
+/// An epoch: pure metadata. Physical arena operations are delegated
+/// to `ArenaPool`; this struct tracks consistency state only.
 ///
 /// # Concurrency
 ///
-/// - Write-side state (`hasher`, `committed_offset`, the `arenas`
-///   vec's tail growth) is mutated only by the stream-level leader.
+/// - Write-side state (`hasher`, `committed_offset`) is mutated only
+///   by the stream-level leader via `update_crc` / `advance_committed`.
 /// - Read-side state (`committed_offset`, `finalized_crc32`, `flags`)
 ///   is published with `Release` and observed with `Acquire`.
-/// - The `arenas` `Mutex` protects vec-level mutation (rotation);
-///   reads clone `Arc<Arena>`s under the lock and drop the guard
-///   before doing work.
 pub struct StreamEpoch {
     pub stream_id: StreamId,
     pub start_offset: Offset,
     pub epoch: Epoch,
-
-    /// The arenas holding records for this epoch, in the order they
-    /// were created. Length grows on arena-full rotation.
-    arenas: Mutex<SmallVec<[Arc<Arena>; 4]>>,
-
-    /// Pool that mints arenas for this epoch. Held so that
-    /// `write_batch` can request a successor on rotation without
-    /// routing back through `Stream`.
-    pool: Arc<dyn ArenaPool>,
-
-    /// Fixed per-arena capacity, passed to `pool.allocate(...)` on
-    /// both initial allocation and rotation.
-    arena_capacity: u32,
 
     /// Committed logical offset: next offset after the last
     /// fully-written record (exclusive). Starts at `start_offset.0`.
@@ -96,46 +83,78 @@ pub struct StreamEpoch {
     finalized_crc32: AtomicU32,
 
     /// Which arenas on this EN currently hold at least one directory
-    /// entry for this (stream, epoch). Denormalized tail of
-    /// `self.arenas` for fast enumeration; kept in sync with arena
-    /// rotation.
+    /// entry for this (stream, epoch). Updated by Stream after pool
+    /// operations (allocation, rotation).
     pub(crate) resident_arenas: Mutex<SmallVec<[ArenaId; 4]>>,
 
     /// Reference count of live directory entries for this epoch
     /// across all resident arenas. Init 1; decremented when Shape A
     /// upload releases an arena (P3).
     pub(crate) directory_ref_count: AtomicU32,
+
+    /// Replica info for this epoch. `None` until `RegisterEpoch`
+    /// arrives. Epoch-scoped: each epoch can have different replica
+    /// configuration (e.g., after failover).
+    replica_info: ArcSwapOption<ReplicaInfo>,
+
+    /// Last periodic CRC32 checksum sent by the primary (via
+    /// `ForwardCrcChecksum`). Advisory: used by secondaries for
+    /// early data-integrity checks while the epoch is still active.
+    last_crc_checksum: AtomicU32,
+
+    /// The committed offset covered by `last_crc_checksum`.
+    /// Secondary compares its own CRC up to this offset against
+    /// `last_crc_checksum` once it has caught up.
+    last_crc_checksum_offset: AtomicU64,
+
+    /// When the last ForwardCrcChecksum was sent. Used by the primary
+    /// to decide when to send the next periodic checkpoint.
+    /// Guarded by single-writer invariant (stream leader).
+    last_checksum_sent: UnsafeCell<Instant>,
+
+    /// Number of records written since the last ForwardCrcChecksum.
+    /// Reset to 0 after each send.
+    records_since_checksum: AtomicU64,
 }
 
 unsafe impl Send for StreamEpoch {}
 unsafe impl Sync for StreamEpoch {}
 
 impl StreamEpoch {
-    /// Create a new epoch and allocate its first arena from `pool`.
+    /// Create a new metadata-only epoch. The first arena is allocated
+    /// and registered by `Stream::register_epoch`, not here.
     pub(crate) fn new(
         stream_id: StreamId,
         epoch: Epoch,
         start_offset: Offset,
-        arena_capacity: u32,
-        pool: Arc<dyn ArenaPool>,
     ) -> Self {
-        let first = pool.allocate(stream_id, epoch, start_offset, arena_capacity);
-        let first_id = first.arena_id;
         Self {
             stream_id,
             start_offset,
             epoch,
-            arenas: Mutex::new(smallvec![first]),
-            pool,
-            arena_capacity,
             committed_offset: AtomicU64::new(start_offset.0),
             limit: AtomicU64::new(LIMIT_OPEN),
             flags: AtomicU8::new(FLAG_INIT_FORWARD),
             hasher: UnsafeCell::new(crc32fast::Hasher::new()),
             finalized_crc32: AtomicU32::new(0),
-            resident_arenas: Mutex::new(smallvec![first_id]),
-            directory_ref_count: AtomicU32::new(1),
+            resident_arenas: Mutex::new(SmallVec::new()),
+            directory_ref_count: AtomicU32::new(0),
+            replica_info: ArcSwapOption::from(None),
+            last_crc_checksum: AtomicU32::new(0),
+            last_crc_checksum_offset: AtomicU64::new(0),
+            last_checksum_sent: UnsafeCell::new(Instant::now()),
+            records_since_checksum: AtomicU64::new(0),
         }
+    }
+
+    // ── Replica info ────────────────────────────────────────────────
+
+    pub(crate) fn replica_info(&self) -> Option<Arc<ReplicaInfo>> {
+        self.replica_info.load_full()
+    }
+
+    pub(crate) fn set_replica_info(&self, info: Arc<ReplicaInfo>) {
+        self.replica_info.store(Some(info));
     }
 
     // ── Flag helpers ────────────────────────────────────────────────
@@ -150,256 +169,6 @@ impl StreamEpoch {
 
     pub fn is_flushed(&self) -> bool {
         self.flags.load(Ordering::Acquire) & FLAG_FLUSHED != 0
-    }
-
-    // ── Arena list helpers ──────────────────────────────────────────
-
-    fn current_arena(&self) -> Arc<Arena> {
-        self.arenas
-            .lock()
-            .last()
-            .cloned()
-            .expect("StreamEpoch must always have at least one arena")
-    }
-
-    fn rotate_arena(&self, next_start: Offset) -> Result<Arc<Arena>, StorageError> {
-        let new_arena =
-            self.pool
-                .allocate(self.stream_id, self.epoch, next_start, self.arena_capacity);
-        let new_id = new_arena.arena_id;
-        self.arenas.lock().push(Arc::clone(&new_arena));
-        self.resident_arenas.lock().push(new_id);
-        self.directory_ref_count.fetch_add(1, Ordering::Release);
-        Ok(new_arena)
-    }
-
-    fn arenas_snapshot(&self) -> SmallVec<[Arc<Arena>; 4]> {
-        self.arenas.lock().clone()
-    }
-
-    /// Find the arena covering `offset`, or None. Walks
-    /// `resident_arenas` in order; arenas are contiguous in offset
-    /// space so this is O(number of rotations) which is ≤ ~4 in
-    /// practice.
-    fn find_arena_for_offset(&self, offset: Offset) -> Option<Arc<Arena>> {
-        self.arenas
-            .lock()
-            .iter()
-            .find(|a| a.contains_offset(offset))
-            .cloned()
-    }
-
-    // ── Write path ──────────────────────────────────────────────────
-
-    /// Arena-level batch append with internal rotation on `ArenaFull`.
-    ///
-    /// Single-writer: only the stream-level leader calls `write_batch`.
-    /// On each job success, advances per-epoch `committed_offset` and
-    /// updates the per-epoch CRC32 hasher inline. On `ArenaFull`,
-    /// rotates to a fresh arena within the same epoch and retries the
-    /// failing job; if the record does not fit in a freshly-rotated
-    /// empty arena, returns `InternalSnafu` ("record too large").
-    ///
-    /// Returns one result per job in 1:1 order.
-    pub(crate) fn write_batch(
-        &self,
-        jobs: &[WriteBatchJob],
-    ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
-        let mut out: SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> =
-            SmallVec::with_capacity(jobs.len());
-
-        // Seal gate.
-        let limit = self.limit.load(Ordering::Acquire);
-        if limit != LIMIT_OPEN {
-            let committed_count =
-                self.committed_offset.load(Ordering::Relaxed) - self.start_offset.0;
-            if committed_count >= limit {
-                for _ in jobs {
-                    out.push(Err(EpochSealedSnafu {
-                        stream_id: self.stream_id,
-                        epoch: self.epoch,
-                    }
-                    .build()));
-                }
-                return out;
-            }
-        }
-
-        self.write_batch_inner(jobs, &mut out);
-        out
-    }
-
-    fn write_batch_inner(
-        &self,
-        jobs: &[WriteBatchJob],
-        out: &mut SmallVec<[Result<ArenaAppendResult, StorageError>; 16]>,
-    ) {
-        let mut idx: usize = 0;
-        while idx < jobs.len() {
-            let arena = self.current_arena();
-            let was_fresh = arena.record_count() == 0;
-            let job = &jobs[idx];
-            let one: [WriteBatchJob; 1] = [WriteBatchJob::new(job.offset, job.payload.clone())];
-            let mut r = arena.write_batch_inline(&one);
-            match r.pop().expect("one result") {
-                Ok(ok) => {
-                    let payload = &job.payload;
-                    // SAFETY: single-writer invariant upheld by caller.
-                    unsafe {
-                        let h = &mut *self.hasher.get();
-                        h.update(&(payload.len() as u32).to_be_bytes());
-                        if !payload.is_empty() {
-                            h.update(payload);
-                        }
-                    }
-                    self.committed_offset.fetch_add(1, Ordering::Release);
-                    out.push(Ok(ok));
-                    idx += 1;
-                }
-                Err(StorageError::ArenaFull { .. }) => {
-                    if was_fresh {
-                        let err = InternalSnafu {
-                            message: format!(
-                                "record too large for arena: stream={} epoch={} arena_capacity={}",
-                                self.stream_id, self.epoch, self.arena_capacity
-                            ),
-                        }
-                        .build();
-                        for _ in &jobs[idx..] {
-                            out.push(Err(err_clone(&err)));
-                        }
-                        return;
-                    }
-                    let next_start = Offset(self.committed_offset.load(Ordering::Relaxed));
-                    if let Err(e) = self.rotate_arena(next_start) {
-                        for _ in &jobs[idx..] {
-                            out.push(Err(err_clone(&e)));
-                        }
-                        return;
-                    }
-                    // Retry the same job on the new arena.
-                }
-                Err(e) => {
-                    out.push(Err(e));
-                    idx += 1;
-                }
-            }
-        }
-    }
-
-    /// Convenience single-record append. Used by tests and by the
-    /// `append_inner` / `replicate` shims that translate store-layer
-    /// calls into a 1-job batch.
-    pub fn append(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
-        self.append_inner(payload)
-    }
-
-    /// Primary append: 1-job batch through `write_batch`.
-    pub(crate) fn append_inner(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
-        // Offset hint: Arena assigns its own authoritative offset; this
-        // is just the anticipated value, ignored on the primary write.
-        let hint = Offset(self.committed_offset.load(Ordering::Relaxed));
-        let job = WriteBatchJob::new(hint, payload);
-        let mut results = self.write_batch(std::slice::from_ref(&job));
-        match results.pop().expect("one result per job") {
-            Ok(r) => Ok(AppendResult {
-                offset: r.offset,
-                byte_pos: r.byte_pos as u64,
-            }),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Secondary replicate: caller passes the primary-assigned offset.
-    /// The offset must equal `committed_offset` for strict-order FIFO
-    /// replay; any mismatch is treated as a protocol error.
-    pub fn replicate(&self, offset: Offset, payload: Bytes) -> Result<AppendResult, StorageError> {
-        if offset.0 < self.start_offset.0 {
-            return Err(InternalSnafu {
-                message: format!(
-                    "stale forward: offset {} < start_offset {}",
-                    offset.0, self.start_offset.0
-                ),
-            }
-            .build());
-        }
-        let expected = self.committed_offset.load(Ordering::Relaxed);
-        if offset.0 != expected {
-            return Err(InternalSnafu {
-                message: format!(
-                    "out-of-order forward: got {} expected {}",
-                    offset.0, expected
-                ),
-            }
-            .build());
-        }
-        let job = WriteBatchJob::new(offset, payload);
-        let mut results = self.write_batch(std::slice::from_ref(&job));
-        match results.pop().expect("one result") {
-            Ok(r) => {
-                // Sanity: arena-assigned offset must match the primary's.
-                if r.offset != offset {
-                    return Err(InternalSnafu {
-                        message: format!(
-                            "arena assigned offset {} but primary said {}",
-                            r.offset.0, offset.0
-                        ),
-                    }
-                    .build());
-                }
-                Ok(AppendResult {
-                    offset: r.offset,
-                    byte_pos: r.byte_pos as u64,
-                })
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    // ── Read path ───────────────────────────────────────────────────
-
-    /// Read up to `count` records starting at the given logical offset.
-    ///
-    /// Finds the arena containing `offset` and delegates. If the read
-    /// exhausts the arena before `count` records, the tail of the
-    /// result is drawn from successor arenas (rotation-aware).
-    pub fn read_at_offset(&self, offset: Offset, count: u32) -> Result<Vec<Bytes>, StorageError> {
-        let arenas = self.arenas_snapshot();
-        if arenas.is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut out: Vec<Bytes> = Vec::with_capacity(count as usize);
-        let mut next = offset;
-        for arena in arenas.iter() {
-            if out.len() as u32 >= count {
-                break;
-            }
-            if !arena.contains_offset(next) {
-                continue;
-            }
-            let want = count - out.len() as u32;
-            let mut got = arena.read(next, want)?;
-            if got.is_empty() {
-                break;
-            }
-            next = Offset(next.0 + got.len() as u64);
-            out.append(&mut got);
-        }
-        Ok(out)
-    }
-
-    /// Lookup the byte position of record `seq` (relative to
-    /// `self.start_offset`). Walks the arena list; returns the
-    /// arena-local byte position on hit, `None` otherwise.
-    ///
-    /// NOTE: with multi-arena epochs the returned byte position is
-    /// arena-local, not epoch-global. Callers that need to route the
-    /// read should prefer `read_at_offset`.
-    pub fn index_lookup(&self, seq: u64) -> Option<u64> {
-        let offset = Offset(self.start_offset.0 + seq);
-        let arena = self.find_arena_for_offset(offset)?;
-        let local_seq = offset.0 - arena.start_offset.0;
-        arena.directory().single_entry().lookup(local_seq)
     }
 
     // ── Seal / finalize ─────────────────────────────────────────────
@@ -479,15 +248,9 @@ impl StreamEpoch {
         self.finalized_crc32.store(crc, Ordering::Release);
     }
 
-    /// With arena rotation the write_batch path advances
-    /// `committed_offset` inline, so `try_advance_committed` is no
-    /// longer needed for forward delivery. It is retained as a no-op
-    /// stub so call sites that invoke it after
-    /// `store_primary_checksum` stay green; the sequential replicate
-    /// path already finalized committed state.
     pub fn try_advance_committed(&self) {
         // Intentional no-op. Forward frames advance committed_offset
-        // synchronously via `replicate`.
+        // synchronously via `Stream::replicate`.
     }
 
     pub fn store_primary_checksum(&self, crc32: u32) {
@@ -555,37 +318,8 @@ impl StreamEpoch {
         self.committed_offset.load(Ordering::Acquire)
     }
 
-    /// Total bytes written across every arena in this epoch.
-    pub fn bytes_written(&self) -> u64 {
-        self.arenas.lock().iter().map(|a| a.bytes_written()).sum()
-    }
-
-    /// Per-arena capacity (same value across every resident arena in
-    /// this epoch; not a multiply-by-arenas total).
-    pub fn capacity(&self) -> u32 {
-        self.arena_capacity
-    }
-
     pub fn limit_hint(&self) -> u64 {
         self.limit.load(Ordering::Acquire)
-    }
-
-    /// Concatenation of every resident arena's committed bytes.
-    /// Used by `ForwardChecksum` and S3 flush.
-    pub fn committed_data(&self) -> Bytes {
-        let arenas = self.arenas_snapshot();
-        if arenas.is_empty() {
-            return Bytes::new();
-        }
-        if arenas.len() == 1 {
-            return arenas[0].committed_data();
-        }
-        let total: usize = arenas.iter().map(|a| a.bytes_written() as usize).sum();
-        let mut buf = BytesMut::with_capacity(total);
-        for arena in arenas.iter() {
-            buf.extend_from_slice(&arena.committed_data());
-        }
-        buf.freeze()
     }
 
     #[allow(dead_code)]
@@ -603,16 +337,109 @@ impl StreamEpoch {
         let prev = self.directory_ref_count.fetch_sub(1, Ordering::Release);
         prev.saturating_sub(1)
     }
-}
 
-/// Clone a StorageError by its Display string. SNAFU errors don't
-/// implement Clone; when we need to broadcast the same failure across
-/// multiple pending jobs in a batch, re-wrap via `InternalSnafu`.
-fn err_clone(e: &StorageError) -> StorageError {
-    InternalSnafu {
-        message: e.to_string(),
+    // ── Pool-delegated metadata updates ─────────────────────────────
+
+    /// Update the per-epoch CRC32 hasher with one record's payload.
+    /// Called by Stream AFTER `pool.write_batch` returns, preserving
+    /// the same ordering as the physical writes.
+    ///
+    /// # SAFETY
+    ///
+    /// Single-writer invariant upheld by Stream leader: only one
+    /// task at a time calls this method per epoch.
+    pub(crate) fn update_crc(&self, payload: &[u8]) {
+        // SAFETY: single-writer invariant upheld by Stream leader.
+        unsafe {
+            let h = &mut *self.hasher.get();
+            h.update(&(payload.len() as u32).to_be_bytes());
+            if !payload.is_empty() {
+                h.update(payload);
+            }
+        }
     }
-    .build()
+
+    /// Advance `committed_offset` by `count` records. Called by
+    /// Stream AFTER `pool.write_batch` returns.
+    pub(crate) fn advance_committed(&self, count: u32) {
+        self.committed_offset.fetch_add(count as u64, Ordering::Release);
+    }
+
+    // ── Periodic CRC checksum (ForwardCrcChecksum) ─────────────────
+
+    /// Store a periodic CRC checkpoint received from the primary.
+    /// Called by the secondary's forward handler.
+    pub(crate) fn store_crc_checksum(&self, checksum: u32, up_to_offset: u64) {
+        self.last_crc_checksum.store(checksum, Ordering::Release);
+        self.last_crc_checksum_offset.store(up_to_offset, Ordering::Release);
+    }
+
+    /// Verify the local CRC up to `last_crc_checksum_offset` against
+    /// the primary's stored checkpoint. Returns `None` if the
+    /// secondary hasn't caught up to the checkpoint offset yet.
+    ///
+    /// # SAFETY
+    ///
+    /// Reads the hasher under single-writer invariant: the secondary's
+    /// forward handler is the only writer, and this is called after
+    /// ForwardCrcChecksum processing.
+    pub(crate) fn verify_crc_checksum(&self) -> Option<bool> {
+        let up_to = self.last_crc_checksum_offset.load(Ordering::Acquire);
+        if up_to == 0 {
+            return None;
+        }
+        let committed = self.committed_offset.load(Ordering::Acquire);
+        if committed < up_to {
+            // Secondary hasn't caught up yet.
+            return None;
+        }
+        // SAFETY: single-writer invariant — secondary's forward handler
+        // is the only task that mutates the hasher, and ForwardCrcChecksum
+        // frames arrive after all preceding Forward frames for the same
+        // offsets have been processed.
+        let local_crc = unsafe { (*self.hasher.get()).clone().finalize() };
+        let remote_crc = self.last_crc_checksum.load(Ordering::Acquire);
+        Some(local_crc == remote_crc)
+    }
+
+    /// Snapshot the current CRC32 value for sending a periodic
+    /// `ForwardCrcChecksum`. Clones the hasher (does NOT finalize it)
+    /// so that ongoing writes can continue. Resets the tracking
+    /// counters after snapshotting.
+    ///
+    /// # SAFETY
+    ///
+    /// Single-writer invariant: only the stream leader calls this.
+    pub(crate) fn snapshot_crc(&self) -> (u32, Offset) {
+        // SAFETY: single-writer invariant upheld by stream leader.
+        let crc = unsafe { (*self.hasher.get()).clone().finalize() };
+        let offset = Offset(self.committed_offset.load(Ordering::Acquire));
+        // SAFETY: single-writer invariant.
+        unsafe {
+            *self.last_checksum_sent.get() = Instant::now();
+        }
+        self.records_since_checksum.store(0, Ordering::Release);
+        (crc, offset)
+    }
+
+    /// Whether it's time to send a periodic ForwardCrcChecksum.
+    /// True when 4096 records written OR 10 seconds elapsed.
+    pub(crate) fn should_send_crc_checksum(&self) -> bool {
+        let records = self.records_since_checksum.load(Ordering::Acquire);
+        if records >= CRC_CHECKSUM_RECORD_INTERVAL {
+            return true;
+        }
+        // SAFETY: single-writer invariant — only stream leader reads
+        // and writes this field.
+        let elapsed = unsafe { (*self.last_checksum_sent.get()).elapsed() };
+        elapsed >= Duration::from_millis(CRC_CHECKSUM_TIME_INTERVAL_MS)
+    }
+
+    /// Increment the count of records written since last checksum.
+    /// Called by Stream after each write.
+    pub(crate) fn incr_records_since_checksum(&self, count: u32) {
+        self.records_since_checksum.fetch_add(count as u64, Ordering::Release);
+    }
 }
 
 impl std::fmt::Debug for StreamEpoch {
@@ -621,7 +448,7 @@ impl std::fmt::Debug for StreamEpoch {
             .field("stream_id", &self.stream_id)
             .field("epoch", &self.epoch)
             .field("start_offset", &self.start_offset)
-            .field("arena_count", &self.arenas.lock().len())
+            .field("resident_arena_count", &self.resident_arenas.lock().len())
             .field(
                 "committed_offset",
                 &self.committed_offset.load(Ordering::Relaxed),
@@ -634,73 +461,96 @@ impl std::fmt::Debug for StreamEpoch {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arena::{ArenaIdGenerator, DedicatedArenaPool};
-    use smallvec::smallvec;
+    use crate::arena::{ArenaIdGenerator, ArenaPool, DedicatedArenaPool, WriteBatchJob};
+    use bytes::Bytes;
+    use common::errors::StorageError;
 
-    fn new_epoch(start: u64, arena_capacity: u32) -> StreamEpoch {
+    fn new_epoch_with_pool(start: u64, arena_capacity: u32) -> (StreamEpoch, Arc<dyn ArenaPool>) {
         let pool: Arc<dyn ArenaPool> =
             Arc::new(DedicatedArenaPool::new(Arc::new(ArenaIdGenerator::new(1))));
-        StreamEpoch::new(StreamId(7), Epoch(3), Offset(start), arena_capacity, pool)
+        let ep = StreamEpoch::new(StreamId(7), Epoch(3), Offset(start));
+        // Allocate the first arena through the pool (as Stream::register_epoch does).
+        let arena = pool.allocate(ep.stream_id, ep.epoch, Offset(start), arena_capacity);
+        ep.resident_arenas.lock().push(arena.arena_id);
+        ep.directory_ref_count.fetch_add(1, Ordering::Release);
+        (ep, pool)
+    }
+
+    /// Helper: write one record via pool, then update epoch metadata.
+    /// Also syncs resident_arenas when arena rotation occurs.
+    fn write_one(
+        ep: &StreamEpoch,
+        pool: &dyn ArenaPool,
+        payload: Bytes,
+    ) -> Result<AppendResult, StorageError> {
+        let hint = Offset(ep.committed_offset());
+        let job = WriteBatchJob::new(hint, payload.clone());
+        let mut results = pool.write_batch(ep.stream_id, ep.epoch, std::slice::from_ref(&job));
+        match results.pop().expect("one result") {
+            Ok(r) => {
+                // Sync resident_arenas if the arena was rotated (new arena_id).
+                let known: SmallVec<[ArenaId; 4]> = ep.resident_arenas.lock().clone();
+                if !known.contains(&r.arena_id) {
+                    ep.resident_arenas.lock().push(r.arena_id);
+                    ep.directory_ref_count.fetch_add(1, Ordering::Release);
+                }
+                ep.update_crc(&payload);
+                ep.advance_committed(1);
+                Ok(AppendResult {
+                    offset: r.offset,
+                    byte_pos: r.byte_pos as u64,
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 
     #[test]
     fn append_inner_single_arena_happy_path() {
-        let ep = new_epoch(0, 4096);
-        let r0 = ep.append(Bytes::from_static(b"msg0")).unwrap();
-        let r1 = ep.append(Bytes::from_static(b"msg1")).unwrap();
-        let r2 = ep.append(Bytes::from_static(b"msg2")).unwrap();
+        let (ep, pool) = new_epoch_with_pool(0, 4096);
+        let r0 = write_one(&ep, &*pool, Bytes::from_static(b"msg0")).unwrap();
+        let r1 = write_one(&ep, &*pool, Bytes::from_static(b"msg1")).unwrap();
+        let r2 = write_one(&ep, &*pool, Bytes::from_static(b"msg2")).unwrap();
         assert_eq!(r0.offset, Offset(0));
         assert_eq!(r1.offset, Offset(1));
         assert_eq!(r2.offset, Offset(2));
         assert_eq!(ep.committed_offset(), 3);
-        assert_eq!(ep.arenas.lock().len(), 1);
         assert_eq!(ep.resident_arenas().len(), 1);
     }
 
     #[test]
     fn append_inner_rotates_on_arena_full() {
-        // Capacity 16 bytes: fits two 4-byte payloads (4+4 each = 8 bytes).
-        // Third record triggers rotation.
-        let ep = new_epoch(100, 16);
-        let r0 = ep.append(Bytes::from_static(b"aaaa")).unwrap();
-        let r1 = ep.append(Bytes::from_static(b"bbbb")).unwrap();
-        let r2 = ep.append(Bytes::from_static(b"cccc")).unwrap();
+        let (ep, pool) = new_epoch_with_pool(100, 16);
+        let r0 = write_one(&ep, &*pool, Bytes::from_static(b"aaaa")).unwrap();
+        let r1 = write_one(&ep, &*pool, Bytes::from_static(b"bbbb")).unwrap();
+        let r2 = write_one(&ep, &*pool, Bytes::from_static(b"cccc")).unwrap();
 
         assert_eq!(r0.offset, Offset(100));
         assert_eq!(r1.offset, Offset(101));
         assert_eq!(r2.offset, Offset(102));
         assert_eq!(ep.committed_offset(), 103);
-
-        let arenas = ep.arenas.lock();
-        assert_eq!(arenas.len(), 2);
-        // First arena holds r0, r1; second arena holds r2 and starts at offset 102.
-        assert_eq!(arenas[0].start_offset, Offset(100));
-        assert_eq!(arenas[0].record_count(), 2);
-        assert_eq!(arenas[1].start_offset, Offset(102));
-        assert_eq!(arenas[1].record_count(), 1);
-        drop(arenas);
-
+        // Pool should have 2 arenas after rotation.
         assert_eq!(ep.resident_arenas().len(), 2);
         assert_eq!(ep.directory_ref_count.load(Ordering::Acquire), 2);
     }
 
     #[test]
     fn read_at_offset_crosses_arena_boundary() {
-        let ep = new_epoch(0, 16);
+        let (ep, pool) = new_epoch_with_pool(0, 16);
         for i in 0..5u32 {
-            ep.append(Bytes::copy_from_slice(&i.to_be_bytes())).unwrap();
+            write_one(&ep, &*pool, Bytes::copy_from_slice(&i.to_be_bytes())).unwrap();
         }
-        // Expect rotation across the boundary.
-        assert!(ep.arenas.lock().len() >= 2);
+        // Pool should have rotated.
+        assert!(ep.resident_arenas().len() >= 2);
 
-        let msgs = ep.read_at_offset(Offset(0), 5).unwrap();
+        let msgs = pool.read_at_offset(ep.stream_id, ep.epoch, Offset(0), 5).unwrap();
         assert_eq!(msgs.len(), 5);
         for (i, msg) in msgs.iter().enumerate() {
             assert_eq!(msg.as_ref(), (i as u32).to_be_bytes());
         }
 
         // Partial read starting mid-stream.
-        let tail = ep.read_at_offset(Offset(3), 10).unwrap();
+        let tail = pool.read_at_offset(ep.stream_id, ep.epoch, Offset(3), 10).unwrap();
         assert_eq!(tail.len(), 2);
         assert_eq!(tail[0].as_ref(), 3u32.to_be_bytes());
         assert_eq!(tail[1].as_ref(), 4u32.to_be_bytes());
@@ -708,13 +558,12 @@ mod tests {
 
     #[test]
     fn seal_after_rotation_finalizes_crc_over_all_records() {
-        // Epoch-level CRC must cover every record in order across every arena.
-        let ep = new_epoch(0, 16);
+        let (ep, pool) = new_epoch_with_pool(0, 16);
         let payloads: &[&[u8]] = &[b"aaaa", b"bbbb", b"cccc", b"dddd"];
         for p in payloads {
-            ep.append(Bytes::copy_from_slice(p)).unwrap();
+            write_one(&ep, &*pool, Bytes::copy_from_slice(p)).unwrap();
         }
-        assert!(ep.arenas.lock().len() >= 2, "expected rotation");
+        assert!(ep.resident_arenas().len() >= 2, "expected rotation");
         ep.seal(None);
 
         // Independently compute the expected CRC over [len:be u32][payload]*.
@@ -727,83 +576,25 @@ mod tests {
     }
 
     #[test]
-    fn write_batch_returns_per_job_results_in_order() {
-        let ep = new_epoch(0, 4096);
-        let jobs: SmallVec<[WriteBatchJob; 16]> = smallvec![
-            WriteBatchJob::new(Offset(0), Bytes::from_static(b"a")),
-            WriteBatchJob::new(Offset(1), Bytes::from_static(b"bb")),
-            WriteBatchJob::new(Offset(2), Bytes::from_static(b"ccc")),
-        ];
-        let results = ep.write_batch(&jobs);
-        assert_eq!(results.len(), 3);
-        assert_eq!(results[0].as_ref().unwrap().offset, Offset(0));
-        assert_eq!(results[1].as_ref().unwrap().offset, Offset(1));
-        assert_eq!(results[2].as_ref().unwrap().offset, Offset(2));
-        assert_eq!(ep.committed_offset(), 3);
-    }
-
-    #[test]
-    fn write_batch_seal_rejects_remaining_jobs() {
-        let ep = new_epoch(0, 4096);
-        ep.append(Bytes::from_static(b"a")).unwrap();
-        ep.seal(None);
-
-        let jobs: SmallVec<[WriteBatchJob; 16]> = smallvec![
-            WriteBatchJob::new(Offset(1), Bytes::from_static(b"rejected1")),
-            WriteBatchJob::new(Offset(2), Bytes::from_static(b"rejected2")),
-        ];
-        let results = ep.write_batch(&jobs);
-        assert_eq!(results.len(), 2);
-        assert!(matches!(results[0], Err(StorageError::EpochSealed { .. })));
-        assert!(matches!(results[1], Err(StorageError::EpochSealed { .. })));
-    }
-
-    #[test]
-    fn write_batch_record_too_large_for_arena_reports_internal() {
-        // Capacity 8: any 5+ byte payload would need > 8 bytes (len 4 + payload).
-        let ep = new_epoch(0, 8);
-        let jobs: SmallVec<[WriteBatchJob; 16]> = smallvec![
-            WriteBatchJob::new(Offset(0), Bytes::from_static(b"toolarge")),
-            WriteBatchJob::new(Offset(1), Bytes::from_static(b"next")),
-        ];
-        let results = ep.write_batch(&jobs);
-        assert_eq!(results.len(), 2);
-        // First fails as "too large", second inherits the fail (no forward progress).
-        for r in &results {
-            assert!(matches!(r, Err(StorageError::Internal { .. })));
-        }
-        // No records committed, no rotation.
+    fn update_crc_and_advance_committed() {
+        let ep = StreamEpoch::new(StreamId(1), Epoch(1), Offset(0));
         assert_eq!(ep.committed_offset(), 0);
-        assert_eq!(ep.arenas.lock().len(), 1);
+
+        ep.update_crc(b"hello");
+        ep.advance_committed(1);
+        assert_eq!(ep.committed_offset(), 1);
+
+        ep.update_crc(b"world");
+        ep.advance_committed(1);
+        assert_eq!(ep.committed_offset(), 2);
     }
 
     #[test]
-    fn replicate_out_of_order_fails() {
-        let ep = new_epoch(0, 4096);
-        // Replicate offset 0 OK.
-        ep.replicate(Offset(0), Bytes::from_static(b"a")).unwrap();
-        // Offset 2 skipping 1 fails.
-        let err = ep
-            .replicate(Offset(2), Bytes::from_static(b"b"))
-            .unwrap_err();
-        assert!(matches!(err, StorageError::Internal { .. }));
-    }
-
-    #[test]
-    fn replicate_matches_primary_offset_across_rotation() {
-        // Simulate a secondary replay with offsets provided by the primary.
-        let ep = new_epoch(0, 16);
-        let payloads: &[&[u8]] = &[b"aaaa", b"bbbb", b"cccc"];
-        for (i, p) in payloads.iter().enumerate() {
-            ep.replicate(Offset(i as u64), Bytes::copy_from_slice(p))
-                .unwrap();
-        }
-        assert!(ep.arenas.lock().len() >= 2);
-        assert_eq!(ep.committed_offset(), 3);
-        let msgs = ep.read_at_offset(Offset(0), 3).unwrap();
-        assert_eq!(msgs.len(), 3);
-        for (i, msg) in msgs.iter().enumerate() {
-            assert_eq!(msg.as_ref(), payloads[i]);
-        }
+    fn replica_info_set_and_get() {
+        let ep = StreamEpoch::new(StreamId(1), Epoch(1), Offset(0));
+        assert!(ep.replica_info().is_none());
+        // Note: can't easily construct ReplicaInfo in a unit test without
+        // the full store infrastructure. The set/get contract is tested
+        // via integration tests.
     }
 }

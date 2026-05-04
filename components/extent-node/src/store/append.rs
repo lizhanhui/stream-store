@@ -1,15 +1,12 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use common::errors::StorageError;
-use common::types::{Epoch, ErrorCode, Offset, StreamId};
+use common::types::{Epoch, ErrorCode, StreamId};
 use rpc::frame::{Frame, VariableHeader};
-use smallvec::SmallVec;
 use tokio::sync::mpsc::Sender;
 use tracing::debug;
 
 use super::{AppendJob, ExtentNodeStore};
-use crate::arena::WriteBatchJob;
 use crate::stream::Stream;
 
 impl ExtentNodeStore {
@@ -95,9 +92,10 @@ impl ExtentNodeStore {
             None => return,
         };
         let (checksum, committed_bytes) = match stream.with_epoch(sealed_epoch, |ext| {
+            let pool = stream.pool();
             (
                 ext.finalized_crc32().unwrap_or(0),
-                ext.committed_data().len() as u64,
+                pool.committed_data(stream_id, sealed_epoch).len() as u64,
             )
         }) {
             Some(pair) => pair,
@@ -124,9 +122,9 @@ impl ExtentNodeStore {
 
     /// Optimized batch append: all frames share the same stream_id/epoch.
     ///
-    /// Amortizes map lookups (3N → 3), leader elections (N → 1),
-    /// ReplicaInfo access (N clones → 0, borrow within guard), and
-    /// atomic operations (2N → 2).
+    /// Thin router: resolves the stream, checks epoch, elects the leader,
+    /// then delegates to `Stream::append_batch_leader` for the actual
+    /// write + dispatch.
     ///
     /// Pin guards are scoped in blocks so they're dropped before `.await` points
     /// (papaya pin guards are non-Send).
@@ -137,29 +135,22 @@ impl ExtentNodeStore {
     ) -> Vec<Frame> {
         let stream_id = frames[0].stream_id();
 
-        struct BatchEntry {
-            request_id: u32,
-            payload_for_forward: bytes::Bytes,
-            offset: Offset,
-            payload_len: usize,
-        }
-        let mut responses = Vec::new();
-        let mut entries: Vec<BatchEntry> = Vec::with_capacity(frames.len());
-
         // Resolve the Stream once; drop the pin guard before any await.
         let stream: Arc<Stream> = {
             let guard = self.streams.pin();
             match guard.get(&stream_id) {
                 Some(s) => Arc::clone(s),
                 None => {
-                    for frame in frames {
-                        responses.push(Frame::error_from_request(
-                            frame,
-                            ErrorCode::UnknownStream,
-                            &format!("stream {} not found", stream_id),
-                        ));
-                    }
-                    return responses;
+                    return frames
+                        .iter()
+                        .map(|frame| {
+                            Frame::error_from_request(
+                                frame,
+                                ErrorCode::UnknownStream,
+                                &format!("stream {} not found", stream_id),
+                            )
+                        })
+                        .collect();
                 }
             }
         };
@@ -167,14 +158,16 @@ impl ExtentNodeStore {
         let epoch = stream.epoch();
         let client_epoch = frames[0].epoch();
         if client_epoch != Epoch(0) && client_epoch != epoch {
-            for frame in frames {
-                responses.push(Frame::error_from_request(
-                    frame,
-                    ErrorCode::EpochStale,
-                    &format!("epoch stale: client={}, current={}", client_epoch, epoch),
-                ));
-            }
-            return responses;
+            return frames
+                .iter()
+                .map(|frame| {
+                    Frame::error_from_request(
+                        frame,
+                        ErrorCode::EpochStale,
+                        &format!("epoch stale: client={}, current={}", client_epoch, epoch),
+                    )
+                })
+                .collect();
         }
 
         let batch_len = frames.len() as u64;
@@ -191,175 +184,11 @@ impl ExtentNodeStore {
                 };
                 let _ = stream.job_tx().send(job);
             }
-            return responses; // All deferred — empty responses.
+            return Vec::new(); // All deferred — empty responses.
         }
 
         // FAST PATH: I'm the active writer (prev == 0).
-        //
-        // Build one WriteBatch covering every frame, then call the
-        // arena pool once. Per-job errors fan back out into the
-        // normal ACK path below.
-        let mut jobs: SmallVec<[WriteBatchJob; 16]> = SmallVec::with_capacity(frames.len());
-        let hint = stream.max_offset();
-        for (i, frame) in frames.iter().enumerate() {
-            let payload = frame.payload.clone().unwrap_or_default();
-            jobs.push(WriteBatchJob::new(Offset(hint.0 + i as u64), payload));
-        }
-        let results = stream.write_batch_active(&jobs);
-
-        for (i, res) in results.into_iter().enumerate() {
-            let request_id = frames[i].request_id();
-            let payload = frames[i].payload.clone().unwrap_or_default();
-            let payload_len = payload.len();
-            let payload_for_forward = payload;
-            match res {
-                Ok(result) => {
-                    entries.push(BatchEntry {
-                        request_id,
-                        payload_for_forward,
-                        offset: result.offset,
-                        payload_len,
-                    });
-                }
-                Err(StorageError::EpochSealed { .. }) => {
-                    let err = Frame::append_ack_error(
-                        request_id,
-                        stream_id,
-                        epoch,
-                        ErrorCode::ExtentSealed,
-                        "extent is sealed",
-                    );
-                    if let Some(tx) = response_tx {
-                        let _ = tx.try_send(err);
-                    } else {
-                        responses.push(err);
-                    }
-                }
-                Err(e) => {
-                    let err = Frame::append_ack_error(
-                        request_id,
-                        stream_id,
-                        epoch,
-                        ErrorCode::InternalError,
-                        &e.to_string(),
-                    );
-                    if let Some(tx) = response_tx {
-                        let _ = tx.try_send(err);
-                    } else {
-                        responses.push(err);
-                    }
-                }
-            }
-        }
-
-        // Process successful entries: metrics, replica info, forwards, ACKs.
-        if !entries.is_empty() {
-            let total_bytes: u64 = entries.iter().map(|e| e.payload_len as u64).sum();
-            stream
-                .metrics_handle()
-                .append_count
-                .fetch_add(entries.len() as u64, Ordering::Relaxed);
-            stream
-                .metrics_handle()
-                .bytes_written
-                .fetch_add(total_bytes, Ordering::Relaxed);
-
-            let replica = stream.replica_info();
-
-            match replica.as_ref() {
-                None => {
-                    for entry in &entries {
-                        let ack = Frame::new(
-                            VariableHeader::AppendAck {
-                                request_id: entry.request_id,
-                                stream_id,
-                                epoch,
-                                offset: entry.offset,
-                            },
-                            None,
-                        );
-                        if let Some(tx) = response_tx {
-                            let _ = tx.try_send(ack);
-                        } else {
-                            responses.push(ack);
-                        }
-                    }
-                }
-                Some(ri) if ri.is_primary() => {
-                    if ri.is_standalone() {
-                        for entry in &entries {
-                            let ack = Frame::new(
-                                VariableHeader::AppendAck {
-                                    request_id: entry.request_id,
-                                    stream_id,
-                                    epoch,
-                                    offset: entry.offset,
-                                },
-                                None,
-                            );
-                            if let Some(tx) = response_tx {
-                                let _ = tx.try_send(ack);
-                            } else {
-                                responses.push(ack);
-                            }
-                        }
-                    } else {
-                        if stream.has_secondaries() {
-                            for entry in &entries {
-                                let forward_frame = Frame::new(
-                                    VariableHeader::Forward {
-                                        stream_id,
-                                        epoch,
-                                        offset: entry.offset,
-                                    },
-                                    Some(entry.payload_for_forward.clone()),
-                                );
-                                if let Some(init) = stream.maybe_build_init_forward(&forward_frame)
-                                {
-                                    stream.send_forward(init);
-                                }
-                                stream.send_forward(forward_frame);
-                            }
-                        }
-                        if let Some(resp_tx) = response_tx {
-                            let aq = stream.init_ack_queue(
-                                ri.required_secondary_acks(),
-                                stream.replication_timeout(),
-                            );
-                            let now = std::time::Instant::now();
-                            for entry in &entries {
-                                aq.enqueue(crate::ack_queue::PendingAck {
-                                    request_id: entry.request_id,
-                                    stream_id,
-                                    response_tx: resp_tx.clone(),
-                                    assigned_offset: entry.offset.0,
-                                    epoch,
-                                    created_at: now,
-                                });
-                            }
-                        }
-                    }
-                }
-                Some(_) => {
-                    for entry in &entries {
-                        let ack = Frame::new(
-                            VariableHeader::AppendAck {
-                                request_id: entry.request_id,
-                                stream_id,
-                                epoch,
-                                offset: entry.offset,
-                            },
-                            None,
-                        );
-                        if let Some(tx) = response_tx {
-                            let _ = tx.try_send(ack);
-                        } else {
-                            responses.push(ack);
-                        }
-                    }
-                }
-            }
-        }
+        let responses = stream.append_batch_leader(epoch, frames, response_tx);
 
         let remaining = stream.in_flight().fetch_sub(batch_len, Ordering::Release);
 
