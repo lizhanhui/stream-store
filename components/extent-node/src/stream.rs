@@ -63,7 +63,7 @@ struct StreamInner {
 /// append and used during read to resolve offsets without client-side byte_pos.
 ///
 /// Pipelined group commit is coordinated at the stream level via `in_flight`,
-/// `request_tx`, and `request_rx`. This ensures extent transitions (seal + create) are
+/// `tx`, and `rx`. This ensures extent transitions (seal + create) are
 /// handled transparently by the stream-level leader without callers needing to
 /// know about individual extent boundaries.
 pub struct Stream {
@@ -78,8 +78,8 @@ pub struct Stream {
     in_flight: AtomicU64,
 
     /// Channel for followers to submit append requests to the leader writer.
-    request_tx: Sender<AppendRequest>,
-    request_rx: Receiver<AppendRequest>,
+    tx: Sender<AppendRequest>,
+    rx: Receiver<AppendRequest>,
 
     /// Per-stream ACK queue for quorum-based replication (Primary only).
     /// `None` on Secondaries. Initialized once at RegisterEpoch time via `OnceLock`.
@@ -147,13 +147,13 @@ impl Stream {
         metrics: Arc<crate::store::StoreMetrics>,
         replication_timeout: Duration,
     ) -> Self {
-        let (request_tx, request_rx) = unbounded();
+        let (tx, rx) = unbounded();
         Self {
             id,
             epoch: AtomicU32::new(0),
             in_flight: AtomicU64::new(0),
-            request_tx,
-            request_rx,
+            tx,
+            rx,
             ack_queue: OnceLock::new(),
             flush_in_progress: papaya::HashMap::new(),
             epochs: ArcSwap::from_pointee(SmallVec::new()),
@@ -311,13 +311,13 @@ impl Stream {
     }
 
     /// Return a reference to the request sender channel.
-    pub(crate) fn request_tx(&self) -> &Sender<AppendRequest> {
-        &self.request_tx
+    pub(crate) fn tx(&self) -> &Sender<AppendRequest> {
+        &self.tx
     }
 
     /// Return a reference to the request receiver channel.
     pub(crate) fn request_rx(&self) -> &Receiver<AppendRequest> {
-        &self.request_rx
+        &self.rx
     }
 
     /// Get the AckQueue for this stream (Primary only). Returns `None` on Secondaries.

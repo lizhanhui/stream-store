@@ -6,7 +6,7 @@
 
 **Architecture:** Three structural changes on the ExtentNode:
 
-1. **Split `StreamEpoch` into `Arena` (byte pool) + `StreamEpoch` (epoch metadata).** `Arena` owns `Arc<ArenaBuffer>`, raw write pointer, `capacity`, `write_cursor`, `record_count`, `committed_bytes`, `ArenaDirectory`, `in_flight`, and the `WriteBatch` delegation channels. `StreamEpoch` owns `stream_id`, `epoch`, `start_offset`, `committed_offset` (logical), `limit` (seal), `flags`, `hasher` + `finalized_crc32` (per-epoch CRC), and `arenas: Mutex<SmallVec<[Arc<Arena>; 4]>>` — one arena per rotation within the epoch.
+1. **Split `StreamEpoch` into `Arena` (byte pool) + `StreamEpoch` (epoch metadata).** `Arena` owns `Arc<ArenaBuffer>`, raw write pointer, `capacity`, `write_cursor`, `record_count`, `committed_bytes`, `ArenaDirectory`. (`in_flight` + `tx`/`rx` delegation channels previously on Arena have moved to `SharedArenaPool`; they are unused in Dedicated.) `StreamEpoch` owns `stream_id`, `epoch`, `start_offset`, `committed_offset` (logical), `limit` (seal), `flags`, `hasher` + `finalized_crc32` (per-epoch CRC), and `arenas: Mutex<SmallVec<[Arc<Arena>; 4]>>` — one arena per rotation within the epoch.
 2. **`ArenaPool` becomes a pure factory trait.** `fn allocate(stream_id, epoch, start_offset, capacity) -> Arc<Arena>`. `DedicatedArenaPool` is stateless except for its shared `ArenaIdGenerator`; each Dedicated stream owns its own `DedicatedArenaPool`. `SharedArenaPool` stays a panicking stub (P3 scope).
 3. **Arena-full rotates, does not seal.** `Arena::write_batch` returns `Err(ArenaFull)` on capacity overflow. `StreamEpoch::write_batch` catches `ArenaFull`, calls `self.pool.allocate(...)` to mint a successor arena within the same epoch, appends to `self.arenas`, and retries the failing job. The entire epoch-full seal path in `store/append.rs` is deleted.
 
@@ -116,11 +116,11 @@ Goal: After this phase, `Arena` owns the byte pool, `StreamEpoch` owns epoch met
 
 Run:
 ```bash
-grep -n '^\s*\(pub(crate) \)\?\(arena\|buf\|capacity\|write_cursor\|record_count\|committed_bytes\|directory\|in_flight\|tx\|rx\)' \
+grep -n '^\s*\(pub(crate) \)\?\(arena\|buf\|capacity\|write_cursor\|record_count\|committed_bytes\|directory\)' \
   components/extent-node/src/stream_epoch.rs
 ```
 
-Expected: roughly 10 fields. These move to `Arena`.
+Expected: roughly 7 fields. These move to `Arena`. (Note: `in_flight` + `tx`/`rx` have moved to `SharedArenaPool`; they no longer relocate from StreamEpoch to Arena.)
 
 - [ ] **Step 2: List every method on `StreamEpoch` that touches those fields**
 
@@ -156,12 +156,9 @@ pub(crate) struct Arena {
     record_count: AtomicU64,
     committed_bytes: AtomicU64,
     directory: ArenaDirectory,
-    /// Arena-level leader-election counter. Unused in Dedicated (stream leader
-    /// is always the arena leader); wired in P3 for Shared.
-    pub(crate) in_flight: AtomicU64,
-    /// Delegation channel. Unused in Dedicated; wired in P3.
-    pub(crate) tx: Sender<WriteBatch>,
-    pub(crate) rx: Receiver<WriteBatch>,
+    // NOTE: `in_flight`, `tx`/`rx` delegation channels have moved to
+    // SharedArenaPool. They were previously on Arena for P3 Shared wiring
+    // but are now owned by the pool itself.
 }
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
@@ -183,7 +180,6 @@ impl Arena {
         let record_cap = (capacity / MIN_RECORD_SIZE) as usize;
         let entry = EpochArenaEntry::with_capacity(stream_id, epoch, start_offset, record_cap);
         let directory = ArenaDirectory::new(entry);
-        let (tx, rx) = unbounded();
         Self {
             arena_id, stream_id, epoch, start_offset,
             buffer, buf, capacity,
@@ -191,8 +187,6 @@ impl Arena {
             record_count: AtomicU64::new(0),
             committed_bytes: AtomicU64::new(0),
             directory,
-            in_flight: AtomicU64::new(0),
-            tx, rx,
         }
     }
 }
@@ -200,7 +194,7 @@ impl Arena {
 
 `MIN_RECORD_SIZE` is currently defined in `stream_epoch.rs`; move it to `arena::arena` (or `arena::mod`) — `Arena` is the new owner.
 
-- [ ] **Step 3: Replace `write_batch` with `write_batch`**
+- [ ] **Step 3: Rewrite `write_batch` method**
 
 ```rust
 impl Arena {
@@ -275,14 +269,14 @@ Keep the `read` body approximately as it is today in `arena.rs:157`, but derive 
 - [ ] **Step 6: Verify `arena` crate compiles**
 
 Run: `cargo check -p extent-node 2>&1 | tail -20`
-Expected: errors in `stream_epoch.rs` and `pool.rs` that reference the old `Arena` signature. These are the fix list for Tasks 1.3–1.6. Build is broken until Task 1.8.
+Expected: errors in `stream_epoch.rs` and `pool/` that reference the old `Arena` signature. These are the fix list for Tasks 1.3–1.6. Build is broken until Task 1.8.
 
 No commit.
 
 ### Task 1.3: Rewrite `DedicatedArenaPool` as a factory; define the trait
 
 **Files:**
-- Modify: `components/extent-node/src/arena/pool.rs`
+- Modify: `components/extent-node/src/arena/pool/` (`mod.rs` for trait, `dedicated.rs` for DedicatedArenaPool, `shared.rs` for SharedArenaPool)
 
 - [ ] **Step 1: Replace the `ArenaPool` trait**
 
@@ -855,7 +849,7 @@ No commit yet. The tree compiles; individual tests may fail until Phase 5 rewrit
 
 Run: `git diff --stat`
 
-Expected: changes concentrated in `components/extent-node/src/arena/{arena,pool}.rs`, `stream_epoch.rs`, `stream.rs`, `store/{append,forward,mod,register}.rs`, `components/common/src/errors.rs`, and test helpers.
+Expected: changes concentrated in `components/extent-node/src/arena/{arena.rs,pool/{mod.rs,dedicated.rs,shared.rs}}`, `stream_epoch.rs`, `stream.rs`, `store/{append,forward,mod,register}.rs`, `components/common/src/errors.rs`, and test helpers.
 
 - [ ] **Step 2: Commit**
 
@@ -865,7 +859,8 @@ git commit -m "$(cat <<'EOF'
 refactor(extent-node): split StreamEpoch into Arena + epoch-metadata
 
 Arena becomes the sole byte-pool primitive, owning the buffer, directory,
-cursors, record count, and the arena-level leader-election channels.
+cursors, and record count. (`in_flight` + `tx`/`rx` delegation channels
+have moved to `SharedArenaPool`; they are no longer Arena fields.)
 StreamEpoch owns epoch-level metadata over `SmallVec<[Arc<Arena>; 4]>`;
 arena-full triggers internal rotation within the same epoch.
 
@@ -901,7 +896,7 @@ Goal: remove `#[allow(dead_code)]` attributes that applied to relocated fields, 
 ### Task 2.1: Strip stale allow(dead_code)
 
 **Files:**
-- Modify: `components/extent-node/src/stream_epoch.rs`, `arena/write_batch.rs`, `arena/pool.rs`, `arena/mod.rs`
+- Modify: `components/extent-node/src/stream_epoch.rs`, `arena/write_batch.rs`, `arena/pool/mod.rs`, `arena/pool/dedicated.rs`, `arena/pool/shared.rs`, `arena/mod.rs`
 
 - [ ] **Step 1: Grep for `#[allow(dead_code)]`**
 
@@ -1085,7 +1080,7 @@ Test cases:
 ### Task 5.2: `DedicatedArenaPool` factory tests
 
 **Files:**
-- Modify: `components/extent-node/src/arena/pool.rs`
+- Modify: `components/extent-node/src/arena/pool/dedicated.rs`
 
 - [ ] **Step 1: Factory test**
 

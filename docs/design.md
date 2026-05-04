@@ -59,30 +59,23 @@ Both paths share the same downstream procedure in Stream Manager: seal in MySQL 
 
 **Lazy Secondary Extent Creation**: Secondaries create extents on-demand when they receive the **first Forward frame** from the Primary, rather than requiring `RegisterExtent` to arrive first. The Primary sends a `ForwardInitExtent` (Forward opcode 0x05, flag=0x01) before the first Forward for a new extent, carrying `stream_id`, `extent_id`, `start_offset`, `extent_capacity`, and `cache_extents`. This eliminates the race where a secondary receives forwards before `RegisterExtent` arrives, and reduces the seal-and-new critical path to a single SM↔Primary round-trip. `RegisterExtent` to secondaries is still sent as a fire-and-forget hint for arena pre-allocation, but is **not required for correctness**.
 
-**ExtentFull handling — Epoch-Based Autonomous Extent Creation**: When the Primary's arena is exhausted, the transition is handled **entirely within the Extent Node** — Stream Manager is not on the critical path. The system uses a **stream epoch** model:
+**Arena-full handling — Arena Rotation Within an Epoch**: When the Primary's arena is exhausted, the transition is handled **entirely within the Extent Node** — Stream Manager is not on the critical path. The system uses a **stream epoch** model with a **two-layer leader writer** architecture:
 
 1. **Stream Epoch**: Each stream has an epoch. Within an epoch, the replica set (Primary + Secondaries) is fixed. SM only bumps the epoch on failure recovery or rebalancing.
 
-2. **Autonomous Creation**: When the Primary's active extent fills up, the **stream-level leader** (pipelined group commit) handles the transition inline:
-   - Seals the current extent locally (atomic `limit` store)
-   - Creates a new extent with the next sequential ID (same replica set, same epoch)
-   - Retries the triggering append on the new extent — **the client never sees an error**
-   - Asynchronously notifies Stream Manager via `NOTIFY_SEALED_EXTENT` (fire-and-forget)
-   - Secondaries learn about the new extent via lazy creation on the first Forward frame
+2. **Two-Layer Leader Writer Election**: The write path uses a two-layer delegation model:
+   - **Layer 1 (Stream-level)**: `stream.in_flight` elects one leader writer per stream via `fetch_add`. Followers push `AppendRequest` into the stream's `request_tx` channel and return immediately. The stream leader owns all extent transitions (seal, arena rotation, retry).
+   - **Layer 2 (Arena-pool-level, P3)**: For `Shared`-class streams, `SharedArenaPool.in_flight` elects one arena writer per shared arena via a second CAS. Stream leaders that lose the arena-level CAS delegate their `WriteBatch` into the pool's `tx` channel. On the `Dedicated` path (today's default), the stream leader IS the arena writer — no second CAS is needed.
 
-3. **Stream-Level Leader Election**: The pipelined group commit leader election (`in_flight` counter + follower channel) operates at the **Stream level**, not the Extent level. This means:
-   - Only one thread writes to any extent in a stream at any time
-   - Extent transitions happen within the leader's turn — no re-election, no race
-   - Followers queued during the transition are processed on the new extent after it's created
-   - Message ordering is preserved by construction (single writer + FIFO channel)
+3. **Arena Rotation**: When the active arena fills, the pool rotates to a fresh arena and the leader retries inline — **the client never sees an error**. This is an arena-lifecycle event, not a seal. The epoch and replica set are unaffected. Secondaries learn about arena rotation via `ForwardInitEpoch` on the first Forward frame for the new arena.
 
-4. **SM Metadata Catch-Up**: Stream Manager receives `NOTIFY_SEALED_EXTENT` notifications and updates MySQL metadata asynchronously. If notifications are lost, SM reconciles at the next epoch bump.
+4. **SM Metadata Catch-Up**: Stream Manager receives `UpdateExtentProgress` notifications and updates MySQL metadata asynchronously. If notifications are lost, SM reconciles at the next epoch bump.
 
-5. **Epoch Bump**: SM bumps the epoch when the replica set needs to change (node failure, rebalancing). SM sends `Seal(stream_id, epoch)` to the Primary, waits for it to seal, reconciles metadata, then allocates a new epoch with a new replica set.
+5. **Epoch Bump**: SM bumps the epoch when the replica set needs to change (node failure, rebalancing). SM sends `SealEpoch` 2-phase (Prepare/Commit) to replicas, reconciles metadata, then allocates a new epoch with a new replica set.
 
-This eliminates the SM round-trip (1 EN↔SM RTT + MySQL transaction + 1 SM↔EN RTT) from the extent-full critical path, reducing it to a local seal + arena allocation (~microseconds).
+This eliminates the SM round-trip (1 EN↔SM RTT + MySQL transaction + 1 SM↔EN RTT) from the arena-full critical path, reducing it to a local arena rotation (~microseconds).
 
-**Consistency** is resolved on the sealed extent (backward-looking). **Availability** is provided by the new extent (forward-looking). The system never blocks writes to achieve consistency.
+**Consistency** is resolved on the sealed epoch (backward-looking). **Availability** is provided by the new epoch (forward-looking). The system never blocks writes to achieve consistency.
 
 ## Architecture
 
@@ -247,7 +240,7 @@ stream-store/                          (Workspace root)
     │       ├── store/                 -- ExtentNodeStore: split into focused submodules
     │       │   ├── mod.rs             -- ExtentNodeStore struct, construction, accessors, RequestHandler dispatch
     │       │   ├── types.rs           -- ExtentUpdate, ReplicaInfo, AppendRequest
-    │       │   ├── append.rs          -- Write/append path, pipelined group commit, seal_and_create
+    │       │   ├── append.rs          -- Write/append path, pipelined group commit
     │       │   ├── forward.rs         -- Replication receive: Forward, ForwardInitExtent, ForwardChecksum
     │       │   ├── register.rs        -- RegisterExtent handler (SM → EN)
     │       │   ├── read.rs            -- Read and QueryOffset handlers
@@ -363,18 +356,28 @@ CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)
 - **Hot data** (active/sealed-in-memory extents): Read from any replica.
 - **Cold data** (flushed extents): Read from S3 via read cache.
 
-### Extent-Node Concurrency: Stream-Level Pipelined Group Commit
+### Extent-Node Concurrency: Two-Layer Pipelined Group Commit
 
-Each stream on an Extent Node uses a **pipelined group commit** pattern to maximize append throughput under high concurrency. Instead of multiple writers contending on atomic cursors (which causes cache-line bouncing), a **leader election at the stream level** delegates all writes to a single leader writer per stream. This means the leader can transparently handle extent-full transitions (seal + create new extent + retry) within its own turn — no re-election needed.
+The write path uses a **two-layer leader writer** architecture that separates stream-level coordination from arena-level memory access:
+
+**Layer 1 — Stream-level leader election** (`stream.in_flight`): The first task to arrive at a stream becomes the leader writer via `in_flight.fetch_add(1)`. Followers push `AppendRequest` into the stream's `request_tx` channel and return immediately. The leader handles all epoch transitions inline (seal, arena rotation) — no re-election, no race.
+
+**Layer 2 — Arena-pool-level leader election** (P3, `SharedArenaPool.in_flight`): For `Dedicated`-class streams, the stream leader IS the arena writer — no second CAS. For `Shared`-class streams (P3), multiple stream leaders may contend on the same shared arena. A second `in_flight` CAS on `SharedArenaPool` elects one arena writer; losers delegate their `WriteBatch` into the pool's `tx` channel.
+
+This layering ensures that the stream leader's responsibilities (replication, ACK quorum, epoch transitions) are decoupled from the arena writer's responsibilities (memcpy, directory update, arena rotation). On Dedicated, both roles collapse into one task — zero overhead.
 
 #### Arena Layout
 
-Each active extent pre-allocates a contiguous buffer (sized by `epoch_capacity`, default 64 MiB). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed extents.
+Each active epoch pre-allocates a contiguous arena buffer (sized by `epoch_capacity`, default 64 MiB). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed arenas.
+
+The `ArenaPool` trait abstracts arena memory management:
+- **`DedicatedArenaPool`**: per-stream ringbuffer of arenas. Active arena = `arenas.last()`, rotation = `arenas.push()`. No HashMap — O(1) active-arena lookup. The stream leader writes directly; no arena-level CAS.
+- **`SharedArenaPool`** (P3): EN-wide singleton. Multiple streams multiplex onto shared arenas. Arena-level CAS (`in_flight` + `tx`/`rx` channel) elects one writer per arena. Directory supports multi-entry (one `EpochArenaEntry` per `(stream, epoch)` that has written to the arena).
 
 The arena has no internal index structure. Records are self-contained: a reader can walk forward from any byte position by reading the length prefix and advancing by `4 + len` bytes. Random access is provided by an **internal index** (see below).
 
 ```
-Extent Arena (pre-allocated contiguous buffer, configurable size):
+Arena (pre-allocated contiguous buffer, configurable size):
 
   ┌─────────────────────────────────────────────────────────────┐
   │  [len|payload][len|payload][len|payload][   free space   ]  │
@@ -384,21 +387,25 @@ Extent Arena (pre-allocated contiguous buffer, configurable size):
 
   write_cursor    : AtomicU64 — byte offset of next free slot
   record_count    : AtomicU64 — number of records (sequence counter)
-  committed_seq   : AtomicU64 — all records with seq < committed_seq are readable
   committed_bytes : AtomicU64 — byte position up to which all records are fully written
 
-Stream-level (not per-extent):
+Stream-level (Layer 1):
   in_flight       : AtomicU64 — leader election counter (0 = idle)
-  job_tx/job_rx   : crossbeam unbounded channel for follower delegation
+  request_tx/rx   : crossbeam unbounded channel for follower delegation
+
+SharedArenaPool-level (Layer 2, P3 only):
+  in_flight       : AtomicU64 — arena-pool leader election counter
+  tx/rx           : crossbeam channel for arena-pool delegation
 ```
 
-#### Append Path (Stream-Level Pipelined Group Commit)
+#### Append Path (Two-Layer Pipelined Group Commit)
 
 ```
-Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → LEADER
-  ├─ try_append_active(payload_A)
-  │   ├─ append_inner on active extent → OK
-  │   └─ return (AppendResult, extent_id)
+Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → STREAM LEADER
+  ├─ pool.write_batch(stream_id, epoch, &[ArenaAppend])
+  │   ├─ Dedicated: Arena::write_batch on active arena → OK
+  │   └─ Shared (P3): arena-level CAS → write or delegate to arena leader
+  ├─ epoch.update_crc + epoch.advance_committed
   ├─ broadcast Forward (if RF≥2) or send AppendAck (if RF=1)
   ├─ in_flight.fetch_sub(1) → remaining=3 → drain batch
   │
@@ -410,36 +417,34 @@ Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → LEADER
   │  ├─ push AppendRequest to stream.request_tx
   │  └─ return None (deferred)
   │
-  └─ drain loop:
-     ├─ recv jobs [B, C] from stream.job_rx
-     ├─ try_append_active(payload_B) → ExtentFull!
-     │   ├─ seal current extent, create_next_extent()
-     │   ├─ retry append on new extent → OK
-     │   └─ return (AppendResult, new_extent_id, SealNotification)
-     ├─ send Forward for B with new_extent_id
-     ├─ try_append_active(payload_C) → OK (on new extent)
-     ├─ send Forward for C with new_extent_id
+  └─ drain_delegated_requests loop:
+     ├─ recv requests [B, C] from stream.request_rx
+     ├─ pool.write_batch for B → ArenaFull!
+     │   ├─ pool rotates to fresh arena, retries → OK
+     │   └─ return ArenaAppendResult
+     ├─ send Forward for B
+     ├─ pool.write_batch for C → OK (on new arena)
      ├─ in_flight.fetch_sub(2) → remaining=0 → done
      └─ break
 ```
 
 Detailed steps:
 
-1. **Stream-level leader election**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the thread is the **leader writer** for the entire stream (fast path). If `prev > 0`, a leader writer exists — push `AppendRequest` to the stream's channel and return immediately (slow path).
+1. **Stream-level leader election (Layer 1)**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the task is the **leader writer** for the stream (fast path). If `prev > 0`, a leader writer exists — push `AppendRequest` to the stream's `request_tx` channel and return immediately (slow path).
 
-2. **Single-writer append** (`try_append_active` → `append_inner`): The leader uses plain `load`/`store` on `write_cursor` and `record_count` (no `fetch_add`). Same memcpy as before. Direct `store` of `committed_bytes`, index entry, and `committed_seq` — no spin-wait needed since there's only one writer.
+2. **Arena write**: The stream leader calls `pool.write_batch(stream_id, epoch, &[ArenaAppend])`. On Dedicated, this calls `Arena::write_batch` directly (the leader IS the arena writer). On Shared (P3), a second CAS at the pool level may be required — if the stream leader loses the arena-level election, it delegates its `WriteBatch` into the pool's `tx` channel.
 
-3. **Extent-full transition** (inline, within leader's turn): If `append_inner` returns `ExtentFull`, the leader drops the shared RwLock ref, acquires an exclusive ref, calls `seal_and_create_next()`, re-acquires shared ref, retries. All within the same leader turn — no re-election, no race. Followers queued during the transition are processed on the new extent.
+3. **Arena-full rotation** (inline, within leader's turn): If `Arena::write_batch` returns `ArenaFull`, the pool rotates to a fresh arena and retries. This is transparent to the caller — no seal, no epoch bump, no re-election. Followers queued during rotation are processed on the new arena.
 
 4. **Replication / ACK**: After append, the leader checks `ReplicaInfo`:
    - **RF=1 / standalone / no replica**: Send immediate `AppendAck` via `response_tx`.
-   - **RF≥2 Primary**: Broadcast `Forward` to all secondaries with the **actual extent_id** the record landed on (may differ from the client's request if transition happened), queue `PendingAck`.
+   - **RF≥2 Primary**: Broadcast `Forward` to all secondaries, queue `PendingAck`.
 
-5. **Batch drain**: After own append, `in_flight.fetch_sub(1, Release)`. If `remaining > 1`, drain `stream.job_rx` and process each follower's payload through `try_append_active` (which handles extent-full inline). `in_flight.fetch_sub(batch_size, Release)` after each batch. Loop until `remaining ≤ batch_size`.
+5. **Batch drain**: After own append, `in_flight.fetch_sub(1, Release)`. If `remaining > 1`, drain `stream.request_rx` and process each follower's payload through `append_one` (which handles arena-full inline). `in_flight.fetch_sub(batch_size, Release)` after each batch. Loop until `remaining ≤ batch_size`.
 
 6. **Follower return**: Followers return `None` immediately. Their ACK (or error) is sent via `response_tx` by the leader.
 
-#### Atomic Ordering Analysis
+#### Atomic Ordering Analysis (Layer 1)
 
 - **`fetch_add(1, Acquire)` on entry**: If we see `prev > 0`, Acquire ensures visibility of the leader's prior operations. If `prev == 0`, harmless.
 - **`fetch_sub(1, Release)` after own append**: Release ensures the next reader (via Acquire in fetch_add) sees committed writes to the arena.
@@ -447,18 +452,20 @@ Detailed steps:
 
 Why not AcqRel everywhere? The `fetch_sub` doesn't need Acquire — the draining leader already has full visibility. The `fetch_add` doesn't need Release — the follower publishes via channel, not via atomic. Minimal orderings reduce overhead on ARM.
 
-#### Internal Extent Index (Compressed u32 Pointers)
+Layer 2 (Shared arena CAS, P3) uses the same pattern but at the pool level: `SharedArenaPool.in_flight` with identical Acquire/Release orderings.
 
-Each extent maintains an **internal index** — a lock-free array mapping sequence numbers to byte positions within the arena. The index is populated atomically inside `append_inner()` after the commit stores succeed, and used during reads to resolve logical offsets to physical byte positions. There is no separate `IndexExtent` struct; the index is absorbed directly into `Extent`.
+#### Internal Arena Index (Compressed u32 Pointers)
+
+Each arena maintains an **internal index** — a lock-free array mapping sequence numbers to byte positions within the arena. The index is populated atomically inside `Arena::write()` after the commit stores succeed, and used during reads to resolve logical offsets to physical byte positions.
 
 **Index structure:**
-- `Box<[AtomicU32]>` — one entry per possible record in the extent, using compressed 32-bit pointers (sufficient for 64 MiB arenas, max byte_pos < 2^32).
+- `Box<[AtomicU32]>` — one entry per possible record in the arena, using compressed 32-bit pointers (sufficient for 64 MiB arenas, max byte_pos < 2^32).
 - Entry `i` stores the byte_pos for the `i`-th record (where `i = offset - extent.start_offset`).
 - Capacity = `extent_capacity / 5` (minimum record = 4 byte header + 1 byte payload).
 - Sentinel value `u32::MAX` distinguishes unwritten entries from byte_pos=0.
 - Memory savings: 4 bytes per entry vs 8 bytes with `AtomicU64` — halves index memory overhead.
 
-**Write path:** Inside `append_inner()`, after `committed_bytes.store(Release)`, the writer records `index[seq].store(byte_pos as u32, Release)`. Single-writer guarantee means no contention.
+**Write path:** Inside `Arena::write()`, after `committed_bytes.store(Release)`, the writer records `index[seq].store(byte_pos as u32, Release)`. Single-writer guarantee means no contention.
 
 **Ordering analysis:** The reader's Acquire load on `index[seq]` synchronizes-with the writer's Release store. Since the index store happens after `committed_bytes.store(Release)`, which happens after the payload memcpy, the reader is guaranteed to see the fully written payload. On x86-64, `AtomicU32` with Release/Acquire compiles to plain `mov` instructions (TSO provides the ordering for free) — zero runtime cost.
 
@@ -482,7 +489,7 @@ Each extent pre-allocates a contiguous arena sized by `epoch_capacity` (default 
 
 #### Seal
 
-Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (leader has finished draining), then reads the final `record_count`. Subsequent appends see the limit and return `ExtentSealed`. The `committed_seq` at seal time is the definitive record count reported to Stream Manager.
+Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (leader has finished draining), then reads the final `record_count`. Subsequent appends see the limit and return `EpochSealed`.
 
 #### Properties
 
@@ -492,10 +499,10 @@ Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (lea
 | No overlap | Single writer advances `write_cursor` — each record occupies a disjoint region |
 | Read consistency | `committed_bytes` advances in-order; readers see a gap-free prefix |
 | Zero-copy reads | `Bytes::slice` into the arena buffer; no allocation or copy |
-| S3 flush | Sealed extent records encoded into chunk-compressed S3 format; uploaded by Primary (normal) or SM-delegated secondary (DR) |
-| No mutex on hot path | Leader election uses a single `fetch_add`; followers push to unbounded channel |
-| O(1) random read | Internal extent index resolves offset→byte_pos; no sequential walk needed |
-| Scalable under contention | Followers delegate to leader, eliminating cache-line bouncing |
+| S3 flush | Sealed arena records encoded into chunk-compressed S3 format; uploaded by Primary (normal) or SM-delegated secondary (DR) |
+| No mutex on hot path | Two-layer leader election: stream-level `fetch_add` + arena-pool-level `fetch_add` (P3); Dedicated collapses to single CAS |
+| O(1) random read | Internal arena index resolves offset→byte_pos; no sequential walk needed |
+| Scalable under contention | Followers delegate to leader at each layer, eliminating cache-line bouncing |
 
 ### Failure Handling
 
@@ -706,7 +713,7 @@ read(stream, offset=1050, count=10)
 | Object storage API | S3-compatible | Widest ecosystem (AWS, MinIO, Ceph, Alibaba OSS S3-compat) |
 | Replication protocol | Broadcast replication with quorum ACK | O(1) hop latency (vs O(N) for chain), tolerates minority failures, simple parallel fan-out |
 | Durability before S3 | Pure in-memory N-way (typically 2-way) | Low latency; single-node failure tolerated; S3 flush bounds risk |
-| Stream concurrency | Stream-level pipelined group commit with leader election, lock-free arena with internal compressed index for O(1) reads | Single leader writer per stream eliminates cache-line bouncing; extent-full transition is inline (no re-election); followers delegate via channel; batch drain amortizes cost; no mutex on hot path |
+| Stream concurrency | Two-layer pipelined group commit (stream + arena-pool) with leader election, lock-free arena with internal compressed index for O(1) reads | Single leader writer per stream eliminates cache-line bouncing; arena rotation is inline (no seal, no re-election); Dedicated collapses both layers into one CAS; Shared (P3) adds arena-level CAS for multi-stream multiplexing; followers delegate via channel; batch drain amortizes cost; no mutex on hot path |
 | Multi-dispatch | Shared data + index streams | Storage efficient; avoids body duplication across subscribers |
 | Stream Manager metadata store | MySQL (sqlx) | Reuses existing infra; metadata ops are infrequent (per-extent, not per-message) |
 | Consistency model | Seal-and-new (WAS) | Separates consistency (sealed extent) from availability (new extent) |
