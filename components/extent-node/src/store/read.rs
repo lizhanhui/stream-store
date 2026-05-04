@@ -23,7 +23,7 @@ impl ExtentNodeStore {
         let target_offset = frame.offset();
         let epoch = stream
             .find_epoch_for_offset(target_offset)
-            .or_else(|| stream.active_epoch())
+            .or_else(|| stream.active_epoch_number())
             .unwrap_or(Epoch(0));
 
         match stream.read(epoch, target_offset, count) {

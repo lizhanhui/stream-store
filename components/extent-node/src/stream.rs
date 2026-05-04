@@ -177,7 +177,7 @@ impl Stream {
 
     /// The currently-active (last, highest-epoch) StreamEpoch. None if none
     /// registered yet.
-    fn active_epoch_ref(&self) -> Option<Arc<StreamEpoch>> {
+    pub fn active_epoch(&self) -> Option<Arc<StreamEpoch>> {
         self.epochs.load().last().cloned()
     }
 
@@ -339,7 +339,7 @@ impl Stream {
         &self,
         jobs: &[WriteBatchJob],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
-        match self.active_epoch_ref() {
+        match self.active_epoch() {
             Some(ep) => ep.write_batch(jobs),
             None => {
                 let err = InternalSnafu {
@@ -390,14 +390,14 @@ impl Stream {
 
     /// Whether this stream can accept appends (its last epoch is active/unsealed).
     pub fn is_mutable(&self) -> bool {
-        self.active_epoch_ref()
+        self.active_epoch()
             .map(|e| e.state() == EpochState::Active)
             .unwrap_or(false)
     }
 
-    /// The active epoch, or None if no epochs are registered.
-    pub fn active_epoch(&self) -> Option<Epoch> {
-        self.active_epoch_ref().map(|e| e.epoch)
+    /// The active epoch number, or None if no epochs are registered.
+    pub fn active_epoch_number(&self) -> Option<Epoch> {
+        self.active_epoch().map(|e| e.epoch)
     }
 
     /// The sealed offset range for the given epoch.
@@ -411,7 +411,7 @@ impl Stream {
     /// The maximum offset (exclusive): the next offset that would be assigned.
     /// Returns `Offset(0)` if the stream has no extents.
     pub fn max_offset(&self) -> Offset {
-        self.active_epoch_ref()
+        self.active_epoch()
             .map(|e| e.next_offset())
             .unwrap_or(Offset(0))
     }
@@ -572,7 +572,7 @@ impl Stream {
     /// Returns `(sealed_epoch, end_offset)` if the active epoch was sealed, or `None`
     /// if no active epoch exists or it was already sealed.
     pub fn seal_current_epoch(&self) -> Option<(Epoch, Offset)> {
-        let epoch = self.active_epoch()?;
+        let epoch = self.active_epoch_number()?;
         let (_, end_offset) = self.seal_epoch_by_number(epoch, None)?;
         Some((epoch, Offset(end_offset)))
     }
@@ -707,7 +707,7 @@ mod tests {
         let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
         assert_eq!(stream.max_offset(), Offset(0));
         assert!(!stream.is_mutable());
-        assert_eq!(stream.active_epoch(), None);
+        assert_eq!(stream.active_epoch_number(), None);
         assert!(
             stream
                 .append(Epoch(0), Bytes::from_static(b"fail"))
