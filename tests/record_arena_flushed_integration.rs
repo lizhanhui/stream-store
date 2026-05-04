@@ -49,11 +49,7 @@ async fn fresh_store() -> MetadataStore {
 }
 
 /// Look up a single epoch row so tests can assert on its state / offsets.
-async fn get_epoch(
-    store: &MetadataStore,
-    stream_id: StreamId,
-    epoch: Epoch,
-) -> EpochRowSnapshot {
+async fn get_epoch(store: &MetadataStore, stream_id: StreamId, epoch: Epoch) -> EpochRowSnapshot {
     let epochs = store.get_extents(stream_id).await.expect("get_extents");
     let row = epochs
         .into_iter()
@@ -73,10 +69,7 @@ struct EpochRowSnapshot {
 
 /// Create a stream and allocate its first epoch so Active-state tests have
 /// something to transition. Returns `(stream_id, epoch)`.
-async fn setup_stream_with_active_epoch(
-    store: &MetadataStore,
-    name: &str,
-) -> (StreamId, Epoch) {
+async fn setup_stream_with_active_epoch(store: &MetadataStore, name: &str) -> (StreamId, Epoch) {
     let stream_id = store
         .create_stream(name, 1, StorageClass::S3, EpochPolicy::default())
         .await

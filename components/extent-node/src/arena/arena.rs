@@ -188,11 +188,7 @@ impl Arena {
         // is disjoint from every other writer's slot.
         unsafe {
             let dst = self.buf.add(byte_pos as usize);
-            std::ptr::copy_nonoverlapping(
-                (payload_len as u32).to_be_bytes().as_ptr(),
-                dst,
-                4,
-            );
+            std::ptr::copy_nonoverlapping((payload_len as u32).to_be_bytes().as_ptr(), dst, 4);
             if payload_len > 0 {
                 std::ptr::copy_nonoverlapping(job.payload.as_ptr(), dst.add(4), payload_len);
             }
@@ -214,11 +210,7 @@ impl Arena {
 
     /// Read up to `count` records starting at the given logical offset.
     /// Returns an empty vec if the offset is past the committed frontier.
-    pub(crate) fn read(
-        &self,
-        offset: Offset,
-        count: u32,
-    ) -> Result<Vec<Bytes>, StorageError> {
+    pub(crate) fn read(&self, offset: Offset, count: u32) -> Result<Vec<Bytes>, StorageError> {
         if offset.0 < self.start_offset.0 {
             return Err(InternalSnafu {
                 message: format!(
@@ -302,8 +294,10 @@ mod tests {
     #[test]
     fn write_batch_inline_single_record_round_trip() {
         let arena = mk(4096);
-        let jobs: SmallVec<[WriteBatchJob; 16]> =
-            smallvec![WriteBatchJob::new(Offset(100), Bytes::from_static(b"hello"))];
+        let jobs: SmallVec<[WriteBatchJob; 16]> = smallvec![WriteBatchJob::new(
+            Offset(100),
+            Bytes::from_static(b"hello")
+        )];
 
         let results = arena.write_batch_inline(&jobs);
 

@@ -304,11 +304,7 @@ async fn client_recovers_after_primary_killed() {
         .await
         .unwrap();
     let messages = reader
-        .read(
-            stream_id,
-            Offset(sealed.start_offset),
-            100,
-        )
+        .read(stream_id, Offset(sealed.start_offset), 100)
         .await
         .unwrap();
     info!(

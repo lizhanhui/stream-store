@@ -23,8 +23,12 @@ impl ExtentNodeStore {
     /// (the caller already holds a guard).
     pub(crate) fn maybe_build_init_forward(&self, stream: &Stream, frame: &Frame) -> Option<Frame> {
         let (stream_id, epoch) = match &frame.variable_header {
-            VariableHeader::Forward { stream_id, epoch, .. }
-            | VariableHeader::ForwardChecksum { stream_id, epoch, .. } => (*stream_id, *epoch),
+            VariableHeader::Forward {
+                stream_id, epoch, ..
+            }
+            | VariableHeader::ForwardChecksum {
+                stream_id, epoch, ..
+            } => (*stream_id, *epoch),
             _ => return None,
         };
 
@@ -150,13 +154,7 @@ impl ExtentNodeStore {
         let replicate_result =
             stream.replicate(epoch, offset, frame.payload.clone().unwrap_or_default());
 
-        self.finish_forward(
-            stream,
-            stream_id,
-            epoch,
-            replicate_result,
-            &frame,
-        )
+        self.finish_forward(stream, stream_id, epoch, replicate_result, &frame)
     }
 
     /// Shared tail of handle_forward: process replicate result, update metrics, return watermark.

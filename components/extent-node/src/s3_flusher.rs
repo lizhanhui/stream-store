@@ -174,7 +174,7 @@ async fn flush(s3_client: &S3Client, store: &ExtentNodeStore, req: &FlushRequest
         if let Some(ref tx) = store.update_tx {
             let _ = tx.try_send(ExtentUpdate::Flushed {
                 stream_id: req.stream_id,
-                                epoch,
+                epoch,
                 start_offset: req.start_offset,
                 end_offset: req.end_offset,
                 s3_key: Bytes::from(key.clone()),

@@ -162,9 +162,7 @@ impl ExtentNodeStore {
         };
 
         let offset = append_result.offset;
-        let _extent_start_offset = stream
-            .with_epoch(epoch, |e| e.start_offset.0)
-            .unwrap_or(0);
+        let _extent_start_offset = stream.with_epoch(epoch, |e| e.start_offset.0).unwrap_or(0);
 
         // Update metrics counters.
         self.append_count.fetch_add(1, Ordering::Relaxed);
@@ -587,7 +585,7 @@ impl ExtentNodeStore {
                                         stream_id,
                                         response_tx: resp_tx.clone(),
                                         assigned_offset: entry.offset.0,
-                                                                                epoch,
+                                        epoch,
                                         created_at: now,
                                     });
                                 }

@@ -470,7 +470,7 @@ impl StreamClient {
     ///   provided offset without querying replicas. Used when the primary ExtentNode has
     ///   already sealed the extent locally (e.g. extent full).
     ///
-        /// Seal a stream by epoch on the StreamManager.
+    /// Seal a stream by epoch on the StreamManager.
     ///
     /// The SM looks up the active extent at this epoch, seals it via EN quorum,
     /// bumps epoch, and allocates a new extent on the surviving (or new) replica set.

@@ -119,15 +119,7 @@ async fn broadcast_replication_rf2() {
     // Register broadcast replication.
     // Secondary must be registered first so it's ready to accept forwarded appends.
     register_extent(&secondary_addr, stream_id, epoch, 1, 2, &[]).await;
-    register_extent(
-        &primary_addr,
-        stream_id,
-        epoch,
-        0,
-        2,
-        &[&secondary_addr],
-    )
-    .await;
+    register_extent(&primary_addr, stream_id, epoch, 0, 2, &[&secondary_addr]).await;
 
     // Give a moment for connections to settle.
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -238,10 +230,7 @@ async fn broadcast_replication_rf3() {
         let max = c.query_offset(StreamId(stream_id)).await.unwrap();
         assert_eq!(max, Offset(3), "{label} should have offset 3");
 
-        let msgs = c
-            .read(StreamId(stream_id), Offset(0), 10)
-            .await
-            .unwrap();
+        let msgs = c.read(StreamId(stream_id), Offset(0), 10).await.unwrap();
         assert_eq!(msgs.len(), 3, "{label} should have 3 messages");
         for (i, msg) in msgs.iter().enumerate().take(3) {
             assert_eq!(

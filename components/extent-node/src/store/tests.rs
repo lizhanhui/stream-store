@@ -5,8 +5,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use common::config::DEFAULT_CACHE_EPOCHS;
 use common::types::{
-    ArenaClass, Epoch, EpochPolicy, ErrorCode, Offset, Opcode, StorageClass,
-    StreamConfig, StreamId,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, Offset, Opcode, StorageClass, StreamConfig, StreamId,
 };
 use rpc::frame::{Frame, VariableHeader};
 use server::handler::RequestHandler;
@@ -1340,9 +1339,7 @@ async fn flush_extent_seals_active_extent() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        let sealed = stream
-            .with_epoch(Epoch(0), |ext| ext.is_sealed())
-            .unwrap();
+        let sealed = stream.with_epoch(Epoch(0), |ext| ext.is_sealed()).unwrap();
         assert!(sealed, "extent should be sealed after FlushExtent");
     }
 
@@ -1403,9 +1400,7 @@ async fn flush_extent_corrects_sealed_extent() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        let sealed = stream
-            .with_epoch(Epoch(0), |ext| ext.is_sealed())
-            .unwrap();
+        let sealed = stream.with_epoch(Epoch(0), |ext| ext.is_sealed()).unwrap();
         assert!(sealed, "extent should still be sealed after FlushExtent");
     }
 
@@ -1664,9 +1659,7 @@ async fn seal_commit_corrects_higher_offset() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        let sealed = stream
-            .with_epoch(Epoch(0), |ext| ext.is_sealed())
-            .unwrap();
+        let sealed = stream.with_epoch(Epoch(0), |ext| ext.is_sealed()).unwrap();
         assert!(sealed, "extent should still be sealed after SealCommit");
         // committed_offset is unchanged (5 records were written).
         let count = stream
@@ -1709,9 +1702,7 @@ async fn seal_commit_seals_active_extent() {
     {
         let guard = store.streams.pin();
         let stream = guard.get(&sid).unwrap();
-        let sealed = stream
-            .with_epoch(Epoch(0), |ext| ext.is_sealed())
-            .unwrap();
+        let sealed = stream.with_epoch(Epoch(0), |ext| ext.is_sealed()).unwrap();
         assert!(sealed, "extent should be sealed after SealEpochCommit");
         let count = stream
             .with_epoch(Epoch(0), |ext| ext.message_count())

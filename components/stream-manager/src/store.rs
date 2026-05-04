@@ -8,8 +8,7 @@ use bytes::Bytes;
 use common::config::DEFAULT_CACHE_EPOCHS;
 use common::errors::{InternalSnafu, StorageError};
 use common::types::{
-    ArenaClass, Epoch, EpochPolicy, ErrorCode, Offset, Opcode, StorageClass, StreamConfig,
-    StreamId,
+    ArenaClass, Epoch, EpochPolicy, ErrorCode, Offset, Opcode, StorageClass, StreamConfig, StreamId,
 };
 use futures_util::future;
 use rpc::frame::{Frame, VariableHeader};
@@ -416,11 +415,7 @@ impl StreamManagerStore {
     /// Secondaries create extents lazily on the first Forward frame, so these
     /// RPCs are hints for pre-allocation, not required for correctness.
     /// Each is spawned as an independent task to avoid blocking the caller.
-    fn notify_secondaries(
-        &self,
-        config: StreamConfig,
-        secondary_addrs: &[String],
-    ) {
+    fn notify_secondaries(&self, config: StreamConfig, secondary_addrs: &[String]) {
         for (i, addr) in secondary_addrs.iter().enumerate() {
             let role = (i + 1) as u8; // 1, 2, ...
             let addr = addr.clone();
@@ -748,17 +743,15 @@ impl StreamManagerStore {
         .await;
 
         match result {
-            Ok((stream_id, primary_addr)) => {
-                Frame::new(
-                    VariableHeader::CreateStreamResp {
-                        request_id: frame.request_id(),
-                        stream_id,
-                        epoch: Epoch(0),
-                        primary_addr: Bytes::from(primary_addr),
-                    },
-                    None,
-                )
-            }
+            Ok((stream_id, primary_addr)) => Frame::new(
+                VariableHeader::CreateStreamResp {
+                    request_id: frame.request_id(),
+                    stream_id,
+                    epoch: Epoch(0),
+                    primary_addr: Bytes::from(primary_addr),
+                },
+                None,
+            ),
             Err(e) => {
                 error!("create_stream failed: {e}");
                 Frame::error_from_request(&frame, ErrorCode::InternalError, &e.to_string())
@@ -954,10 +947,7 @@ impl StreamManagerStore {
         let replicas = self.store.get_replicas(stream_id, epoch).await?;
         if replicas.is_empty() {
             return Err(InternalSnafu {
-                message: format!(
-                    "no replicas found for stream {} epoch {}",
-                    stream_id, epoch
-                ),
+                message: format!("no replicas found for stream {} epoch {}", stream_id, epoch),
             }
             .build());
         }
@@ -1544,8 +1534,7 @@ impl StreamManagerStore {
                     "Epoch seal: reconciled, sealing epoch {} at new epoch {} for stream {}",
                     active.epoch, new_epoch, stream_id
                 );
-                match self.seal_epoch(stream_id, None, new_epoch).await
-                {
+                match self.seal_epoch(stream_id, None, new_epoch).await {
                     Ok((_new_epoch, new_primary_addr)) => {
                         return Frame::new(
                             VariableHeader::SealStreamResp {
@@ -1858,9 +1847,7 @@ impl StreamManagerStore {
                 "{caller}: dispatched FlushEpoch to {sent_count} replica(s) for stream={stream_id} epoch={epoch}",
             );
         } else {
-            tracing::warn!(
-                "{caller}: no replicas available for stream={stream_id} epoch={epoch}",
-            );
+            tracing::warn!("{caller}: no replicas available for stream={stream_id} epoch={epoch}",);
         }
     }
 

@@ -188,7 +188,8 @@ impl ExtentNodeStore {
 
     /// Handle FLUSH_EPOCH (0x1B): SM commands this EN to upload a sealed epoch to S3.
     pub(crate) fn handle_flush_extent(&self, frame: Frame) -> Frame {
-        let (request_id, stream_id, epoch, _start_offset, end_offset) = match &frame.variable_header {
+        let (request_id, stream_id, epoch, _start_offset, end_offset) = match &frame.variable_header
+        {
             VariableHeader::FlushEpoch {
                 request_id,
                 stream_id,
@@ -208,7 +209,10 @@ impl ExtentNodeStore {
         let flush_tx = match self.flush_tx {
             Some(ref tx) => tx,
             None => {
-                warn!("FlushEpoch: no S3 configured, ignoring stream={} epoch={}", stream_id, epoch);
+                warn!(
+                    "FlushEpoch: no S3 configured, ignoring stream={} epoch={}",
+                    stream_id, epoch
+                );
                 return Frame::flush_epoch_resp_error(
                     request_id,
                     stream_id,
@@ -269,7 +273,10 @@ impl ExtentNodeStore {
             .map(|s| s.start_flush(epoch))
             .unwrap_or(false);
         if !started {
-            info!("FlushEpoch: already in progress for stream={} epoch={}, skipping", stream_id, epoch);
+            info!(
+                "FlushEpoch: already in progress for stream={} epoch={}, skipping",
+                stream_id, epoch
+            );
             return Frame::new(
                 VariableHeader::FlushEpochResp {
                     request_id,
@@ -288,7 +295,10 @@ impl ExtentNodeStore {
             })
             .is_err()
         {
-            warn!("FlushEpoch: flush channel full for stream={} epoch={}", stream_id, epoch);
+            warn!(
+                "FlushEpoch: flush channel full for stream={} epoch={}",
+                stream_id, epoch
+            );
             if let Some(s) = self.streams.pin().get(&stream_id) {
                 s.finish_flush(epoch);
             }
@@ -300,7 +310,10 @@ impl ExtentNodeStore {
             );
         }
 
-        info!("FlushEpoch: queued DR flush for stream={} epoch={}", stream_id, epoch);
+        info!(
+            "FlushEpoch: queued DR flush for stream={} epoch={}",
+            stream_id, epoch
+        );
         Frame::new(
             VariableHeader::FlushEpochResp {
                 request_id,
@@ -312,23 +325,23 @@ impl ExtentNodeStore {
 
     /// Handle SealEpoch phase 2: commit local seal point to SM's authoritative committed offset.
     pub(crate) fn handle_seal_commit(&self, frame: Frame) -> Frame {
-        let (request_id, stream_id, epoch, _start_offset, end_offset) =
-            match &frame.variable_header {
-                VariableHeader::SealEpochCommit {
-                    request_id,
-                    stream_id,
-                    epoch,
-                    start_offset,
-                    end_offset,
-                } => (*request_id, *stream_id, *epoch, *start_offset, *end_offset),
-                _ => {
-                    return Frame::error_from_request(
-                        &frame,
-                        ErrorCode::InternalError,
-                        "invalid SealEpochCommit frame",
-                    );
-                }
-            };
+        let (request_id, stream_id, epoch, _start_offset, end_offset) = match &frame.variable_header
+        {
+            VariableHeader::SealEpochCommit {
+                request_id,
+                stream_id,
+                epoch,
+                start_offset,
+                end_offset,
+            } => (*request_id, *stream_id, *epoch, *start_offset, *end_offset),
+            _ => {
+                return Frame::error_from_request(
+                    &frame,
+                    ErrorCode::InternalError,
+                    "invalid SealEpochCommit frame",
+                );
+            }
+        };
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {

@@ -8,9 +8,7 @@ use common::types::{Epoch, EpochState, Offset, StreamId};
 use parking_lot::Mutex;
 use smallvec::{SmallVec, smallvec};
 
-use crate::arena::{
-    Arena, ArenaAppendResult, ArenaId, ArenaPool, WriteBatchJob,
-};
+use crate::arena::{Arena, ArenaAppendResult, ArenaId, ArenaPool, WriteBatchJob};
 
 /// Sentinel value for `limit`: extent is not sealed.
 const LIMIT_OPEN: u64 = u64::MAX;
@@ -165,9 +163,9 @@ impl StreamEpoch {
     }
 
     fn rotate_arena(&self, next_start: Offset) -> Result<Arc<Arena>, StorageError> {
-        let new_arena = self
-            .pool
-            .allocate(self.stream_id, self.epoch, next_start, self.arena_capacity);
+        let new_arena =
+            self.pool
+                .allocate(self.stream_id, self.epoch, next_start, self.arena_capacity);
         let new_id = new_arena.arena_id;
         self.arenas.lock().push(Arc::clone(&new_arena));
         self.resident_arenas.lock().push(new_id);
@@ -365,11 +363,7 @@ impl StreamEpoch {
     /// Finds the arena containing `offset` and delegates. If the read
     /// exhausts the arena before `count` records, the tail of the
     /// result is drawn from successor arenas (rotation-aware).
-    pub fn read_at_offset(
-        &self,
-        offset: Offset,
-        count: u32,
-    ) -> Result<Vec<Bytes>, StorageError> {
+    pub fn read_at_offset(&self, offset: Offset, count: u32) -> Result<Vec<Bytes>, StorageError> {
         let arenas = self.arenas_snapshot();
         if arenas.is_empty() {
             return Ok(Vec::new());
@@ -425,8 +419,7 @@ impl StreamEpoch {
             }
         } else {
             // Primary path: caller guarantees no writers are active.
-            let preliminary =
-                self.committed_offset.load(Ordering::Acquire) - self.start_offset.0;
+            let preliminary = self.committed_offset.load(Ordering::Acquire) - self.start_offset.0;
             match self.limit.compare_exchange(
                 LIMIT_OPEN,
                 preliminary,
@@ -439,8 +432,7 @@ impl StreamEpoch {
                 }
             }
             // Writers are drained; committed_offset is final.
-            let final_count =
-                self.committed_offset.load(Ordering::Acquire) - self.start_offset.0;
+            let final_count = self.committed_offset.load(Ordering::Acquire) - self.start_offset.0;
             if final_count > preliminary {
                 self.limit.store(final_count, Ordering::Release);
             }
@@ -565,11 +557,7 @@ impl StreamEpoch {
 
     /// Total bytes written across every arena in this epoch.
     pub fn bytes_written(&self) -> u64 {
-        self.arenas
-            .lock()
-            .iter()
-            .map(|a| a.bytes_written())
-            .sum()
+        self.arenas.lock().iter().map(|a| a.bytes_written()).sum()
     }
 
     /// Per-arena capacity (same value across every resident arena in
@@ -766,14 +754,8 @@ mod tests {
         ];
         let results = ep.write_batch(&jobs);
         assert_eq!(results.len(), 2);
-        assert!(matches!(
-            results[0],
-            Err(StorageError::EpochSealed { .. })
-        ));
-        assert!(matches!(
-            results[1],
-            Err(StorageError::EpochSealed { .. })
-        ));
+        assert!(matches!(results[0], Err(StorageError::EpochSealed { .. })));
+        assert!(matches!(results[1], Err(StorageError::EpochSealed { .. })));
     }
 
     #[test]
@@ -801,7 +783,9 @@ mod tests {
         // Replicate offset 0 OK.
         ep.replicate(Offset(0), Bytes::from_static(b"a")).unwrap();
         // Offset 2 skipping 1 fails.
-        let err = ep.replicate(Offset(2), Bytes::from_static(b"b")).unwrap_err();
+        let err = ep
+            .replicate(Offset(2), Bytes::from_static(b"b"))
+            .unwrap_err();
         assert!(matches!(err, StorageError::Internal { .. }));
     }
 

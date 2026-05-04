@@ -46,12 +46,12 @@ impl EpochArenaEntry {
         stream_id: StreamId,
         epoch: Epoch,
         start_offset: Offset,
-        record_cap: usize,
+        capacity: usize,
     ) -> Self {
         // alloc_zeroed path, identical to today's Extent.index init.
         let byte_positions = {
             let layout = Layout::from_size_align(
-                record_cap * std::mem::size_of::<AtomicU32>(),
+                capacity * std::mem::size_of::<AtomicU32>(),
                 std::mem::align_of::<AtomicU32>(),
             )
             .expect("invalid directory layout");
@@ -64,7 +64,7 @@ impl EpochArenaEntry {
             // SAFETY: ptr points to record_cap * 4 zeroed bytes; we
             // reconstruct a Vec<AtomicU32> of exactly that capacity so
             // the Box<[AtomicU32]> conversion is well-formed.
-            unsafe { Vec::from_raw_parts(ptr as *mut AtomicU32, record_cap, record_cap) }
+            unsafe { Vec::from_raw_parts(ptr as *mut AtomicU32, capacity, capacity) }
                 .into_boxed_slice()
         };
         Self {

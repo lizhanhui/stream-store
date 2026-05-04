@@ -2,8 +2,8 @@ use std::collections::HashMap;
 
 use common::errors::{DatabaseSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
-    ArenaClass, Epoch, EpochPolicy, EpochState, NodeMetrics, NodeState, ReplicaDetail, StorageClass,
-    StreamEpochInfo, StreamId,
+    ArenaClass, Epoch, EpochPolicy, EpochState, NodeMetrics, NodeState, ReplicaDetail,
+    StorageClass, StreamEpochInfo, StreamId,
 };
 use snafu::ResultExt;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPoolOptions};
@@ -566,7 +566,10 @@ impl MetadataStore {
     }
 
     /// Get all epochs for a stream, ordered by epoch.
-    pub async fn get_extents(&self, stream_id: StreamId) -> Result<Vec<StreamEpochRow>, StorageError> {
+    pub async fn get_extents(
+        &self,
+        stream_id: StreamId,
+    ) -> Result<Vec<StreamEpochRow>, StorageError> {
         let rows = sqlx::query(
             "SELECT stream_id, start_offset, end_offset, state, epoch \
              FROM stream_epochs WHERE stream_id = ? ORDER BY epoch",
@@ -760,7 +763,7 @@ impl MetadataStore {
                     .get_replicas_with_liveness(stream_id, ext.epoch)
                     .await?;
                 Ok(Some(StreamEpochInfo {
-                        start_offset: ext.start_offset,
+                    start_offset: ext.start_offset,
                     end_offset: ext.end_offset,
                     epoch: ext.epoch,
                     state: ext.state,
@@ -841,7 +844,7 @@ impl MetadataStore {
                     .get_replicas_with_liveness(stream_id, ext.epoch)
                     .await?;
                 Ok(Some(StreamEpochInfo {
-                        start_offset: ext.start_offset,
+                    start_offset: ext.start_offset,
                     end_offset: ext.end_offset,
                     epoch: ext.epoch,
                     state: ext.state,

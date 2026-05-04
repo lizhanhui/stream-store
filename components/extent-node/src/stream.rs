@@ -368,7 +368,12 @@ impl Stream {
     }
 
     /// Read `count` messages starting from the given logical `offset` within the specified epoch.
-    pub fn read(&self, epoch: Epoch, offset: Offset, count: u32) -> Result<Vec<Bytes>, StorageError> {
+    pub fn read(
+        &self,
+        epoch: Epoch,
+        offset: Offset,
+        count: u32,
+    ) -> Result<Vec<Bytes>, StorageError> {
         let extent = self.find_epoch_by_number(epoch).ok_or_else(|| {
             InternalSnafu {
                 message: format!("stream {}: epoch {} not found", self.id, epoch),
@@ -522,12 +527,7 @@ impl Stream {
     /// or when a secondary receives ForwardInitEpoch).
     ///
     /// `epoch_capacity` is the arena size for this specific epoch.
-    pub fn register_epoch(
-        &self,
-        start_offset: Offset,
-        epoch: Epoch,
-        epoch_capacity: u32,
-    ) {
+    pub fn register_epoch(&self, start_offset: Offset, epoch: Epoch, epoch_capacity: u32) {
         self.epoch.store(epoch.0, Ordering::Release);
         {
             let mut inner = self.inner.write();
@@ -546,12 +546,7 @@ impl Stream {
 
     /// Simplified register_epoch for tests.
     #[cfg(test)]
-    pub fn register_epoch_simple(
-        &self,
-        start_offset: Offset,
-        epoch_capacity: u32,
-        epoch: Epoch,
-    ) {
+    pub fn register_epoch_simple(&self, start_offset: Offset, epoch_capacity: u32, epoch: Epoch) {
         self.register_epoch(start_offset, epoch, epoch_capacity);
     }
 
@@ -624,15 +619,9 @@ mod tests {
     fn basic_append_and_read() {
         let stream = new_stream_with_epoch(StreamId(1));
         let epoch = Epoch(0);
-        let r0 = stream
-            .append(epoch, Bytes::from_static(b"msg0"))
-            .unwrap();
-        let r1 = stream
-            .append(epoch, Bytes::from_static(b"msg1"))
-            .unwrap();
-        let r2 = stream
-            .append(epoch, Bytes::from_static(b"msg2"))
-            .unwrap();
+        let r0 = stream.append(epoch, Bytes::from_static(b"msg0")).unwrap();
+        let r1 = stream.append(epoch, Bytes::from_static(b"msg1")).unwrap();
+        let r2 = stream.append(epoch, Bytes::from_static(b"msg2")).unwrap();
 
         assert_eq!(r0.offset, Offset(0));
         assert_eq!(r1.offset, Offset(1));
@@ -677,9 +666,7 @@ mod tests {
     fn read_beyond_end_returns_available() {
         let stream = new_stream_with_epoch(StreamId(1));
         let epoch = Epoch(0);
-        let r = stream
-            .append(epoch, Bytes::from_static(b"only"))
-            .unwrap();
+        let r = stream.append(epoch, Bytes::from_static(b"only")).unwrap();
 
         let msgs = stream.read(epoch, r.offset, 100).unwrap();
         assert_eq!(msgs.len(), 1);
@@ -687,7 +674,10 @@ mod tests {
 
     #[test]
     fn read_empty_stream() {
-        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
+        let stream = {
+            let ids = test_arena_ids();
+            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids))
+        };
         assert_eq!(stream.max_offset(), Offset(0));
 
         // Stream with no extents: read returns error (extent not found).
@@ -697,7 +687,10 @@ mod tests {
 
     #[test]
     fn empty_stream_properties() {
-        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
+        let stream = {
+            let ids = test_arena_ids();
+            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids))
+        };
         assert_eq!(stream.max_offset(), Offset(0));
         assert!(!stream.is_mutable());
         assert_eq!(stream.active_epoch_number(), None);
@@ -764,7 +757,10 @@ mod tests {
 
     #[test]
     fn evict_oldest_sealed_extents() {
-        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
+        let stream = {
+            let ids = test_arena_ids();
+            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids))
+        };
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_epochs(2);
 
@@ -797,14 +793,15 @@ mod tests {
 
     #[test]
     fn no_eviction_when_limit_is_zero() {
-        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
+        let stream = {
+            let ids = test_arena_ids();
+            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids))
+        };
         stream.set_max_epochs(0); // 0 means no limit
 
         for i in 0..5u32 {
             stream.register_epoch_simple(Offset(i as u64), DEFAULT_EPOCH_CAPACITY, Epoch(i));
-            stream
-                .append(Epoch(i), Bytes::from_static(b"x"))
-                .unwrap();
+            stream.append(Epoch(i), Bytes::from_static(b"x")).unwrap();
             stream.seal(Epoch(i), None);
         }
         // Register one more active extent.
@@ -820,7 +817,10 @@ mod tests {
     fn evict_unsealed_extents_secondary_scenario() {
         // On secondaries, old extents may not be sealed (autonomous extent-full
         // only seals on the Primary). Eviction should still work for Memory-class streams.
-        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
+        let stream = {
+            let ids = test_arena_ids();
+            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids))
+        };
         stream.set_storage_class(StorageClass::Memory);
         stream.set_max_epochs(2);
 
@@ -846,22 +846,21 @@ mod tests {
     #[test]
     fn s3_stream_skips_eviction_until_flushed() {
         // S3-class streams must NOT evict extents that haven't been flushed.
-        let stream = { let ids = test_arena_ids(); Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids)) };
+        let stream = {
+            let ids = test_arena_ids();
+            Stream::new(StreamId(1), Arc::clone(&ids), test_pool(&ids))
+        };
         // Default is StorageClass::S3, verify explicitly.
         assert_eq!(stream.storage_class(), StorageClass::S3);
         stream.set_max_epochs(2);
 
         // Create 3 extents: extent 0 (sealed), extent 1 (sealed), extent 2 (active).
         stream.register_epoch_simple(Offset(0), DEFAULT_EPOCH_CAPACITY, Epoch(0));
-        stream
-            .append(Epoch(0), Bytes::from_static(b"a"))
-            .unwrap();
+        stream.append(Epoch(0), Bytes::from_static(b"a")).unwrap();
         stream.seal(Epoch(0), None);
 
         stream.register_epoch_simple(Offset(1), DEFAULT_EPOCH_CAPACITY, Epoch(1));
-        stream
-            .append(Epoch(1), Bytes::from_static(b"b"))
-            .unwrap();
+        stream.append(Epoch(1), Bytes::from_static(b"b")).unwrap();
         stream.seal(Epoch(1), None);
 
         stream.register_epoch_simple(Offset(2), DEFAULT_EPOCH_CAPACITY, Epoch(2));
@@ -874,9 +873,7 @@ mod tests {
 
         // Mark extent 0 as flushed, then trigger eviction by adding extent 3.
         stream.with_epoch(Epoch(0), |ext| ext.mark_flushed());
-        stream
-            .append(Epoch(2), Bytes::from_static(b"c"))
-            .unwrap();
+        stream.append(Epoch(2), Bytes::from_static(b"c")).unwrap();
         stream.seal(Epoch(2), None);
         stream.register_epoch_simple(Offset(3), DEFAULT_EPOCH_CAPACITY, Epoch(3));
 
@@ -893,5 +890,4 @@ mod tests {
         assert!(stream.with_epoch(Epoch(2), |_| ()).is_some());
         assert!(stream.with_epoch(Epoch(3), |_| ()).is_some());
     }
-
 }

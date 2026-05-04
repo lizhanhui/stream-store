@@ -174,10 +174,7 @@ async fn main() {
         .expect("describe_stream after seal");
     let new_epoch = Epoch(post_seal_extents[0].epoch.0);
 
-    info!(
-        "[8] Sealed extent {:?} (messages={sealed_count})",
-        epoch
-    );
+    info!("[8] Sealed extent {:?} (messages={sealed_count})", epoch);
     info!("    New epoch={new_epoch}, epoch={new_epoch:?}, primary={new_primary_addr}");
 
     // ── 10. Append more records to the new extent ──
@@ -202,11 +199,7 @@ async fn main() {
     // ── 11. Read from new extent ──
     let start_offset = sealed_count as u64; // new extent starts after sealed messages
     let read_new = extent_node_client_2
-        .read(
-            stream_id,
-            Offset(start_offset),
-            new_messages.len() as u16,
-        )
+        .read(stream_id, Offset(start_offset), new_messages.len() as u16)
         .await
         .expect("read after seal failed");
 

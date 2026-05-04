@@ -509,19 +509,17 @@ impl StreamManagerClient {
                 stream_id,
                 current_offset,
                 epoch,
-            } => {
-                (
-                    Frame::new(
-                        VariableHeader::UpdateEpochProgress {
-                            stream_id,
-                            epoch,
-                            current_offset: Offset(current_offset),
-                        },
-                        None,
-                    ),
-                    format!("UpdateEpochProgress stream={stream_id}"),
-                )
-            }
+            } => (
+                Frame::new(
+                    VariableHeader::UpdateEpochProgress {
+                        stream_id,
+                        epoch,
+                        current_offset: Offset(current_offset),
+                    },
+                    None,
+                ),
+                format!("UpdateEpochProgress stream={stream_id}"),
+            ),
             ExtentUpdate::Flushed {
                 stream_id,
                 epoch,
