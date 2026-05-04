@@ -67,7 +67,7 @@ pub struct ExtentNodeStore {
     /// Per-stream data with fine-grained locking.
     /// Uses `IdentityBuildHasher` — StreamId is a server-assigned u32, so the
     /// identity hash (no mixing) is safe and eliminates ~15 ns of SipHash per lookup.
-    pub(crate) streams: papaya::HashMap<StreamId, Stream, IdentityBuildHasher>,
+    pub(crate) streams: papaya::HashMap<StreamId, Arc<Stream>, IdentityBuildHasher>,
     /// ArenaId generator used by register_epoch paths.
     pub(crate) arena_ids: Arc<ArenaIdGenerator>,
     /// EN-wide singleton pool for Shared-class streams. All Shared
@@ -177,7 +177,7 @@ impl ExtentNodeStore {
                 stream.set_max_epochs(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
-            guard.insert(stream_id, stream);
+            guard.insert(stream_id, Arc::new(stream));
             true
         }
     }
