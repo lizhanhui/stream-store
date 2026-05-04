@@ -6,11 +6,13 @@ use bytes::Bytes;
 use common::errors::StorageError;
 use common::types::{Epoch, ErrorCode, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
+use smallvec::SmallVec;
 use tokio::sync::mpsc::Sender;
 use tracing::debug;
 
 use super::{AppendJob, ExtentNodeStore};
 use crate::ack_queue::PendingAck;
+use crate::arena::WriteBatchJob;
 use crate::stream::Stream;
 
 impl ExtentNodeStore {
@@ -121,10 +123,13 @@ impl ExtentNodeStore {
         let payload_len = payload.len();
         let payload_for_forward = payload.clone();
 
-        // Write locally via single-writer append on the active extent.
-        // Arena-full is handled transparently by the pool (rotation); any
+        // Route through the arena pool via a 1-job WriteBatch. Arena-full
+        // is handled transparently inside StreamEpoch::write_batch; any
         // error that reaches us is a genuine per-job failure.
-        let append_result = match stream.try_append_active(payload) {
+        let hint_offset = stream.max_offset();
+        let job = WriteBatchJob::new(hint_offset, payload);
+        let mut results = stream.write_batch_active(std::slice::from_ref(&job));
+        let append_result = match results.pop().expect("one result per job") {
             Ok(r) => r,
             Err(StorageError::EpochSealed { .. }) => {
                 let err = Frame::append_ack_error(
@@ -448,13 +453,24 @@ impl ExtentNodeStore {
             }
 
             // FAST PATH: I'm the active writer (prev == 0).
-            for frame in frames {
-                let request_id = frame.request_id();
+            //
+            // Build one WriteBatch covering every frame, then call the
+            // arena pool once. Per-job errors fan back out into the
+            // normal ACK path below.
+            let mut jobs: SmallVec<[WriteBatchJob; 16]> = SmallVec::with_capacity(frames.len());
+            let hint = stream.max_offset();
+            for (i, frame) in frames.iter().enumerate() {
                 let payload = frame.payload.clone().unwrap_or_default();
-                let payload_len = payload.len();
-                let payload_for_forward = payload.clone();
+                jobs.push(WriteBatchJob::new(Offset(hint.0 + i as u64), payload));
+            }
+            let results = stream.write_batch_active(&jobs);
 
-                match stream.try_append_active(payload.clone()) {
+            for (i, res) in results.into_iter().enumerate() {
+                let request_id = frames[i].request_id();
+                let payload = frames[i].payload.clone().unwrap_or_default();
+                let payload_len = payload.len();
+                let payload_for_forward = payload;
+                match res {
                     Ok(result) => {
                         entries.push(BatchEntry {
                             request_id,

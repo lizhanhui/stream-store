@@ -331,27 +331,10 @@ impl Stream {
         extent.append(payload)
     }
 
-    /// Append to the active epoch (single-writer, called by stream-level leader).
-    pub fn try_append_active(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
-        let extent = self.active_epoch_ref().ok_or_else(|| {
-            InternalSnafu {
-                message: format!("stream {}: no active epoch", self.id),
-            }
-            .build()
-        })?;
-        extent.append_inner(payload)
-    }
-
     /// Batch-append to the active epoch. Returns one result per input
     /// job in 1:1 order. Arena-full rotations are handled internally
     /// by `StreamEpoch::write_batch`; this method never escalates to
     /// epoch-level seal.
-    ///
-    /// Successor to `try_append_active`. The two coexist while the
-    /// store-layer hot path still builds 1-record batches; a later
-    /// task will swap `do_append_and_respond` to call this directly
-    /// and drop the single-record shim.
-    #[allow(dead_code)]
     pub(crate) fn write_batch_active(
         &self,
         jobs: &[WriteBatchJob],
