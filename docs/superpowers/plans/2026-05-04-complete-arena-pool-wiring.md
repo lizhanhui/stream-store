@@ -6,11 +6,11 @@
 
 **Architecture:** Three structural changes on the ExtentNode:
 
-1. **Split `StreamEpoch` into `Arena` (byte pool) + `StreamEpoch` (epoch metadata).** `Arena` owns `Arc<ArenaBuffer>`, raw write pointer, `capacity`, `write_cursor`, `record_count`, `committed_bytes`, `ArenaDirectory`, `arena_in_flight`, and the `WriteBatch` delegation channels. `StreamEpoch` owns `stream_id`, `epoch`, `start_offset`, `committed_offset` (logical), `limit` (seal), `flags`, `hasher` + `finalized_crc32` (per-epoch CRC), and `arenas: Mutex<SmallVec<[Arc<Arena>; 4]>>` — one arena per rotation within the epoch.
+1. **Split `StreamEpoch` into `Arena` (byte pool) + `StreamEpoch` (epoch metadata).** `Arena` owns `Arc<ArenaBuffer>`, raw write pointer, `capacity`, `write_cursor`, `record_count`, `committed_bytes`, `ArenaDirectory`, `in_flight`, and the `WriteBatch` delegation channels. `StreamEpoch` owns `stream_id`, `epoch`, `start_offset`, `committed_offset` (logical), `limit` (seal), `flags`, `hasher` + `finalized_crc32` (per-epoch CRC), and `arenas: Mutex<SmallVec<[Arc<Arena>; 4]>>` — one arena per rotation within the epoch.
 2. **`ArenaPool` becomes a pure factory trait.** `fn allocate(stream_id, epoch, start_offset, capacity) -> Arc<Arena>`. `DedicatedArenaPool` is stateless except for its shared `ArenaIdGenerator`; each Dedicated stream owns its own `DedicatedArenaPool`. `SharedArenaPool` stays a panicking stub (P3 scope).
-3. **Arena-full rotates, does not seal.** `Arena::write_batch_inline` returns `Err(ArenaFull)` on capacity overflow. `StreamEpoch::write_batch` catches `ArenaFull`, calls `self.pool.allocate(...)` to mint a successor arena within the same epoch, appends to `self.arenas`, and retries the failing job. The entire epoch-full seal path in `store/append.rs` is deleted.
+3. **Arena-full rotates, does not seal.** `Arena::write_batch` returns `Err(ArenaFull)` on capacity overflow. `StreamEpoch::write_batch` catches `ArenaFull`, calls `self.pool.allocate(...)` to mint a successor arena within the same epoch, appends to `self.arenas`, and retries the failing job. The entire epoch-full seal path in `store/append.rs` is deleted.
 
-`WriteBatch { stream_id, epoch, jobs, reply }` becomes the single hand-off type; primary computes offsets from `arena.record_count + start_offset` before the call, secondary uses offsets from `Forward` frames — same code path. Only `Arena::write_batch_inline(&[WriteBatchJob])` exists in this plan; the delegation channel + `reply: Option<oneshot>` stay on the struct as fields for P3 but are unused in Dedicated.
+`WriteBatch { stream_id, epoch, jobs, reply }` becomes the single hand-off type; primary computes offsets from `arena.record_count + start_offset` before the call, secondary uses offsets from `Forward` frames — same code path. Only `Arena::write_batch(&[ArenaAppend])` exists in this plan; the delegation channel + `reply: Option<oneshot>` stay on the struct as fields for P3 but are unused in Dedicated.
 
 **Tech Stack:** Rust 1.80+, Tokio async runtime, `bytes`, `smallvec`, `parking_lot`, `crossbeam-channel`, `arc-swap`, `papaya`. No new deps.
 
@@ -34,15 +34,15 @@ This plan modifies existing files in place. No new files are created.
 
 | File | Role in refactor |
 |---|---|
-| `components/extent-node/src/arena/arena.rs` | Rewrite `Arena` as the single byte-pool primitive; drop `ranges`/`record_range`/multi-entry lookup helpers; adopt `arena_in_flight` + `job_tx/rx` fields moved from StreamEpoch |
-| `components/extent-node/src/arena/pool.rs` | Trim `ArenaPool` to a factory (`fn allocate`); rewrite `DedicatedArenaPool` as stateless factory; `SharedArenaPool::allocate` panics |
+| `components/extent-node/src/arena/arena.rs` | Rewrite `Arena` as the single byte-pool primitive; drop `ranges`/`record_range`/multi-entry lookup helpers |
+| `components/extent-node/src/arena/pool/` | `ArenaPool` trait in `mod.rs`; `DedicatedArenaPool` in `dedicated.rs`; `SharedArenaPool` (with `in_flight` + `tx`/`rx` fields) in `shared.rs` |
 | `components/extent-node/src/arena/write_batch.rs` | Keep types; drop `#[allow(dead_code)]` once wired |
 | `components/extent-node/src/arena/directory.rs` | No structural change (stays single-entry for Dedicated) |
 | `components/extent-node/src/arena/mod.rs` | Fix stale header comment; re-export `Arena` non-dead |
 | `components/extent-node/src/stream_epoch.rs` | Replace buffer/directory/cursor fields with `arenas: Mutex<SmallVec<[Arc<Arena>; 4]>>`; rewrite `append_inner`/`replicate`/`read`/`seal`/`try_advance_committed` to delegate to current arena with rotation |
 | `components/extent-node/src/stream.rs` | Add `pool: Arc<dyn ArenaPool>` field; `new` takes pool param; `register_epoch` uses `self.pool.allocate`; delete `try_append_active`; add `write_batch_active` |
 | `components/extent-node/src/store/mod.rs` | `ExtentNodeStore` gains `shared_pool: Arc<SharedArenaPool>` singleton; `try_create_stream`/register paths pick a pool per `arena_class` |
-| `components/extent-node/src/store/append.rs` | `handle_append`/`handle_append_batch_inner`/`drain_follower_jobs` switch to `Stream::write_batch_active(&[WriteBatchJob])`; delete epoch-full seal branches |
+| `components/extent-node/src/store/append.rs` | `handle_append`/`handle_append_batch_inner`/`drain_delegated_requests` switch to `Stream::write_batch_active(&[ArenaAppend])`; delete epoch-full seal branches |
 | `components/extent-node/src/store/forward.rs` | Secondary replicate path uses the same `write_batch_active` call; drop stale `extent_capacity` plumbing |
 | `components/extent-node/src/store/register.rs` | Pass `arena_class` through to the right pool factory |
 | `components/rpc/src/frame/header.rs` / `encode.rs` / `decode.rs` / `tests.rs` | Drop `extent_capacity` field from `ForwardInitEpoch` |
@@ -116,7 +116,7 @@ Goal: After this phase, `Arena` owns the byte pool, `StreamEpoch` owns epoch met
 
 Run:
 ```bash
-grep -n '^\s*\(pub(crate) \)\?\(arena\|buf\|capacity\|write_cursor\|record_count\|committed_bytes\|directory\|arena_in_flight\|arena_job_tx\|arena_job_rx\)' \
+grep -n '^\s*\(pub(crate) \)\?\(arena\|buf\|capacity\|write_cursor\|record_count\|committed_bytes\|directory\|in_flight\|tx\|rx\)' \
   components/extent-node/src/stream_epoch.rs
 ```
 
@@ -158,10 +158,10 @@ pub(crate) struct Arena {
     directory: ArenaDirectory,
     /// Arena-level leader-election counter. Unused in Dedicated (stream leader
     /// is always the arena leader); wired in P3 for Shared.
-    pub(crate) arena_in_flight: AtomicU64,
+    pub(crate) in_flight: AtomicU64,
     /// Delegation channel. Unused in Dedicated; wired in P3.
-    pub(crate) arena_job_tx: Sender<WriteBatch>,
-    pub(crate) arena_job_rx: Receiver<WriteBatch>,
+    pub(crate) tx: Sender<WriteBatch>,
+    pub(crate) rx: Receiver<WriteBatch>,
 }
 unsafe impl Send for Arena {}
 unsafe impl Sync for Arena {}
@@ -183,7 +183,7 @@ impl Arena {
         let record_cap = (capacity / MIN_RECORD_SIZE) as usize;
         let entry = EpochArenaEntry::with_capacity(stream_id, epoch, start_offset, record_cap);
         let directory = ArenaDirectory::new(entry);
-        let (arena_job_tx, arena_job_rx) = unbounded();
+        let (tx, rx) = unbounded();
         Self {
             arena_id, stream_id, epoch, start_offset,
             buffer, buf, capacity,
@@ -191,8 +191,8 @@ impl Arena {
             record_count: AtomicU64::new(0),
             committed_bytes: AtomicU64::new(0),
             directory,
-            arena_in_flight: AtomicU64::new(0),
-            arena_job_tx, arena_job_rx,
+            in_flight: AtomicU64::new(0),
+            tx, rx,
         }
     }
 }
@@ -200,25 +200,25 @@ impl Arena {
 
 `MIN_RECORD_SIZE` is currently defined in `stream_epoch.rs`; move it to `arena::arena` (or `arena::mod`) — `Arena` is the new owner.
 
-- [ ] **Step 3: Replace `write_batch` with `write_batch_inline`**
+- [ ] **Step 3: Replace `write_batch` with `write_batch`**
 
 ```rust
 impl Arena {
     /// Single-writer append of a job batch. Caller owns the single-writer
     /// invariant. On `ArenaFull`, caller must rotate to a new arena and
     /// retry the failing job.
-    pub(crate) fn write_batch_inline(
+    pub(crate) fn write_batch(
         &self,
-        jobs: &[WriteBatchJob],
+        jobs: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
         let mut out = SmallVec::with_capacity(jobs.len());
         for job in jobs {
-            out.push(self.write_one(job));
+            out.push(self.write(job));
         }
         out
     }
 
-    fn write_one(&self, job: &WriteBatchJob) -> Result<ArenaAppendResult, StorageError> {
+    fn write(&self, job: &ArenaAppend) -> Result<ArenaAppendResult, StorageError> {
         let payload_len = job.payload.len();
         let record_len = 4 + payload_len as u64;
         let byte_pos = self.write_cursor.load(Ordering::Relaxed);
@@ -487,7 +487,7 @@ impl StreamEpoch {
 impl StreamEpoch {
     pub(crate) fn write_batch(
         &self,
-        jobs: &[WriteBatchJob],
+        jobs: &[ArenaAppend],
     ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
         // Seal check applies to the whole batch.
         let limit = self.limit.load(Ordering::Acquire);
@@ -504,7 +504,7 @@ impl StreamEpoch {
         loop {
             if remaining.is_empty() { break; }
             let arena = self.current_arena();
-            let mut batch = arena.write_batch_inline(remaining);
+            let mut batch = arena.write_batch(remaining);
             // Consume results in order; on ArenaFull, rotate and resume.
             let mut rotated_at: Option<usize> = None;
             for (i, r) in batch.drain(..).enumerate() {
@@ -566,7 +566,7 @@ Note: `start_offset` of a rotated arena is the next logical offset at rotation t
 ```rust
 pub(crate) fn append_inner(&self, payload: Bytes) -> Result<AppendResult, StorageError> {
     let next_offset = Offset(self.committed_offset.load(Ordering::Relaxed));
-    let job = WriteBatchJob::new(next_offset, payload);
+    let job = ArenaAppend::new(next_offset, payload);
     let mut results = self.write_batch(std::slice::from_ref(&job));
     match results.pop().expect("one result per job") {
         Ok(r) => Ok(AppendResult { offset: r.offset, byte_pos: r.byte_pos as u64 }),
@@ -587,7 +587,7 @@ pub fn replicate(&self, offset: Offset, payload: Bytes) -> Result<AppendResult, 
     if offset.0 != expected {
         return Err(InternalSnafu { message: format!("out-of-order forward: got {} expected {}", offset.0, expected) }.build());
     }
-    let job = WriteBatchJob::new(offset, payload);
+    let job = ArenaAppend::new(offset, payload);
     let mut results = self.write_batch(std::slice::from_ref(&job));
     match results.pop().expect("one result") {
         Ok(r) => Ok(AppendResult { offset: r.offset, byte_pos: r.byte_pos as u64 }),
@@ -705,7 +705,7 @@ Replace with `write_batch_active`:
 ```rust
 pub fn write_batch_active(
     &self,
-    jobs: &[WriteBatchJob],
+    jobs: &[ArenaAppend],
 ) -> SmallVec<[Result<ArenaAppendResult, StorageError>; 16]> {
     match self.active_epoch_ref() {
         Some(ep) => ep.write_batch(jobs),
@@ -740,7 +740,7 @@ No commit.
 Replace the `stream.try_append_active(payload)` call with a 1-job WriteBatch:
 
 ```rust
-let job = WriteBatchJob::new(
+let job = ArenaAppend::new(
     Offset(0), // sentinel — will be assigned by Arena based on write_cursor
     payload,
 );
@@ -759,27 +759,27 @@ let append_result = match results.pop().expect("one result") {
 - (a) Arena assigns offset (`Offset(self.start_offset.0 + seq)`); primary ignores `job.offset` on write, uses it on forward.
 - (b) Primary pre-reserves from `epoch.committed_offset` before building the WriteBatch.
 
-Option (a) is atomic within one arena but breaks across rotation (the rotated arena's `start_offset` is the pre-rotation `committed_offset`, so sequence numbers restart from 0 — the `ArenaAppendResult.offset` still resolves correctly). Go with (a): `WriteBatchJob.offset` becomes the **echo-back hint** used by secondaries (who pass the authoritative primary-assigned offset); on primary, `Arena::write_one` ignores `job.offset` and derives offset from its own `start_offset + seq`.
+Option (a) is atomic within one arena but breaks across rotation (the rotated arena's `start_offset` is the pre-rotation `committed_offset`, so sequence numbers restart from 0 — the `ArenaAppendResult.offset` still resolves correctly). Go with (a): `ArenaAppend.offset` becomes the **echo-back hint** used by secondaries (who pass the authoritative primary-assigned offset); on primary, `Arena::write` ignores `job.offset` and derives offset from its own `start_offset + seq`.
 
-Update `ArenaAppendResult` construction in `Arena::write_one`:
+Update `ArenaAppendResult` construction in `Arena::write`:
 ```rust
 let assigned_offset = Offset(self.start_offset.0 + seq);
 Ok(ArenaAppendResult::new(assigned_offset, self.arena_id, byte_pos as u32))
 ```
 
-On secondary, `Arena::write_one` validates `job.offset == assigned_offset` and returns the authoritative one; mismatch is `Err(InternalSnafu)`.
+On secondary, `Arena::write` validates `job.offset == assigned_offset` and returns the authoritative one; mismatch is `Err(InternalSnafu)`.
 
 - [ ] **Step 2: Delete the epoch-full seal branch**
 
 In `handle_append` (lines 100–124) and `handle_append_batch_inner` (lines 842–866): the entire `if extent_full { seal_current_epoch; ... }` block goes away. Arena rotation is internal; no seal happens on arena-full. `extent_full: bool` and the second element of `do_append_and_respond`'s return tuple disappear.
 
-- [ ] **Step 3: Update `drain_follower_jobs`**
+- [ ] **Step 3: Update `drain_delegated_requests`**
 
-Collect all drained `AppendJob`s into a `SmallVec<WriteBatchJob>`, call `stream.write_batch_active` once per drain cycle, iterate results to send ACKs + Forward frames. Delete `extent_full_idx` logic.
+Collect all drained `AppendRequest`s into a `SmallVec<ArenaAppend>`, call `stream.write_batch_active` once per drain cycle, iterate results to send ACKs + Forward frames. Delete `extent_full_idx` logic.
 
 - [ ] **Step 4: Convert the batch path**
 
-`handle_append_batch_inner`: build `SmallVec<WriteBatchJob>` from the incoming frames, one `stream.write_batch_active` call, iterate results. Delete the per-frame `try_append_active` loop (lines 677–730).
+`handle_append_batch_inner`: build `SmallVec<ArenaAppend>` from the incoming frames, one `stream.write_batch_active` call, iterate results. Delete the per-frame `try_append_active` loop (lines 677–730).
 
 - [ ] **Step 5: Remove `SealReason::EpochFull`**
 
@@ -802,7 +802,7 @@ No commit.
 
 Replace `stream.replicate(epoch, offset, payload)` with:
 ```rust
-let job = WriteBatchJob::new(offset, payload);
+let job = ArenaAppend::new(offset, payload);
 let mut results = stream.write_batch_active(std::slice::from_ref(&job));
 ```
 
@@ -1076,10 +1076,10 @@ Goal: cover the new structure with focused tests. All tests deleted in Phase 1.5
 - [ ] **Step 1: Add `#[cfg(test)] mod tests`**
 
 Test cases:
-- `write_batch_inline_single_record_round_trip`: one job in, one `Ok(ArenaAppendResult)` out, `arena.bytes_written()` equals record length, `arena.record_count()` is 1.
-- `write_batch_inline_multiple_records_advance_cursor`: three jobs; assert offsets are `start + 0/1/2` and byte positions are contiguous.
-- `write_batch_inline_returns_arena_full_at_boundary`: arena capacity 16 bytes; two 4+4-byte records fit; the third returns `Err(ArenaFull)`; cursor + record_count unchanged.
-- `arena_read_round_trip`: write three records via `write_batch_inline`, read three back, assert bytewise equality.
+- `write_batch_single_record_round_trip`: one job in, one `Ok(ArenaAppendResult)` out, `arena.bytes_written()` equals record length, `arena.record_count()` is 1.
+- `write_batch_multiple_records_advance_cursor`: three jobs; assert offsets are `start + 0/1/2` and byte positions are contiguous.
+- `write_batch_returns_arena_full_at_boundary`: arena capacity 16 bytes; two 4+4-byte records fit; the third returns `Err(ArenaFull)`; cursor + record_count unchanged.
+- `arena_read_round_trip`: write three records via `write_batch`, read three back, assert bytewise equality.
 - `arena_contains_offset_checks_range`: verify `contains_offset` at boundary (`start_offset`, `next_offset() - 1`, `next_offset()`).
 
 ### Task 5.2: `DedicatedArenaPool` factory tests
@@ -1221,7 +1221,7 @@ Per conversation decisions:
 - Arena-full rotates internally within the same epoch; `EpochFullSnafu`
   is renamed `ArenaFullSnafu` and no longer surfaces past `StreamEpoch`.
 - Store hot paths (`handle_append`, `handle_append_batch_inner`,
-  `drain_follower_jobs`, secondary `replicate`) assemble `WriteBatch`es
+  `drain_delegated_requests`, secondary `replicate`) assemble `WriteBatch`es
   and call `Stream::write_batch_active`.
 - Per-epoch CRC (single hasher covering records across all arenas in
   order); per-arena CRC is not introduced.

@@ -184,7 +184,7 @@ In `components/extent-node/src/store/register.rs`:
 In `components/extent-node/src/store/append.rs`:
 - In `seal_and_create(...)`, where it computes the next extent's capacity via the growth formula, replace with `let next_capacity = self.config.extent_capacity;`.
 
-- [ ] **Step 3: Strip capacity fields from `ExtentUpdate` / `ReplicaInfo` / `AppendJob` structs in types.rs**
+- [ ] **Step 3: Strip capacity fields from `ExtentUpdate` / `ReplicaInfo` / `AppendRequest` structs in types.rs**
 
 In `components/extent-node/src/store/types.rs`: remove any `min_extent_capacity`, `max_extent_capacity`, `extent_growth_factor` fields from structs; keep only `extent_capacity`.
 

@@ -43,7 +43,7 @@ Start with **explicit configuration** — a `stream_class` or `tier` field in `C
 
 ### Resolution
 
-See [docs/adaptive-capacity.md](adaptive-capacity.md) for the detailed design: adaptive extent capacity with tick-as-append for idle shrink. Replaces the explicit tier model with a heuristic approach that automatically scales arena size based on usage patterns.
+Replaced with fixed `epoch_capacity` (default 64 MiB) configured per stream at creation time. Adaptive sizing was removed during P1 (collapse Extent into Epoch); see the Arena Layout section in [design.md](design.md) for current details.
 
 ---
 

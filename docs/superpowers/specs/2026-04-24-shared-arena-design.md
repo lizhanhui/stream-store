@@ -153,8 +153,8 @@ struct Stream {
 
     // Pipelined group commit (same shape for both classes):
     in_flight: AtomicU64,
-    job_tx:    crossbeam::channel::Sender<AppendJob>,
-    job_rx:    crossbeam::channel::Receiver<AppendJob>,
+    request_tx:    crossbeam::channel::Sender<AppendRequest>,
+    request_rx:    crossbeam::channel::Receiver<AppendRequest>,
 }
 ```
 
@@ -291,7 +291,7 @@ struct EpochArenaEntry {
     arena_end_byte:   u32,
 }
 
-struct SharedAppendJob {
+struct SharedAppendRequest {
     // One record submitted inside a WriteBatch from a stream leader.
     seq:     u64,
     payload: Bytes,
@@ -321,8 +321,8 @@ struct SharedArena {
 
     // Arena-level leader election (CAS on entry):
     in_flight:  AtomicU64,
-    job_tx:     crossbeam::channel::Sender<WriteBatch>,
-    job_rx:     crossbeam::channel::Receiver<WriteBatch>,
+    request_tx:     crossbeam::channel::Sender<WriteBatch>,
+    request_rx:     crossbeam::channel::Receiver<WriteBatch>,
 
     s3_key:     OnceLock<String>,
 }
@@ -331,11 +331,11 @@ struct WriteBatch {
     // One batch from one stream leader; records are already in seq order.
     stream_id: StreamId,
     epoch:     u64,
-    jobs:      SmallVec<[SharedAppendJob; 16]>,
-    reply:     oneshot::Sender<WriteBatchAck>,
+    jobs:      SmallVec<[SharedAppendRequest; 16]>,
+    reply:     oneshot::Sender<WriteBatchResult>,
 }
 
-struct WriteBatchAck {
+struct WriteBatchResult {
     // Per-job result, in the same order as WriteBatch.jobs.
     // Each record's resolved (arena_id, byte_pos) — records in a batch may
     // straddle an arena roll so arena_id is per-record.
@@ -377,12 +377,12 @@ Identical to today's Dedicated fast path:
 prev = stream.in_flight.fetch_add(1, Acquire)
 if prev > 0:
     // follower
-    stream.job_tx.send(AppendJob { payload, client_reply_tx })
+    stream.request_tx.send(AppendRequest { payload, client_reply_tx })
     return None
 // leader turn
 loop:
     own_batch = collect own payload
-    drained   = drain_up_to(stream.job_rx, max_stream_batch)
+    drained   = drain_up_to(stream.request_rx, max_stream_batch)
     batch     = own_batch ++ drained
     for payload in batch: assign seq = ep.record_count.load() then ++
     write_batch(batch)                          // class-specific, Layer 2
@@ -408,7 +408,7 @@ is FIFO by virtue of `in_flight` gating.
 
 **Dedicated** — the stream owns the arena exclusively, so no arena-level
 CAS is needed; the stream leader memcpies directly. The arena struct
-still exists, but its `in_flight` / `job_tx` / `job_rx` fields are unused
+still exists, but its `in_flight` / `request_tx` / `request_rx` fields are unused
 on the Dedicated path (kept only to share one struct definition across
 classes):
 
@@ -436,7 +436,7 @@ if prev == 0:
     // arena leader
     process_batch(arena, own_batch)            // see below
     loop:
-        drained_batches = drain_up_to(arena.job_rx, max_arena_batch)
+        drained_batches = drain_up_to(arena.request_rx, max_arena_batch)
         for b in drained_batches: process_batch(arena, b); b.reply.send(...)
         remaining = arena.in_flight.fetch_sub(1 + drained.len(), Release)
                     - (1 + drained.len())
@@ -444,7 +444,7 @@ if prev == 0:
 else:
     // arena follower: delegate own batch and await
     (tx, rx) = oneshot::channel()
-    arena.job_tx.send(WriteBatch { stream_id, epoch, jobs: own_batch, reply: tx })
+    arena.request_tx.send(WriteBatch { stream_id, epoch, jobs: own_batch, reply: tx })
     ack = rx.await
     apply ack.results to the stream leader's local list
 
@@ -480,8 +480,8 @@ Notes:
   `start_offset + i` is strictly monotonic per stream.
 - Within a stream, across batches: the stream's `in_flight` CAS
   guarantees that batch B's leader turn only starts after batch A's
-  `fetch_sub` completes. The crossbeam `stream.job_rx` is FIFO, so
-  A's arena submission precedes B's. The arena's `job_rx` is FIFO, so
+  `fetch_sub` completes. The crossbeam `stream.request_rx` is FIFO, so
+  A's arena submission precedes B's. The arena's `request_rx` is FIFO, so
   A reaches the arena leader first. Directory entries extend monotonically.
 - Across streams: arena FIFO preserves the cross-stream write order in
   the buffer, but cross-stream ordering is irrelevant to correctness —

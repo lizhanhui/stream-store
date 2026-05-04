@@ -246,7 +246,7 @@ stream-store/                          (Workspace root)
     │       ├── stream.rs              -- Stream: ordered extent list, active extent tracking, seal-and-new
     │       ├── store/                 -- ExtentNodeStore: split into focused submodules
     │       │   ├── mod.rs             -- ExtentNodeStore struct, construction, accessors, RequestHandler dispatch
-    │       │   ├── types.rs           -- ExtentUpdate, ReplicaInfo, AppendJob
+    │       │   ├── types.rs           -- ExtentUpdate, ReplicaInfo, AppendRequest
     │       │   ├── append.rs          -- Write/append path, pipelined group commit, seal_and_create
     │       │   ├── forward.rs         -- Replication receive: Forward, ForwardInitExtent, ForwardChecksum
     │       │   ├── register.rs        -- RegisterExtent handler (SM → EN)
@@ -369,7 +369,7 @@ Each stream on an Extent Node uses a **pipelined group commit** pattern to maxim
 
 #### Arena Layout
 
-Each active extent pre-allocates a contiguous buffer (adaptive sizing: starts at `min_extent_capacity`, default 8 MiB, and grows by `extent_growth_factor` up to `max_extent_capacity`, default 256 MiB). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed extents.
+Each active extent pre-allocates a contiguous buffer (sized by `epoch_capacity`, default 64 MiB). Records are stored sequentially in the arena in wire format: `[payload_len: u32 BE][payload: bytes]`. This is the same format as the S3 object body, enabling zero-copy upload of sealed extents.
 
 The arena has no internal index structure. Records are self-contained: a reader can walk forward from any byte position by reading the length prefix and advancing by `4 + len` bytes. Random access is provided by an **internal index** (see below).
 
@@ -403,11 +403,11 @@ Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → LEADER
   ├─ in_flight.fetch_sub(1) → remaining=3 → drain batch
   │
   │  Writer B arrives: in_flight.fetch_add(1) → prev=1 → FOLLOWER
-  │  ├─ push AppendJob to stream.job_tx
+  │  ├─ push AppendRequest to stream.request_tx
   │  └─ return None (deferred)
   │
   │  Writer C arrives: in_flight.fetch_add(1) → prev=2 → FOLLOWER
-  │  ├─ push AppendJob to stream.job_tx
+  │  ├─ push AppendRequest to stream.request_tx
   │  └─ return None (deferred)
   │
   └─ drain loop:
@@ -425,7 +425,7 @@ Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → LEADER
 
 Detailed steps:
 
-1. **Stream-level leader election**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the thread is the **leader writer** for the entire stream (fast path). If `prev > 0`, an leader writer exists — push `AppendJob` to the stream's channel and return immediately (slow path).
+1. **Stream-level leader election**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the thread is the **leader writer** for the entire stream (fast path). If `prev > 0`, a leader writer exists — push `AppendRequest` to the stream's channel and return immediately (slow path).
 
 2. **Single-writer append** (`try_append_active` → `append_inner`): The leader uses plain `load`/`store` on `write_cursor` and `record_count` (no `fetch_add`). Same memcpy as before. Direct `store` of `committed_bytes`, index entry, and `committed_seq` — no spin-wait needed since there's only one writer.
 
@@ -476,17 +476,9 @@ Each extent maintains an **internal index** — a lock-free array mapping sequen
 - **Lock-free reads** — readers use atomic loads on `committed_bytes` and index entries, never blocking the writer.
 - **Single-struct ownership** — one `Extent` owns both data and index, simplifying lifecycle management.
 
-#### Adaptive Extent Capacity
+#### Extent Capacity
 
-Extent capacity is adaptive per stream, controlled by three parameters set at stream creation time:
-
-- **`min_extent_capacity`** (default 8 MiB): Initial arena size and floor for shrink.
-- **`max_extent_capacity`** (default 256 MiB): Ceiling for growth.
-- **`extent_growth_factor`** (default 2): Multiplier applied on extent-full.
-
-The first extent starts at `min_extent_capacity`. On extent-full, the next extent's capacity is multiplied by `extent_growth_factor` (capped at `max_extent_capacity`). On idle-shrink (extent under-utilized for 5 minutes), capacity halves (floored at `min_extent_capacity`). This ensures hot streams quickly reach steady-state capacity while idle streams reclaim memory.
-
-See [adaptive-capacity.md](adaptive-capacity.md) for the full scaling model, decision flow, and implementation details.
+Each extent pre-allocates a contiguous arena sized by `epoch_capacity` (default 64 MiB, configured per-stream at creation time). When an arena fills, the pool rotates to a fresh arena and the leader retries inline — no re-election needed. The `ArenaPool` trait abstracts over Dedicated (per-stream ringbuffer) and Shared (P3) arena allocation strategies.
 
 #### Seal
 

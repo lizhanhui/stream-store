@@ -6,7 +6,7 @@
 
 **Architecture:**
 1. **Multi-entry arena directory.** `ArenaDirectory` widens from a single `EpochArenaEntry` to `papaya::HashMap<(StreamId, Epoch), EpochArenaEntry>` so many streams can share one arena buffer.
-2. **Functional `SharedArenaPool`.** Uses `ArcSwap<Arc<SharedArena>>` for the `active` arena and `papaya::HashMap<ArenaId, Arc<SharedArena>>` for resident arenas. Arena-level CAS via `arena_in_flight` elects one writer who memcpies inline and drains the MPSC; other streams delegate via `arena_job_tx`.
+2. **Functional `SharedArenaPool`.** Uses `ArcSwap<Arc<SharedArena>>` for the `active` arena and `papaya::HashMap<ArenaId, Arc<SharedArena>>` for resident arenas. Arena-level CAS via `in_flight` elects one writer who memcpies inline and drains the MPSC; other streams delegate via `tx`.
 3. **Stream routing by class.** `ExtentNodeStore` owns both a per-stream Dedicated pool factory AND one process-wide `SharedArenaPool`. At `try_create_stream` / `register_extent` time, if the stream's `arena_class == Shared`, `Stream.pool` points at `SharedArenaPool`; otherwise `DedicatedArenaPool` (today's path).
 4. **Arena roll.** When a shared arena fills, the arena leader hands it off to the flusher and ArcSwaps a new active. Roll is bounded: the in-progress batch may straddle arenas; per-job `JobResult.arena_id` already captures this.
 5. **Shape A compaction + upload.** Fresh flush path that iterates the directory, filters by cohort (`ReplicaInfo.primary_node_id == self.node_id` via stream lookup → epoch lookup → replica info), compacts each primary-cohort entry via `encode_extent` (reused from P1), concatenates into a Shape A container, and uploads to `{namespace}/arenas/{arena_id:016x}.dat`.
@@ -37,7 +37,7 @@
 **Modified:**
 - `components/extent-node/src/arena/directory.rs` — widen to multi-entry HashMap (keep single-entry helper for Dedicated)
 - `components/extent-node/src/arena/pool.rs` — `SharedArenaPool` gains real impl; `allocate_epoch` now returns either a fresh StreamEpoch (Dedicated) or a handle that references the shared pool
-- `components/extent-node/src/arena/write_batch.rs` — `WriteBatchAck.results` now legitimately heterogeneous per arena_id (multi-arena roll within a batch)
+- `components/extent-node/src/arena/write_batch.rs` — `WriteBatchResult.results` now legitimately heterogeneous per arena_id (multi-arena roll within a batch)
 - `components/extent-node/src/stream_epoch.rs` — Shared-class `StreamEpoch` becomes a "virtual" epoch: its `write_batch` delegates to the shared pool rather than owning a local buffer; new field `backing: ArenaBacking` enum
 - `components/extent-node/src/stream.rs` — routing based on `arena_class` on `register_extent`; backing dispatch at `append_inner` / `read` / `try_verify_checksum`
 - `components/extent-node/src/store/mod.rs` — owns `shared_pool: Arc<SharedArenaPool>` alongside `default_pool`; threads it through Stream construction
@@ -309,7 +309,7 @@ use tokio::sync::oneshot;
 
 use common::errors::StorageError;
 
-use crate::arena::{ArenaBuffer, ArenaDirectory, ArenaId, OwnedArenaSlice, WriteBatch, WriteBatchAck};
+use crate::arena::{ArenaBuffer, ArenaDirectory, ArenaId, OwnedArenaSlice, WriteBatch, WriteBatchResult};
 
 /// Arena state machine. Mirrors the spec (§ Arena Roll).
 #[repr(u8)]
@@ -336,8 +336,8 @@ pub(crate) struct SharedArena {
 
     /// Delegation channel for followers. Crossbeam bounded to
     /// `shared_writer_channel_capacity` (see config).
-    pub(crate) job_tx: Sender<WriteBatch>,
-    pub(crate) job_rx: Receiver<WriteBatch>,
+    pub(crate) tx: Sender<WriteBatch>,
+    pub(crate) rx: Receiver<WriteBatch>,
 
     /// Write cursor (bytes). Single-writer, updated by whichever
     /// stream leader is currently the arena leader.
@@ -359,7 +359,7 @@ unsafe impl Sync for SharedArena {}
 impl SharedArena {
     pub(crate) fn new(id: ArenaId, arena_size: u32) -> Self {
         let buf = ArenaBuffer::new(arena_size);
-        let (job_tx, job_rx) = unbounded();
+        let (tx, rx) = unbounded();
         Self {
             id,
             buf,
@@ -367,8 +367,8 @@ impl SharedArena {
             created_at: Instant::now(),
             directory: ArenaDirectory::empty(),
             in_flight: AtomicU64::new(0),
-            job_tx,
-            job_rx,
+            tx,
+            rx,
             write_cursor: AtomicU64::new(0),
             capacity: arena_size,
             hasher: UnsafeCell::new(crc32fast::Hasher::new()),
@@ -678,7 +678,7 @@ unsafe impl Sync for ArenaBacking {}
 
 - [ ] **Step 2: Move Dedicated fields off the top-level struct**
 
-`StreamEpoch` currently has inline `arena`, `buf`, `write_cursor`, `committed_bytes`, `capacity`, etc. Move the Dedicated-specific ones into `ArenaBacking::Dedicated`. `record_count`, `committed_offset`, `limit`, `flags`, `hasher`, `finalized_crc32`, `directory` (for Dedicated path), `resident_arenas`, `directory_ref_count`, `arena_in_flight`, `arena_job_tx`, `arena_job_rx` stay on the outer struct.
+`StreamEpoch` currently has inline `arena`, `buf`, `write_cursor`, `committed_bytes`, `capacity`, etc. Move the Dedicated-specific ones into `ArenaBacking::Dedicated`. `record_count`, `committed_offset`, `limit`, `flags`, `hasher`, `finalized_crc32`, `directory` (for Dedicated path), `resident_arenas`, `directory_ref_count`, `in_flight`, `tx`, `rx` stay on the outer struct.
 
 Wait: `directory` is Dedicated-specific in P3. Keep it on the outer struct for Dedicated; Shared epochs don't have a single `directory` — they write into the pool's currently-active `SharedArena.directory`. Move `directory` into `ArenaBacking::Dedicated`.
 
@@ -703,9 +703,9 @@ pub struct StreamEpoch {
     finalized_crc32: AtomicU32,
     pub(crate) resident_arenas: Mutex<SmallVec<[ArenaId; 4]>>,
     pub(crate) directory_ref_count: AtomicU32,
-    pub(crate) arena_in_flight: AtomicU64,
-    pub(crate) arena_job_tx: Sender<WriteBatch>,
-    pub(crate) arena_job_rx: Receiver<WriteBatch>,
+    pub(crate) in_flight: AtomicU64,
+    pub(crate) tx: Sender<WriteBatch>,
+    pub(crate) rx: Receiver<WriteBatch>,
 }
 ```
 
@@ -726,7 +726,7 @@ impl StreamEpoch {
         let record_cap = (capacity / MIN_RECORD_SIZE) as usize;
         let entry = EpochArenaEntry::with_capacity(stream_id, epoch, start_offset, record_cap);
         let directory = ArenaDirectory::with_single(entry);
-        let (arena_job_tx, arena_job_rx) = unbounded();
+        let (tx, rx) = unbounded();
         Self {
             id,
             start_offset,
@@ -750,8 +750,8 @@ impl StreamEpoch {
             finalized_crc32: AtomicU32::new(0),
             resident_arenas: Mutex::new(smallvec![arena_id]),
             directory_ref_count: AtomicU32::new(1),
-            arena_in_flight: AtomicU64::new(0),
-            arena_job_tx, arena_job_rx,
+            in_flight: AtomicU64::new(0),
+            tx, rx,
         }
     }
 
@@ -763,7 +763,7 @@ impl StreamEpoch {
         pool: Arc<crate::arena::SharedArenaPool>,
     ) -> Self {
         let initial_arena_id = pool.active().id;
-        let (arena_job_tx, arena_job_rx) = unbounded();
+        let (tx, rx) = unbounded();
         Self {
             id,
             start_offset,
@@ -779,8 +779,8 @@ impl StreamEpoch {
             finalized_crc32: AtomicU32::new(0),
             resident_arenas: Mutex::new(smallvec![initial_arena_id]),
             directory_ref_count: AtomicU32::new(1),
-            arena_in_flight: AtomicU64::new(0),
-            arena_job_tx, arena_job_rx,
+            in_flight: AtomicU64::new(0),
+            tx, rx,
         }
     }
 

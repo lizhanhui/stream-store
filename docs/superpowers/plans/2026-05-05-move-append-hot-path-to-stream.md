@@ -2,15 +2,15 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Move `do_append_and_respond`, `drain_follower_jobs`, and `maybe_build_init_forward` from `ExtentNodeStore` onto `Stream`. Collapse the Store's `replicas: HashMap<StreamId, Arc<ReplicaInfo>>` and the append/bytes counters into per-stream state, so the hot path is a single `papaya::HashMap::get → Arc<Stream>` lookup followed by pure per-stream method calls — no further map lookups, no EN-wide atomics visited on the append path.
+**Goal:** Move `do_append_and_respond`, `drain_delegated_requests`, and `maybe_build_init_forward` from `ExtentNodeStore` onto `Stream`. Collapse the Store's `replicas: HashMap<StreamId, Arc<ReplicaInfo>>` and the append/bytes counters into per-stream state, so the hot path is a single `papaya::HashMap::get → Arc<Stream>` lookup followed by pure per-stream method calls — no further map lookups, no EN-wide atomics visited on the append path.
 
-**Why.** The drain-follower loop currently re-acquires the `streams` pin guard four times per iteration because papaya guards are `!Send` across `.await`. `do_append_and_respond` does one more `replicas` map lookup per call. Moving these onto `Stream` eliminates both: the drain owns an `Arc<Stream>` for the whole loop (no guard dance), and replica info is on the Stream struct directly (no second lookup). EN-wide `append_count` / `bytes_written` counters become an `Arc<StoreMetrics>` shared across every Stream, so the aggregate heartbeat view is unchanged.
+**Why.** The drain-delegated loop currently re-acquires the `streams` pin guard four times per iteration because papaya guards are `!Send` across `.await`. `do_append_and_respond` does one more `replicas` map lookup per call. Moving these onto `Stream` eliminates both: the drain owns an `Arc<Stream>` for the whole loop (no guard dance), and replica info is on the Stream struct directly (no second lookup). EN-wide `append_count` / `bytes_written` counters become an `Arc<StoreMetrics>` shared across every Stream, so the aggregate heartbeat view is unchanged.
 
 **Architecture.** Three structural changes on the ExtentNode:
 
 1. **`StoreMetrics`** (new): `append_count`, `bytes_written` move into `Arc<StoreMetrics>`. The Store and every Stream hold a clone; increments happen on the Stream, reads happen on the Store (heartbeat).
 2. **`Stream.replica_info: ArcSwap<Option<Arc<ReplicaInfo>>>`** (new): ReplicaInfo is immutable within an epoch; `ArcSwap` matches today's per-epoch-immutable shape and lets the hot path do a single atomic load. `Store.replicas` is deleted.
-3. **`streams: papaya::HashMap<StreamId, Arc<Stream>>`** (was `Stream`): required so `drain_follower_jobs` can hold an `Arc<Stream>` across `.await` points and so `Stream::handle_append` can be called without the caller holding the pin guard.
+3. **`streams: papaya::HashMap<StreamId, Arc<Stream>>`** (was `Stream`): required so `drain_delegated_requests` can hold an `Arc<Stream>` across `.await` points and so `Stream::handle_append` can be called without the caller holding the pin guard.
 
 After these, the hot path structure is:
 
@@ -20,7 +20,7 @@ Store::handle_append
   └── stream.handle_append(frame, resp_tx).await
         ├── leader election on stream.in_flight
         ├── stream.append_one(...)     // ex do_append_and_respond
-        └── stream.drain_follower_jobs(...) // no guard dance
+        └── stream.drain_delegated_requests(...) // no guard dance
 ```
 
 **Scope boundaries.**
@@ -44,9 +44,9 @@ Store::handle_append
 
 | File | Role |
 |---|---|
-| `components/extent-node/src/stream.rs` | Add `replica_info`, `metrics`, `replication_timeout` fields; add `handle_append`, `append_one`, `drain_follower_jobs`, `maybe_build_init_forward` methods; `Stream::new` grows a `StoreMetrics` + `Duration` param |
+| `components/extent-node/src/stream.rs` | Add `replica_info`, `metrics`, `replication_timeout` fields; add `handle_append`, `append_one`, `drain_delegated_requests`, `maybe_build_init_forward` methods; `Stream::new` grows a `StoreMetrics` + `Duration` param |
 | `components/extent-node/src/store/mod.rs` | Add `pub(crate) struct StoreMetrics`; replace `append_count` / `bytes_written` / `replicas` fields with `metrics: Arc<StoreMetrics>`; switch `streams` value type to `Arc<Stream>`; pass `metrics` / timeout into `Stream::new` in `try_create_stream` |
-| `components/extent-node/src/store/append.rs` | `handle_append` + `handle_append_batch_inner` become thin routers; `do_append_and_respond` / `drain_follower_jobs` / `maybe_build_init_forward` move out |
+| `components/extent-node/src/store/append.rs` | `handle_append` + `handle_append_batch_inner` become thin routers; `do_append_and_respond` / `drain_delegated_requests` / `maybe_build_init_forward` move out |
 | `components/extent-node/src/store/forward.rs` | Uses `stream.metrics` instead of `self.append_count` / `self.bytes_written` |
 | `components/extent-node/src/store/register.rs` | Calls `stream.set_replica_info(...)` instead of inserting into `self.replicas` |
 | `components/extent-node/src/store/{seal,read,tests}.rs` | Call-site churn: `guard.get(&id)` returns `Option<&Arc<Stream>>`; use `stream.replica_info()` instead of `store.get_replica_info(id)` where present |
@@ -63,7 +63,7 @@ Six phases, ~6 commits, every phase leaves the tree green (no intentional breaks
 3. **Phase 2** — Move `replica_info` onto Stream; delete `Store.replicas`
 4. **Phase 3** — Move `replication_timeout` onto Stream; Store keeps a field only for passing new streams the current value
 5. **Phase 4** — Switch `streams` map value to `Arc<Stream>`
-6. **Phase 5** — Move `do_append_and_respond` + `maybe_build_init_forward` + `drain_follower_jobs` onto Stream; Store's append handlers become thin routers
+6. **Phase 5** — Move `do_append_and_respond` + `maybe_build_init_forward` + `drain_delegated_requests` onto Stream; Store's append handlers become thin routers
 7. **Phase 6** — Validation + optional benchmark
 
 ---
@@ -89,7 +89,7 @@ Run:
 cd /data/repo/stream-store
 grep -rn 'self\.replicas\|\.replicas\.pin\|self\.append_count\|self\.bytes_written\|self\.replication_timeout' \
   components/extent-node/src/ | wc -l
-grep -rn 'do_append_and_respond\|drain_follower_jobs\|maybe_build_init_forward' \
+grep -rn 'do_append_and_respond\|drain_delegated_requests\|maybe_build_init_forward' \
   components/extent-node/src/ | wc -l
 grep -rn 'self\.streams\.pin()\|streams\.pin()\.get' \
   components/extent-node/src/ | wc -l
@@ -514,7 +514,7 @@ git commit -m "refactor(stream): move replication_timeout to Stream.replication_
 
 ## Phase 4: `streams` map values switch to `Arc<Stream>`
 
-Goal: drain-follower-jobs can `Arc::clone` the stream once and keep it across `.await` without holding a papaya pin guard.
+Goal: drain-delegated-requests can `Arc::clone` the stream once and keep it across `.await` without holding a papaya pin guard.
 
 ### Task 4.1: Change the field type
 
@@ -551,7 +551,7 @@ For every hit, `guard.get(&id)` now returns `Option<&Arc<Stream>>` instead of `O
 
 - Binding patterns like `if let Some(stream) = guard.get(&id)` — the type of `stream` becomes `&Arc<Stream>`; still auto-derefs to `&Stream` for method calls. Usually no change.
 - Code that calls `guard.get(&id).cloned()` to get an owned `Stream` — was wrong before (Stream isn't Clone); unlikely to exist.
-- Code that calls `guard.get(&id).map(Arc::clone)` to get `Arc<Stream>` — now correct and needed; before Phase 4 this doesn't compile. **The drain-follower migration in Phase 5 relies on this.**
+- Code that calls `guard.get(&id).map(Arc::clone)` to get `Arc<Stream>` — now correct and needed; before Phase 4 this doesn't compile. **The drain-delegated migration in Phase 5 relies on this.**
 
 - [ ] **Step 2: Iteration call sites**
 
@@ -578,7 +578,7 @@ git add -A
 git commit -m "$(cat <<'EOF'
 refactor(store): wrap streams map values in Arc<Stream>
 
-Required to let Stream::drain_follower_jobs (moved in the next phase)
+Required to let Stream::drain_delegated_requests (moved in the next phase)
 hold an Arc<Stream> across .await points. Most call sites are
 unaffected (auto-deref handles method calls through Arc); the only
 intentional new pattern is `guard.get(&id).map(Arc::clone)` to extract
@@ -678,7 +678,7 @@ let own_result = stream.append_one(request_id, epoch, payload, response_tx.clone
 
 Same substitution inside `handle_append_batch_inner`'s fast path (there's a batched inline version today, not a call to `do_append_and_respond`; but when the batch is just 1 frame the batch path delegates to `handle_append`, so the hot path is unified).
 
-### Task 5.3: `drain_follower_jobs` → `Stream`
+### Task 5.3: `drain_delegated_requests` → `Stream`
 
 **Files:**
 - Modify: `components/extent-node/src/store/append.rs` (remove)
@@ -691,31 +691,31 @@ Move to `impl Stream`. Critically, the current four per-iteration `self.streams.
 New signature:
 ```rust
 impl Stream {
-    pub(crate) async fn drain_follower_jobs(&self) { /* body */ }
+    pub(crate) async fn drain_delegated_requests(&self) { /* body */ }
 }
 ```
 
 Body rewrites:
 - All `let stream = match guard.get(&stream_id) { Some(s) => s, None => return … };` → gone.
-- `stream.job_rx().try_recv()` → `self.job_rx().try_recv()`
+- `stream.request_rx().try_recv()` → `self.request_rx().try_recv()`
 - `stream.in_flight().load(...)` / `fetch_sub(...)` → `self.in_flight()...`
 - `self.do_append_and_respond(stream, ...)` → `self.append_one(...)`
 - `stream.epoch()` → `self.epoch()`
-- The `break`/`return` exits that were triggered by "stream not found in map" — drop those cases entirely. If the Stream has been evicted from the map, the caller holding the `Arc<Self>` still has a valid handle; draining whatever remains in `job_rx` is correct. (The map only holds the Stream; the channel's Senders live on whoever still holds a clone of `stream.job_tx()`.)
+- The `break`/`return` exits that were triggered by "stream not found in map" — drop those cases entirely. If the Stream has been evicted from the map, the caller holding the `Arc<Self>` still has a valid handle; draining whatever remains in `request_rx` is correct. (The map only holds the Stream; the channel's Senders live on whoever still holds a clone of `stream.request_tx()`.)
 
 - [ ] **Step 2: Update Store's callers**
 
 `handle_append` currently does:
 ```rust
 if remaining > 1 {
-    self.drain_follower_jobs(stream_id).await;
+    self.drain_delegated_requests(stream_id).await;
 }
 ```
 
 The `stream` variable holding `Arc<Stream>` is already in scope from the leader-election block. Change to:
 ```rust
 if remaining > 1 {
-    stream.drain_follower_jobs().await;
+    stream.drain_delegated_requests().await;
 }
 ```
 
@@ -733,7 +733,7 @@ let (own_result, stream_arc, remaining) = {
 };
 // Guard dropped — now .await-safe.
 if remaining > 1 {
-    stream_arc.drain_follower_jobs().await;
+    stream_arc.drain_delegated_requests().await;
 }
 own_result
 ```
@@ -742,7 +742,7 @@ Same restructuring in `handle_append_batch_inner` (its batch processing block en
 
 - [ ] **Step 3: Delete the three methods from `store/append.rs`**
 
-`do_append_and_respond`, `drain_follower_jobs`, and the use statement for `AppendJob` (if no longer needed locally) come out. Re-check imports.
+`do_append_and_respond`, `drain_delegated_requests`, and the use statement for `AppendRequest` (if no longer needed locally) come out. Re-check imports.
 
 ### Task 5.4: Commit Phase 5
 
@@ -758,13 +758,13 @@ git add -A
 git commit -m "$(cat <<'EOF'
 refactor(store): move append hot path methods onto Stream
 
-do_append_and_respond, drain_follower_jobs, and
+do_append_and_respond, drain_delegated_requests, and
 maybe_build_init_forward move out of ExtentNodeStore onto Stream:
 
 - Store::handle_append becomes a thin router: one papaya lookup to
   extract Arc<Stream>, then delegates to stream.append_one and
-  stream.drain_follower_jobs. No further map lookups on the path.
-- drain_follower_jobs drops from four `streams.pin().get(&stream_id)`
+  stream.drain_delegated_requests. No further map lookups on the path.
+- drain_delegated_requests drops from four `streams.pin().get(&stream_id)`
   calls per iteration to zero — the Arc<Stream> clone at the top of
   handle_append stays live across every .await.
 - ReplicaInfo, metrics, and replication_timeout access all become
@@ -789,7 +789,7 @@ Run:
 ```bash
 grep -rn 'self\.replicas' components/extent-node/src/
 grep -rn 'self\.append_count\|self\.bytes_written' components/extent-node/src/
-grep -rn 'self\.do_append_and_respond\|self\.drain_follower_jobs' components/extent-node/src/
+grep -rn 'self\.do_append_and_respond\|self\.drain_delegated_requests' components/extent-node/src/
 grep -rn 'self\.maybe_build_init_forward' components/extent-node/src/
 ```
 Expected: all empty.
@@ -827,7 +827,7 @@ git push -u origin $(git branch --show-current)
 gh pr create --title "Move append hot path onto Stream" --body "$(cat <<'EOF'
 ## Summary
 
-Moves `do_append_and_respond`, `drain_follower_jobs`, and
+Moves `do_append_and_respond`, `drain_delegated_requests`, and
 `maybe_build_init_forward` from `ExtentNodeStore` onto `Stream`.
 Eliminates the per-iteration papaya pin-guard acquisition in the
 follower drain loop and collapses the `Store.replicas` hashmap lookup
@@ -871,7 +871,7 @@ EOF
 - [x] `replica_info` moves to Stream — Phase 2
 - [x] `replication_timeout` moves to Stream — Phase 3
 - [x] `streams` map values become `Arc<Stream>` — Phase 4
-- [x] `do_append_and_respond` / `drain_follower_jobs` / `maybe_build_init_forward` move to Stream — Phase 5
+- [x] `do_append_and_respond` / `drain_delegated_requests` / `maybe_build_init_forward` move to Stream — Phase 5
 
 **2. Every phase green-builds:**
 Every commit compiles clean and passes the 132-test lib suite. No intentionally broken window anywhere.
@@ -880,9 +880,9 @@ Every commit compiles clean and passes the 132-test lib suite. No intentionally 
 
 **4. Ambiguity check:**
 - Test helpers in `stream.rs::tests` get an explicit `test_metrics()` fixture (Phase 1 Task 1.2 Step 4).
-- `drain_follower_jobs` takes `&self` (not `self: Arc<Self>`) because the caller holds the `Arc<Stream>` and awaits inline — no task spawn required (Phase 5 Task 5.3 Step 1).
+- `drain_delegated_requests` takes `&self` (not `self: Arc<Self>`) because the caller holds the `Arc<Stream>` and awaits inline — no task spawn required (Phase 5 Task 5.3 Step 1).
 - The `Arc<Stream>` clone in `handle_append` happens inside the pin-guard block and is returned out of it; guard drops at the end of the block (Phase 5 Task 5.3 Step 2).
 
 **5. Failure modes:**
-- Stream evicted from `streams` map while a drain-follower is in progress: now harmless. Before this plan, the guard dance would detect "stream not found" and `return notifications` from the drain. After: drain holds the `Arc<Stream>` and finishes its work; senders hanging on the channel keep the channel alive until they drop. Matches today's behaviour semantically.
+- Stream evicted from `streams` map while a drain-delegated is in progress: now harmless. Before this plan, the guard dance would detect "stream not found" and `return notifications` from the drain. After: drain holds the `Arc<Stream>` and finishes its work; senders hanging on the channel keep the channel alive until they drop. Matches today's behaviour semantically.
 - RegisterEpoch arrives for a stream that doesn't exist in the streams map yet: `register.rs` already creates the stream via `try_create_stream` before setting replica info; the rewrite (Task 2.2) preserves that ordering.

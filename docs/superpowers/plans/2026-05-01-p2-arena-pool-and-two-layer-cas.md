@@ -33,8 +33,10 @@ Net new files:
 - `components/extent-node/src/arena/buffer.rs` — `ArenaBuffer` (moved from `extent.rs`)
 - `components/extent-node/src/arena/directory.rs` — `ArenaDirectory`, `EpochArenaEntry`
 - `components/extent-node/src/arena/id.rs` — `ArenaId` type + generator
-- `components/extent-node/src/arena/pool.rs` — `ArenaPool` trait, `DedicatedArenaPool`, `SharedArenaPool` stub
-- `components/extent-node/src/arena/write_batch.rs` — `WriteBatch`, `JobResult`, `SharedAppendJob`
+- `components/extent-node/src/arena/pool/mod.rs` — `ArenaPool` trait
+- `components/extent-node/src/arena/pool/dedicated.rs` — `DedicatedArenaPool`
+- `components/extent-node/src/arena/pool/shared.rs` — `SharedArenaPool` stub
+- `components/extent-node/src/arena/write_batch.rs` — `WriteBatch`, `JobResult`, `SharedAppendRequest`
 - `components/extent-node/src/stream_epoch.rs` — `StreamEpoch` (the renamed `Extent`)
 - `components/stream-manager/migrations/V7__add_arena_class.sql` — schema column add
 
@@ -65,7 +67,7 @@ The plan is sequenced so the build is green at the end of every phase and, where
 5. **Phase 4** — Introduce `ArenaClass` enum + MySQL column + wire field (Dedicated-only default). `RegisterEpoch` / `ForwardInitEpoch` payload shapes grow by one byte.
 6. **Phase 5** — Introduce `ArenaPool` trait + `DedicatedArenaPool` wrapping today's per-stream arena list. Add `SharedArenaPool` stub that `panic!("shared arena pool not wired yet")` on every method. Plumb `Stream` to own a `dyn ArenaPool` through `ArenaClass`. Factor the current per-epoch allocate path into pool calls.
 7. **Phase 6** — Introduce `ArenaId` (16-bit node id prefix + 48-bit counter). Stamp every arena buffer with its `ArenaId` at allocation. Add `resident_arenas: Mutex<SmallVec<[ArenaId; 4]>>` and `directory_ref_count: AtomicU32` to `StreamEpoch` (still single-entry in practice under Dedicated, but the fields are live).
-8. **Phase 7** — Introduce `WriteBatch` / `JobResult` / `SharedAppendJob` types. Add the arena-level `in_flight` / `job_tx` / `job_rx` on the arena struct. Refactor Dedicated append to go through `ArenaPool::write_batch(batch) -> WriteBatchAck`. The leader still memcpies directly; the CAS is fast-path uncontended.
+8. **Phase 7** — Introduce `WriteBatch` / `JobResult` / `SharedAppendRequest` types. Add the arena-level `in_flight` / `request_tx` / `request_rx` on the arena struct. Refactor Dedicated append to go through `ArenaPool::write_batch(batch) -> WriteBatchResult`. The leader still memcpies directly; the CAS is fast-path uncontended.
 9. **Phase 8** — Full workspace tests, grep pass, push, PR.
 
 ---
@@ -593,8 +595,8 @@ pub struct Stream {
     pub id: StreamId,
     epoch: AtomicU32,
     in_flight: AtomicU64,
-    job_tx: Sender<AppendJob>,
-    job_rx: Receiver<AppendJob>,
+    request_tx: Sender<AppendRequest>,
+    request_rx: Receiver<AppendRequest>,
     ack_queue: OnceLock<AckQueue>,
     flush_in_progress: papaya::HashMap<ExtentId, ()>,
 
@@ -1033,14 +1035,22 @@ Goal: introduce the pool abstraction. Today's per-stream arena list is repackage
 ### Task 5.1: Define the ArenaPool trait
 
 **Files:**
-- Create: `components/extent-node/src/arena/pool.rs`
+- Create: `components/extent-node/src/arena/pool/mod.rs`
+- Create: `components/extent-node/src/arena/pool/dedicated.rs`
+- Create: `components/extent-node/src/arena/pool/shared.rs`
 - Modify: `components/extent-node/src/arena/mod.rs`
 
 - [ ] **Step 1: Write the module**
 
-Create `components/extent-node/src/arena/pool.rs`:
+Create `components/extent-node/src/arena/pool/mod.rs`:
 
 ```rust
+mod dedicated;
+mod shared;
+
+pub(crate) use dedicated::DedicatedArenaPool;
+pub(crate) use shared::SharedArenaPool;
+
 use std::sync::Arc;
 
 use common::types::{ArenaClass, Epoch, ExtentId, Offset, StreamId};
@@ -1070,6 +1080,17 @@ pub(crate) trait ArenaPool: Send + Sync {
         epoch:        Epoch,
     ) -> Arc<StreamEpoch>;
 }
+```
+
+Create `components/extent-node/src/arena/pool/dedicated.rs`:
+
+```rust
+use std::sync::Arc;
+
+use common::types::{ArenaClass, Epoch, ExtentId, Offset, StreamId};
+
+use crate::arena::pool::ArenaPool;
+use crate::stream_epoch::StreamEpoch;
 
 pub(crate) struct DedicatedArenaPool {
     arena_size: u32,
@@ -1100,6 +1121,17 @@ impl ArenaPool for DedicatedArenaPool {
         ))
     }
 }
+```
+
+Create `components/extent-node/src/arena/pool/shared.rs`:
+
+```rust
+use std::sync::Arc;
+
+use common::types::{ArenaClass, Epoch, ExtentId, Offset, StreamId};
+
+use crate::arena::pool::ArenaPool;
+use crate::stream_epoch::StreamEpoch;
 
 pub(crate) struct SharedArenaPool {
     _arena_size: u32,
@@ -1508,7 +1540,7 @@ use crate::arena::ArenaId;
 
 /// One record submitted inside a WriteBatch from a stream leader.
 #[derive(Debug)]
-pub(crate) struct SharedAppendJob {
+pub(crate) struct SharedAppendRequest {
     pub seq:     u64,
     pub payload: Bytes,
 }
@@ -1528,12 +1560,12 @@ pub(crate) struct JobResult {
 pub(crate) struct WriteBatch {
     pub stream_id: StreamId,
     pub epoch:     Epoch,
-    pub jobs:      SmallVec<[SharedAppendJob; 16]>,
-    pub reply:     oneshot::Sender<WriteBatchAck>,
+    pub jobs:      SmallVec<[SharedAppendRequest; 16]>,
+    pub reply:     oneshot::Sender<WriteBatchResult>,
 }
 
 #[derive(Debug)]
-pub(crate) struct WriteBatchAck {
+pub(crate) struct WriteBatchResult {
     pub results: SmallVec<[JobResult; 16]>,
 }
 ```
@@ -1551,7 +1583,7 @@ pub(crate) use buffer::{ArenaBuffer, OwnedArenaSlice};
 pub(crate) use directory::{ArenaDirectory, EpochArenaEntry};
 pub use id::{ArenaId, ArenaIdGenerator, node_prefix_from_id};
 pub(crate) use pool::{ArenaPool, DedicatedArenaPool, SharedArenaPool};
-pub(crate) use write_batch::{JobResult, SharedAppendJob, WriteBatch, WriteBatchAck};
+pub(crate) use write_batch::{JobResult, SharedAppendRequest, WriteBatch, WriteBatchResult};
 ```
 
 - [ ] **Step 2: Build + commit**
@@ -1560,7 +1592,7 @@ pub(crate) use write_batch::{JobResult, SharedAppendJob, WriteBatch, WriteBatchA
 cargo check --workspace --tests --benches 2>&1 | tail -5
 git add components/extent-node/src/arena
 git commit -m "$(cat <<'EOF'
-feat(arena): define WriteBatch / JobResult / SharedAppendJob
+feat(arena): define WriteBatch / JobResult / SharedAppendRequest
 
 The three types that the spec's Layer-2 arena writer consumes. No
 callers yet — they land in the next commit that routes Dedicated
@@ -1579,6 +1611,14 @@ EOF
 
 On `StreamEpoch` (since in Dedicated it IS the arena):
 
+> **Note:** `in_flight`, `tx`, and `rx` were
+> originally described as StreamEpoch fields here, but have since moved
+> to `SharedArenaPool` as `in_flight`, `tx`, and `rx` respectively.
+> Dedicated arenas (one owner) don't need the delegation channel; only
+> SharedArenaPool uses it. The StreamEpoch struct retains the
+> arena-level CAS state only for the in-flight counter when it lives on
+> the dedicated path.
+
 ```rust
 use crossbeam::channel::{Receiver, Sender, unbounded};
 
@@ -1588,22 +1628,26 @@ pub struct StreamEpoch {
     /// Arena-level leader election. In P2's Dedicated path the owning
     /// stream is the sole submitter, so this CAS is uncontended by
     /// construction.
-    arena_in_flight: AtomicU64,
+    /// NOTE: For Shared arenas, this field lives on SharedArenaPool as
+    /// `in_flight` instead. Dedicated StreamEpoch keeps it inline.
+    in_flight: AtomicU64,
 
     /// Arena-level delegation channel. Unused on the Dedicated path
     /// (uncontended CAS means no follower ever delegates) but kept to
     /// share one struct shape across classes in P3+.
-    arena_job_tx: Sender<WriteBatch>,
-    arena_job_rx: Receiver<WriteBatch>,
+    /// NOTE: For Shared arenas, these live on SharedArenaPool as
+    /// `tx` and `rx` instead.
+    tx: Sender<WriteBatch>,
+    rx: Receiver<WriteBatch>,
 }
 
 impl StreamEpoch {
     pub fn with_capacity(..., arena_id: ArenaId) -> Self {
-        let (arena_job_tx, arena_job_rx) = unbounded();
+        let (tx, rx) = unbounded();
         Self {
             // …
-            arena_in_flight: AtomicU64::new(0),
-            arena_job_tx, arena_job_rx,
+            in_flight: AtomicU64::new(0),
+            tx, rx,
         }
     }
 }
@@ -1616,8 +1660,8 @@ impl StreamEpoch {
     /// Write a batch of records into this epoch's arena.
     /// Dedicated path: caller is the stream leader, no other writers,
     /// uncontended CAS. Memcpies inline; returns per-record JobResults.
-    pub(crate) fn write_batch(&self, batch: &[SharedAppendJob]) -> Result<SmallVec<[JobResult; 16]>, StorageError> {
-        let prev = self.arena_in_flight.fetch_add(1, Ordering::Acquire);
+    pub(crate) fn write_batch(&self, batch: &[SharedAppendRequest]) -> Result<SmallVec<[JobResult; 16]>, StorageError> {
+        let prev = self.in_flight.fetch_add(1, Ordering::Acquire);
         debug_assert_eq!(prev, 0, "Dedicated arena must be uncontended");
 
         let mut results: SmallVec<[JobResult; 16]> = SmallVec::new();
@@ -1626,7 +1670,7 @@ impl StreamEpoch {
             results.push(JobResult { arena_id: self.arena_id, byte_pos: byte_pos as u32 });
         }
 
-        self.arena_in_flight.fetch_sub(1, Ordering::Release);
+        self.in_flight.fetch_sub(1, Ordering::Release);
         Ok(results)
     }
 
@@ -1647,7 +1691,7 @@ The refactor should preserve today's append hot path byte-for-byte; just factor 
 
 - [ ] **Step 3: Have the stream leader call write_batch**
 
-In `components/extent-node/src/store/append.rs`, at the place where today's leader memcpies each drained AppendJob into the active epoch: collect the jobs into a SmallVec and issue one `active_epoch.write_batch(&jobs)?` call. Apply the returned JobResults (byte_pos) to each forwarded frame's downstream send.
+In `components/extent-node/src/store/append.rs`, at the place where today's leader memcpies each drained AppendRequest into the active epoch: collect the jobs into a SmallVec and issue one `active_epoch.write_batch(&jobs)?` call. Apply the returned JobResults (byte_pos) to each forwarded frame's downstream send.
 
 Note: the per-job `arena_id` returned by `write_batch` is all the same in P2 (one arena per batch since Dedicated doesn't roll mid-batch). Record it anyway for P3-readiness.
 
@@ -1664,13 +1708,13 @@ git add -A
 git commit -m "$(cat <<'EOF'
 feat(arena): Dedicated path flows through Layer-2 CAS write_batch
 
-Stream leader now assembles a batch of SharedAppendJob and calls
+Stream leader now assembles a batch of SharedAppendRequest and calls
 StreamEpoch::write_batch instead of calling today's single-record
 append() in a loop. P2 is Dedicated-only so the arena-level
 in_flight CAS is uncontended by construction; memcpy still runs
 inline on the leader thread.
 
-The channel-delegation fallback (arena_job_tx / arena_job_rx) is
+The channel-delegation fallback (tx / rx) is
 present but unused — it lands hot in a later plan when Shared
 streams cause arena-level contention.
 EOF
