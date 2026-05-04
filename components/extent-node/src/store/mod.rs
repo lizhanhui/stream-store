@@ -8,7 +8,7 @@ mod types;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use types::AppendJob;
+pub(crate) use types::AppendRequest;
 pub use types::{ExtentUpdate, ReplicaInfo};
 
 use std::sync::OnceLock;

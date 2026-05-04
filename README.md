@@ -12,7 +12,7 @@ Traditional message brokers rely on cloud block storage for durability. Block st
 
 The core storage engine uses a **pre-allocated contiguous arena** with a **pipelined group commit** pattern:
 
-- **Leader election** via `AtomicU64::fetch_add` — the first writer becomes the active writer (leader); concurrent writers delegate their payloads to the leader via a lock-free channel.
+- **Leader election** via `AtomicU64::fetch_add` — the first writer becomes the leader writer (leader); concurrent writers delegate their payloads to the leader via a lock-free channel.
 - **Single-writer append** — the leader uses plain `load`/`store` on cursors (no contention, no spin-wait), then batch-drains all queued follower payloads, amortizing synchronization cost across the group.
 - **No cache-line bouncing** — followers push to an unbounded channel and return immediately; only the leader touches arena cursors.
 - Internal compressed index (`AtomicU32` pointers) enables **O(1) random reads** at ~950M lookups/sec.

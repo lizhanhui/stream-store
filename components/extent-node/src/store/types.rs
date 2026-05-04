@@ -65,19 +65,22 @@ impl ReplicaInfo {
 
 // ── Pipelined group commit types ─────────────────────────────────────────────
 
-/// A pending append job delegated from a follower to the active writer.
+/// A pending AppendRequest delegated from a follower to the leader writer.
 ///
-/// When a thread arrives at a stream and finds another writer already active
-/// (via `in_flight` counter), it pushes an `AppendJob` into the stream's channel
-/// and returns immediately. The active writer drains these jobs as a batch.
-pub(crate) struct AppendJob {
+/// When a task arrives at a stream and finds another task has already become leader writer
+/// (via `in_flight` counter), it pushes an `AppendRequest` into the stream's MPSC channel
+/// and returns immediately. The leader writer drains these append requests as a batch.
+pub(crate) struct AppendRequest {
     pub request_id: u32,
+
     /// Retained for symmetry with the frame header; the Stream that
     /// owns the channel queue is already known at dequeue time, so
     /// `append_one` does not consult this field.
     #[allow(dead_code)]
     pub stream_id: StreamId,
+
     pub payload: Bytes,
+
     /// Channel back to the client connection for sending response frames.
     /// `None` in test mode (no client connection).
     pub response_tx: Option<Sender<Frame>>,

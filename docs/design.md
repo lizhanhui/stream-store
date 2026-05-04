@@ -365,7 +365,7 @@ CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)
 
 ### Extent-Node Concurrency: Stream-Level Pipelined Group Commit
 
-Each stream on an Extent Node uses a **pipelined group commit** pattern to maximize append throughput under high concurrency. Instead of multiple writers contending on atomic cursors (which causes cache-line bouncing), a **leader election at the stream level** delegates all writes to a single active writer per stream. This means the leader can transparently handle extent-full transitions (seal + create new extent + retry) within its own turn — no re-election needed.
+Each stream on an Extent Node uses a **pipelined group commit** pattern to maximize append throughput under high concurrency. Instead of multiple writers contending on atomic cursors (which causes cache-line bouncing), a **leader election at the stream level** delegates all writes to a single leader writer per stream. This means the leader can transparently handle extent-full transitions (seal + create new extent + retry) within its own turn — no re-election needed.
 
 #### Arena Layout
 
@@ -425,7 +425,7 @@ Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → LEADER
 
 Detailed steps:
 
-1. **Stream-level leader election**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the thread is the **active writer** for the entire stream (fast path). If `prev > 0`, an active writer exists — push `AppendJob` to the stream's channel and return immediately (slow path).
+1. **Stream-level leader election**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the thread is the **leader writer** for the entire stream (fast path). If `prev > 0`, an leader writer exists — push `AppendJob` to the stream's channel and return immediately (slow path).
 
 2. **Single-writer append** (`try_append_active` → `append_inner`): The leader uses plain `load`/`store` on `write_cursor` and `record_count` (no `fetch_add`). Same memcpy as before. Direct `store` of `committed_bytes`, index entry, and `committed_seq` — no spin-wait needed since there's only one writer.
 
@@ -714,7 +714,7 @@ read(stream, offset=1050, count=10)
 | Object storage API | S3-compatible | Widest ecosystem (AWS, MinIO, Ceph, Alibaba OSS S3-compat) |
 | Replication protocol | Broadcast replication with quorum ACK | O(1) hop latency (vs O(N) for chain), tolerates minority failures, simple parallel fan-out |
 | Durability before S3 | Pure in-memory N-way (typically 2-way) | Low latency; single-node failure tolerated; S3 flush bounds risk |
-| Stream concurrency | Stream-level pipelined group commit with leader election, lock-free arena with internal compressed index for O(1) reads | Single active writer per stream eliminates cache-line bouncing; extent-full transition is inline (no re-election); followers delegate via channel; batch drain amortizes cost; no mutex on hot path |
+| Stream concurrency | Stream-level pipelined group commit with leader election, lock-free arena with internal compressed index for O(1) reads | Single leader writer per stream eliminates cache-line bouncing; extent-full transition is inline (no re-election); followers delegate via channel; batch drain amortizes cost; no mutex on hot path |
 | Multi-dispatch | Shared data + index streams | Storage efficient; avoids body duplication across subscribers |
 | Stream Manager metadata store | MySQL (sqlx) | Reuses existing infra; metadata ops are infrequent (per-extent, not per-message) |
 | Consistency model | Seal-and-new (WAS) | Separates consistency (sealed extent) from availability (new extent) |

@@ -6,7 +6,7 @@ use rpc::frame::{Frame, VariableHeader};
 use tokio::sync::mpsc::Sender;
 use tracing::debug;
 
-use super::{AppendJob, ExtentNodeStore};
+use super::{AppendRequest, ExtentNodeStore};
 use crate::stream::Stream;
 
 impl ExtentNodeStore {
@@ -16,10 +16,10 @@ impl ExtentNodeStore {
     /// `Arc<Stream>`, then the per-stream leader election / append /
     /// drain happens on the Stream itself (no further map lookups).
     ///
-    /// - `prev == 0`: this thread becomes the active writer.
+    /// - `prev == 0`: this task becomes the leader writer.
     ///   Calls `stream.append_one(...)`, then `stream.drain_follower_jobs()`
     ///   if followers arrived.
-    /// - `prev > 0`: pushes an `AppendJob` to the channel and returns.
+    /// - `prev > 0`: pushes an `AppendRequest` to the channel and returns.
     ///
     /// Arena-full is handled inside `StreamEpoch::write_batch` via
     /// internal arena rotation; the store layer never sees it.
@@ -59,7 +59,7 @@ impl ExtentNodeStore {
         let prev = stream.in_flight().fetch_add(1, Ordering::Acquire);
 
         if prev > 0 {
-            let job = AppendJob {
+            let job = AppendRequest {
                 request_id: frame.request_id(),
                 stream_id,
                 payload: frame.payload.clone().unwrap_or_default(),
@@ -69,7 +69,7 @@ impl ExtentNodeStore {
             return None;
         }
 
-        // FAST PATH: I'm the active writer (prev == 0).
+        // FAST PATH: I'm the leader writer (prev == 0).
         let payload = frame.payload.clone().unwrap_or_default();
         let request_id = frame.request_id();
         let own_result = stream.append_one(request_id, epoch, payload, response_tx.cloned());
@@ -174,9 +174,9 @@ impl ExtentNodeStore {
         let prev = stream.in_flight().fetch_add(batch_len, Ordering::Acquire);
 
         if prev > 0 {
-            // SLOW PATH: active writer exists. Push all as AppendJobs.
+            // SLOW PATH: leader writer exists. Push all as AppendRequests.
             for frame in frames {
-                let job = AppendJob {
+                let job = AppendRequest {
                     request_id: frame.request_id(),
                     stream_id,
                     payload: frame.payload.clone().unwrap_or_default(),
@@ -187,7 +187,7 @@ impl ExtentNodeStore {
             return Vec::new(); // All deferred — empty responses.
         }
 
-        // FAST PATH: I'm the active writer (prev == 0).
+        // FAST PATH: I'm the leader writer (prev == 0).
         let responses = stream.append_batch_leader(epoch, frames, response_tx);
 
         let remaining = stream.in_flight().fetch_sub(batch_len, Ordering::Release);

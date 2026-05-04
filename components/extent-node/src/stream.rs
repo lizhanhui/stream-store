@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::ack_queue::{AckQueue, PendingAck};
 use crate::arena::{ArenaAppendResult, ArenaId, ArenaIdGenerator, ArenaPool, WriteBatchJob};
-use crate::store::{AppendJob, ReplicaInfo};
+use crate::store::{AppendRequest, ReplicaInfo};
 use crate::stream_epoch::{AppendResult, StreamEpoch};
 
 /// Entry for a successful append within a batch, used by `dispatch_results`.
@@ -77,9 +77,9 @@ pub struct Stream {
     /// 0 = idle. The leader owns the entire stream, handling extent transitions inline.
     in_flight: AtomicU64,
 
-    /// Channel for followers to submit append jobs to the active writer.
-    job_tx: Sender<AppendJob>,
-    job_rx: Receiver<AppendJob>,
+    /// Channel for followers to submit append jobs to the leader writer.
+    job_tx: Sender<AppendRequest>,
+    job_rx: Receiver<AppendRequest>,
 
     /// Per-stream ACK queue for quorum-based replication (Primary only).
     /// `None` on Secondaries. Initialized once at RegisterEpoch time via `OnceLock`.
@@ -311,12 +311,12 @@ impl Stream {
     }
 
     /// Return a reference to the job sender channel.
-    pub(crate) fn job_tx(&self) -> &Sender<AppendJob> {
+    pub(crate) fn job_tx(&self) -> &Sender<AppendRequest> {
         &self.job_tx
     }
 
     /// Return a reference to the job receiver channel.
-    pub(crate) fn job_rx(&self) -> &Receiver<AppendJob> {
+    pub(crate) fn job_rx(&self) -> &Receiver<AppendRequest> {
         &self.job_rx
     }
 
@@ -1196,7 +1196,7 @@ impl Stream {
 
     /// Drain follower append jobs from this stream's channel.
     ///
-    /// Called by the active writer after its own append when
+    /// Called by the leader writer after its own append when
     /// `in_flight > 1`. Loops until all followers have been processed.
     /// Forward frames are pushed inline by `append_one`; this method
     /// only deals with per-job logical outcomes (seal, err, ok).
@@ -1207,7 +1207,7 @@ impl Stream {
     pub(crate) async fn drain_follower_jobs(&self) {
         loop {
             // ── Phase 1: Drain jobs from the channel ──
-            let mut batch: Vec<AppendJob> = Vec::new();
+            let mut batch: Vec<AppendRequest> = Vec::new();
             let mut epoch = Epoch(0);
             loop {
                 if batch.is_empty() {
