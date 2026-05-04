@@ -642,3 +642,184 @@ impl std::fmt::Debug for StreamEpoch {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::arena::{ArenaIdGenerator, DedicatedArenaPool};
+    use smallvec::smallvec;
+
+    fn new_epoch(start: u64, arena_capacity: u32) -> StreamEpoch {
+        let pool: Arc<dyn ArenaPool> =
+            Arc::new(DedicatedArenaPool::new(Arc::new(ArenaIdGenerator::new(1))));
+        StreamEpoch::new(StreamId(7), Epoch(3), Offset(start), arena_capacity, pool)
+    }
+
+    #[test]
+    fn append_inner_single_arena_happy_path() {
+        let ep = new_epoch(0, 4096);
+        let r0 = ep.append(Bytes::from_static(b"msg0")).unwrap();
+        let r1 = ep.append(Bytes::from_static(b"msg1")).unwrap();
+        let r2 = ep.append(Bytes::from_static(b"msg2")).unwrap();
+        assert_eq!(r0.offset, Offset(0));
+        assert_eq!(r1.offset, Offset(1));
+        assert_eq!(r2.offset, Offset(2));
+        assert_eq!(ep.committed_offset(), 3);
+        assert_eq!(ep.arenas.lock().len(), 1);
+        assert_eq!(ep.resident_arenas().len(), 1);
+    }
+
+    #[test]
+    fn append_inner_rotates_on_arena_full() {
+        // Capacity 16 bytes: fits two 4-byte payloads (4+4 each = 8 bytes).
+        // Third record triggers rotation.
+        let ep = new_epoch(100, 16);
+        let r0 = ep.append(Bytes::from_static(b"aaaa")).unwrap();
+        let r1 = ep.append(Bytes::from_static(b"bbbb")).unwrap();
+        let r2 = ep.append(Bytes::from_static(b"cccc")).unwrap();
+
+        assert_eq!(r0.offset, Offset(100));
+        assert_eq!(r1.offset, Offset(101));
+        assert_eq!(r2.offset, Offset(102));
+        assert_eq!(ep.committed_offset(), 103);
+
+        let arenas = ep.arenas.lock();
+        assert_eq!(arenas.len(), 2);
+        // First arena holds r0, r1; second arena holds r2 and starts at offset 102.
+        assert_eq!(arenas[0].start_offset, Offset(100));
+        assert_eq!(arenas[0].record_count(), 2);
+        assert_eq!(arenas[1].start_offset, Offset(102));
+        assert_eq!(arenas[1].record_count(), 1);
+        drop(arenas);
+
+        assert_eq!(ep.resident_arenas().len(), 2);
+        assert_eq!(ep.directory_ref_count.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn read_at_offset_crosses_arena_boundary() {
+        let ep = new_epoch(0, 16);
+        for i in 0..5u32 {
+            ep.append(Bytes::copy_from_slice(&i.to_be_bytes())).unwrap();
+        }
+        // Expect rotation across the boundary.
+        assert!(ep.arenas.lock().len() >= 2);
+
+        let msgs = ep.read_at_offset(Offset(0), 5).unwrap();
+        assert_eq!(msgs.len(), 5);
+        for (i, msg) in msgs.iter().enumerate() {
+            assert_eq!(msg.as_ref(), (i as u32).to_be_bytes());
+        }
+
+        // Partial read starting mid-stream.
+        let tail = ep.read_at_offset(Offset(3), 10).unwrap();
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[0].as_ref(), 3u32.to_be_bytes());
+        assert_eq!(tail[1].as_ref(), 4u32.to_be_bytes());
+    }
+
+    #[test]
+    fn seal_after_rotation_finalizes_crc_over_all_records() {
+        // Epoch-level CRC must cover every record in order across every arena.
+        let ep = new_epoch(0, 16);
+        let payloads: &[&[u8]] = &[b"aaaa", b"bbbb", b"cccc", b"dddd"];
+        for p in payloads {
+            ep.append(Bytes::copy_from_slice(p)).unwrap();
+        }
+        assert!(ep.arenas.lock().len() >= 2, "expected rotation");
+        ep.seal(None);
+
+        // Independently compute the expected CRC over [len:be u32][payload]*.
+        let mut expected = crc32fast::Hasher::new();
+        for p in payloads {
+            expected.update(&(p.len() as u32).to_be_bytes());
+            expected.update(p);
+        }
+        assert_eq!(ep.finalized_crc32(), Some(expected.finalize()));
+    }
+
+    #[test]
+    fn write_batch_returns_per_job_results_in_order() {
+        let ep = new_epoch(0, 4096);
+        let jobs: SmallVec<[WriteBatchJob; 16]> = smallvec![
+            WriteBatchJob::new(Offset(0), Bytes::from_static(b"a")),
+            WriteBatchJob::new(Offset(1), Bytes::from_static(b"bb")),
+            WriteBatchJob::new(Offset(2), Bytes::from_static(b"ccc")),
+        ];
+        let results = ep.write_batch(&jobs);
+        assert_eq!(results.len(), 3);
+        assert_eq!(results[0].as_ref().unwrap().offset, Offset(0));
+        assert_eq!(results[1].as_ref().unwrap().offset, Offset(1));
+        assert_eq!(results[2].as_ref().unwrap().offset, Offset(2));
+        assert_eq!(ep.committed_offset(), 3);
+    }
+
+    #[test]
+    fn write_batch_seal_rejects_remaining_jobs() {
+        let ep = new_epoch(0, 4096);
+        ep.append(Bytes::from_static(b"a")).unwrap();
+        ep.seal(None);
+
+        let jobs: SmallVec<[WriteBatchJob; 16]> = smallvec![
+            WriteBatchJob::new(Offset(1), Bytes::from_static(b"rejected1")),
+            WriteBatchJob::new(Offset(2), Bytes::from_static(b"rejected2")),
+        ];
+        let results = ep.write_batch(&jobs);
+        assert_eq!(results.len(), 2);
+        assert!(matches!(
+            results[0],
+            Err(StorageError::EpochSealed { .. })
+        ));
+        assert!(matches!(
+            results[1],
+            Err(StorageError::EpochSealed { .. })
+        ));
+    }
+
+    #[test]
+    fn write_batch_record_too_large_for_arena_reports_internal() {
+        // Capacity 8: any 5+ byte payload would need > 8 bytes (len 4 + payload).
+        let ep = new_epoch(0, 8);
+        let jobs: SmallVec<[WriteBatchJob; 16]> = smallvec![
+            WriteBatchJob::new(Offset(0), Bytes::from_static(b"toolarge")),
+            WriteBatchJob::new(Offset(1), Bytes::from_static(b"next")),
+        ];
+        let results = ep.write_batch(&jobs);
+        assert_eq!(results.len(), 2);
+        // First fails as "too large", second inherits the fail (no forward progress).
+        for r in &results {
+            assert!(matches!(r, Err(StorageError::Internal { .. })));
+        }
+        // No records committed, no rotation.
+        assert_eq!(ep.committed_offset(), 0);
+        assert_eq!(ep.arenas.lock().len(), 1);
+    }
+
+    #[test]
+    fn replicate_out_of_order_fails() {
+        let ep = new_epoch(0, 4096);
+        // Replicate offset 0 OK.
+        ep.replicate(Offset(0), Bytes::from_static(b"a")).unwrap();
+        // Offset 2 skipping 1 fails.
+        let err = ep.replicate(Offset(2), Bytes::from_static(b"b")).unwrap_err();
+        assert!(matches!(err, StorageError::Internal { .. }));
+    }
+
+    #[test]
+    fn replicate_matches_primary_offset_across_rotation() {
+        // Simulate a secondary replay with offsets provided by the primary.
+        let ep = new_epoch(0, 16);
+        let payloads: &[&[u8]] = &[b"aaaa", b"bbbb", b"cccc"];
+        for (i, p) in payloads.iter().enumerate() {
+            ep.replicate(Offset(i as u64), Bytes::copy_from_slice(p))
+                .unwrap();
+        }
+        assert!(ep.arenas.lock().len() >= 2);
+        assert_eq!(ep.committed_offset(), 3);
+        let msgs = ep.read_at_offset(Offset(0), 3).unwrap();
+        assert_eq!(msgs.len(), 3);
+        for (i, msg) in msgs.iter().enumerate() {
+            assert_eq!(msg.as_ref(), payloads[i]);
+        }
+    }
+}

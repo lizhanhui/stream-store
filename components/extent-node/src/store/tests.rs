@@ -1791,3 +1791,52 @@ async fn seal_commit_unknown_stream() {
         "should return success for unknown stream"
     );
 }
+
+#[tokio::test]
+async fn handle_append_batch_routes_through_write_batch_active() {
+    // Batch append on the store-level fast path assembles a single
+    // WriteBatch and routes it through Stream::write_batch_active. This
+    // test exercises the batch entry point introduced in Phase 2.
+    let store = test_store();
+    let sid = register_stream(&store, 30, 1).await;
+
+    let frames: Vec<Frame> = (0..4)
+        .map(|i| {
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 100 + i,
+                    stream_id: sid,
+                    epoch: Epoch(0),
+                },
+                Some(Bytes::copy_from_slice(format!("msg{i}").as_bytes())),
+            )
+        })
+        .collect();
+
+    let responses = store.handle_append_batch_inner(&frames, None).await;
+    assert_eq!(responses.len(), 4);
+    for (i, resp) in responses.iter().enumerate() {
+        assert_eq!(resp.opcode(), Opcode::Append);
+        assert!(!resp.is_error_response(), "append {i} should succeed");
+        assert_eq!(resp.offset(), Offset(i as u64));
+    }
+
+    // Read them back to confirm data is present.
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Read {
+                    request_id: 200,
+                    stream_id: sid,
+                    offset: Offset(0),
+                    count: 4,
+                },
+                None,
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.opcode(), Opcode::Read);
+    assert!(!resp.is_error_response());
+}
