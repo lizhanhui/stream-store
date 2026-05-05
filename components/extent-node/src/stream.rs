@@ -78,7 +78,7 @@ pub struct Stream {
     in_flight: AtomicU64,
 
     /// Channel for followers to submit append requests to the leader writer.
-    tx: Sender<AppendRequest>,
+    pub(crate) tx: Sender<AppendRequest>,
     rx: Receiver<AppendRequest>,
 
     /// Per-stream ACK queue for quorum-based replication (Primary only).
@@ -308,16 +308,6 @@ impl Stream {
     /// Return the stream-level in_flight counter (for pipelined group commit).
     pub(crate) fn in_flight(&self) -> &AtomicU64 {
         &self.in_flight
-    }
-
-    /// Return a reference to the request sender channel.
-    pub(crate) fn tx(&self) -> &Sender<AppendRequest> {
-        &self.tx
-    }
-
-    /// Return a reference to the request receiver channel.
-    pub(crate) fn request_rx(&self) -> &Receiver<AppendRequest> {
-        &self.rx
     }
 
     /// Get the AckQueue for this stream (Primary only). Returns `None` on Secondaries.
@@ -1214,10 +1204,10 @@ impl Stream {
                 if batch.is_empty() {
                     epoch = self.epoch();
                 }
-                match self.request_rx().try_recv() {
+                match self.rx.try_recv() {
                     Ok(request) => {
                         batch.push(request);
-                        while let Ok(request) = self.request_rx().try_recv() {
+                        while let Ok(request) = self.rx.try_recv() {
                             batch.push(request);
                         }
                         break;

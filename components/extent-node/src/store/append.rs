@@ -65,7 +65,7 @@ impl ExtentNodeStore {
                 payload: frame.payload.clone().unwrap_or_default(),
                 response_tx: response_tx.cloned(),
             };
-            let _ = stream.tx().send(job);
+            let _ = stream.tx.send(job);
             return None;
         }
 
@@ -182,7 +182,7 @@ impl ExtentNodeStore {
                     payload: frame.payload.clone().unwrap_or_default(),
                     response_tx: response_tx.cloned(),
                 };
-                let _ = stream.tx().send(job);
+                let _ = stream.tx.send(job);
             }
             return Vec::new(); // All deferred — empty responses.
         }

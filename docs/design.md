@@ -64,7 +64,7 @@ Both paths share the same downstream procedure in Stream Manager: seal in MySQL 
 1. **Stream Epoch**: Each stream has an epoch. Within an epoch, the replica set (Primary + Secondaries) is fixed. SM only bumps the epoch on failure recovery or rebalancing.
 
 2. **Two-Layer Leader Writer Election**: The write path uses a two-layer delegation model:
-   - **Layer 1 (Stream-level)**: `stream.in_flight` elects one leader writer per stream via `fetch_add`. Followers push `AppendRequest` into the stream's `request_tx` channel and return immediately. The stream leader owns all extent transitions (seal, arena rotation, retry).
+   - **Layer 1 (Stream-level)**: `stream.in_flight` elects one leader writer per stream via `fetch_add`. Followers push `AppendRequest` into the stream's `tx` channel and return immediately. The stream leader owns all extent transitions (seal, arena rotation, retry).
    - **Layer 2 (Arena-pool-level, P3)**: For `Shared`-class streams, `SharedArenaPool.in_flight` elects one arena writer per shared arena via a second CAS. Stream leaders that lose the arena-level CAS delegate their `WriteBatch` into the pool's `tx` channel. On the `Dedicated` path (today's default), the stream leader IS the arena writer — no second CAS is needed.
 
 3. **Arena Rotation**: When the active arena fills, the pool rotates to a fresh arena and the leader retries inline — **the client never sees an error**. This is an arena-lifecycle event, not a seal. The epoch and replica set are unaffected. Secondaries learn about arena rotation via `ForwardInitEpoch` on the first Forward frame for the new arena.
@@ -360,7 +360,7 @@ CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)
 
 The write path uses a **two-layer leader writer** architecture that separates stream-level coordination from arena-level memory access:
 
-**Layer 1 — Stream-level leader election** (`stream.in_flight`): The first task to arrive at a stream becomes the leader writer via `in_flight.fetch_add(1)`. Followers push `AppendRequest` into the stream's `request_tx` channel and return immediately. The leader handles all epoch transitions inline (seal, arena rotation) — no re-election, no race.
+**Layer 1 — Stream-level leader election** (`stream.in_flight`): The first task to arrive at a stream becomes the leader writer via `in_flight.fetch_add(1)`. Followers push `AppendRequest` into the stream's `tx` channel and return immediately. The leader handles all epoch transitions inline (seal, arena rotation) — no re-election, no race.
 
 **Layer 2 — Arena-pool-level leader election** (P3, `SharedArenaPool.in_flight`): For `Dedicated`-class streams, the stream leader IS the arena writer — no second CAS. For `Shared`-class streams (P3), multiple stream leaders may contend on the same shared arena. A second `in_flight` CAS on `SharedArenaPool` elects one arena writer; losers delegate their `WriteBatch` into the pool's `tx` channel.
 
@@ -391,7 +391,7 @@ Arena (pre-allocated contiguous buffer, configurable size):
 
 Stream-level (Layer 1):
   in_flight       : AtomicU64 — leader election counter (0 = idle)
-  request_tx/rx   : crossbeam unbounded channel for follower delegation
+  tx/rx   : crossbeam unbounded channel for follower delegation
 
 SharedArenaPool-level (Layer 2, P3 only):
   in_flight       : AtomicU64 — arena-pool leader election counter
@@ -410,15 +410,15 @@ Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → STREAM LEADER
   ├─ in_flight.fetch_sub(1) → remaining=3 → drain batch
   │
   │  Writer B arrives: in_flight.fetch_add(1) → prev=1 → FOLLOWER
-  │  ├─ push AppendRequest to stream.request_tx
+  │  ├─ push AppendRequest to stream.tx
   │  └─ return None (deferred)
   │
   │  Writer C arrives: in_flight.fetch_add(1) → prev=2 → FOLLOWER
-  │  ├─ push AppendRequest to stream.request_tx
+  │  ├─ push AppendRequest to stream.tx
   │  └─ return None (deferred)
   │
   └─ drain_delegated_requests loop:
-     ├─ recv requests [B, C] from stream.request_rx
+     ├─ recv requests [B, C] from stream.rx
      ├─ pool.write_batch for B → ArenaFull!
      │   ├─ pool rotates to fresh arena, retries → OK
      │   └─ return ArenaAppendResult
@@ -430,7 +430,7 @@ Writer A arrives at stream: in_flight.fetch_add(1) → prev=0 → STREAM LEADER
 
 Detailed steps:
 
-1. **Stream-level leader election (Layer 1)**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the task is the **leader writer** for the stream (fast path). If `prev > 0`, a leader writer exists — push `AppendRequest` to the stream's `request_tx` channel and return immediately (slow path).
+1. **Stream-level leader election (Layer 1)**: `stream.in_flight.fetch_add(1, Acquire)`. If `prev == 0`, the task is the **leader writer** for the stream (fast path). If `prev > 0`, a leader writer exists — push `AppendRequest` to the stream's `tx` channel and return immediately (slow path).
 
 2. **Arena write**: The stream leader calls `pool.write_batch(stream_id, epoch, &[ArenaAppend])`. On Dedicated, this calls `Arena::write_batch` directly (the leader IS the arena writer). On Shared (P3), a second CAS at the pool level may be required — if the stream leader loses the arena-level election, it delegates its `WriteBatch` into the pool's `tx` channel.
 
@@ -440,7 +440,7 @@ Detailed steps:
    - **RF=1 / standalone / no replica**: Send immediate `AppendAck` via `response_tx`.
    - **RF≥2 Primary**: Broadcast `Forward` to all secondaries, queue `PendingAck`.
 
-5. **Batch drain**: After own append, `in_flight.fetch_sub(1, Release)`. If `remaining > 1`, drain `stream.request_rx` and process each follower's payload through `append_one` (which handles arena-full inline). `in_flight.fetch_sub(batch_size, Release)` after each batch. Loop until `remaining ≤ batch_size`.
+5. **Batch drain**: After own append, `in_flight.fetch_sub(1, Release)`. If `remaining > 1`, drain `stream.rx` and process each follower's payload through `append_one` (which handles arena-full inline). `in_flight.fetch_sub(batch_size, Release)` after each batch. Loop until `remaining ≤ batch_size`.
 
 6. **Follower return**: Followers return `None` immediately. Their ACK (or error) is sent via `response_tx` by the leader.
 

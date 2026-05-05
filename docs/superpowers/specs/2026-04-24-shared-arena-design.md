@@ -153,8 +153,8 @@ struct Stream {
 
     // Pipelined group commit (same shape for both classes):
     in_flight: AtomicU64,
-    request_tx:    crossbeam::channel::Sender<AppendRequest>,
-    request_rx:    crossbeam::channel::Receiver<AppendRequest>,
+    tx:    crossbeam::channel::Sender<AppendRequest>,
+    rx:    crossbeam::channel::Receiver<AppendRequest>,
 }
 ```
 
@@ -377,12 +377,12 @@ Identical to today's Dedicated fast path:
 prev = stream.in_flight.fetch_add(1, Acquire)
 if prev > 0:
     // follower
-    stream.request_tx.send(AppendRequest { payload, client_reply_tx })
+    stream.tx.send(AppendRequest { payload, client_reply_tx })
     return None
 // leader turn
 loop:
     own_batch = collect own payload
-    drained   = drain_up_to(stream.request_rx, max_stream_batch)
+    drained   = drain_up_to(stream.rx, max_stream_batch)
     batch     = own_batch ++ drained
     for payload in batch: assign seq = ep.record_count.load() then ++
     write_batch(batch)                          // class-specific, Layer 2
@@ -480,7 +480,7 @@ Notes:
   `start_offset + i` is strictly monotonic per stream.
 - Within a stream, across batches: the stream's `in_flight` CAS
   guarantees that batch B's leader turn only starts after batch A's
-  `fetch_sub` completes. The crossbeam `stream.request_rx` is FIFO, so
+  `fetch_sub` completes. The crossbeam `stream.rx` is FIFO, so
   A's arena submission precedes B's. The arena's `request_rx` is FIFO, so
   A reaches the arena leader first. Directory entries extend monotonically.
 - Across streams: arena FIFO preserves the cross-stream write order in

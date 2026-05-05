@@ -697,11 +697,11 @@ impl Stream {
 
 Body rewrites:
 - All `let stream = match guard.get(&stream_id) { Some(s) => s, None => return … };` → gone.
-- `stream.request_rx().try_recv()` → `self.request_rx().try_recv()`
+- `stream.rx.try_recv()` → `self.rx.try_recv()`
 - `stream.in_flight().load(...)` / `fetch_sub(...)` → `self.in_flight()...`
 - `self.do_append_and_respond(stream, ...)` → `self.append_one(...)`
 - `stream.epoch()` → `self.epoch()`
-- The `break`/`return` exits that were triggered by "stream not found in map" — drop those cases entirely. If the Stream has been evicted from the map, the caller holding the `Arc<Self>` still has a valid handle; draining whatever remains in `request_rx` is correct. (The map only holds the Stream; the channel's Senders live on whoever still holds a clone of `stream.request_tx()`.)
+- The `break`/`return` exits that were triggered by "stream not found in map" — drop those cases entirely. If the Stream has been evicted from the map, the caller holding the `Arc<Self>` still has a valid handle; draining whatever remains in `rx` is correct. (The map only holds the Stream; the channel's Senders live on whoever still holds a clone of `stream.tx`.)
 
 - [ ] **Step 2: Update Store's callers**
 

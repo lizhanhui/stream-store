@@ -595,8 +595,8 @@ pub struct Stream {
     pub id: StreamId,
     epoch: AtomicU32,
     in_flight: AtomicU64,
-    request_tx: Sender<AppendRequest>,
-    request_rx: Receiver<AppendRequest>,
+    tx: Sender<AppendRequest>,
+    rx: Receiver<AppendRequest>,
     ack_queue: OnceLock<AckQueue>,
     flush_in_progress: papaya::HashMap<ExtentId, ()>,
 
