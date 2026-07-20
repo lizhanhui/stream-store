@@ -3421,7 +3421,7 @@ dependencies = [
  "proc-macro2",
  "quote",
  "snafu",
- "syn 2.0.119",
+ "syn 3.0.2",
 ]
 
 [[package]]
