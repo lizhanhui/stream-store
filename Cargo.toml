@@ -30,7 +30,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1.1"
 crc32fast = "1.5"
 smallvec = "1.15"
-tikv-jemallocator = "0.6"
+tikv-jemallocator = "0.7"
 core_affinity = "0.8"
 papaya = "0.2"
 parking_lot = "0.12"
