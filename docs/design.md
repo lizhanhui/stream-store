@@ -346,7 +346,7 @@ CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)
 
 1. Client sends APPEND to Primary. Primary assigns monotonic sequence number, buffers in memory.
 2. Primary broadcasts the append to **all Secondaries in parallel** using the dedicated Forward opcode (0x05), which carries the primary-assigned `byte_pos` for deterministic replication.
-3. Each Secondary buffers the append and sends a cumulative WATERMARK ACK back to Primary with its highest committed offset.
+3. Each Secondary serializes Forward processing per extent and accepts a Forward only when both its logical offset and byte position equal the next contiguous frontiers for that extent. A gap or layout mismatch is rejected without mutation or WATERMARK response. After a valid append, the Secondary sends a cumulative WATERMARK ACK back to Primary with its highest contiguous committed offset.
 4. Primary tracks per-secondary watermarks in an AckQueue. It computes the quorum offset: sorts secondary watermarks descending, takes the k-th value where `k = RF/2`.
 5. Primary ACKs all pending clients whose offset <= quorum offset (deferred response via per-connection channel).
 

@@ -610,6 +610,72 @@ async fn secondary_returns_watermark() {
 }
 
 #[tokio::test]
+async fn secondary_withholds_watermark_after_forward_gap() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(10);
+    let extent_id = ExtentId(50);
+
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 1,
+                    extent_id,
+                    role: 1,
+                    config: test_config(stream_id.0, 2),
+                },
+                Some(build_register_extent_payload(&[])),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let first = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Forward {
+                    stream_id,
+                    extent_id,
+                    epoch: Epoch(0),
+                    offset: Offset(0),
+                    byte_pos: 0,
+                },
+                Some(Bytes::from_static(b"msg0")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.offset(), Offset(0));
+
+    let gap = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Forward {
+                    stream_id,
+                    extent_id,
+                    epoch: Epoch(0),
+                    offset: Offset(2),
+                    byte_pos: 8,
+                },
+                Some(Bytes::from_static(b"msg2")),
+            ),
+            None,
+        )
+        .await;
+
+    assert!(
+        gap.is_none(),
+        "a gap must not produce a cumulative watermark"
+    );
+    let streams = store.streams.pin();
+    assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(1));
+}
+
+#[tokio::test]
 async fn cumulative_ack_drains_multiple_pending() {
     // Test that a single watermark can drain multiple pending ACKs.
     let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(100);

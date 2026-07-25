@@ -2,12 +2,15 @@ use std::alloc::{Layout, alloc, dealloc};
 use std::cell::UnsafeCell;
 use std::ops::Deref;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use common::errors::StorageError;
-use common::errors::{ExtentFullSnafu, ExtentSealedSnafu, InternalSnafu};
+use common::errors::{
+    ExtentFullSnafu, ExtentSealedSnafu, InternalSnafu, ReplicationGapSnafu,
+    ReplicationPositionMismatchSnafu,
+};
 use common::types::{Epoch, ExtentId, ExtentState, Offset};
 
 /// Sentinel for unwritten index entries.
@@ -192,8 +195,8 @@ pub struct Extent {
     /// committed record (exclusive). All offsets in [start_offset, committed_offset)
     /// have been fully written and are safe to read.
     /// Advanced inline in both `append_inner()` (primary) and `replicate()`
-    /// (secondary). In-order Forward delivery guarantees sequential processing.
-    /// Watermark ACKs use this value to report progress to the primary.
+    /// (secondary). Replication validates the next expected offset and byte
+    /// position before advancing. Watermark ACKs report this contiguous value.
     committed_offset: AtomicU64,
 
     /// Committed byte position: contiguous byte frontier.
@@ -225,15 +228,16 @@ pub struct Extent {
     ///   (set by Primary after upload, by Secondaries on ForwardFlushed)
     flags: AtomicU8,
 
+    /// Serializes validation and mutation for Forward frames. Normal traffic
+    /// arrives on one FIFO connection, but multiple connections can call the
+    /// server concurrently. The lock preserves a single Secondary writer.
+    replication_lock: Mutex<()>,
+
     /// Incremental CRC32 hasher.
     ///
     /// Updated inline in both `append_inner()` (primary) and `replicate()`
-    /// (secondary). In-order Forward delivery guarantees sequential processing
-    /// on secondaries, so CRC32 can be hashed directly from the payload.
-    ///
-    /// `UnsafeCell` is used instead of `Mutex` because the single-writer
-    /// invariant already guarantees exclusive access — same reasoning as
-    /// `write_cursor`, `record_count`, etc.
+    /// (secondary). Primary writes are serialized by stream-level leader
+    /// election; Secondary writes are serialized by `replication_lock`.
     hasher: UnsafeCell<crc32fast::Hasher>,
 
     /// Finalized CRC32 checksum.
@@ -305,6 +309,7 @@ impl Extent {
             limit: AtomicU64::new(LIMIT_OPEN),
             index,
             flags: AtomicU8::new(FLAG_INIT_FORWARD),
+            replication_lock: Mutex::new(()),
             hasher: UnsafeCell::new(crc32fast::Hasher::new()),
             finalized_crc32: AtomicU32::new(0),
         }
@@ -478,10 +483,10 @@ impl Extent {
     /// `byte_pos` and logical offset as the primary, ensuring bit-for-bit
     /// identical arena layouts across replicas.
     ///
-    /// Forward frames arrive in strict offset order (guaranteed by the
-    /// per-address FIFO mpsc channel), so CRC32 is computed inline and
-    /// committed state is advanced directly — matching `append_inner`
-    /// semantics on the primary.
+    /// Forward frames normally arrive in strict offset order through the
+    /// per-address FIFO channel, but the transport can lose frames. Offset and
+    /// byte-position checks enforce a contiguous frontier before CRC32 and
+    /// committed state are advanced.
     ///
     /// Returns the logical offset on success.
     pub fn replicate(
@@ -490,6 +495,11 @@ impl Extent {
         byte_pos: u64,
         payload: Bytes,
     ) -> Result<AppendResult, StorageError> {
+        let _replication_guard = self
+            .replication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // Reject stale Forward frames from a previous extent (offset < start_offset).
         if offset.0 < self.start_offset.0 {
             return Err(InternalSnafu {
@@ -501,6 +511,32 @@ impl Extent {
             .build());
         }
         let seq = offset.0 - self.start_offset.0;
+
+        // A Watermark is cumulative, so only the next contiguous record may
+        // advance it. FIFO transport does not imply lossless transport: a full
+        // channel or failed TCP session can discard an earlier Forward frame.
+        let expected_offset = Offset(self.committed_offset.load(Ordering::Acquire));
+        if offset != expected_offset {
+            return Err(ReplicationGapSnafu {
+                extent_id: self.id,
+                expected_offset,
+                received_offset: offset,
+            }
+            .build());
+        }
+
+        // Identical offsets are not sufficient for bit-for-bit replicas. A
+        // mismatched byte position indicates a missing or divergent record.
+        let expected_byte_pos = self.committed_bytes.load(Ordering::Acquire);
+        if byte_pos != expected_byte_pos {
+            return Err(ReplicationPositionMismatchSnafu {
+                extent_id: self.id,
+                expected_byte_pos,
+                received_byte_pos: byte_pos,
+            }
+            .build());
+        }
+
         // Check seal limit (limit is count-based).
         let limit = self.limit.load(Ordering::Acquire);
         if limit != LIMIT_OPEN && seq >= limit {
@@ -766,6 +802,10 @@ impl Extent {
     ///
     /// Same as `replicate()` — single connection read loop on secondaries.
     pub fn try_advance_committed(&self) {
+        let _replication_guard = self
+            .replication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let h = unsafe { &mut *self.hasher.get() };
         let mut seq = self.committed_offset.load(Ordering::Relaxed) - self.start_offset.0;
 
@@ -828,6 +868,11 @@ impl Extent {
     ///
     /// When ready, finalizes the local hasher and compares with the stored primary CRC32.
     pub fn try_verify_checksum(&self) -> Option<bool> {
+        let _replication_guard = self
+            .replication_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
         // Check if ForwardChecksum has been received.
         let flags = self.flags.load(Ordering::Acquire);
         if flags & FLAG_CHECKSUM_RECEIVED == 0 {
@@ -1123,6 +1168,114 @@ mod tests {
     }
 
     #[test]
+    fn replicate_rejects_offset_gap_without_advancing_frontier() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            .unwrap();
+
+        let result = ext.replicate(Offset(2), 8, Bytes::from_static(b"msg2"));
+
+        assert!(matches!(
+            result,
+            Err(StorageError::ReplicationGap {
+                expected_offset: Offset(1),
+                received_offset: Offset(2),
+                ..
+            })
+        ));
+        assert_eq!(ext.next_offset(), Offset(1));
+        assert_eq!(ext.message_count(), 1);
+        assert_eq!(ext.record_count.load(Ordering::Acquire), 1);
+        assert_eq!(ext.index_lookup(1), None);
+        assert_eq!(ext.index_lookup(2), None);
+        assert_eq!(ext.committed_data().len(), 8);
+
+        let control = Extent::with_capacity(ExtentId(2), Offset(0), 4096, Epoch(0));
+        control
+            .replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            .unwrap();
+        ext.seal(None);
+        control.seal(None);
+        assert_eq!(ext.finalized_crc32(), control.finalized_crc32());
+    }
+
+    #[test]
+    fn concurrent_duplicate_forwards_have_one_writer() {
+        use std::sync::{Arc, Barrier};
+
+        const WRITERS: usize = 16;
+        let ext = Arc::new(Extent::with_capacity(
+            ExtentId(1),
+            Offset(0),
+            4096,
+            Epoch(0),
+        ));
+        let barrier = Arc::new(Barrier::new(WRITERS));
+        let mut handles = Vec::with_capacity(WRITERS);
+
+        for _ in 0..WRITERS {
+            let ext = Arc::clone(&ext);
+            let barrier = Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            }));
+        }
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert!(
+            results
+                .iter()
+                .filter(|result| result.is_err())
+                .all(|result| {
+                    matches!(
+                        result,
+                        Err(StorageError::ReplicationGap {
+                            expected_offset: Offset(1),
+                            received_offset: Offset(0),
+                            ..
+                        })
+                    )
+                })
+        );
+        assert_eq!(ext.next_offset(), Offset(1));
+        assert_eq!(ext.message_count(), 1);
+        assert_eq!(ext.committed_data().len(), 8);
+    }
+
+    #[test]
+    fn replicate_rejects_byte_position_gap_without_advancing_frontier() {
+        let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
+        ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            .unwrap();
+
+        let result = ext.replicate(Offset(1), 9, Bytes::from_static(b"msg1"));
+
+        assert!(matches!(
+            result,
+            Err(StorageError::ReplicationPositionMismatch {
+                expected_byte_pos: 8,
+                received_byte_pos: 9,
+                ..
+            })
+        ));
+        assert_eq!(ext.next_offset(), Offset(1));
+        assert_eq!(ext.message_count(), 1);
+        assert_eq!(ext.record_count.load(Ordering::Acquire), 1);
+        assert_eq!(ext.index_lookup(1), None);
+        assert_eq!(ext.committed_data().len(), 8);
+
+        let control = Extent::with_capacity(ExtentId(2), Offset(0), 4096, Epoch(0));
+        control
+            .replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            .unwrap();
+        ext.seal(None);
+        control.seal(None);
+        assert_eq!(ext.finalized_crc32(), control.finalized_crc32());
+    }
+
+    #[test]
     fn replicate_matches_append_layout() {
         // Prove that replicate() produces a bit-for-bit identical arena as append().
         let primary = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
@@ -1167,7 +1320,8 @@ mod tests {
         let ext = Extent::with_capacity(ExtentId(1), Offset(0), 4096, Epoch(0));
 
         // Secondary receives 1 of 3 expected messages before seal.
-        ext.append(Bytes::from_static(b"msg0")).unwrap();
+        ext.replicate(Offset(0), 0, Bytes::from_static(b"msg0"))
+            .unwrap();
         assert_eq!(ext.message_count(), 1);
 
         // SM seals with committed_offset=3 (primary committed 3 records).
@@ -1175,15 +1329,19 @@ mod tests {
         assert!(ext.is_sealed());
         assert!(ext.accepts_post_seal_writes()); // committed count(1) < limit(3)
 
-        // Late forwarded appends within the sealed range should succeed.
-        let r1 = ext.append(Bytes::from_static(b"msg1")).unwrap();
+        // Late contiguous forwards within the sealed range should succeed.
+        let r1 = ext
+            .replicate(Offset(1), 8, Bytes::from_static(b"msg1"))
+            .unwrap();
         assert_eq!(r1.offset, Offset(1));
-        let r2 = ext.append(Bytes::from_static(b"msg2")).unwrap();
+        let r2 = ext
+            .replicate(Offset(2), 16, Bytes::from_static(b"msg2"))
+            .unwrap();
         assert_eq!(r2.offset, Offset(2));
 
-        // Now at the limit — further appends should be rejected.
+        // Now at the limit — further forwards should be rejected.
         assert!(!ext.accepts_post_seal_writes());
-        let result = ext.append(Bytes::from_static(b"should-fail"));
+        let result = ext.replicate(Offset(3), 24, Bytes::from_static(b"should-fail"));
         assert!(matches!(result, Err(StorageError::ExtentSealed { .. })));
     }
 
