@@ -4,11 +4,11 @@ This document records inconsistencies found while comparing the implementation w
 
 ## P0: Data Integrity and Consistency
 
-### 1. Secondary nodes accept client appends
+### 1. Secondary nodes accept client appends — Resolved
 
-The design requires the Primary to be the sole append acceptor (`design.md:129-131`, `design.md:1153-1155`). The append path writes the record before checking the replica role, and the Secondary branch then returns a successful `AppendAck` (`components/extent-node/src/store/append.rs:278-316`, `components/extent-node/src/store/append.rs:408-425`).
+The design requires the Primary to be the sole append acceptor. Previously, the append path wrote the record before checking the replica role, and the Secondary branch then returned a successful `AppendAck`. A stale or misrouted client could therefore receive success for a record written to only one Secondary, without forwarding or quorum replication.
 
-A stale or misrouted client can therefore receive success for a record written to only one Secondary, without forwarding or quorum replication.
+**Resolution:** APPEND now requires an explicit Primary `ReplicaInfo` before leader election and repeats the check at the mutation boundary. Explicit and lazily created Secondaries return `NotPrimary` (error code 6) without changing the stream. The client maps this response to `StorageError::NotPrimary` so callers can rediscover through `DescribeStream`. Regression tests cover both Secondary states and verify that their maximum offset is unchanged.
 
 ### 2. Replication transport can drop records and acknowledge across the gap
 

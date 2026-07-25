@@ -73,6 +73,21 @@ impl ExtentNodeStore {
                 ));
             }
 
+            // Only an explicitly registered Primary may mutate stream data. A stream
+            // can exist before ReplicaInfo is published when ForwardInitExtent wins
+            // the race with RegisterExtent; that state is a lazy Secondary, not a
+            // standalone Primary.
+            let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
+            if !replica.as_ref().is_some_and(|ri| ri.is_primary()) {
+                let extent_id = replica.as_ref().map_or(ExtentId(0), |ri| ri.extent_id);
+                return Some(Frame::error_from_request(
+                    &frame,
+                    ErrorCode::NotPrimary,
+                    "this extent node is not the stream primary",
+                    extent_id,
+                ));
+            }
+
             let is_tick = frame.flags() & FLAG_SYSTEM_TICK != 0;
             let prev = stream.in_flight().fetch_add(1, Ordering::Acquire);
 
@@ -271,6 +286,30 @@ impl ExtentNodeStore {
         payload: Bytes,
         response_tx: Option<Sender<Frame>>,
     ) -> (Option<Frame>, bool) {
+        // Defend the mutation boundary even though handle_append performs the
+        // same check before leader election. Future callers must not be able to
+        // bypass Primary-only append ownership.
+        let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
+        let replica = match replica {
+            Some(ri) if ri.is_primary() => ri,
+            replica => {
+                let extent_id = replica.as_ref().map_or(ExtentId(0), |ri| ri.extent_id);
+                let err = Frame::append_ack_error(
+                    request_id,
+                    stream_id,
+                    epoch,
+                    extent_id,
+                    ErrorCode::NotPrimary,
+                    "this extent node is not the stream primary",
+                );
+                if let Some(tx) = response_tx {
+                    let _ = tx.try_send(err);
+                    return (None, false);
+                }
+                return (Some(err), false);
+            }
+        };
+
         let payload_len = payload.len();
         let payload_for_forward = payload.clone();
 
@@ -324,105 +363,60 @@ impl ExtentNodeStore {
         self.bytes_written
             .fetch_add(payload_len as u64, Ordering::Relaxed);
 
-        // Check replica info for this stream (Arc clone — one atomic, no deep copy).
-        let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
-
-        match replica {
-            None => {
-                // Standalone mode: immediate ACK.
-                let ack = Frame::new(
-                    VariableHeader::AppendAck {
-                        request_id,
+        if replica.is_standalone() {
+            // RF=1: no secondaries, ACK immediately.
+            let ack = Frame::new(
+                VariableHeader::AppendAck {
+                    request_id,
+                    stream_id,
+                    epoch,
+                    extent_id,
+                    offset,
+                },
+                None,
+            );
+            if let Some(tx) = response_tx {
+                let _ = tx.try_send(ack);
+                (None, false)
+            } else {
+                (Some(ack), false)
+            }
+        } else {
+            // RF≥2: push Forward frames inline into per-stream channels.
+            if stream.has_secondaries() {
+                let forward_frame = Frame::new(
+                    VariableHeader::Forward {
                         stream_id,
-                        epoch,
                         extent_id,
-                        offset,
-                    },
-                    None,
-                );
-                if let Some(tx) = response_tx {
-                    let _ = tx.try_send(ack);
-                    (None, false)
-                } else {
-                    (Some(ack), false)
-                }
-            }
-            Some(ref ri) if ri.is_primary() => {
-                if ri.is_standalone() {
-                    // RF=1: no secondaries, ACK immediately.
-                    let ack = Frame::new(
-                        VariableHeader::AppendAck {
-                            request_id,
-                            stream_id,
-                            epoch,
-                            extent_id,
-                            offset,
-                        },
-                        None,
-                    );
-                    if let Some(tx) = response_tx {
-                        let _ = tx.try_send(ack);
-                        (None, false)
-                    } else {
-                        (Some(ack), false)
-                    }
-                } else {
-                    // RF≥2: push Forward frames inline into per-stream channels.
-                    if stream.has_secondaries() {
-                        let forward_frame = Frame::new(
-                            VariableHeader::Forward {
-                                stream_id,
-                                extent_id,
-                                epoch,
-                                offset,
-                                byte_pos: append_result.byte_pos,
-                            },
-                            Some(payload_for_forward),
-                        );
-                        // Inject ForwardInitExtent if this is the first forward for the extent.
-                        if let Some(init) = self.maybe_build_init_forward(stream, &forward_frame) {
-                            stream.send_forward(init);
-                        }
-                        stream.send_forward(forward_frame);
-                    }
-
-                    // Queue deferred ACK — lock-free, no contention with watermark readers.
-                    if let Some(ref resp_tx) = response_tx {
-                        let aq = stream
-                            .init_ack_queue(ri.required_secondary_acks(), self.replication_timeout);
-                        aq.enqueue(PendingAck {
-                            request_id,
-                            stream_id,
-                            response_tx: resp_tx.clone(),
-                            assigned_offset: offset.0,
-                            extent_id,
-                            epoch,
-                            created_at: Instant::now(),
-                        });
-                    }
-
-                    (None, false)
-                }
-            }
-            Some(_) => {
-                // Secondary received normal Append (not Forward) — shouldn't normally happen.
-                let ack = Frame::new(
-                    VariableHeader::AppendAck {
-                        request_id,
-                        stream_id,
                         epoch,
-                        extent_id,
                         offset,
+                        byte_pos: append_result.byte_pos,
                     },
-                    None,
+                    Some(payload_for_forward),
                 );
-                if let Some(tx) = response_tx {
-                    let _ = tx.try_send(ack);
-                    (None, false)
-                } else {
-                    (Some(ack), false)
+                // Inject ForwardInitExtent if this is the first forward for the extent.
+                if let Some(init) = self.maybe_build_init_forward(stream, &forward_frame) {
+                    stream.send_forward(init);
                 }
+                stream.send_forward(forward_frame);
             }
+
+            // Queue deferred ACK — lock-free, no contention with watermark readers.
+            if let Some(ref resp_tx) = response_tx {
+                let aq = stream
+                    .init_ack_queue(replica.required_secondary_acks(), self.replication_timeout);
+                aq.enqueue(PendingAck {
+                    request_id,
+                    stream_id,
+                    response_tx: resp_tx.clone(),
+                    assigned_offset: offset.0,
+                    extent_id,
+                    epoch,
+                    created_at: Instant::now(),
+                });
+            }
+
+            (None, false)
         }
     }
 

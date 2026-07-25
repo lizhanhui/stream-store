@@ -324,6 +324,101 @@ async fn register_extent_secondary() {
 }
 
 #[tokio::test]
+async fn secondary_rejects_client_append_without_mutation() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(42);
+    let payload = build_register_extent_payload(&[]);
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 1,
+                    extent_id: ExtentId(100),
+                    role: 1,
+                    config: test_config(stream_id.0, 2),
+                },
+                Some(payload),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 2,
+                    stream_id,
+                    epoch: Epoch(0),
+                },
+                Some(Bytes::from_static(b"must not be written")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(resp.is_error_response());
+    assert_eq!(resp.error_code(), ErrorCode::NotPrimary as u16);
+    let streams = store.streams.pin();
+    assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(0));
+}
+
+#[tokio::test]
+async fn lazy_secondary_rejects_client_append_without_mutation() {
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(43);
+
+    assert!(
+        store
+            .handle_frame(
+                Frame::new(
+                    VariableHeader::ForwardInitExtent {
+                        stream_id,
+                        extent_id: ExtentId(101),
+                        epoch: Epoch(7),
+                        start_offset: Offset(12),
+                        extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        cache_extents: DEFAULT_CACHE_EXTENTS,
+                        min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                        max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                        extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+                        storage_class: StorageClass::S3,
+                    },
+                    None,
+                ),
+                None,
+            )
+            .await
+            .is_none()
+    );
+    assert!(store.get_replica_info(stream_id).is_none());
+
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 2,
+                    stream_id,
+                    epoch: Epoch(7),
+                },
+                Some(Bytes::from_static(b"must not be written")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert!(resp.is_error_response());
+    assert_eq!(resp.error_code(), ErrorCode::NotPrimary as u16);
+    let streams = store.streams.pin();
+    assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(12));
+}
+
+#[tokio::test]
 async fn register_extent_then_append_rf1() {
     use rpc::payload::build_register_extent_payload;
 
