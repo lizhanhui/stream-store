@@ -54,7 +54,7 @@ async fn start_stream_manager_rf2() -> String {
         "node",
         "refinery_schema_history",
     ] {
-        sqlx::query(&format!("DROP TABLE IF EXISTS {table}"))
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE IF EXISTS {table}")))
             .execute(&pool)
             .await
             .unwrap_or_else(|e| panic!("drop {table}: {e}"));
