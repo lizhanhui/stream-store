@@ -6,8 +6,9 @@
 //! fire-and-forget), completely decoupling append latency from network I/O.
 //!
 //! Channels are created once per address and outlive individual TCP connections.
-//! On TCP failure, the writer task reconnects in a loop — frames buffered in
-//! the channel survive outages and are drained on reconnect.
+//! On TCP failure, the writer task reconnects in a loop. Frames still buffered
+//! in the channel survive outages; frames already dequeued for a failed write
+//! may be lost, so Secondaries enforce contiguous replication frontiers.
 //!
 //! Streams cache cloned `Sender` handles at RegisterExtent time so
 //! the hot append path pushes directly into channels with zero lookup overhead.

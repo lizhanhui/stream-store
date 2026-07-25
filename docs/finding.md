@@ -10,13 +10,11 @@ The design requires the Primary to be the sole append acceptor. Previously, the 
 
 **Resolution:** APPEND now requires an explicit Primary `ReplicaInfo` before leader election and repeats the check at the mutation boundary. Explicit and lazily created Secondaries return `NotPrimary` (error code 6) without changing the stream. The client maps this response to `StorageError::NotPrimary` so callers can rediscover through `DescribeStream`. Regression tests cover both Secondary states and verify that their maximum offset is unchanged.
 
-### 2. Replication transport can drop records and acknowledge across the gap
+### 2. Replication transport can drop records and acknowledge across the gap — Resolved
 
-`Stream::send_forward` drops a Forward frame when a bounded downstream channel is full (`components/extent-node/src/stream.rs:544-570`). Frames removed from the channel can also be lost when downstream socket writes fail (`components/extent-node/src/downstream.rs:205-257`).
+The downstream channel and TCP session can lose Forward frames. Previously, the Secondary trusted FIFO ordering as lossless delivery, advanced `committed_offset` directly to any received offset, and returned that value as a cumulative Watermark. A later record could therefore falsely acknowledge a missing predecessor.
 
-The Secondary does not verify that a received offset is the next contiguous offset. It writes the record and advances `committed_offset` directly to the received offset (`components/extent-node/src/extent.rs:487-550`), then returns this as a cumulative watermark (`components/extent-node/src/store/forward.rs:259-288`).
-
-If offset 10 is dropped and offset 11 arrives, the Secondary can report a watermark covering both offsets. The Primary may then acknowledge offset 10 even though it is absent from that replica. This violates the gap-free quorum guarantee in `design.md:1153-1188`.
+**Resolution:** `Extent::replicate` now serializes Secondary writers and requires both the received offset and byte position to equal the extent's next contiguous frontiers before writing any data. Gaps return `StorageError::ReplicationGap`; layout divergence returns `StorageError::ReplicationPositionMismatch`. Either error leaves the arena, index, CRC, counters, and committed frontiers unchanged, so `finish_forward` withholds the Watermark. Tests cover logical gaps, byte-position gaps, concurrent duplicate Forwards, unchanged state and CRC, post-seal late contiguous replication, and the absence of a Watermark after a skipped Forward. Reliable replay remains a separate availability enhancement; the current fix restores quorum safety by stalling the affected Secondary.
 
 ### 3. `RegisterExtent` cannot establish an authoritative start offset
 

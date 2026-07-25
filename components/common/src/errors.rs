@@ -75,6 +75,28 @@ pub enum StorageError {
         location: snafu::Location,
     },
 
+    #[snafu(display(
+        "replication gap: extent {extent_id}, expected offset {expected_offset}, received {received_offset}"
+    ))]
+    ReplicationGap {
+        extent_id: ExtentId,
+        expected_offset: Offset,
+        received_offset: Offset,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
+    #[snafu(display(
+        "replication position mismatch: extent {extent_id}, expected byte position {expected_byte_pos}, received {received_byte_pos}"
+    ))]
+    ReplicationPositionMismatch {
+        extent_id: ExtentId,
+        expected_byte_pos: u64,
+        received_byte_pos: u64,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     // ── Database errors (wraps sqlx::Error) ──────────────────────────────
     #[snafu(display("database error: {message}"))]
     Database {
