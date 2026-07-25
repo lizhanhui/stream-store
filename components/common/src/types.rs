@@ -355,6 +355,7 @@ pub enum ErrorCode {
     ExtentSealed = 3,
     InternalError = 4,
     EpochStale = 5,
+    NotPrimary = 6,
 }
 
 impl ErrorCode {
@@ -366,6 +367,7 @@ impl ErrorCode {
             3 => Some(ErrorCode::ExtentSealed),
             4 => Some(ErrorCode::InternalError),
             5 => Some(ErrorCode::EpochStale),
+            6 => Some(ErrorCode::NotPrimary),
             _ => None,
         }
     }

@@ -6,7 +6,7 @@ use std::time::Duration;
 use bytes::{Buf, Bytes};
 use common::config::{DEFAULT_CONNECT_TIMEOUT_MS, DEFAULT_SM_REQUEST_TIMEOUT_MS};
 use common::errors::{
-    EpochStaleSnafu, ExtentSealedSnafu, InternalSnafu, NetworkSnafu, StorageError,
+    EpochStaleSnafu, ExtentSealedSnafu, InternalSnafu, NetworkSnafu, NotPrimarySnafu, StorageError,
     UnknownStreamSnafu,
 };
 use common::types::{
@@ -263,6 +263,11 @@ impl StreamClient {
                 epoch: resp.epoch(),
             }
             .build(),
+            Some(ErrorCode::NotPrimary) => NotPrimarySnafu {
+                stream_id: resp.stream_id(),
+                epoch: resp.epoch(),
+            }
+            .build(),
             _ => InternalSnafu { message: msg }.build(),
         })
     }
@@ -317,9 +322,9 @@ impl StreamClient {
     /// Append a message to a stream. Returns the assigned offset and diagnostics.
     ///
     /// The `epoch` parameter identifies which replica set the client is targeting.
-    /// If the epoch is stale (the Primary has been reassigned via an epoch bump),
-    /// the server returns `EpochStale` and the client should re-discover via
-    /// `describe_stream`.
+    /// If the epoch is stale or this connection targets a non-Primary replica,
+    /// the server returns `EpochStale` or `NotPrimary`; the caller should
+    /// re-discover via `describe_stream`.
     pub async fn append(
         &self,
         stream_id: StreamId,
@@ -733,5 +738,32 @@ impl StreamClient {
         {
             self.cache_primary(stream_id, &primary.node_addr).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maps_not_primary_response_to_domain_error() {
+        let response = Frame::append_ack_error(
+            1,
+            StreamId(9),
+            Epoch(3),
+            ExtentId(7),
+            ErrorCode::NotPrimary,
+            "this extent node is not the stream primary",
+        );
+
+        let error = StreamClient::check_error(&response).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::NotPrimary {
+                stream_id: StreamId(9),
+                epoch: Epoch(3),
+                ..
+            }
+        ));
     }
 }

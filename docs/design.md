@@ -319,7 +319,7 @@ Unlike chain replication where writes flow sequentially through the chain (O(N) 
 
 ### Write Path
 
-The Primary is the sole append acceptor. It assigns monotonic sequence numbers and broadcasts appends to all Secondaries in parallel. Each Secondary buffers the append and returns a **cumulative watermark ACK** directly to the Primary. The Primary tracks watermarks from all Secondaries and computes a **quorum offset** -- the highest offset confirmed by at least `RF/2` Secondaries (plus the Primary itself). The Primary ACKs clients in-order: only when their offset <= the quorum offset.
+The Primary is the sole append acceptor. An Extent Node without an explicit Primary assignment rejects a client APPEND with `NotPrimary` (error code 6) before leader election or local mutation; the client must rediscover the current Primary through `DescribeStream`. This includes lazily created Secondary streams whose `RegisterExtent` hint has not arrived. The Primary assigns monotonic sequence numbers and broadcasts appends to all Secondaries in parallel. Each Secondary buffers the append and returns a **cumulative watermark ACK** directly to the Primary. The Primary tracks watermarks from all Secondaries and computes a **quorum offset** -- the highest offset confirmed by at least `RF/2` Secondaries (plus the Primary itself). The Primary ACKs clients in-order: only when their offset <= the quorum offset.
 
 ```
 CLIENT        PRIMARY             SECONDARY_1          SECONDARY_2 (RF=3)

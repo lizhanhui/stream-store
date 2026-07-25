@@ -67,6 +67,14 @@ pub enum StorageError {
         location: snafu::Location,
     },
 
+    #[snafu(display("not primary: stream {stream_id}, epoch {epoch}"))]
+    NotPrimary {
+        stream_id: StreamId,
+        epoch: Epoch,
+        #[snafu(implicit)]
+        location: snafu::Location,
+    },
+
     // ── Database errors (wraps sqlx::Error) ──────────────────────────────
     #[snafu(display("database error: {message}"))]
     Database {
