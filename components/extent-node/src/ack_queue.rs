@@ -9,6 +9,7 @@
 //! update per-secondary offsets, and send AppendAck frames back to clients.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -59,6 +60,8 @@ pub struct PendingAck {
 pub struct AckQueue {
     /// Lock-free producer channel. Append leaders push PendingAcks here.
     tx: crossbeam_channel::Sender<PendingAck>,
+    /// Epoch for which this queue is active; u64::MAX means inactive.
+    active_epoch: AtomicU64,
     /// Consumer state, protected by Mutex. Only watermark readers touch this.
     inner: Mutex<AckQueueInner>,
 }
@@ -71,8 +74,9 @@ pub struct AckQueueInner {
     /// Populated by [`receive_pending`] which drains `rx`.
     pub(crate) pending: VecDeque<PendingAck>,
 
-    /// Highest acked offset per secondary, indexed by ordinal (role - 1).
-    /// `u64::MAX` = never reported.
+    /// Extent and highest offset acknowledged by each secondary.
+    acked_extent: [Option<ExtentId>; MAX_SECONDARIES],
+    /// `u64::MAX` = never reported for the corresponding extent.
     acked: [u64; MAX_SECONDARIES],
 
     /// Number of secondary ACKs needed for quorum.
@@ -91,9 +95,11 @@ impl AckQueue {
         let (tx, rx) = crossbeam_channel::unbounded();
         Self {
             tx,
+            active_epoch: AtomicU64::new(0),
             inner: Mutex::new(AckQueueInner {
                 rx,
                 pending: VecDeque::new(),
+                acked_extent: [None; MAX_SECONDARIES],
                 acked: [u64::MAX; MAX_SECONDARIES],
                 required_acks: required_secondary_acks,
                 replication_timeout,
@@ -106,7 +112,71 @@ impl AckQueue {
     /// Uses crossbeam's unbounded channel internally, so this never blocks
     /// and never contends with the watermark reader's Mutex.
     pub fn enqueue(&self, ack: PendingAck) {
+        if !self.is_active_at(ack.epoch) {
+            let frame = Frame::append_ack_error(
+                ack.request_id,
+                ack.stream_id,
+                ack.epoch,
+                ack.extent_id,
+                ErrorCode::NotPrimary,
+                "Primary assignment changed",
+            );
+            let _ = ack.response_tx.try_send(frame);
+            return;
+        }
         let _ = self.tx.send(ack);
+    }
+
+    pub fn is_active_at(&self, epoch: Epoch) -> bool {
+        self.active_epoch.load(Ordering::Acquire) == epoch.0 as u64
+    }
+
+    /// Activate this queue for a Primary assignment. A new epoch or quorum
+    /// topology invalidates all old pending acknowledgments and watermarks.
+    pub fn activate(&self, epoch: Epoch, required_acks: u32) {
+        if self.is_active_at(epoch) {
+            let inner = self.inner.lock().unwrap();
+            if inner.required_acks == required_acks {
+                return;
+            }
+            drop(inner);
+        }
+
+        self.active_epoch.store(u64::MAX, Ordering::Release);
+        let mut inner = self.inner.lock().unwrap();
+        inner.fail_all_pending("Primary assignment changed");
+        inner.acked_extent = [None; MAX_SECONDARIES];
+        inner.acked = [u64::MAX; MAX_SECONDARIES];
+        inner.required_acks = required_acks;
+        self.active_epoch.store(epoch.0 as u64, Ordering::Release);
+    }
+
+    /// Deactivate the queue when this node becomes a Secondary.
+    pub fn deactivate(&self) {
+        self.active_epoch.store(u64::MAX, Ordering::Release);
+        self.inner
+            .lock()
+            .unwrap()
+            .fail_all_pending("this extent node is not the stream primary");
+    }
+
+    pub fn apply_watermark(
+        &self,
+        epoch: Epoch,
+        extent_id: ExtentId,
+        secondary_index: u8,
+        offset: u64,
+    ) {
+        if !self.is_active_at(epoch) {
+            return;
+        }
+        let mut inner = self.inner.lock().unwrap();
+        if !self.is_active_at(epoch) {
+            return;
+        }
+        inner.receive_pending();
+        inner.ack_from_secondary(secondary_index, extent_id, offset);
+        inner.drain_quorum();
     }
 
     /// Lock the consumer-side state for watermark processing.
@@ -119,6 +189,21 @@ impl AckQueue {
 }
 
 impl AckQueueInner {
+    fn fail_all_pending(&mut self, message: &str) {
+        self.receive_pending();
+        while let Some(ack) = self.pending.pop_front() {
+            let frame = Frame::append_ack_error(
+                ack.request_id,
+                ack.stream_id,
+                ack.epoch,
+                ack.extent_id,
+                ErrorCode::NotPrimary,
+                message,
+            );
+            let _ = ack.response_tx.try_send(frame);
+        }
+    }
+
     /// Drain all available PendingAcks from the lock-free channel into
     /// the local `pending` VecDeque. Call this before `drain_quorum`.
     pub fn receive_pending(&mut self) {
@@ -132,6 +217,10 @@ impl AckQueueInner {
     ///
     /// Returns None if quorum cannot be met (not enough secondaries have reported).
     pub fn quorum_offset(&self) -> Option<u64> {
+        self.quorum_offset_for(ExtentId(0))
+    }
+
+    fn quorum_offset_for(&self, extent_id: ExtentId) -> Option<u64> {
         if self.required_acks == 0 {
             return None; // RF=1, no quorum needed
         }
@@ -140,9 +229,9 @@ impl AckQueueInner {
         // Collect offsets from secondaries that have reported (not u64::MAX).
         let mut offsets = [0u64; MAX_SECONDARIES];
         let mut count = 0;
-        for &v in &self.acked {
-            if v != u64::MAX {
-                offsets[count] = v;
+        for (index, &value) in self.acked.iter().enumerate() {
+            if self.acked_extent[index] == Some(extent_id) && value != u64::MAX {
+                offsets[count] = value;
                 count += 1;
             }
         }
@@ -166,7 +255,7 @@ impl AckQueueInner {
     /// `secondary_index` is the secondary's ordinal (role - 1): secondary-1 → 0,
     /// secondary-2 → 1, etc. Callers resolve this once per (stream, connection)
     /// pair and cache it locally.
-    pub fn ack_from_secondary(&mut self, secondary_index: u8, offset: u64) {
+    pub fn ack_from_secondary(&mut self, secondary_index: u8, extent_id: ExtentId, offset: u64) {
         let idx = secondary_index as usize;
         debug_assert!(
             idx < MAX_SECONDARIES,
@@ -175,6 +264,11 @@ impl AckQueueInner {
             MAX_SECONDARIES,
         );
         if idx >= MAX_SECONDARIES {
+            return;
+        }
+        if self.acked_extent[idx] != Some(extent_id) {
+            self.acked_extent[idx] = Some(extent_id);
+            self.acked[idx] = offset;
             return;
         }
         let current = self.acked[idx];
@@ -192,27 +286,26 @@ impl AckQueueInner {
     /// After the normal quorum drain, sweeps the front of the queue for expired
     /// entries (older than the configured replication timeout) and sends error responses.
     pub fn drain_quorum(&mut self) {
-        let qo = self.quorum_offset();
-        if let Some(qo) = qo {
-            while let Some(front) = self.pending.front() {
-                if front.assigned_offset <= qo {
-                    let ack = self.pending.pop_front().unwrap();
-                    let frame = Frame::new(
-                        VariableHeader::AppendAck {
-                            request_id: ack.request_id,
-                            stream_id: ack.stream_id,
-                            epoch: ack.epoch,
-                            extent_id: ack.extent_id,
-                            offset: Offset(ack.assigned_offset),
-                        },
-                        None,
-                    );
-                    // Best-effort send — if the client disconnected, the channel is closed.
-                    let _ = ack.response_tx.try_send(frame);
-                } else {
-                    break;
-                }
+        while let Some(front) = self.pending.front() {
+            let Some(quorum_offset) = self.quorum_offset_for(front.extent_id) else {
+                break;
+            };
+            if front.assigned_offset > quorum_offset {
+                break;
             }
+            let ack = self.pending.pop_front().unwrap();
+            let frame = Frame::new(
+                VariableHeader::AppendAck {
+                    request_id: ack.request_id,
+                    stream_id: ack.stream_id,
+                    epoch: ack.epoch,
+                    extent_id: ack.extent_id,
+                    offset: Offset(ack.assigned_offset),
+                },
+                None,
+            );
+            // Best-effort send — if the client disconnected, the channel is closed.
+            let _ = ack.response_tx.try_send(frame);
         }
 
         // Timeout sweep: expire PendingAcks older than the configured replication timeout.

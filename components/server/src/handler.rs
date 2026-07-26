@@ -10,6 +10,12 @@ use common::types::Opcode;
 use rpc::codec::FrameCodec;
 use rpc::frame::Frame;
 
+fn same_append_batch(first: &Frame, next: &Frame) -> bool {
+    next.opcode() == Opcode::Append
+        && next.stream_id() == first.stream_id()
+        && next.epoch() == first.epoch()
+}
+
 /// Trait implemented by ExtentNode and StreamManager to handle incoming frames.
 ///
 /// Returns `Some(Frame)` for immediate responses, or `None` when the response
@@ -296,18 +302,15 @@ async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, ha
             };
 
             if frame.opcode() == Opcode::Append {
-                let target_stream = frame.stream_id();
-                let target_extent = frame.extent_id();
+                let batch_head = frame.clone();
                 let mut batch = vec![frame];
 
-                // Greedily extend: peek next frame, only take if same-extent Append.
+                // Greedily extend: only same-stream, same-client-epoch appends
+                // may share one optimized authorization decision.
                 while let Some(result) = framed_read.next().now_or_never() {
                     match result {
                         Some(Ok(next)) => {
-                            if next.opcode() == Opcode::Append
-                                && next.stream_id() == target_stream
-                                && next.extent_id() == target_extent
-                            {
+                            if same_append_batch(&batch_head, &next) {
                                 batch.push(next);
                             } else {
                                 // Save for next iteration — don't process inline.
@@ -354,4 +357,33 @@ async fn serve_connection_with_deferred<H: RequestHandler>(stream: TcpStream, ha
     }
     .instrument(span)
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::types::{Epoch, StreamId};
+    use rpc::frame::VariableHeader;
+
+    #[test]
+    fn append_batch_key_includes_epoch() {
+        let first = Frame::new(
+            VariableHeader::Append {
+                request_id: 1,
+                stream_id: StreamId(7),
+                epoch: Epoch(3),
+            },
+            None,
+        );
+        let next = Frame::new(
+            VariableHeader::Append {
+                request_id: 2,
+                stream_id: StreamId(7),
+                epoch: Epoch(4),
+            },
+            None,
+        );
+
+        assert!(!same_append_batch(&first, &next));
+    }
 }

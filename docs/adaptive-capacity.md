@@ -18,7 +18,7 @@ Start each stream at a small arena (configurable `min_extent_capacity`, default 
 
 ## Semantic Clarification
 
-**`extent_capacity`** always and only means: the associated extent's capacity (the arena size for that specific extent). It appears in `ForwardInitExtent` and `Extent::capacity()`. It does **not** appear in `RegisterExtent` (which only carries stream-level bounds: `min_extent_capacity`, `max_extent_capacity`, `extent_growth_factor`). Stream-level bounds use distinct names: `min_extent_capacity` and `max_extent_capacity`.
+**`extent_capacity`** always and only means: the associated extent's capacity (the arena size for that specific extent). It appears in `ForwardInitExtent` (which creates secondaries with the Primary's actual extent capacity and carries the authoritative `start_offset`) and `Extent::capacity()`. It does **not** appear in `RegisterExtent`, which is sent only to the Primary and carries stream-level bounds: `min_extent_capacity`, `max_extent_capacity`, `extent_growth_factor`. Stream-level bounds use distinct names: `min_extent_capacity` and `max_extent_capacity`.
 
 ## Capacity Scaling Model
 
@@ -108,12 +108,13 @@ try_append_active():
 - `min_extent_capacity: u32` (0 = default 8 MiB)
 - `max_extent_capacity: u32` (0 = default 256 MiB)
 
-**RegisterExtent** (0x15): Carries stream-level capacity bounds only (no per-extent `extent_capacity`):
+**RegisterExtent** (0x15): Sent **only to the Primary** Extent Node. Carries stream-level capacity bounds and the SM-assigned authoritative `start_offset` (no per-extent `extent_capacity`):
 - `min_extent_capacity: u32` -- stream's floor
 - `max_extent_capacity: u32` -- stream's ceiling
 - `extent_growth_factor: u8` -- adaptive growth multiplier
+- `start_offset: u64` -- SM-authoritative extent start offset
 
-SM sets the initial extent capacity to `min_extent_capacity` for new and post-epoch-bump extents.
+Secondaries are created by the Primary via `ForwardInitExtent`, which carries the per-extent `extent_capacity` and the same authoritative `start_offset`. SM sets the initial extent capacity to `min_extent_capacity` for new and post-epoch-bump extents.
 
 **ForwardInitExtent** (0x05 flag=0x01): Carries the primary's actual `extent_capacity` plus the full adaptive config:
 - `extent_capacity: u32` -- this extent's actual arena size
@@ -127,7 +128,7 @@ SM sets the initial extent capacity to `min_extent_capacity` for new and post-ep
 **File**: `components/stream-manager/src/store.rs`
 
 - `handle_create_stream`: parse min/max, store both. Initial `extent_capacity = min_extent_capacity`.
-- `seal_allocate_register`: fetch min/max from DB, use `extent_capacity = min_extent_capacity` for new extents. Pass all three to `register_primary` / `notify_secondaries`.
+- `seal_allocate_register`: fetch min/max from DB, use `extent_capacity = min_extent_capacity` for new extents. Pass the three bounds + authoritative `start_offset` to `register_primary` (secondaries created by the Primary via `ForwardInitExtent`).
 - `handle_extent_update`: record `new_extent_capacity` for observability.
 
 ### 5. Stream struct: adaptive capacity state

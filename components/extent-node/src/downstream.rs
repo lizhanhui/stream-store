@@ -29,9 +29,8 @@ use tokio::sync::{broadcast, mpsc};
 use tokio_util::codec::FramedWrite;
 use tracing::{error, info, warn};
 
-use common::types::Opcode;
 use rpc::codec::FrameCodec;
-use rpc::frame::Frame;
+use rpc::frame::{Frame, VariableHeader};
 
 use crate::store::ExtentNodeStore;
 
@@ -276,9 +275,10 @@ async fn downstream_reader_inline(
 ) {
     let mut framed_read = FramedRead::new(read_half, FrameCodec);
 
-    // Cache: stream_id → secondary index (role - 1). Resolved once per stream
-    // per TCP session; immutable within an epoch.
-    let mut index_cache: HashMap<common::types::StreamId, u8> = HashMap::new();
+    // Cache: stream_id → (epoch, secondary index). Replica ordering is only
+    // immutable within an epoch.
+    let mut index_cache: HashMap<common::types::StreamId, (common::types::Epoch, u8)> =
+        HashMap::new();
 
     loop {
         let result = tokio::select! {
@@ -291,16 +291,28 @@ async fn downstream_reader_inline(
 
         match result {
             Some(Ok(frame)) => {
-                if frame.opcode() == Opcode::Watermark {
-                    let stream_id = frame.stream_id();
-                    let acked_offset = frame.offset().0;
+                if let VariableHeader::Watermark {
+                    stream_id,
+                    extent_id,
+                    epoch,
+                    offset,
+                } = &frame.variable_header
+                {
+                    let (stream_id, extent_id, epoch, acked_offset) =
+                        (*stream_id, *extent_id, *epoch, offset.0);
+                    let _transition = store.role_transition.read().unwrap();
+                    if store.primary_replica_at(stream_id, epoch).is_none() {
+                        warn!(
+                            "ignoring stale watermark from {addr}: stream={stream_id}, epoch={epoch}",
+                        );
+                        continue;
+                    }
 
-                    // Resolve secondary index (cached after first lookup).
                     let secondary_index = match index_cache.get(&stream_id) {
-                        Some(&idx) => idx,
-                        None => match store.secondary_index(stream_id, &addr) {
+                        Some(&(cached_epoch, idx)) if cached_epoch == epoch => idx,
+                        _ => match store.secondary_index(stream_id, &addr) {
                             Some(idx) => {
-                                index_cache.insert(stream_id, idx);
+                                index_cache.insert(stream_id, (epoch, idx));
                                 idx
                             }
                             None => {
@@ -312,14 +324,10 @@ async fn downstream_reader_inline(
                         },
                     };
 
-                    // Inline watermark processing — no channel hop, no string allocation.
                     let streams_guard = store.streams.pin();
                     if let Some(stream) = streams_guard.get(&stream_id) {
                         if let Some(aq) = stream.ack_queue() {
-                            let mut inner = aq.lock_inner();
-                            inner.receive_pending();
-                            inner.ack_from_secondary(secondary_index, acked_offset);
-                            inner.drain_quorum();
+                            aq.apply_watermark(epoch, extent_id, secondary_index, acked_offset);
                         } else {
                             warn!(
                                 "received watermark for stream {:?} but no ack_queue exists",

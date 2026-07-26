@@ -159,6 +159,9 @@ impl ExtentNode {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {
+                        // Replication timeout must progress even when a lost init/gap
+                        // produces neither Watermarks nor a socket disconnect.
+                        tick_store.expire_pending_acks();
                         // Snapshot (StreamId, Epoch) pairs — lightweight read-only scan.
                         let streams = tick_store.stream_epochs();
                         for (stream_id, epoch) in streams {

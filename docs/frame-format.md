@@ -158,7 +158,7 @@ Payload:
 
 Dedicated opcode for Primary→Secondary broadcast replication. Uses flags to distinguish three variants:
 
-**flag=0x00 Forward** — Per-record replication. Carries the primary-assigned `byte_pos` so the secondary writes each record at the exact same arena position, enabling bit-for-bit identical replicas. Fire-and-forget: no `request_id`; secondary responds with cumulative `Watermark`.
+**flag=0x00 Forward** — Per-record replication. Carries the primary-assigned `byte_pos` so the secondary writes each record at the exact same arena position, enabling bit-for-bit identical replicas. A receiver accepts it only with an explicit Secondary assignment for the same epoch and an existing target extent at that epoch. Any role/epoch/extent mismatch is rejected without mutation or `Watermark`. Fire-and-forget: no `request_id`; secondary responds with cumulative `Watermark`.
 
 ```
 Fixed Header (8B)    -- flags=0x00
@@ -173,7 +173,7 @@ Payload:
   [payload      : bytes]  -- message body
 ```
 
-**flag=0x01 ForwardInitExtent** — Sent once by the Primary before the first Forward frame for a new extent. Carries extent metadata so the secondary can create the extent with the correct capacity and adaptive sizing config. No payload, no response.
+**flag=0x01 ForwardInitExtent** — Sent once by the Primary before the first Forward frame for a new extent, on the same FIFO channel. It installs/advances the receiver's explicit Secondary role for the epoch and creates the extent with the authoritative start offset, capacity, and adaptive sizing config. Delivery is best-effort and is not replayed: if this frame is lost, or any Forward is rejected as a gap, that Secondary is quarantined for the rest of the epoch and withholds Watermarks. A same-epoch successor init cannot make it rejoin; only a newer epoch clears quarantine. With RF=3, the stream may continue temporarily on the remaining quorum. No payload, no response.
 
 ```
 Fixed Header (8B)    -- flags=0x01
@@ -523,7 +523,7 @@ No Payload.
 
 ##### 0x15 REGISTER_EXTENT (Stream Manager <-> Extent Node)
 
-Register an extent's replica membership on an Extent Node. Primary receives all secondary addresses for broadcast forwarding; Secondaries receive an empty address list. SM waits for the **Primary's** `RegisterExtent` ack (flag=0x01) before responding to the seal requester. `RegisterExtent` to Secondaries is fire-and-forget -- secondaries create extents lazily on first forwarded append (see "Lazy Secondary Extent Creation" in Seal-and-New).
+Register an extent's replica membership on the **Primary** Extent Node. The Primary receives the full secondary address list for broadcast forwarding. SM waits for the **Primary's** `RegisterExtent` ack (flag=0x01) before responding to the seal requester. Secondaries are NOT registered via this opcode — the Primary creates them in-band via `ForwardInitExtent` before the first `Forward` (see "Lazy Secondary Extent Creation" in Seal-and-New), propagating the same authoritative `start_offset`.
 
 **Request (flag=0x00): SM -> EN**
 
@@ -579,7 +579,7 @@ Payload:
 
 ##### 0x17 WATERMARK (Secondary -> Primary)
 
-Cumulative ACK from Secondary to Primary. Primary uses watermark ACKs from all secondaries to compute quorum offset and ACK clients.
+Extent-qualified cumulative ACK from Secondary to Primary. The Primary computes quorum independently for each `extent_id`; a watermark for a successor extent cannot acknowledge pending records from its predecessor.
 
 ```
 Fixed Header (8B)

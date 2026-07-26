@@ -1,3 +1,4 @@
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use common::config::{
@@ -8,7 +9,7 @@ use common::types::{Epoch, ExtentId, ExtentPolicy, Offset, StreamId};
 use rpc::frame::{Frame, VariableHeader};
 use tracing::{info, warn};
 
-use super::ExtentNodeStore;
+use super::{ExtentNodeStore, ReplicaInfo};
 use crate::extent::AppendResult;
 use crate::stream::Stream;
 
@@ -62,6 +63,17 @@ impl ExtentNodeStore {
                 None,
             ))
         })?
+    }
+
+    /// Send the one-shot init before the first replication event for an extent.
+    /// Both frames use the same per-secondary FIFO channels. Delivery remains
+    /// best-effort; a lost frame fails closed because the Secondary withholds
+    /// its Watermark.
+    pub(crate) fn send_forward_with_init(&self, stream: &Stream, event: Frame) {
+        if let Some(init) = self.maybe_build_init_forward(stream, &event) {
+            stream.send_forward(init);
+        }
+        stream.send_forward(event);
     }
 
     /// Handle ForwardInitExtent (0x0B, flag=0x01) — init-extent notification.
@@ -125,6 +137,89 @@ impl ExtentNodeStore {
             extent_growth_factor
         };
 
+        let _transition = self.role_transition.write().unwrap();
+        if self.forwarding_quarantined(stream_id, epoch) {
+            warn!(
+                "ignoring ForwardInitExtent for quarantined epoch: stream={}, extent={}, epoch={}",
+                stream_id, extent_id, epoch,
+            );
+            return;
+        }
+        self.clear_older_forward_quarantine(stream_id, epoch);
+        let existing = self.replicas.pin().get(&stream_id).map(Arc::clone);
+
+        // A stale init must never demote a newer assignment. A current Primary
+        // also ignores same-epoch init from a peer; the SM registration wins.
+        if existing.as_ref().is_some_and(|replica| {
+            replica.epoch.0 > epoch.0 || (replica.is_primary() && replica.epoch == epoch)
+        }) {
+            warn!(
+                "ignoring stale/conflicting ForwardInitExtent: stream={}, extent={}, epoch={}",
+                stream_id, extent_id, epoch,
+            );
+            return;
+        }
+        if existing.as_ref().is_some_and(|replica| {
+            !replica.is_primary() && replica.epoch == epoch && replica.extent_id == extent_id
+        }) {
+            // Exact duplicate delivery is idempotent. The first init remains
+            // authoritative for immutable extent metadata and stream policy.
+            return;
+        }
+        if existing
+            .as_ref()
+            .is_some_and(|replica| replica.epoch == epoch && replica.extent_id.0 > extent_id.0)
+        {
+            return;
+        }
+
+        if let Some(replica) = existing
+            .as_ref()
+            .filter(|replica| !replica.is_primary() && replica.epoch == epoch)
+        {
+            let contiguous = self
+                .streams
+                .pin()
+                .get(&stream_id)
+                .is_some_and(|stream| stream.max_offset() == start_offset);
+            if extent_id.0 != replica.extent_id.0.saturating_add(1) || !contiguous {
+                warn!(
+                    "ForwardInitExtent successor mismatch; quarantining stream={}, extent={}, epoch={}",
+                    stream_id, extent_id, epoch,
+                );
+                self.quarantine_forwarding(stream_id, epoch);
+                return;
+            }
+        }
+
+        if self
+            .streams
+            .pin()
+            .get(&stream_id)
+            .and_then(|stream| stream.with_extent(extent_id, |extent| extent.epoch != epoch))
+            .unwrap_or(false)
+        {
+            self.quarantine_forwarding(stream_id, epoch);
+            return;
+        }
+
+        // Publish Secondary authority before changing stream state. Appends that
+        // race with this transition fail closed as NotPrimary.
+        let replication_factor = existing
+            .as_ref()
+            .map_or(0, |replica| replica.replication_factor);
+        self.replicas.pin().insert(
+            stream_id,
+            Arc::new(ReplicaInfo {
+                stream_id,
+                extent_id,
+                epoch,
+                role: 1,
+                replication_factor,
+                replica_addrs: Vec::new(),
+            }),
+        );
+
         let is_new = self.try_create_stream(
             stream_id,
             storage_class,
@@ -136,6 +231,11 @@ impl ExtentNodeStore {
             },
         );
         self.try_register_extent(stream_id, extent_id, start_offset, epoch, extent_capacity);
+        if let Some(stream) = self.streams.pin().get(&stream_id) {
+            stream.set_epoch(epoch);
+            stream.set_downstream_txs(Vec::new());
+            stream.deactivate_ack_queue();
+        }
 
         if is_new {
             info!(
@@ -163,6 +263,9 @@ impl ExtentNodeStore {
     }
 
     /// Register an extent on a stream if it doesn't already exist.
+    ///
+    /// Uses an atomic check-and-insert so concurrent `ForwardInitExtent` and
+    /// `Forward` deliveries cannot create duplicate extents.
     fn try_register_extent(
         &self,
         stream_id: StreamId,
@@ -173,9 +276,14 @@ impl ExtentNodeStore {
     ) {
         let guard = self.streams.pin();
         if let Some(stream) = guard.get(&stream_id)
-            && stream.with_extent(extent_id, |_| ()).is_none()
+            && let Some(existing) =
+                stream.register_extent_if_absent(extent_id, start_offset, epoch, extent_capacity)
+            && existing != start_offset
         {
-            stream.register_extent(extent_id, start_offset, epoch, extent_capacity);
+            warn!(
+                "ForwardInitExtent start_offset mismatch: stream={}, extent={}, existing={}, from_primary={} — keeping existing",
+                stream_id, extent_id, existing.0, start_offset.0,
+            );
         }
     }
 
@@ -199,8 +307,27 @@ impl ExtentNodeStore {
             } => (*stream_id, *extent_id, *epoch, *offset, *byte_pos),
             _ => return None,
         };
+        let _transition = self.role_transition.read().unwrap();
 
-        // Look up the stream — must exist (created by ForwardInitExtent or RegisterExtent).
+        if self.forwarding_quarantined(stream_id, epoch) {
+            return None;
+        }
+
+        // Forward is accepted only by an explicit Secondary assignment for the
+        // same epoch. Missing/lost ForwardInitExtent therefore fails closed.
+        let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
+        if !replica
+            .as_ref()
+            .is_some_and(|replica| !replica.is_primary() && replica.epoch == epoch)
+        {
+            warn!(
+                "Forward rejected for role/epoch mismatch: stream={}, extent={}, epoch={}",
+                stream_id, extent_id, epoch,
+            );
+            self.quarantine_forwarding(stream_id, epoch);
+            return None;
+        }
+
         let streams = self.streams.pin();
         let stream = match streams.get(&stream_id) {
             Some(s) => s,
@@ -209,9 +336,23 @@ impl ExtentNodeStore {
                     "Forward for unknown stream {}, extent {} — missing ForwardInitExtent?",
                     stream_id, extent_id,
                 );
+                self.quarantine_forwarding(stream_id, epoch);
                 return None;
             }
         };
+
+        if stream.epoch() != epoch
+            || !stream
+                .with_extent(extent_id, |extent| extent.epoch == epoch)
+                .unwrap_or(false)
+        {
+            warn!(
+                "Forward rejected for unknown/stale extent: stream={}, extent={}, epoch={}",
+                stream_id, extent_id, epoch,
+            );
+            self.quarantine_forwarding(stream_id, epoch);
+            return None;
+        }
 
         let replicate_result = stream.replicate(
             extent_id,
@@ -247,6 +388,7 @@ impl ExtentNodeStore {
                     "Forward replicate failed for stream={}, extent={}: {}",
                     stream_id, extent_id, e,
                 );
+                self.quarantine_forwarding(stream_id, epoch);
                 return None;
             }
         };
@@ -292,17 +434,34 @@ impl ExtentNodeStore {
 
     /// Handle ForwardChecksum (0x0B, flag=0x02) — CRC32 verification for sealed extent.
     pub(crate) fn handle_forward_checksum(&self, frame: Frame) {
-        let (stream_id, extent_id, primary_crc32, primary_committed_bytes) =
+        let (stream_id, extent_id, epoch, primary_crc32, primary_committed_bytes) =
             match &frame.variable_header {
                 VariableHeader::ForwardChecksum {
                     stream_id,
                     extent_id,
+                    epoch,
                     checksum,
                     committed_bytes,
-                    ..
-                } => (*stream_id, *extent_id, *checksum, *committed_bytes),
+                } => (*stream_id, *extent_id, *epoch, *checksum, *committed_bytes),
                 _ => return,
             };
+        let _transition = self.role_transition.read().unwrap();
+        if self.forwarding_quarantined(stream_id, epoch) {
+            return;
+        }
+
+        let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
+        if !replica
+            .as_ref()
+            .is_some_and(|replica| !replica.is_primary() && replica.epoch == epoch)
+        {
+            warn!(
+                "ForwardChecksum rejected for role/epoch mismatch: stream={}, extent={}, epoch={}",
+                stream_id, extent_id, epoch,
+            );
+            self.quarantine_forwarding(stream_id, epoch);
+            return;
+        }
 
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
@@ -312,10 +471,22 @@ impl ExtentNodeStore {
                     "ForwardChecksum for unknown stream {}, extent {}",
                     stream_id, extent_id,
                 );
+                self.quarantine_forwarding(stream_id, epoch);
                 return;
             }
         };
 
+        if stream.epoch() != epoch {
+            self.quarantine_forwarding(stream_id, epoch);
+            return;
+        }
+        if !stream
+            .with_extent(extent_id, |extent| extent.epoch == epoch)
+            .unwrap_or(false)
+        {
+            self.quarantine_forwarding(stream_id, epoch);
+            return;
+        }
         let found = stream.with_extent(extent_id, |extent| {
             extent.store_primary_checksum(primary_crc32);
             extent.try_advance_committed();

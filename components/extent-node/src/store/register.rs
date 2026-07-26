@@ -31,6 +31,15 @@ impl ExtentNodeStore {
             }
         };
 
+        if role != ROLE_PRIMARY {
+            return Frame::error_from_request(
+                &frame,
+                ErrorCode::NotPrimary,
+                "RegisterExtent is Primary-only; secondaries use ForwardInitExtent",
+                extent_id,
+            );
+        }
+
         let stream_id = config.stream_id;
         let epoch = config.epoch;
         let replication_factor = config.replication_factor;
@@ -65,32 +74,51 @@ impl ExtentNodeStore {
                 }
             };
 
-        // Create the stream locally if it doesn't exist, then register the new extent.
-        // Skip extent creation if it already exists (idempotent — extent may have been
-        // lazily created by a forwarded append that arrived before this RegisterExtent).
+        // Serialize role transitions with ForwardInitExtent. This is a cold path
+        // and must atomically publish the role/epoch together with extent state.
+        let _transition = self.role_transition.write().unwrap();
+        if self
+            .replicas
+            .pin()
+            .get(&stream_id)
+            .is_some_and(|existing| existing.epoch.0 > epoch.0)
+        {
+            return Frame::error_from_request(
+                &frame,
+                ErrorCode::EpochStale,
+                "stale RegisterExtent epoch",
+                extent_id,
+            );
+        }
+
         self.try_create_stream(stream_id, config.storage_class, &policy);
 
-        // Register the extent (idempotent — skips if already exists).
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
-            match stream.with_extent(extent_id, |ext| ext.start_offset) {
-                None => {
-                    // Create with the SM-assigned authoritative start offset —
-                    // never inferred from local state, which may be absent
-                    // (fresh node) or stale (lagging node).
-                    stream.register_extent(extent_id, start_offset, epoch, policy.min_capacity);
+            if stream
+                .with_extent(extent_id, |extent| extent.epoch != epoch)
+                .unwrap_or(false)
+            {
+                return Frame::error_from_request(
+                    &frame,
+                    ErrorCode::EpochStale,
+                    "extent id already belongs to another epoch",
+                    extent_id,
+                );
+            }
+            if let Some(existing) = stream.register_extent_if_absent(
+                extent_id,
+                start_offset,
+                epoch,
+                policy.min_capacity,
+            ) {
+                if existing != start_offset {
+                    warn!(
+                        "RegisterExtent start_offset mismatch: stream={}, extent={}, existing={}, from_sm={} — keeping existing",
+                        stream_id, extent_id, existing.0, start_offset.0,
+                    );
                 }
-                Some(existing) => {
-                    // Extent already exists (lazy creation from Forward), but update epoch
-                    // from authoritative source (RegisterExtent carries the real epoch).
-                    if existing != start_offset {
-                        warn!(
-                            "RegisterExtent start_offset mismatch: stream={}, extent={}, existing={}, from_sm={} — keeping existing",
-                            stream_id, extent_id, existing.0, start_offset.0,
-                        );
-                    }
-                    stream.set_epoch(epoch);
-                }
+                stream.set_epoch(epoch);
             }
         }
 
@@ -112,6 +140,7 @@ impl ExtentNodeStore {
         let ri = ReplicaInfo {
             stream_id,
             extent_id,
+            epoch,
             role,
             replication_factor,
             replica_addrs,
@@ -120,23 +149,30 @@ impl ExtentNodeStore {
         // If this node is Primary, initialize an AckQueue on the stream.
         if ri.is_primary() {
             if let Some(stream) = streams_guard.get(&stream_id) {
-                stream.init_ack_queue(ri.required_secondary_acks(), self.replication_timeout);
+                stream.init_ack_queue(
+                    epoch,
+                    ri.required_secondary_acks(),
+                    self.replication_timeout,
+                );
             }
 
-            // Cache per-secondary Sender handles in the Stream so the
-            // hot append path can push Forward frames with zero lookup overhead.
-            if !ri.replica_addrs.is_empty()
-                && let Some(pool) = self.downstream.get()
-            {
-                let txs: Vec<_> = ri
-                    .replica_addrs
-                    .iter()
-                    .map(|addr| pool.get_or_create_sender(addr))
-                    .collect();
-                if let Some(stream) = streams_guard.get(&stream_id) {
-                    stream.set_downstream_txs(txs);
-                }
+            // Replace the cached topology even when RF=1 so sender handles from
+            // an older Primary assignment cannot survive re-registration.
+            let txs = self
+                .downstream
+                .get()
+                .map(|pool| {
+                    ri.replica_addrs
+                        .iter()
+                        .map(|addr| pool.get_or_create_sender(addr))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Some(stream) = streams_guard.get(&stream_id) {
+                stream.set_downstream_txs(txs);
             }
+        } else if let Some(stream) = streams_guard.get(&stream_id) {
+            stream.set_downstream_txs(Vec::new());
         }
 
         self.replicas.pin().insert(stream_id, Arc::new(ri));
