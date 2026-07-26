@@ -3,7 +3,8 @@ use bytes::{BufMut, BytesMut};
 use common::errors::StorageError;
 use common::types::{
     Epoch, ErrorCode, ExtentId, ExtentPolicy, FLAG_DESCRIBE_STREAM_BY_NAME, FLAG_RESPONSE,
-    FLAG_SEAL_COMMIT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass, StreamId,
+    FLAG_SEAL_COMMIT, HEADER_LEN, MAGIC, Offset, Opcode, PROTOCOL_VERSION, StorageClass,
+    StreamConfig, StreamId,
 };
 
 fn sample_append_frame() -> Frame {
@@ -692,5 +693,60 @@ fn update_extent_flushed_round_trip() {
         _ => panic!("expected UpdateExtentFlushed"),
     }
     assert!(decoded.payload.is_none());
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn register_extent_round_trip() {
+    let payload = crate::payload::build_register_extent_payload(&["127.0.0.1:9802"]);
+    let payload_len = payload.len();
+    let frame = Frame::new(
+        VariableHeader::RegisterExtent {
+            request_id: 9,
+            extent_id: ExtentId(7),
+            role: 0,
+            start_offset: Offset(1_000),
+            config: StreamConfig {
+                stream_id: StreamId(42),
+                replication_factor: 2,
+                epoch: Epoch(3),
+                storage_class: StorageClass::S3,
+                policy: ExtentPolicy {
+                    cache: 4,
+                    min_capacity: 8 * 1024 * 1024,
+                    max_capacity: 256 * 1024 * 1024,
+                    scale_factor: 2,
+                },
+            },
+        },
+        Some(payload),
+    );
+
+    let mut buf = BytesMut::new();
+    frame.encode(&mut buf);
+
+    // 8 (fixed) + 38 (variable header incl. start_offset) + 4 (payload len) + payload
+    assert_eq!(buf.len(), 8 + 38 + 4 + payload_len);
+
+    let decoded = Frame::decode(&mut buf).unwrap().unwrap();
+    assert_eq!(decoded.opcode(), Opcode::RegisterExtent);
+    match &decoded.variable_header {
+        VariableHeader::RegisterExtent {
+            request_id,
+            extent_id,
+            role,
+            start_offset,
+            config,
+        } => {
+            assert_eq!(*request_id, 9);
+            assert_eq!(*extent_id, ExtentId(7));
+            assert_eq!(*role, 0);
+            assert_eq!(*start_offset, Offset(1_000));
+            assert_eq!(config.stream_id, StreamId(42));
+            assert_eq!(config.replication_factor, 2);
+            assert_eq!(config.epoch, Epoch(3));
+        }
+        _ => panic!("expected RegisterExtent"),
+    }
     assert!(buf.is_empty());
 }

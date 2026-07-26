@@ -536,6 +536,8 @@ Variable Header:
   [role                    : u8]     -- 0 = Primary, 1+ = Secondary
   [replication_factor      : u8]
   [epoch                   : u32]    -- stream epoch for this extent registration
+  [start_offset            : u64]    -- SM-assigned authoritative start offset of the extent;
+                                      Extent Nodes must use this value, never local state
   [cache_extents           : u16]    -- max extents to retain in memory per stream
   [min_extent_capacity     : u32]    -- floor for adaptive shrink (0 = default 8 MiB)
   [max_extent_capacity     : u32]    -- ceiling for adaptive growth (0 = default 256 MiB)

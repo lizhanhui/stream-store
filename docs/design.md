@@ -678,7 +678,7 @@ read(stream, offset=1050, count=10)
 - Quorum-based ACK: Primary waits for RF/2 secondary cumulative watermark ACKs before ACKing clients
 - Deferred ACK mechanism: WatermarkHandler sends responses through per-connection channel when quorum advances
 - Stream Manager-driven seal: 2-phase Prepare/Commit protocol — SM queries each Extent Node for committed offset (Prepare), computes quorum, broadcasts authoritative offset (Commit)
-- Stream Manager sends RegisterExtent to each Extent Node after extent allocation (Primary gets secondary addrs, Secondaries get empty addrs)
+- Stream Manager sends RegisterExtent to each Extent Node after extent allocation (Primary gets secondary addrs, Secondaries get empty addrs); RegisterExtent carries the SM-assigned authoritative `start_offset` so Extent Nodes never infer it from local state
 - Stream Manager: extent allocation across nodes, seal orchestration
 - Failure detection (heartbeat) and seal-and-new recovery
 - MySQL metadata store (sqlx) for extent/stream/replica/node tables

@@ -535,6 +535,7 @@ impl Frame {
                     let role = body.get_u8();
                     let replication_factor = body.get_u8();
                     let epoch = Epoch(body.get_u32());
+                    let start_offset = Offset(body.get_u64());
                     let cache = body.get_u16();
                     let min_capacity = body.get_u32();
                     let max_capacity = body.get_u32();
@@ -551,6 +552,7 @@ impl Frame {
                             request_id,
                             extent_id,
                             role,
+                            start_offset,
                             config: StreamConfig {
                                 stream_id,
                                 replication_factor,

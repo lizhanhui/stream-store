@@ -15,7 +15,7 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use common::types::{Epoch, ExtentId, ExtentPolicy, StorageClass, StreamConfig, StreamId};
+use common::types::{Epoch, ExtentId, ExtentPolicy, Offset, StorageClass, StreamConfig, StreamId};
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use extent_node::store::ExtentNodeStore;
 use rpc::frame::{Frame, VariableHeader};
@@ -40,6 +40,7 @@ async fn register_bench_stream(store: &ExtentNodeStore, stream_id: u32, extent_i
                     request_id: 0,
                     extent_id: ExtentId(extent_id),
                     role: 0,
+                    start_offset: Offset(0),
                     config: StreamConfig {
                         stream_id: StreamId(stream_id),
                         replication_factor: 1,

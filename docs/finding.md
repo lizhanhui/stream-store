@@ -16,13 +16,15 @@ The downstream channel and TCP session can lose Forward frames. Previously, the 
 
 **Resolution:** `Extent::replicate` now serializes Secondary writers and requires both the received offset and byte position to equal the extent's next contiguous frontiers before writing any data. Gaps return `StorageError::ReplicationGap`; layout divergence returns `StorageError::ReplicationPositionMismatch`. Either error leaves the arena, index, CRC, counters, and committed frontiers unchanged, so `finish_forward` withholds the Watermark. Tests cover logical gaps, byte-position gaps, concurrent duplicate Forwards, unchanged state and CRC, post-seal late contiguous replication, and the absence of a Watermark after a skipped Forward. Reliable replay remains a separate availability enhancement; the current fix restores quorum safety by stalling the affected Secondary.
 
-### 3. `RegisterExtent` cannot establish an authoritative start offset
+### 3. `RegisterExtent` cannot establish an authoritative start offset — Resolved
 
 The `RegisterExtent` protocol does not include `start_offset` (`design.md:710-735`). When an Extent Node creates an extent from this request, it guesses the start offset using its local `stream.max_offset()` (`components/extent-node/src/store/register.rs:101-109`). A newly assigned node can have no preceding extent and choose zero; a lagging node can choose a stale value.
 
 `ForwardInitExtent` carries the correct start offset, but only creates the extent if it does not already exist (`components/extent-node/src/store/forward.rs:163-177`). If the fire-and-forget `RegisterExtent` hint arrives first, `ForwardInitExtent` cannot repair the incorrect value.
 
 This can restart or overlap logical offsets after an epoch change.
+
+**Resolution:** `RegisterExtent` now carries the SM-assigned authoritative `start_offset` (u64) in its variable header, encoded after `epoch`. The Stream Manager populates it from the values it persists: the allocation `start_offset` for initial extents and the sealed extent's `end_offset` for seal-and-new successors (`components/stream-manager/src/store.rs`). `handle_register_extent` creates the extent at the wire value instead of `stream.max_offset()`; when the extent already exists (lazy creation via `ForwardInitExtent`), registration remains idempotent and logs a warning on start-offset mismatch without clobbering the established value. Regression tests cover fresh-node and stale-local-state registration, and verify that registration after lazy init preserves the primary-provided offset.
 
 ### 4. Primary seal reports the local append frontier rather than the quorum frontier
 

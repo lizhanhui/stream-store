@@ -352,10 +352,13 @@ impl StreamManagerStore {
     /// `primary_addr`: the Primary's listen address.
     /// `secondary_addrs`: addresses of all Secondaries (passed to Primary so it
     /// can broadcast Forward frames).
+    /// `start_offset`: SM-assigned authoritative start offset of the extent,
+    /// carried on the wire so the ExtentNode does not infer it from local state.
     async fn register_primary(
         &self,
         config: StreamConfig,
         extent_id: ExtentId,
+        start_offset: u64,
         primary_addr: &str,
         secondary_addrs: &[&str],
     ) -> Result<(), StorageError> {
@@ -379,6 +382,7 @@ impl StreamManagerStore {
                         request_id: 0,
                         extent_id: eid,
                         role: 0, // Primary
+                        start_offset: Offset(start_offset),
                         config,
                     },
                     Some(payload),
@@ -432,6 +436,7 @@ impl StreamManagerStore {
         &self,
         config: StreamConfig,
         extent_id: ExtentId,
+        start_offset: u64,
         secondary_addrs: &[String],
     ) {
         for (i, addr) in secondary_addrs.iter().enumerate() {
@@ -450,6 +455,7 @@ impl StreamManagerStore {
                                     request_id: 0,
                                     extent_id: eid,
                                     role,
+                                    start_offset: Offset(start_offset),
                                     config,
                                 },
                                 Some(payload),
@@ -535,12 +541,12 @@ impl StreamManagerStore {
             ..config
         };
 
-        self.register_primary(effective_config, extent_id, primary_addr, &secondary_addrs)
+        self.register_primary(effective_config, extent_id, start_offset, primary_addr, &secondary_addrs)
             .await
             .unwrap_or_else(|e| {
                 warn!("register_primary failed for initial extent {}: {e}; client will discover on first append", extent_id);
             });
-        self.notify_secondaries(effective_config, extent_id, &node_addrs[1..]);
+        self.notify_secondaries(effective_config, extent_id, start_offset, &node_addrs[1..]);
 
         Ok((extent_id, node_addrs[0].clone()))
     }
@@ -1249,8 +1255,10 @@ impl StreamManagerStore {
 
                 // Register new extent: best-effort. If Primary is dead/slow,
                 // client will discover on first append and trigger another seal-and-new.
+                // The new extent's start_offset is the sealed extent's end_offset,
+                // matching what seal_and_allocate_transaction persisted.
                 if let Err(e) = self
-                    .register_primary(config, new_extent_id, &primary_addr, &secondary_addrs)
+                    .register_primary(config, new_extent_id, end_offset, &primary_addr, &secondary_addrs)
                     .await
                 {
                     warn!(
@@ -1260,7 +1268,7 @@ impl StreamManagerStore {
                 }
 
                 // notify extent secondary nodes in fire-and-forget way
-                self.notify_secondaries(config, new_extent_id, &node_addrs[1..]);
+                self.notify_secondaries(config, new_extent_id, end_offset, &node_addrs[1..]);
 
                 (new_extent_id, primary_addr)
             }

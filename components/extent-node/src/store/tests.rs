@@ -46,6 +46,7 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
                     request_id: req_id,
                     extent_id: ExtentId(1),
                     role: 0,
+                    start_offset: Offset(0),
                     config: test_config(stream_id, 1),
                 },
                 Some(payload),
@@ -250,6 +251,7 @@ async fn register_extent_creates_stream() {
                     request_id: 1,
                     extent_id: ExtentId(100),
                     role: 0,
+                    start_offset: Offset(0),
                     config: test_config(42, 2),
                 },
                 Some(payload),
@@ -298,6 +300,7 @@ async fn register_extent_secondary() {
                     request_id: 1,
                     extent_id: ExtentId(100),
                     role: 1,
+                    start_offset: Offset(0),
                     config: test_config(42, 2),
                 },
                 Some(payload),
@@ -323,6 +326,196 @@ async fn register_extent_secondary() {
     }
 }
 
+/// Regression test (finding 3): a node with no prior state for the stream must
+/// create the extent at the SM-assigned start_offset carried by RegisterExtent,
+/// not at its local (empty) frontier of 0.
+#[tokio::test]
+async fn register_extent_uses_wire_start_offset_on_fresh_node() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+
+    let mut config = test_config(42, 1);
+    config.epoch = Epoch(1);
+    let payload = build_register_extent_payload(&[]);
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 1,
+                    extent_id: ExtentId(7),
+                    role: 0,
+                    start_offset: Offset(1_000),
+                    config,
+                },
+                Some(payload),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.opcode(), Opcode::RegisterExtent);
+
+    // The first append after the epoch change must land at offset 1000, not 0.
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 2,
+                    stream_id: StreamId(42),
+                    epoch: Epoch(1),
+                },
+                Some(Bytes::from_static(b"hello")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.offset(), Offset(1_000));
+}
+
+/// Regression test (finding 3): a lagging node holding stale local state must
+/// also honor the SM-assigned start_offset rather than its stale frontier.
+#[tokio::test]
+async fn register_extent_uses_wire_start_offset_over_stale_local_state() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+    let sid = register_stream(&store, 42, 1).await;
+
+    // Local frontier advances to 1 — stale relative to the SM's view (1000).
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 2,
+                    stream_id: sid,
+                    epoch: Epoch(0),
+                },
+                Some(Bytes::from_static(b"old")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.offset(), Offset(0));
+
+    // SM registers the successor extent (epoch 1) with authoritative start_offset.
+    let mut config = test_config(42, 1);
+    config.epoch = Epoch(1);
+    let payload = build_register_extent_payload(&[]);
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 3,
+                    extent_id: ExtentId(2),
+                    role: 0,
+                    start_offset: Offset(1_000),
+                    config,
+                },
+                Some(payload),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    // Append under the new epoch lands at 1000, not at the stale frontier (1).
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 4,
+                    stream_id: sid,
+                    epoch: Epoch(1),
+                },
+                Some(Bytes::from_static(b"new")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.offset(), Offset(1_000));
+}
+
+/// RegisterExtent is idempotent: when the extent already exists (lazily created
+/// by ForwardInitExtent), registration must not clobber the established
+/// start_offset — neither with a matching nor with a mismatched value.
+#[tokio::test]
+async fn register_extent_after_lazy_init_keeps_start_offset() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+
+    // Primary's ForwardInitExtent arrives first and creates the extent at 1000.
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id: StreamId(42),
+            extent_id: ExtentId(7),
+            epoch: Epoch(1),
+            start_offset: Offset(1_000),
+            extent_capacity: 8 * 1024 * 1024,
+            cache_extents: 4,
+            min_extent_capacity: 8 * 1024 * 1024,
+            max_extent_capacity: 256 * 1024 * 1024,
+            extent_growth_factor: 2,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+
+    // Late RegisterExtent with the matching value: no-op.
+    let mut config = test_config(42, 1);
+    config.epoch = Epoch(1);
+    let payload = build_register_extent_payload(&[]);
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 1,
+                    extent_id: ExtentId(7),
+                    role: 1,
+                    start_offset: Offset(1_000),
+                    config,
+                },
+                Some(payload.clone()),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    {
+        let streams = store.streams.pin();
+        let stream = streams.get(&StreamId(42)).unwrap();
+        assert_eq!(stream.max_offset(), Offset(1_000));
+    }
+
+    // Late RegisterExtent with a mismatched value must not clobber either.
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 2,
+                    extent_id: ExtentId(7),
+                    role: 1,
+                    start_offset: Offset(0),
+                    config,
+                },
+                Some(payload),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    {
+        let streams = store.streams.pin();
+        let stream = streams.get(&StreamId(42)).unwrap();
+        assert_eq!(stream.max_offset(), Offset(1_000));
+    }
+}
+
+
 #[tokio::test]
 async fn secondary_rejects_client_append_without_mutation() {
     use rpc::payload::build_register_extent_payload;
@@ -337,6 +530,7 @@ async fn secondary_rejects_client_append_without_mutation() {
                     request_id: 1,
                     extent_id: ExtentId(100),
                     role: 1,
+                    start_offset: Offset(0),
                     config: test_config(stream_id.0, 2),
                 },
                 Some(payload),
@@ -433,6 +627,7 @@ async fn register_extent_then_append_rf1() {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 0,
+                    start_offset: Offset(0),
                     config: test_config(10, 1),
                 },
                 Some(payload),
@@ -490,6 +685,7 @@ async fn primary_append_defers_and_broadcasts() {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 0,
+                    start_offset: Offset(0),
                     config: test_config(10, 3),
                 },
                 Some(payload),
@@ -577,6 +773,7 @@ async fn secondary_returns_watermark() {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 1,
+                    start_offset: Offset(0),
                     config: test_config(10, 2),
                 },
                 Some(payload),
@@ -624,6 +821,7 @@ async fn secondary_withholds_watermark_after_forward_gap() {
                     request_id: 1,
                     extent_id,
                     role: 1,
+                    start_offset: Offset(0),
                     config: test_config(stream_id.0, 2),
                 },
                 Some(build_register_extent_payload(&[])),
@@ -1178,6 +1376,7 @@ async fn secondary_accepts_forwarded_append_after_seal() {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 1,
+                    start_offset: Offset(0),
                     config: test_config(10, 2),
                 },
                 Some(payload),

@@ -74,8 +74,8 @@ impl Frame {
             VariableHeader::ConnectAckError { .. }
             | VariableHeader::DisconnectAckError { .. }
             | VariableHeader::HeartbeatError { .. } => 4 + 2,
-            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + cache_extents(2) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(1) + storage_class(1)
-            VariableHeader::RegisterExtent { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 2 + 4 + 4 + 1 + 1,
+            // request_id(4) + stream_id(4) + extent_id(4) + role(1) + replication_factor(1) + epoch(4) + start_offset(8) + cache_extents(2) + min_extent_capacity(4) + max_extent_capacity(4) + extent_growth_factor(1) + storage_class(1)
+            VariableHeader::RegisterExtent { .. } => 4 + 4 + 4 + 1 + 1 + 4 + 8 + 2 + 4 + 4 + 1 + 1,
             // request_id(4) + stream_id(4) + extent_id(4)
             VariableHeader::RegisterExtentAck { .. } => 4 + 4 + 4,
             // request_id(4) + stream_id(4) + extent_id(4) + error_code(2)
@@ -429,6 +429,7 @@ impl Frame {
                 request_id,
                 extent_id,
                 role,
+                start_offset,
                 config,
             } => {
                 dst.put_u32(*request_id);
@@ -437,6 +438,7 @@ impl Frame {
                 dst.put_u8(*role);
                 dst.put_u8(config.replication_factor);
                 dst.put_u32(config.epoch.0);
+                dst.put_u64(start_offset.0);
                 dst.put_u16(config.policy.cache);
                 dst.put_u32(config.policy.min_capacity);
                 dst.put_u32(config.policy.max_capacity);

@@ -4,7 +4,7 @@ use common::config::{DEFAULT_MAX_EXTENT_CAPACITY, DEFAULT_MIN_EXTENT_CAPACITY};
 use common::types::{ErrorCode, ExtentId, ExtentPolicy};
 use rpc::frame::{Frame, VariableHeader};
 use rpc::payload::{ROLE_PRIMARY, parse_register_extent_payload};
-use tracing::info;
+use tracing::{info, warn};
 
 use super::{ExtentNodeStore, ReplicaInfo};
 
@@ -13,13 +13,14 @@ impl ExtentNodeStore {
     ///
     /// Creates the stream locally (with the StreamManager-assigned stream_id) and stores replica info.
     pub(crate) fn handle_register_extent(&self, frame: Frame) -> Frame {
-        let (extent_id, role, config) = match &frame.variable_header {
+        let (extent_id, role, start_offset, config) = match &frame.variable_header {
             VariableHeader::RegisterExtent {
                 extent_id,
                 role,
+                start_offset,
                 config,
                 ..
-            } => (*extent_id, *role, *config),
+            } => (*extent_id, *role, *start_offset, *config),
             _ => {
                 return Frame::error_from_request(
                     &frame,
@@ -72,12 +73,24 @@ impl ExtentNodeStore {
         // Register the extent (idempotent — skips if already exists).
         let streams_guard = self.streams.pin();
         if let Some(stream) = streams_guard.get(&stream_id) {
-            if stream.with_extent(extent_id, |_| ()).is_none() {
-                stream.register_extent(extent_id, stream.max_offset(), epoch, policy.min_capacity);
-            } else {
-                // Extent already exists (lazy creation from Forward), but update epoch
-                // from authoritative source (RegisterExtent carries the real epoch).
-                stream.set_epoch(epoch);
+            match stream.with_extent(extent_id, |ext| ext.start_offset) {
+                None => {
+                    // Create with the SM-assigned authoritative start offset —
+                    // never inferred from local state, which may be absent
+                    // (fresh node) or stale (lagging node).
+                    stream.register_extent(extent_id, start_offset, epoch, policy.min_capacity);
+                }
+                Some(existing) => {
+                    // Extent already exists (lazy creation from Forward), but update epoch
+                    // from authoritative source (RegisterExtent carries the real epoch).
+                    if existing != start_offset {
+                        warn!(
+                            "RegisterExtent start_offset mismatch: stream={}, extent={}, existing={}, from_sm={} — keeping existing",
+                            stream_id, extent_id, existing.0, start_offset.0,
+                        );
+                    }
+                    stream.set_epoch(epoch);
+                }
             }
         }
 
