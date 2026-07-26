@@ -165,10 +165,28 @@ impl ExtentNodeStore {
 
         match stream.seal(active_id, None) {
             Some((start_offset, end_offset)) => {
+                // Cap the reported end_offset to the quorum-confirmed frontier.
+                // For RF>1, the AckQueue tracks the highest offset ACKed by a
+                // quorum of secondaries. Reporting only quorum-confirmed records
+                // ensures SM's metadata never declares data committed that
+                // surviving replicas may not hold.
+                // For RF=1 (required_acks == 0), quorum_offset() returns None
+                // and we fall back to the local end_offset.
+                let committed_end_offset = stream
+                    .ack_queue()
+                    .and_then(|aq| {
+                        let inner = aq.lock_inner();
+                        inner.quorum_offset_for_extent(active_id)
+                    })
+                    .map(|q| {
+                        // quorum_offset is an absolute offset; cap to local end.
+                        q.min(end_offset)
+                    })
+                    .unwrap_or(end_offset);
                 let sealed_extent_id = active_id;
                 let _ = stream;
                 info!(
-                    "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={end_offset}",
+                    "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={committed_end_offset} (local={end_offset})",
                     sealed_extent_id, stream_id
                 );
                 // Primary seals finalize CRC32 — send checksum to secondaries inline.
@@ -216,7 +234,7 @@ impl ExtentNodeStore {
                         epoch,
                         extent_id: sealed_extent_id,
                         start_offset,
-                        end_offset,
+                        end_offset: committed_end_offset,
                     },
                     payload,
                 )

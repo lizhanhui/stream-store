@@ -835,6 +835,20 @@ impl Stream {
         let active_bytes_written = inner.extents.last().map(|e| e.bytes_written()).unwrap_or(0);
         let (_, end_offset) = inner.seal_extent(active_id, None)?;
 
+        // Cap reported end_offset to quorum-confirmed frontier (RF > 1).
+        // The extent is sealed at local record_count (prevents new writes),
+        // but we only report quorum-confirmed records to SM to prevent
+        // metadata from declaring committed data that secondaries may not hold.
+        let committed_end_offset = self
+            .ack_queue
+            .get()
+            .and_then(|aq| {
+                let inner_aq = aq.lock_inner();
+                inner_aq.quorum_offset_for_extent(active_id)
+            })
+            .map(|q| q.min(end_offset))
+            .unwrap_or(end_offset);
+
         // Compute next extent capacity based on seal reason.
         match reason {
             SealReason::ExtentFull => {
@@ -864,7 +878,7 @@ impl Stream {
         let new_capacity = inner.extents.last().map(|e| e.capacity()).unwrap_or(0);
         Some(SealNotification {
             sealed_extent_id: active_id,
-            end_offset,
+            end_offset: committed_end_offset,
             new_extent_id: new_id,
             epoch,
             new_extent_capacity: new_capacity,

@@ -26,13 +26,15 @@ This can restart or overlap logical offsets after an epoch change.
 
 **Resolution:** `RegisterExtent` (sent only to the **Primary**) now carries the SM-assigned authoritative `start_offset` (u64) in its variable header, encoded after `epoch`. The Stream Manager populates it from the values it persists: the allocation `start_offset` for initial extents and the sealed extent's `end_offset` for seal-and-new successors (`components/stream-manager/src/store.rs`). The Primary installs the extent at the wire value and propagates the same authoritative `start_offset` once to secondaries via in-band `ForwardInitExtent` (the sole secondary creation path; the SM no longer sends `RegisterExtent` to secondaries). ForwardInitExtent installs an epoch-qualified Secondary role and atomically creates the extent if absent; a newer init demotes a former Primary, while stale/conflicting init is ignored. Forward and ForwardChecksum validate the Secondary role plus stream/extent epoch before mutation. Initialization remains best-effort with no replay: lost init or a replication gap quarantines that Secondary for the rest of the epoch and withholds Watermarks; same-epoch successor extents cannot make it rejoin, while RF=3 may operate temporarily degraded until a later epoch. Watermark quorum accounting is extent-qualified so successor progress cannot acknowledge missing predecessor records. Primary registration is idempotent and uses the wire value instead of `stream.max_offset()`. Regression tests cover fresh/stale local state, role transition, Secondary append rejection, batch rejection without mutation, and init-before-Forward ordering.
 
-### 4. Primary seal reports the local append frontier rather than the quorum frontier
+### 4. ~~Primary seal reports the local append frontier rather than the quorum frontier~~ (Fixed)
 
 The design describes the Primary seal offset as the committed, quorum-confirmed end offset (`design.md:47-55`, `design.md:1183-1188`). Quorum progress is tracked in `AckQueue`, but sealing returns `start_offset + record_count` (`components/extent-node/src/extent.rs:663-691`).
 
 If the Primary has locally appended records that have not reached quorum, those records can still be included in the sealed metadata range. Losing the Primary afterward can leave surviving replicas without data that metadata declares committed.
 
 The design itself is internally inconsistent: `design.md:1324-1326` calls final `record_count` definitive, conflicting with the earlier quorum definition.
+
+**Resolution**: Both `handle_seal` (`store/seal.rs`) and `seal_and_create_next` (`stream.rs`) now cap the reported `end_offset` to the quorum-confirmed frontier from the `AckQueue` when RF > 1. The extent is still sealed at local `record_count` (to prevent new writes), but SM only receives the quorum-confirmed offset in the `SealExtentNodeResp`. For RF=1, `quorum_offset` returns `None` and the local count is used as before.
 
 ### 5. Epoch CAS does not fence the epoch observed by the client request
 

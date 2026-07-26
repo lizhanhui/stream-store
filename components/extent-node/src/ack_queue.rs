@@ -220,6 +220,11 @@ impl AckQueueInner {
         self.quorum_offset_for(ExtentId(0))
     }
 
+    /// Compute the quorum offset for a specific extent.
+    pub fn quorum_offset_for_extent(&self, extent_id: ExtentId) -> Option<u64> {
+        self.quorum_offset_for(extent_id)
+    }
+
     fn quorum_offset_for(&self, extent_id: ExtentId) -> Option<u64> {
         if self.required_acks == 0 {
             return None; // RF=1, no quorum needed
