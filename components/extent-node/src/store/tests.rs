@@ -15,6 +15,7 @@ use server::handler::RequestHandler;
 use tokio::sync::mpsc;
 
 use crate::ack_queue::{AckQueue, DEFAULT_REPLICATION_TIMEOUT, PendingAck};
+use crate::stream::SealReason;
 
 /// Build a default `StreamConfig` for tests.
 fn test_config(stream_id: u32, replication_factor: u8) -> StreamConfig {
@@ -46,6 +47,7 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
                     request_id: req_id,
                     extent_id: ExtentId(1),
                     role: 0,
+                    start_offset: Offset(0),
                     config: test_config(stream_id, 1),
                 },
                 Some(payload),
@@ -55,6 +57,36 @@ async fn register_stream(store: &ExtentNodeStore, stream_id: u32, req_id: u32) -
         .await
         .unwrap();
     assert_eq!(resp.opcode(), Opcode::RegisterExtent);
+    sid
+}
+
+async fn register_stream_at_epoch(
+    store: &ExtentNodeStore,
+    stream_id: u32,
+    req_id: u32,
+    epoch: Epoch,
+) -> StreamId {
+    use rpc::payload::build_register_extent_payload;
+
+    let sid = StreamId(stream_id);
+    let mut config = test_config(stream_id, 1);
+    config.epoch = epoch;
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: req_id,
+                    extent_id: ExtentId(1),
+                    role: 0,
+                    start_offset: Offset(0),
+                    config,
+                },
+                Some(build_register_extent_payload(&[])),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
     sid
 }
 
@@ -250,6 +282,7 @@ async fn register_extent_creates_stream() {
                     request_id: 1,
                     extent_id: ExtentId(100),
                     role: 0,
+                    start_offset: Offset(0),
                     config: test_config(42, 2),
                 },
                 Some(payload),
@@ -283,22 +316,128 @@ async fn register_extent_creates_stream() {
     }
 }
 
+/// Secondaries are created solely via ForwardInitExtent (the Primary's in-band
+/// init frame), not via a RegisterExtent RPC. The extent must be created at the
+/// wire `start_offset` with no AckQueue.
 #[tokio::test]
-async fn register_extent_secondary() {
+async fn forward_init_extent_creates_secondary_extent() {
+    let store = ExtentNodeStore::new();
+
+    // Primary sends ForwardInitExtent to the secondary (role=1, RF=2).
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id: StreamId(42),
+            extent_id: ExtentId(100),
+            epoch: Epoch(1),
+            start_offset: Offset(1_000),
+            extent_capacity: 8 * 1024 * 1024,
+            cache_extents: 4,
+            min_extent_capacity: 8 * 1024 * 1024,
+            max_extent_capacity: 256 * 1024 * 1024,
+            extent_growth_factor: 2,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+
+    // The extent exists at the wire start_offset.
+    {
+        let streams = store.streams.pin();
+        let stream = streams.get(&StreamId(42)).unwrap();
+        let start = stream.with_extent(ExtentId(100), |ext| ext.start_offset);
+        assert_eq!(start, Some(Offset(1_000)));
+        // Secondaries have no AckQueue (no group-commit ownership).
+        assert!(stream.ack_queue().is_none());
+    }
+}
+
+/// Regression test (finding 3): a node with no prior state for the stream must
+/// create the extent at the SM-assigned start_offset carried by RegisterExtent,
+/// not at its local (empty) frontier of 0.
+#[tokio::test]
+async fn register_extent_uses_wire_start_offset_on_fresh_node() {
     use rpc::payload::build_register_extent_payload;
 
     let store = ExtentNodeStore::new();
 
-    // RegisterExtent as Secondary (RF=2, no replica addrs).
+    let mut config = test_config(42, 1);
+    config.epoch = Epoch(1);
     let payload = build_register_extent_payload(&[]);
     let resp = store
         .handle_frame(
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: 1,
-                    extent_id: ExtentId(100),
-                    role: 1,
-                    config: test_config(42, 2),
+                    extent_id: ExtentId(7),
+                    role: 0,
+                    start_offset: Offset(1_000),
+                    config,
+                },
+                Some(payload),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.opcode(), Opcode::RegisterExtent);
+
+    // The first append after the epoch change must land at offset 1000, not 0.
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 2,
+                    stream_id: StreamId(42),
+                    epoch: Epoch(1),
+                },
+                Some(Bytes::from_static(b"hello")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.offset(), Offset(1_000));
+}
+
+/// Regression test (finding 3): a lagging node holding stale local state must
+/// also honor the SM-assigned start_offset rather than its stale frontier.
+#[tokio::test]
+async fn register_extent_uses_wire_start_offset_over_stale_local_state() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+    let sid = register_stream(&store, 42, 1).await;
+
+    // Local frontier advances to 1 — stale relative to the SM's view (1000).
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 2,
+                    stream_id: sid,
+                    epoch: Epoch(0),
+                },
+                Some(Bytes::from_static(b"old")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.offset(), Offset(0));
+
+    // SM registers the successor extent (epoch 1) with authoritative start_offset.
+    let mut config = test_config(42, 1);
+    config.epoch = Epoch(1);
+    let payload = build_register_extent_payload(&[]);
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 3,
+                    extent_id: ExtentId(2),
+                    role: 0,
+                    start_offset: Offset(1_000),
+                    config,
                 },
                 Some(payload),
             ),
@@ -307,37 +446,86 @@ async fn register_extent_secondary() {
         .await
         .unwrap();
 
-    assert_eq!(resp.opcode(), Opcode::RegisterExtent);
-
-    let ri = store.get_replica_info(StreamId(42)).unwrap();
-    assert!(!ri.is_primary());
-    assert_eq!(ri.role, 1);
-    assert!(ri.replica_addrs.is_empty());
-    assert_eq!(ri.replication_factor, 2);
-
-    // Secondary should NOT have an AckQueue.
-    {
-        let streams = store.streams.pin();
-        let stream = streams.get(&StreamId(42)).unwrap();
-        assert!(stream.ack_queue().is_none());
-    }
+    // Append under the new epoch lands at 1000, not at the stale frontier (1).
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 4,
+                    stream_id: sid,
+                    epoch: Epoch(1),
+                },
+                Some(Bytes::from_static(b"new")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.offset(), Offset(1_000));
 }
 
+/// RegisterExtent is idempotent: when the extent already exists (lazily created
+/// by ForwardInitExtent), registration must not clobber the established
+/// start_offset — neither with a matching nor with a mismatched value.
 #[tokio::test]
-async fn secondary_rejects_client_append_without_mutation() {
+async fn register_extent_after_lazy_init_keeps_start_offset() {
     use rpc::payload::build_register_extent_payload;
 
     let store = ExtentNodeStore::new();
-    let stream_id = StreamId(42);
+
+    // Primary's ForwardInitExtent arrives first and creates the extent at 1000.
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id: StreamId(42),
+            extent_id: ExtentId(7),
+            epoch: Epoch(1),
+            start_offset: Offset(1_000),
+            extent_capacity: 8 * 1024 * 1024,
+            cache_extents: 4,
+            min_extent_capacity: 8 * 1024 * 1024,
+            max_extent_capacity: 256 * 1024 * 1024,
+            extent_growth_factor: 2,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+
+    // Late RegisterExtent with the matching value: no-op.
+    let mut config = test_config(42, 1);
+    config.epoch = Epoch(1);
     let payload = build_register_extent_payload(&[]);
     store
         .handle_frame(
             Frame::new(
                 VariableHeader::RegisterExtent {
                     request_id: 1,
-                    extent_id: ExtentId(100),
-                    role: 1,
-                    config: test_config(stream_id.0, 2),
+                    extent_id: ExtentId(7),
+                    role: 0,
+                    start_offset: Offset(1_000),
+                    config,
+                },
+                Some(payload.clone()),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    {
+        let streams = store.streams.pin();
+        let stream = streams.get(&StreamId(42)).unwrap();
+        assert_eq!(stream.max_offset(), Offset(1_000));
+    }
+
+    // Late RegisterExtent with a mismatched value must not clobber either.
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 2,
+                    extent_id: ExtentId(7),
+                    role: 0,
+                    start_offset: Offset(0),
+                    config,
                 },
                 Some(payload),
             ),
@@ -345,26 +533,40 @@ async fn secondary_rejects_client_append_without_mutation() {
         )
         .await
         .unwrap();
+    {
+        let streams = store.streams.pin();
+        let stream = streams.get(&StreamId(42)).unwrap();
+        assert_eq!(stream.max_offset(), Offset(1_000));
+    }
+}
 
-    let resp = store
+#[tokio::test]
+async fn register_extent_rejects_secondary_role() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(42);
+    let response = store
         .handle_frame(
             Frame::new(
-                VariableHeader::Append {
-                    request_id: 2,
-                    stream_id,
-                    epoch: Epoch(0),
+                VariableHeader::RegisterExtent {
+                    request_id: 1,
+                    extent_id: ExtentId(100),
+                    role: 1,
+                    start_offset: Offset(0),
+                    config: test_config(stream_id.0, 2),
                 },
-                Some(Bytes::from_static(b"must not be written")),
+                Some(build_register_extent_payload(&[])),
             ),
             None,
         )
         .await
         .unwrap();
 
-    assert!(resp.is_error_response());
-    assert_eq!(resp.error_code(), ErrorCode::NotPrimary as u16);
-    let streams = store.streams.pin();
-    assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(0));
+    assert!(response.is_error_response());
+    assert_eq!(response.error_code(), ErrorCode::NotPrimary as u16);
+    assert!(store.streams.pin().get(&stream_id).is_none());
+    assert!(store.get_replica_info(stream_id).is_none());
 }
 
 #[tokio::test]
@@ -395,7 +597,12 @@ async fn lazy_secondary_rejects_client_append_without_mutation() {
             .await
             .is_none()
     );
-    assert!(store.get_replica_info(stream_id).is_none());
+    let replica = store
+        .get_replica_info(stream_id)
+        .expect("ForwardInitExtent must install explicit Secondary authority");
+    assert!(!replica.is_primary());
+    assert_eq!(replica.epoch, Epoch(7));
+    assert_eq!(replica.extent_id, ExtentId(101));
 
     let resp = store
         .handle_frame(
@@ -419,6 +626,452 @@ async fn lazy_secondary_rejects_client_append_without_mutation() {
 }
 
 #[tokio::test]
+async fn forward_init_newer_epoch_demotes_former_primary() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(44);
+    let mut primary_config = test_config(stream_id.0, 2);
+    primary_config.epoch = Epoch(3);
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 1,
+                    extent_id: ExtentId(10),
+                    role: 0,
+                    start_offset: Offset(20),
+                    config: primary_config,
+                },
+                Some(build_register_extent_payload(&["127.0.0.1:9802"])),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(store.get_replica_info(stream_id).unwrap().is_primary());
+
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id: ExtentId(11),
+            epoch: Epoch(4),
+            start_offset: Offset(20),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+
+    let replica = store.get_replica_info(stream_id).unwrap();
+    assert!(!replica.is_primary());
+    assert_eq!(replica.epoch, Epoch(4));
+    assert_eq!(replica.extent_id, ExtentId(11));
+
+    let resp = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::Append {
+                    request_id: 2,
+                    stream_id,
+                    epoch: Epoch(4),
+                },
+                Some(Bytes::from_static(b"must not be written")),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(resp.is_error_response());
+    assert_eq!(resp.error_code(), ErrorCode::NotPrimary as u16);
+    let streams = store.streams.pin();
+    let stream = streams.get(&stream_id).unwrap();
+    assert_eq!(stream.max_offset(), Offset(20));
+    assert!(!stream.has_secondaries());
+    assert!(!stream.ack_queue().unwrap().is_active_at(Epoch(4)));
+    drop(streams);
+    assert!(
+        store
+            .seal_and_create(stream_id, SealReason::ExtentFull)
+            .is_none(),
+        "a demoted Primary must not autonomously seal/create"
+    );
+}
+
+#[tokio::test]
+async fn forward_rejects_primary_role_without_mutation() {
+    let store = ExtentNodeStore::new();
+    let stream_id = register_stream(&store, 45, 1).await;
+
+    let resp = store.handle_forward(Frame::new(
+        VariableHeader::Forward {
+            stream_id,
+            extent_id: ExtentId(1),
+            epoch: Epoch(0),
+            offset: Offset(0),
+            byte_pos: 0,
+        },
+        Some(Bytes::from_static(b"must not replicate into primary")),
+    ));
+
+    assert!(resp.is_none());
+    let streams = store.streams.pin();
+    assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(0));
+}
+
+#[tokio::test]
+async fn older_or_equal_forward_init_does_not_demote_current_primary() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(46);
+    let mut config = test_config(stream_id.0, 1);
+    config.epoch = Epoch(5);
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 1,
+                    extent_id: ExtentId(20),
+                    role: 0,
+                    start_offset: Offset(100),
+                    config,
+                },
+                Some(build_register_extent_payload(&[])),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    for (init_epoch, init_extent) in [(Epoch(4), ExtentId(19)), (Epoch(5), ExtentId(21))] {
+        store.handle_forward_init_extent(Frame::new(
+            VariableHeader::ForwardInitExtent {
+                stream_id,
+                extent_id: init_extent,
+                epoch: init_epoch,
+                start_offset: Offset(0),
+                extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                cache_extents: DEFAULT_CACHE_EXTENTS,
+                min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+                max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+                extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+                storage_class: StorageClass::S3,
+            },
+            None,
+        ));
+
+        let replica = store.get_replica_info(stream_id).unwrap();
+        assert!(replica.is_primary());
+        assert_eq!(replica.epoch, Epoch(5));
+        let streams = store.streams.pin();
+        let stream = streams.get(&stream_id).unwrap();
+        assert_eq!(stream.epoch(), Epoch(5));
+        assert!(stream.with_extent(init_extent, |_| ()).is_none());
+    }
+}
+
+#[tokio::test]
+async fn register_extent_rejects_same_id_from_new_epoch() {
+    use rpc::payload::build_register_extent_payload;
+
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(50);
+    let mut first = test_config(stream_id.0, 1);
+    first.epoch = Epoch(1);
+    store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 1,
+                    extent_id: ExtentId(20),
+                    role: 0,
+                    start_offset: Offset(10),
+                    config: first,
+                },
+                Some(build_register_extent_payload(&[])),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut conflicting = first;
+    conflicting.epoch = Epoch(2);
+    let response = store
+        .handle_frame(
+            Frame::new(
+                VariableHeader::RegisterExtent {
+                    request_id: 2,
+                    extent_id: ExtentId(20),
+                    role: 0,
+                    start_offset: Offset(10),
+                    config: conflicting,
+                },
+                Some(build_register_extent_payload(&[])),
+            ),
+            None,
+        )
+        .await
+        .unwrap();
+    assert!(response.is_error_response());
+    assert_eq!(response.error_code(), ErrorCode::EpochStale as u16);
+    assert_eq!(store.get_replica_info(stream_id).unwrap().epoch, Epoch(1));
+}
+
+#[tokio::test]
+async fn batch_append_secondary_returns_not_primary_without_mutation() {
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(47);
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id: ExtentId(30),
+            epoch: Epoch(7),
+            start_offset: Offset(12),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+    let frames = vec![
+        Frame::new(
+            VariableHeader::Append {
+                request_id: 1,
+                stream_id,
+                epoch: Epoch(7),
+            },
+            Some(Bytes::from_static(b"a")),
+        ),
+        Frame::new(
+            VariableHeader::Append {
+                request_id: 2,
+                stream_id,
+                epoch: Epoch(7),
+            },
+            Some(Bytes::from_static(b"b")),
+        ),
+    ];
+
+    let responses = store.handle_append_batch_inner(&frames, None).await;
+    assert_eq!(responses.len(), 2);
+    assert!(responses.iter().all(Frame::is_error_response));
+    assert!(
+        responses
+            .iter()
+            .all(|response| response.error_code() == ErrorCode::NotPrimary as u16)
+    );
+    let streams = store.streams.pin();
+    assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(12));
+}
+
+#[tokio::test]
+async fn mixed_epoch_batch_validates_each_frame() {
+    let store = ExtentNodeStore::new();
+    let stream_id = register_stream_at_epoch(&store, 48, 1, Epoch(3)).await;
+    let frames = vec![
+        Frame::new(
+            VariableHeader::Append {
+                request_id: 1,
+                stream_id,
+                epoch: Epoch(3),
+            },
+            Some(Bytes::from_static(b"accepted")),
+        ),
+        Frame::new(
+            VariableHeader::Append {
+                request_id: 2,
+                stream_id,
+                epoch: Epoch(4),
+            },
+            Some(Bytes::from_static(b"rejected")),
+        ),
+    ];
+
+    let responses = RequestHandler::handle_append_batch(&store, &frames, None).await;
+    assert_eq!(responses.len(), 2);
+    assert!(!responses[0].is_error_response());
+    assert!(responses[1].is_error_response());
+    assert_eq!(responses[1].error_code(), ErrorCode::EpochStale as u16);
+    let streams = store.streams.pin();
+    assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(1));
+}
+
+#[test]
+fn replication_gap_quarantines_secondary_until_new_epoch() {
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(49);
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id: ExtentId(40),
+            epoch: Epoch(7),
+            start_offset: Offset(0),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+    assert!(
+        store
+            .handle_forward(Frame::new(
+                VariableHeader::Forward {
+                    stream_id,
+                    extent_id: ExtentId(40),
+                    epoch: Epoch(7),
+                    offset: Offset(2),
+                    byte_pos: 0,
+                },
+                Some(Bytes::from_static(b"gap")),
+            ))
+            .is_none()
+    );
+
+    // A successor in the same epoch must not let the gapped replica rejoin.
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id: ExtentId(41),
+            epoch: Epoch(7),
+            start_offset: Offset(3),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+    {
+        let streams = store.streams.pin();
+        assert!(
+            streams
+                .get(&stream_id)
+                .unwrap()
+                .with_extent(ExtentId(41), |_| ())
+                .is_none()
+        );
+    }
+
+    // Only a newer epoch clears the quarantine.
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id: ExtentId(42),
+            epoch: Epoch(8),
+            start_offset: Offset(3),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+    let streams = store.streams.pin();
+    assert!(
+        streams
+            .get(&stream_id)
+            .unwrap()
+            .with_extent(ExtentId(42), |_| ())
+            .is_some()
+    );
+}
+
+#[test]
+fn same_epoch_successor_rejects_missing_predecessor_tail() {
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(51);
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id: ExtentId(50),
+            epoch: Epoch(7),
+            start_offset: Offset(0),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+    assert!(
+        store
+            .handle_forward(Frame::new(
+                VariableHeader::Forward {
+                    stream_id,
+                    extent_id: ExtentId(50),
+                    epoch: Epoch(7),
+                    offset: Offset(0),
+                    byte_pos: 0,
+                },
+                Some(Bytes::from_static(b"only-prefix")),
+            ))
+            .is_some()
+    );
+
+    // start_offset 2 proves offset 1 was committed on the Primary but absent here.
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id: ExtentId(51),
+            epoch: Epoch(7),
+            start_offset: Offset(2),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
+
+    assert!(store.forwarding_quarantined(stream_id, Epoch(7)));
+    let streams = store.streams.pin();
+    assert!(
+        streams
+            .get(&stream_id)
+            .unwrap()
+            .with_extent(ExtentId(51), |_| ())
+            .is_none()
+    );
+}
+
+#[test]
+fn quarantine_epoch_update_is_monotonic() {
+    let store = Arc::new(ExtentNodeStore::new());
+    let stream_id = StreamId(52);
+    let mut threads = Vec::new();
+    for epoch in [7, 8].into_iter().cycle().take(64) {
+        let store = Arc::clone(&store);
+        threads.push(std::thread::spawn(move || {
+            store.quarantine_forwarding(stream_id, Epoch(epoch));
+        }));
+    }
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert!(store.forwarding_quarantined(stream_id, Epoch(8)));
+}
+
+#[tokio::test]
 async fn register_extent_then_append_rf1() {
     use rpc::payload::build_register_extent_payload;
 
@@ -433,6 +1086,7 @@ async fn register_extent_then_append_rf1() {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 0,
+                    start_offset: Offset(0),
                     config: test_config(10, 1),
                 },
                 Some(payload),
@@ -490,6 +1144,7 @@ async fn primary_append_defers_and_broadcasts() {
                     request_id: 1,
                     extent_id: ExtentId(50),
                     role: 0,
+                    start_offset: Offset(0),
                     config: test_config(10, 3),
                 },
                 Some(payload),
@@ -519,20 +1174,50 @@ async fn primary_append_defers_and_broadcasts() {
         "Primary with secondaries should defer ACK"
     );
 
-    // Accept connections and read Forward frames from mock secondaries.
+    // Each Secondary observes the one-shot init before the first data Forward.
     let (conn1, _) = listener1.accept().await.unwrap();
     let mut reader1 = FramedRead::new(conn1, FrameCodec);
+    let init1 = reader1.next().await.unwrap().unwrap();
+    assert!(matches!(
+        init1.variable_header,
+        VariableHeader::ForwardInitExtent {
+            stream_id: StreamId(10),
+            extent_id: ExtentId(50),
+            ..
+        }
+    ));
     let fwd1 = reader1.next().await.unwrap().unwrap();
-    assert_eq!(fwd1.opcode(), Opcode::Forward);
-    assert_eq!(fwd1.stream_id(), StreamId(10));
-    assert_eq!(fwd1.offset(), Offset(0));
+    assert!(matches!(
+        fwd1.variable_header,
+        VariableHeader::Forward {
+            stream_id: StreamId(10),
+            extent_id: ExtentId(50),
+            offset: Offset(0),
+            ..
+        }
+    ));
 
     let (conn2, _) = listener2.accept().await.unwrap();
     let mut reader2 = FramedRead::new(conn2, FrameCodec);
+    let init2 = reader2.next().await.unwrap().unwrap();
+    assert!(matches!(
+        init2.variable_header,
+        VariableHeader::ForwardInitExtent {
+            stream_id: StreamId(10),
+            extent_id: ExtentId(50),
+            ..
+        }
+    ));
     let fwd2 = reader2.next().await.unwrap().unwrap();
-    assert_eq!(fwd2.opcode(), Opcode::Forward);
-    assert_eq!(fwd2.stream_id(), StreamId(10));
-    assert_eq!(fwd2.offset(), Offset(0));
+    assert!(matches!(
+        fwd2.variable_header,
+        VariableHeader::Forward {
+            stream_id: StreamId(10),
+            extent_id: ExtentId(50),
+            offset: Offset(0),
+            ..
+        }
+    ));
 
     let streams_guard = store.streams.pin();
     let stream = streams_guard.get(&StreamId(10)).unwrap();
@@ -551,7 +1236,7 @@ async fn primary_append_defers_and_broadcasts() {
     // Simulate watermark from first secondary (quorum met with 1 ACK for RF=3).
     {
         let mut inner = aq.lock_inner();
-        inner.ack_from_secondary(0, 0);
+        inner.ack_from_secondary(0, ExtentId(50), 0);
         inner.drain_quorum();
     }
 
@@ -564,27 +1249,23 @@ async fn primary_append_defers_and_broadcasts() {
 
 #[tokio::test]
 async fn secondary_returns_watermark() {
-    use rpc::payload::build_register_extent_payload;
-
     let store = ExtentNodeStore::new();
 
-    // Register as Secondary (RF=2).
-    let payload = build_register_extent_payload(&[]);
-    store
-        .handle_frame(
-            Frame::new(
-                VariableHeader::RegisterExtent {
-                    request_id: 1,
-                    extent_id: ExtentId(50),
-                    role: 1,
-                    config: test_config(10, 2),
-                },
-                Some(payload),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id: StreamId(10),
+            extent_id: ExtentId(50),
+            epoch: Epoch(0),
+            start_offset: Offset(0),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
 
     // Forward frame (dedicated opcode for replication).
     let resp = store
@@ -611,27 +1292,25 @@ async fn secondary_returns_watermark() {
 
 #[tokio::test]
 async fn secondary_withholds_watermark_after_forward_gap() {
-    use rpc::payload::build_register_extent_payload;
-
     let store = ExtentNodeStore::new();
     let stream_id = StreamId(10);
     let extent_id = ExtentId(50);
 
-    store
-        .handle_frame(
-            Frame::new(
-                VariableHeader::RegisterExtent {
-                    request_id: 1,
-                    extent_id,
-                    role: 1,
-                    config: test_config(stream_id.0, 2),
-                },
-                Some(build_register_extent_payload(&[])),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id,
+            epoch: Epoch(0),
+            start_offset: Offset(0),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
 
     let first = store
         .handle_frame(
@@ -675,6 +1354,29 @@ async fn secondary_withholds_watermark_after_forward_gap() {
     assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(1));
 }
 
+#[test]
+fn watermark_cannot_ack_pending_from_another_extent() {
+    let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(4);
+    let ack_queue = AckQueue::new(1);
+    ack_queue.enqueue(PendingAck {
+        request_id: 1,
+        stream_id: StreamId(10),
+        extent_id: ExtentId(40),
+        epoch: Epoch(0),
+        response_tx: resp_tx,
+        assigned_offset: 10,
+        created_at: Instant::now(),
+    });
+
+    ack_queue.apply_watermark(Epoch(0), ExtentId(41), 0, 20);
+
+    assert!(resp_rx.try_recv().is_err());
+    let mut inner = ack_queue.lock_inner();
+    inner.receive_pending();
+    assert_eq!(inner.pending.len(), 1);
+    assert_eq!(inner.pending[0].extent_id, ExtentId(40));
+}
+
 #[tokio::test]
 async fn cumulative_ack_drains_multiple_pending() {
     // Test that a single watermark can drain multiple pending ACKs.
@@ -698,7 +1400,7 @@ async fn cumulative_ack_drains_multiple_pending() {
     // Single cumulative ACK at offset 2 from one secondary.
     let mut inner = ack_queue.lock_inner();
     inner.receive_pending();
-    inner.ack_from_secondary(0, 2);
+    inner.ack_from_secondary(0, ExtentId(0), 2);
     inner.drain_quorum();
     drop(inner);
 
@@ -718,16 +1420,16 @@ async fn quorum_offset_with_multiple_secondaries() {
     let mut inner = aq.lock_inner();
 
     // Only 1 secondary has reported — not enough for quorum.
-    inner.ack_from_secondary(0, 5);
+    inner.ack_from_secondary(0, ExtentId(0), 5);
     assert!(inner.quorum_offset().is_none());
 
     // Second secondary reports — now we have quorum.
-    inner.ack_from_secondary(1, 3);
+    inner.ack_from_secondary(1, ExtentId(0), 3);
     // quorum_offset = min of top-2 = 3
     assert_eq!(inner.quorum_offset(), Some(3));
 
     // Third secondary reports higher.
-    inner.ack_from_secondary(2, 10);
+    inner.ack_from_secondary(2, ExtentId(0), 10);
     // top-2 descending: [10, 5], so quorum_offset = 5
     assert_eq!(inner.quorum_offset(), Some(5));
 }
@@ -791,7 +1493,7 @@ async fn concurrent_multi_stream_appends() {
 
     let mut stream_ids = Vec::new();
     for i in 0..NUM_STREAMS {
-        let sid = register_stream(&store, i + 1, i as u32).await;
+        let sid = register_stream(&store, i + 1, i).await;
         stream_ids.push(sid);
     }
 
@@ -922,7 +1624,7 @@ async fn concurrent_multi_stream_appends() {
         "metrics: bytes_written mismatch"
     );
     assert_eq!(
-        active_count, NUM_STREAMS as u32,
+        active_count, NUM_STREAMS,
         "metrics: active extent count mismatch"
     );
 
@@ -1166,26 +1868,23 @@ async fn concurrent_appends_same_stream() {
 
 #[tokio::test]
 async fn secondary_accepts_forwarded_append_after_seal() {
-    use rpc::payload::build_register_extent_payload;
-
     let store = ExtentNodeStore::new();
 
-    let payload = build_register_extent_payload(&[]);
-    store
-        .handle_frame(
-            Frame::new(
-                VariableHeader::RegisterExtent {
-                    request_id: 1,
-                    extent_id: ExtentId(50),
-                    role: 1,
-                    config: test_config(10, 2),
-                },
-                Some(payload),
-            ),
-            None,
-        )
-        .await
-        .unwrap();
+    store.handle_forward_init_extent(Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id: StreamId(10),
+            extent_id: ExtentId(50),
+            epoch: Epoch(0),
+            start_offset: Offset(0),
+            extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            cache_extents: DEFAULT_CACHE_EXTENTS,
+            min_extent_capacity: DEFAULT_MIN_EXTENT_CAPACITY,
+            max_extent_capacity: DEFAULT_MAX_EXTENT_CAPACITY,
+            extent_growth_factor: DEFAULT_EXTENT_GROWTH_FACTOR,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    ));
 
     for i in 0u32..2 {
         let byte_pos = i as u64 * 8;
@@ -1388,13 +2087,7 @@ async fn append_with_stale_epoch_returns_epoch_stale() {
 #[tokio::test]
 async fn append_with_epoch_zero_bypasses_epoch_check() {
     let store = ExtentNodeStore::new();
-    let sid = register_stream(&store, 1, 1).await;
-
-    {
-        let guard = store.streams.pin();
-        let stream = guard.get(&sid).unwrap();
-        stream.set_epoch(Epoch(5));
-    }
+    let sid = register_stream_at_epoch(&store, 1, 1, Epoch(5)).await;
 
     let resp = store
         .handle_frame(
@@ -1417,13 +2110,7 @@ async fn append_with_epoch_zero_bypasses_epoch_check() {
 #[tokio::test]
 async fn append_with_matching_epoch_succeeds() {
     let store = ExtentNodeStore::new();
-    let sid = register_stream(&store, 1, 1).await;
-
-    {
-        let guard = store.streams.pin();
-        let stream = guard.get(&sid).unwrap();
-        stream.set_epoch(Epoch(3));
-    }
+    let sid = register_stream_at_epoch(&store, 1, 1, Epoch(3)).await;
 
     let resp = store
         .handle_frame(
@@ -1983,5 +2670,67 @@ async fn seal_commit_unknown_stream() {
     assert!(
         !resp.is_error_response(),
         "should return success for unknown stream"
+    );
+}
+
+/// Concurrent ForwardInitExtent and Forward for the same new extent must not
+/// create duplicate extents. The atomic register_extent_if_absent guarantees a
+/// single extent exists at the wire start_offset.
+#[tokio::test]
+async fn forward_init_and_forward_concurrent_create_single_extent() {
+    use common::types::StorageClass;
+
+    let store = ExtentNodeStore::new();
+    let stream_id = StreamId(10);
+    let extent_id = ExtentId(50);
+
+    let init = Frame::new(
+        VariableHeader::ForwardInitExtent {
+            stream_id,
+            extent_id,
+            epoch: Epoch(1),
+            start_offset: Offset(1_000),
+            extent_capacity: 8 * 1024 * 1024,
+            cache_extents: 4,
+            min_extent_capacity: 8 * 1024 * 1024,
+            max_extent_capacity: 256 * 1024 * 1024,
+            extent_growth_factor: 2,
+            storage_class: StorageClass::S3,
+        },
+        None,
+    );
+    let forward = Frame::new(
+        VariableHeader::Forward {
+            stream_id,
+            extent_id,
+            epoch: Epoch(1),
+            offset: Offset(1_000),
+            byte_pos: 0,
+        },
+        Some(Bytes::from_static(b"msg0")),
+    );
+
+    // Run both deliveries concurrently; ordering is nondeterministic.
+    let (init_res, fwd_res) = tokio::join!(
+        async {
+            store.handle_forward_init_extent(init);
+        },
+        async { store.handle_forward(forward).is_some() },
+    );
+    let _ = (init_res, fwd_res);
+
+    let streams = store.streams.pin();
+    let stream = streams.get(&stream_id).unwrap();
+    // Exactly one extent with this id exists (no duplicate from the race).
+    let reported = stream.report_extents(Epoch(1));
+    assert_eq!(
+        reported.len(),
+        1,
+        "expected exactly one extent after concurrent init+forward"
+    );
+    assert_eq!(reported[0].0, extent_id);
+    assert_eq!(
+        stream.with_extent(extent_id, |ext| ext.start_offset),
+        Some(Offset(1_000))
     );
 }

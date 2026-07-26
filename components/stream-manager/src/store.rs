@@ -352,10 +352,13 @@ impl StreamManagerStore {
     /// `primary_addr`: the Primary's listen address.
     /// `secondary_addrs`: addresses of all Secondaries (passed to Primary so it
     /// can broadcast Forward frames).
+    /// `start_offset`: SM-assigned authoritative start offset of the extent,
+    /// carried on the wire so the ExtentNode does not infer it from local state.
     async fn register_primary(
         &self,
         config: StreamConfig,
         extent_id: ExtentId,
+        start_offset: u64,
         primary_addr: &str,
         secondary_addrs: &[&str],
     ) -> Result<(), StorageError> {
@@ -379,6 +382,7 @@ impl StreamManagerStore {
                         request_id: 0,
                         extent_id: eid,
                         role: 0, // Primary
+                        start_offset: Offset(start_offset),
                         config,
                     },
                     Some(payload),
@@ -423,71 +427,6 @@ impl StreamManagerStore {
         }
     }
 
-    /// Fire-and-forget RegisterExtent to each Secondary ExtentNode.
-    ///
-    /// Secondaries create extents lazily on the first Forward frame, so these
-    /// RPCs are hints for pre-allocation, not required for correctness.
-    /// Each is spawned as an independent task to avoid blocking the caller.
-    fn notify_secondaries(
-        &self,
-        config: StreamConfig,
-        extent_id: ExtentId,
-        secondary_addrs: &[String],
-    ) {
-        for (i, addr) in secondary_addrs.iter().enumerate() {
-            let role = (i + 1) as u8; // 1, 2, ...
-            let addr = addr.clone();
-            let eid = extent_id;
-            let sid = config.stream_id;
-
-            tokio::spawn(async move {
-                let payload = build_register_extent_payload(&[]); // secondaries get no downstream addrs
-                match client::StreamClient::connect(&addr).await {
-                    Ok(client) => {
-                        let result = client
-                            .send_frame(Frame::new(
-                                VariableHeader::RegisterExtent {
-                                    request_id: 0,
-                                    extent_id: eid,
-                                    role,
-                                    config,
-                                },
-                                Some(payload),
-                            ))
-                            .await;
-                        match result {
-                            Ok(resp) if resp.is_error_response() => {
-                                let msg = String::from_utf8_lossy(
-                                    resp.payload.as_deref().unwrap_or_default(),
-                                );
-                                warn!(
-                                    "Secondary {addr} rejected RegisterExtent for stream={} extent={}: {msg}",
-                                    sid, eid
-                                );
-                            }
-                            Ok(_) => {
-                                info!(
-                                    "RegisterExtent sent to Secondary {addr}: stream={}, extent={}, role={role}",
-                                    sid, eid
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "RegisterExtent to Secondary {addr} failed: {e} (will create lazily on first Forward)"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!(
-                            "connect to Secondary {addr} for RegisterExtent failed: {e} (will create lazily on first Forward)"
-                        );
-                    }
-                }
-            });
-        }
-    }
-
     /// Allocate a replica set for a new extent: pick nodes, store in DB, notify ExtentNodes.
     /// Returns (ExtentId, primary node address).
     ///
@@ -523,9 +462,9 @@ impl StreamManagerStore {
             extent_id, config.stream_id, node_addrs
         );
 
-        // Notify ExtentNodes of their replication roles.
-        // Always send RegisterExtent, even for replication_factor=1, so the ExtentNode knows
-        // the StreamManager-assigned stream_id and extent_id (required for seal coordination).
+        // Establish the Primary via RegisterExtent (request-response, awaited). The Primary
+        // then propagates extent creation to secondaries in-band via ForwardInitExtent before
+        // the first Forward, so secondaries never need a separate SM registration RPC.
         let primary_addr = &node_addrs[0];
         let secondary_addrs: Vec<&str> = node_addrs[1..].iter().map(|s| s.as_str()).collect();
         // Effective RF may be degraded below the requested count during failover
@@ -535,12 +474,11 @@ impl StreamManagerStore {
             ..config
         };
 
-        self.register_primary(effective_config, extent_id, primary_addr, &secondary_addrs)
+        self.register_primary(effective_config, extent_id, start_offset, primary_addr, &secondary_addrs)
             .await
             .unwrap_or_else(|e| {
                 warn!("register_primary failed for initial extent {}: {e}; client will discover on first append", extent_id);
             });
-        self.notify_secondaries(effective_config, extent_id, &node_addrs[1..]);
 
         Ok((extent_id, node_addrs[0].clone()))
     }
@@ -1249,8 +1187,16 @@ impl StreamManagerStore {
 
                 // Register new extent: best-effort. If Primary is dead/slow,
                 // client will discover on first append and trigger another seal-and-new.
+                // The new extent's start_offset is the sealed extent's end_offset,
+                // matching what seal_and_allocate_transaction persisted.
                 if let Err(e) = self
-                    .register_primary(config, new_extent_id, &primary_addr, &secondary_addrs)
+                    .register_primary(
+                        config,
+                        new_extent_id,
+                        end_offset,
+                        &primary_addr,
+                        &secondary_addrs,
+                    )
                     .await
                 {
                     warn!(
@@ -1258,9 +1204,6 @@ impl StreamManagerStore {
                         new_extent_id
                     );
                 }
-
-                // notify extent secondary nodes in fire-and-forget way
-                self.notify_secondaries(config, new_extent_id, &node_addrs[1..]);
 
                 (new_extent_id, primary_addr)
             }

@@ -43,7 +43,7 @@ For **client timeout or failure recovery**: the `SEAL_STREAM_MANAGER` opcode (0x
 3. Stream Manager determines the authoritative committed offset: if the Primary responded, its quorum offset is used (most accurate). Otherwise, SM computes the committed offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
 4. **Commit**: Stream Manager broadcasts `SealExtentNode` (flag=0x02) with the authoritative committed offset to all replicas so they correct their local seal point. Commit is fire-and-forget.
 5. Stream Manager updates extent metadata to SEALED with the committed end_offset.
-6. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtent` ack (flag=0x01)** before proceeding. `RegisterExtent` to Secondaries is fire-and-forget (see "Lazy Secondary Extent Creation" below).
+6. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtent` ack (flag=0x01)** before proceeding. Secondaries are created by the Primary via in-band `ForwardInitExtent` before the first `Forward` (see "Lazy Secondary Extent Creation" below), so the SM does not register secondaries directly.
 6. Stream Manager responds to client with the new extent info (Primary address). Writes resume immediately.
 
 **Extent-node Seal** (`FLAG_OFFSET_PRESENT = 1`):
@@ -51,7 +51,7 @@ For **client timeout or failure recovery**: the `SEAL_STREAM_MANAGER` opcode (0x
 2. Stream Manager trusts the reported offset and records it as the extent's `end_offset` in metadata.
 3. Stream Manager updates extent metadata to SEALED.
 4. Stream Manager **fire-and-forgets** Seal RPCs to secondary extent nodes only (`tokio::spawn` -- does not block the response), skipping the Primary (already sealed locally). This ensures secondaries learn about the seal asynchronously.
-5. Stream Manager allocates a new active extent, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtent` ack (flag=0x01)**, then responds to the Extent Node with the new extent info. `RegisterExtent` to Secondaries is fire-and-forget.
+5. Stream Manager allocates a new active extent, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtent` ack (flag=0x01)**, then responds to the Extent Node with the new extent info. Secondaries are created by the Primary via in-band `ForwardInitExtent` before the first `Forward`.
 
 Both paths share the same downstream procedure in Stream Manager: seal in MySQL (transaction), allocate new extent, wait for Primary `RegisterExtent` ack, respond to requester.
 
@@ -678,7 +678,7 @@ read(stream, offset=1050, count=10)
 - Quorum-based ACK: Primary waits for RF/2 secondary cumulative watermark ACKs before ACKing clients
 - Deferred ACK mechanism: WatermarkHandler sends responses through per-connection channel when quorum advances
 - Stream Manager-driven seal: 2-phase Prepare/Commit protocol — SM queries each Extent Node for committed offset (Prepare), computes quorum, broadcasts authoritative offset (Commit)
-- Stream Manager sends RegisterExtent to each Extent Node after extent allocation (Primary gets secondary addrs, Secondaries get empty addrs)
+- Stream Manager sends RegisterExtent to the **Primary** Extent Node after extent allocation (with the full secondary replica set so the Primary can broadcast); RegisterExtent carries the SM-assigned authoritative `start_offset`. Secondaries are created by the Primary via one best-effort in-band `ForwardInitExtent` (which propagates the same authoritative `start_offset`), so the SM never registers secondaries directly. ForwardInitExtent installs an epoch-qualified Secondary role; subsequent Forward/ForwardChecksum frames require that role and matching stream/extent epochs. Missing/lost initialization or any replication gap fails closed without mutation or Watermark (no replay) and quarantines that Secondary for the rest of the epoch; same-epoch successor extents cannot make it rejoin. RF=3 may continue temporarily degraded until a later epoch transition. Watermarks are tracked per extent, so a successor's progress cannot acknowledge missing predecessor records.
 - Stream Manager: extent allocation across nodes, seal orchestration
 - Failure detection (heartbeat) and seal-and-new recovery
 - MySQL metadata store (sqlx) for extent/stream/replica/node tables

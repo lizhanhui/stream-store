@@ -79,6 +79,7 @@ async fn register_extent(
                 request_id: 0,
                 extent_id: ExtentId(extent_id),
                 role,
+                start_offset: Offset(0),
                 config: StreamConfig {
                     stream_id: StreamId(stream_id),
                     replication_factor,

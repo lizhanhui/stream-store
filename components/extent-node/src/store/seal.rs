@@ -177,34 +177,28 @@ impl ExtentNodeStore {
                 // Queue sealed extent for S3 flush (Primary only).
                 // The Primary uploads to S3 and broadcasts ForwardFlushed to
                 // secondaries on completion, enabling eviction across all replicas.
-                if let Some(ref tx) = self.flush_tx {
-                    let is_primary = self
-                        .replicas
+                if let Some(ref tx) = self.flush_tx
+                    && self.primary_replica_at(stream_id, epoch).is_some()
+                {
+                    // Deduplicate: mark flush-in-progress before enqueuing.
+                    let started = self
+                        .streams
                         .pin()
                         .get(&stream_id)
-                        .map(|ri| ri.is_primary())
+                        .map(|s| s.start_flush(sealed_extent_id))
                         .unwrap_or(false);
-                    if is_primary {
-                        // Deduplicate: mark flush-in-progress before enqueuing.
-                        let started = self
-                            .streams
-                            .pin()
-                            .get(&stream_id)
-                            .map(|s| s.start_flush(sealed_extent_id))
-                            .unwrap_or(false);
-                        if started
-                            && tx
-                                .try_send(FlushRequest {
-                                    stream_id,
-                                    extent_id: sealed_extent_id,
-                                    start_offset,
-                                    end_offset,
-                                })
-                                .is_err()
-                            && let Some(s) = self.streams.pin().get(&stream_id)
-                        {
-                            s.finish_flush(sealed_extent_id);
-                        }
+                    if started
+                        && tx
+                            .try_send(FlushRequest {
+                                stream_id,
+                                extent_id: sealed_extent_id,
+                                start_offset,
+                                end_offset,
+                            })
+                            .is_err()
+                        && let Some(s) = self.streams.pin().get(&stream_id)
+                    {
+                        s.finish_flush(sealed_extent_id);
                     }
                 }
 

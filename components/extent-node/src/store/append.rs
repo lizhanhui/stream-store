@@ -77,9 +77,13 @@ impl ExtentNodeStore {
             // can exist before ReplicaInfo is published when ForwardInitExtent wins
             // the race with RegisterExtent; that state is a lazy Secondary, not a
             // standalone Primary.
-            let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
-            if !replica.as_ref().is_some_and(|ri| ri.is_primary()) {
-                let extent_id = replica.as_ref().map_or(ExtentId(0), |ri| ri.extent_id);
+            let replica = self.primary_replica_at(stream_id, epoch);
+            if replica.is_none() {
+                let extent_id = self
+                    .replicas
+                    .pin()
+                    .get(&stream_id)
+                    .map_or(ExtentId(0), |ri| ri.extent_id);
                 return Some(Frame::error_from_request(
                     &frame,
                     ErrorCode::NotPrimary,
@@ -99,6 +103,7 @@ impl ExtentNodeStore {
                 let job = AppendJob {
                     request_id: frame.request_id(),
                     stream_id,
+                    epoch,
                     payload: frame.payload.clone().unwrap_or_default(),
                     response_tx: response_tx.cloned(),
                 };
@@ -286,12 +291,13 @@ impl ExtentNodeStore {
         payload: Bytes,
         response_tx: Option<Sender<Frame>>,
     ) -> (Option<Frame>, bool) {
+        let _transition = self.role_transition.read().unwrap();
         // Defend the mutation boundary even though handle_append performs the
         // same check before leader election. Future callers must not be able to
         // bypass Primary-only append ownership.
-        let replica = self.replicas.pin().get(&stream_id).map(Arc::clone);
+        let replica = self.primary_replica_at(stream_id, epoch);
         let replica = match replica {
-            Some(ri) if ri.is_primary() => ri,
+            Some(ri) => ri,
             replica => {
                 let extent_id = replica.as_ref().map_or(ExtentId(0), |ri| ri.extent_id);
                 let err = Frame::append_ack_error(
@@ -394,17 +400,16 @@ impl ExtentNodeStore {
                     },
                     Some(payload_for_forward),
                 );
-                // Inject ForwardInitExtent if this is the first forward for the extent.
-                if let Some(init) = self.maybe_build_init_forward(stream, &forward_frame) {
-                    stream.send_forward(init);
-                }
-                stream.send_forward(forward_frame);
+                self.send_forward_with_init(stream, forward_frame);
             }
 
             // Queue deferred ACK — lock-free, no contention with watermark readers.
             if let Some(ref resp_tx) = response_tx {
-                let aq = stream
-                    .init_ack_queue(replica.required_secondary_acks(), self.replication_timeout);
+                let aq = stream.init_ack_queue(
+                    epoch,
+                    replica.required_secondary_acks(),
+                    self.replication_timeout,
+                );
                 aq.enqueue(PendingAck {
                     request_id,
                     stream_id,
@@ -437,7 +442,6 @@ impl ExtentNodeStore {
         loop {
             // ── Phase 1: Drain jobs from the channel ──
             let mut batch: Vec<AppendJob> = Vec::new();
-            let mut epoch = Epoch(0);
             loop {
                 // Scope pin guard — must be dropped before yield_now().await.
                 let need_yield = {
@@ -446,9 +450,6 @@ impl ExtentNodeStore {
                         Some(s) => s,
                         None => return notifications,
                     };
-                    if batch.is_empty() {
-                        epoch = stream.epoch();
-                    }
                     match stream.job_rx().try_recv() {
                         Ok(job) => {
                             batch.push(job);
@@ -488,7 +489,7 @@ impl ExtentNodeStore {
                         stream,
                         job.request_id,
                         job.stream_id,
-                        epoch,
+                        job.epoch,
                         job.payload.clone(),
                         job.response_tx.clone(),
                     );
@@ -510,13 +511,12 @@ impl ExtentNodeStore {
                 let done = {
                     let guard = self.streams.pin();
                     if let Some(stream) = guard.get(&stream_id) {
-                        epoch = stream.epoch();
                         for job in &batch[index..] {
                             let (_, _) = self.do_append_and_respond(
                                 stream,
                                 job.request_id,
                                 job.stream_id,
-                                epoch,
+                                job.epoch,
                                 job.payload.clone(),
                                 job.response_tx.clone(),
                             );
@@ -564,7 +564,10 @@ impl ExtentNodeStore {
         stream_id: StreamId,
         reason: SealReason,
     ) -> Option<SealNotification> {
+        let _transition = self.role_transition.read().unwrap();
         if let Some(stream) = self.streams.pin().get(&stream_id) {
+            let epoch = stream.epoch();
+            self.primary_replica_at(stream_id, epoch)?;
             // For IdleShrink, re-check eligibility under write guard.
             if matches!(reason, SealReason::IdleShrink)
                 && !stream
@@ -594,6 +597,13 @@ impl ExtentNodeStore {
 
     /// Send an async UPDATE_EXTENT (Sealed) to SM (fire-and-forget).
     pub(crate) fn send_extent_update(&self, stream_id: StreamId, notification: &SealNotification) {
+        let _transition = self.role_transition.read().unwrap();
+        if self
+            .primary_replica_at(stream_id, notification.epoch)
+            .is_none()
+        {
+            return;
+        }
         if let Some(ref tx) = self.update_tx {
             let _ = tx.try_send(ExtentUpdate::Sealed {
                 stream_id,
@@ -611,17 +621,15 @@ impl ExtentNodeStore {
     /// The Primary uploads to S3 and broadcasts `ForwardFlushed` to secondaries
     /// on completion, enabling eviction across all replicas without extra infra.
     pub(crate) fn send_flush_request(&self, stream_id: StreamId, notification: &SealNotification) {
+        let _transition = self.role_transition.read().unwrap();
         let tx = match self.flush_tx {
             Some(ref tx) => tx,
             None => return,
         };
-        let is_primary = self
-            .replicas
-            .pin()
-            .get(&stream_id)
-            .map(|ri| ri.is_primary())
-            .unwrap_or(false);
-        if !is_primary {
+        if self
+            .primary_replica_at(stream_id, notification.epoch)
+            .is_none()
+        {
             return;
         }
         // Memory-only streams don't flush to S3.
@@ -672,20 +680,25 @@ impl ExtentNodeStore {
     ///
     /// Fire-and-forget: the secondary defers verification via `try_verify_checksum()`.
     pub(crate) fn send_forward_checksum(&self, stream_id: StreamId, sealed_extent_id: ExtentId) {
+        let _transition = self.role_transition.read().unwrap();
         let guard = self.streams.pin();
         let stream = match guard.get(&stream_id) {
             Some(s) => s,
             None => return,
         };
-        let (checksum, committed_bytes) = match stream.with_extent(sealed_extent_id, |ext| {
+        let (checksum, committed_bytes, epoch) = match stream.with_extent(sealed_extent_id, |ext| {
             (
                 ext.finalized_crc32().unwrap_or(0),
                 ext.committed_data().len() as u64,
+                ext.epoch,
             )
         }) {
-            Some(pair) => pair,
+            Some(values) => values,
             None => return,
         };
+        if self.primary_replica_at(stream_id, epoch).is_none() {
+            return;
+        }
         debug!(
             "ForwardChecksum sent: stream={}, extent={}, crc32={:#x}, bytes={}",
             stream_id, sealed_extent_id, checksum, committed_bytes,
@@ -694,16 +707,13 @@ impl ExtentNodeStore {
             VariableHeader::ForwardChecksum {
                 stream_id,
                 extent_id: sealed_extent_id,
-                epoch: stream.epoch(),
+                epoch,
                 checksum,
                 committed_bytes,
             },
             None,
         );
-        if let Some(init) = self.maybe_build_init_forward(stream, &frame) {
-            stream.send_forward(init);
-        }
-        stream.send_forward(frame);
+        self.send_forward_with_init(stream, frame);
     }
 
     /// Optimized batch append: all frames share the same stream_id/epoch.
@@ -741,6 +751,7 @@ impl ExtentNodeStore {
 
         // ── Validation + leader election + batch appends (scoped pin guard) ──
         let (epoch, batch_len) = {
+            let _transition = self.role_transition.read().unwrap();
             let guard = self.streams.pin();
             let stream = match guard.get(&stream_id) {
                 Some(s) => s,
@@ -771,6 +782,23 @@ impl ExtentNodeStore {
                 return responses;
             }
 
+            if self.primary_replica_at(stream_id, epoch).is_none() {
+                let extent_id = self
+                    .replicas
+                    .pin()
+                    .get(&stream_id)
+                    .map_or(ExtentId(0), |replica| replica.extent_id);
+                for frame in frames {
+                    responses.push(Frame::error_from_request(
+                        frame,
+                        ErrorCode::NotPrimary,
+                        "this extent node is not the stream primary",
+                        extent_id,
+                    ));
+                }
+                return responses;
+            }
+
             let batch_len = frames.len() as u64;
             let prev = stream.in_flight().fetch_add(batch_len, Ordering::Acquire);
 
@@ -780,6 +808,7 @@ impl ExtentNodeStore {
                     let job = AppendJob {
                         request_id: frame.request_id(),
                         stream_id,
+                        epoch,
                         payload: frame.payload.clone().unwrap_or_default(),
                         response_tx: response_tx.cloned(),
                     };
@@ -800,6 +829,23 @@ impl ExtentNodeStore {
                         request_id,
                         payload,
                     });
+                    continue;
+                }
+
+                if self.primary_replica_at(stream_id, epoch).is_none() {
+                    let err = Frame::append_ack_error(
+                        request_id,
+                        stream_id,
+                        epoch,
+                        ExtentId(0),
+                        ErrorCode::NotPrimary,
+                        "this extent node is not the stream primary",
+                    );
+                    if let Some(tx) = response_tx {
+                        let _ = tx.try_send(err);
+                    } else {
+                        responses.push(err);
+                    }
                     continue;
                 }
 
@@ -870,15 +916,13 @@ impl ExtentNodeStore {
                 match replica.as_ref() {
                     None => {
                         for entry in &entries {
-                            let ack = Frame::new(
-                                VariableHeader::AppendAck {
-                                    request_id: entry.request_id,
-                                    stream_id,
-                                    epoch,
-                                    extent_id: entry.extent_id,
-                                    offset: entry.offset,
-                                },
-                                None,
+                            let ack = Frame::append_ack_error(
+                                entry.request_id,
+                                stream_id,
+                                epoch,
+                                entry.extent_id,
+                                ErrorCode::NotPrimary,
+                                "this extent node is not the stream primary",
                             );
                             if let Some(tx) = response_tx {
                                 let _ = tx.try_send(ack);
@@ -887,7 +931,7 @@ impl ExtentNodeStore {
                             }
                         }
                     }
-                    Some(ri) if ri.is_primary() => {
+                    Some(ri) if ri.is_primary_at(epoch) => {
                         if ri.is_standalone() {
                             for entry in &entries {
                                 let ack = Frame::new(
@@ -919,16 +963,12 @@ impl ExtentNodeStore {
                                         },
                                         Some(entry.payload_for_forward.clone()),
                                     );
-                                    if let Some(init) =
-                                        self.maybe_build_init_forward(stream, &forward_frame)
-                                    {
-                                        stream.send_forward(init);
-                                    }
-                                    stream.send_forward(forward_frame);
+                                    self.send_forward_with_init(stream, forward_frame);
                                 }
                             }
                             if let Some(resp_tx) = response_tx {
                                 let aq = stream.init_ack_queue(
+                                    epoch,
                                     ri.required_secondary_acks(),
                                     self.replication_timeout,
                                 );
@@ -949,15 +989,13 @@ impl ExtentNodeStore {
                     }
                     Some(_) => {
                         for entry in &entries {
-                            let ack = Frame::new(
-                                VariableHeader::AppendAck {
-                                    request_id: entry.request_id,
-                                    stream_id,
-                                    epoch,
-                                    extent_id: entry.extent_id,
-                                    offset: entry.offset,
-                                },
-                                None,
+                            let ack = Frame::append_ack_error(
+                                entry.request_id,
+                                stream_id,
+                                epoch,
+                                entry.extent_id,
+                                ErrorCode::NotPrimary,
+                                "this extent node is not the stream primary",
                             );
                             if let Some(tx) = response_tx {
                                 let _ = tx.try_send(ack);

@@ -11,8 +11,9 @@ mod tests;
 pub(crate) use types::AppendJob;
 pub use types::{ExtentUpdate, ReplicaInfo};
 
-use std::sync::OnceLock;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
 use common::hasher::IdentityBuildHasher;
@@ -49,6 +50,10 @@ pub struct ExtentNodeStore {
     /// Replication info per stream_id (registered via RegisterExtent).
     /// Immutable within an epoch — wrapped in Arc for cheap hot-path cloning.
     pub(crate) replicas: papaya::HashMap<StreamId, Arc<ReplicaInfo>, IdentityBuildHasher>,
+    /// Epoch in which a Secondary rejected replication and must remain excluded.
+    pub(crate) forward_quarantine: Mutex<HashMap<StreamId, Epoch>>,
+    /// Cold transitions take write ownership; runtime mutations take read ownership.
+    pub(crate) role_transition: RwLock<()>,
     /// Direct TCP connection pool for broadcast replication (None for standalone/test mode).
     /// Initialized via `set_downstream()` after construction (OnceLock breaks circular dep).
     pub(crate) downstream: OnceLock<Arc<DownstreamPool>>,
@@ -77,6 +82,8 @@ impl ExtentNodeStore {
             streams: papaya::HashMap::with_hasher(IdentityBuildHasher),
 
             replicas: papaya::HashMap::with_hasher(IdentityBuildHasher),
+            forward_quarantine: Mutex::new(HashMap::new()),
+            role_transition: RwLock::new(()),
             downstream: OnceLock::new(),
             s3_client: OnceLock::new(),
             update_tx: None,
@@ -116,7 +123,11 @@ impl ExtentNodeStore {
                 stream.set_max_extents(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
-            stream.set_capacity_bounds(policy.min_capacity, policy.max_capacity, policy.scale_factor);
+            stream.set_capacity_bounds(
+                policy.min_capacity,
+                policy.max_capacity,
+                policy.scale_factor,
+            );
             false
         } else {
             let stream = Stream::new(stream_id);
@@ -124,7 +135,11 @@ impl ExtentNodeStore {
                 stream.set_max_extents(policy.cache as usize);
             }
             stream.set_storage_class(storage_class);
-            stream.set_capacity_bounds(policy.min_capacity, policy.max_capacity, policy.scale_factor);
+            stream.set_capacity_bounds(
+                policy.min_capacity,
+                policy.max_capacity,
+                policy.scale_factor,
+            );
             guard.insert(stream_id, stream);
             true
         }
@@ -134,6 +149,51 @@ impl ExtentNodeStore {
     /// Called once during ExtentNode bootstrap after async initialization.
     pub fn set_s3_client(&self, client: Arc<S3Client>) {
         self.s3_client.set(client).ok();
+    }
+
+    /// Return the current Primary assignment only when it is valid for the
+    /// expected epoch and agrees with the stream's current epoch.
+    pub(crate) fn primary_replica_at(
+        &self,
+        stream_id: StreamId,
+        expected_epoch: Epoch,
+    ) -> Option<Arc<ReplicaInfo>> {
+        let streams = self.streams.pin();
+        let stream = streams.get(&stream_id)?;
+        if stream.epoch() != expected_epoch {
+            return None;
+        }
+        self.replicas
+            .pin()
+            .get(&stream_id)
+            .filter(|replica| replica.is_primary_at(expected_epoch))
+            .map(Arc::clone)
+    }
+
+    pub(crate) fn quarantine_forwarding(&self, stream_id: StreamId, epoch: Epoch) {
+        let mut quarantine = self.forward_quarantine.lock().unwrap();
+        let current = quarantine.entry(stream_id).or_insert(epoch);
+        if current.0 < epoch.0 {
+            *current = epoch;
+        }
+    }
+
+    pub(crate) fn forwarding_quarantined(&self, stream_id: StreamId, epoch: Epoch) -> bool {
+        self.forward_quarantine
+            .lock()
+            .unwrap()
+            .get(&stream_id)
+            .is_some_and(|quarantined| *quarantined == epoch)
+    }
+
+    pub(crate) fn clear_older_forward_quarantine(&self, stream_id: StreamId, epoch: Epoch) {
+        let mut quarantine = self.forward_quarantine.lock().unwrap();
+        if quarantine
+            .get(&stream_id)
+            .is_some_and(|quarantined| quarantined.0 < epoch.0)
+        {
+            quarantine.remove(&stream_id);
+        }
     }
 
     /// Get a reference to the S3 client, if configured.
@@ -161,13 +221,16 @@ impl ExtentNodeStore {
 
     /// Expire stale PendingAcks across all streams by running the timeout sweep.
     ///
-    /// Called when a downstream secondary reader exits (secondary died or disconnected),
-    /// so clients get timely error responses instead of waiting for SM recovery.
-    /// Without this, RF=2 clients would stall for the full SM heartbeat detection
-    /// window (~7.5s) because no watermark ACKs arrive to trigger `drain_quorum`.
+    /// Called periodically and when a downstream reader exits, so replication
+    /// timeout progresses even when a lost init/gap yields no Watermark.
     pub fn expire_pending_acks(&self) {
+        let _transition = self.role_transition.read().unwrap();
         let guard = self.streams.pin();
-        for (_k, stream) in guard.iter() {
+        for (stream_id, stream) in guard.iter() {
+            let epoch = stream.epoch();
+            if self.primary_replica_at(*stream_id, epoch).is_none() {
+                continue;
+            }
             if let Some(aq) = stream.ack_queue() {
                 let mut inner = aq.lock_inner();
                 inner.receive_pending();
@@ -325,13 +388,24 @@ impl RequestHandler for ExtentNodeStore {
         if frames.is_empty() {
             return Vec::new();
         }
-        // Single frame: fall back to normal path (avoids overhead of batch setup).
-        if frames.len() == 1 {
-            return self
-                .handle_append(frames[0].clone(), response_tx)
-                .await
-                .into_iter()
-                .collect();
+        // Single or heterogeneous batches use per-frame validation. The server
+        // normally groups by stream+client epoch, but this boundary fails safe
+        // for direct callers too.
+        let first = &frames[0];
+        if frames.len() == 1
+            || frames.iter().any(|frame| {
+                frame.opcode() != Opcode::Append
+                    || frame.stream_id() != first.stream_id()
+                    || frame.epoch() != first.epoch()
+            })
+        {
+            let mut responses = Vec::new();
+            for frame in frames {
+                if let Some(response) = self.handle_append(frame.clone(), response_tx).await {
+                    responses.push(response);
+                }
+            }
+            return responses;
         }
         self.handle_append_batch_inner(frames, response_tx).await
     }

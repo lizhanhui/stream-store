@@ -335,9 +335,23 @@ impl Stream {
 
     /// Initialize the AckQueue for this stream (Primary only, idempotent).
     /// Returns a reference to the (possibly pre-existing) AckQueue.
-    pub(crate) fn init_ack_queue(&self, required_acks: u32, timeout: Duration) -> &AckQueue {
-        self.ack_queue
-            .get_or_init(|| AckQueue::with_timeout(required_acks, timeout))
+    pub(crate) fn init_ack_queue(
+        &self,
+        epoch: Epoch,
+        required_acks: u32,
+        timeout: Duration,
+    ) -> &AckQueue {
+        let queue = self
+            .ack_queue
+            .get_or_init(|| AckQueue::with_timeout(required_acks, timeout));
+        queue.activate(epoch, required_acks);
+        queue
+    }
+
+    pub(crate) fn deactivate_ack_queue(&self) {
+        if let Some(queue) = self.ack_queue.get() {
+            queue.deactivate();
+        }
     }
 
     // ── Read-lock methods ──────────────────────────────────────────────
@@ -714,6 +728,55 @@ impl Stream {
                 Epoch(0),
             ));
         }
+    }
+
+    /// Register an extent only if it does not already exist.
+    ///
+    /// Acquires the write lock once and performs the existence check and the
+    /// insert atomically, so concurrent `ForwardInitExtent` and `Forward`
+    /// deliveries cannot both observe "absent" and push duplicate extents.
+    ///
+    /// Returns `None` if the extent was newly created, or `Some(existing_start_offset)`
+    /// if an extent with this id already exists (in which case the caller may
+    /// emit a mismatch warning — the existing value is preserved).
+    pub fn register_extent_if_absent(
+        &self,
+        id: ExtentId,
+        start_offset: Offset,
+        epoch: Epoch,
+        extent_capacity: u32,
+    ) -> Option<Offset> {
+        let mut inner = self.inner.write();
+        if inner.extents.iter().any(|e| e.id == id) {
+            let existing = inner
+                .extents
+                .iter()
+                .find(|e| e.id == id)
+                .map(|e| e.start_offset);
+            return existing;
+        }
+
+        self.epoch.store(epoch.0, Ordering::Release);
+        inner.next_extent_capacity = extent_capacity;
+        inner.next_extent_id = ExtentId(id.0 + 1);
+        inner.active_extent_created_at = Some(Instant::now());
+        inner.extents.push(Extent::with_capacity(
+            id,
+            start_offset,
+            extent_capacity,
+            epoch,
+        ));
+        inner.evict_oldest_extents(self.id);
+
+        if inner.max_extents > 0 && inner.extent_pool.is_empty() {
+            inner.extent_pool.push_back(Extent::with_capacity(
+                ExtentId(0), // placeholder — reset() overwrites on use
+                Offset(0),
+                extent_capacity,
+                Epoch(0),
+            ));
+        }
+        None
     }
 
     /// Simplified register_extent for tests and backward compatibility.

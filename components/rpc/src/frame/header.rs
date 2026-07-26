@@ -182,6 +182,9 @@ pub enum VariableHeader {
         extent_id: ExtentId,
         /// 0 = Primary, 1+ = Secondary.
         role: u8,
+        /// SM-assigned authoritative start offset of the extent being registered.
+        /// Extent Nodes must use this value instead of inferring it from local state.
+        start_offset: Offset,
         /// Stream identity, replication, epoch, durability, and sizing policy.
         config: StreamConfig,
     },

@@ -49,6 +49,8 @@ pub struct ReplicaInfo {
     pub stream_id: StreamId,
     /// Extent this replica assignment covers.
     pub extent_id: ExtentId,
+    /// Epoch in which this role assignment is valid.
+    pub epoch: Epoch,
     /// 0 = Primary, 1+ = Secondary.
     pub role: u8,
     /// Total replication factor (used for quorum calculation).
@@ -60,6 +62,10 @@ pub struct ReplicaInfo {
 impl ReplicaInfo {
     pub fn is_primary(&self) -> bool {
         self.role == ROLE_PRIMARY
+    }
+
+    pub fn is_primary_at(&self, epoch: Epoch) -> bool {
+        self.is_primary() && self.epoch == epoch
     }
 
     /// True if RF=1 (no secondaries needed). Immediate ACK.
@@ -85,6 +91,8 @@ impl ReplicaInfo {
 pub(crate) struct AppendJob {
     pub request_id: u32,
     pub stream_id: StreamId,
+    /// Epoch under which this append was admitted by the Primary.
+    pub epoch: Epoch,
     pub payload: Bytes,
     /// Channel back to the client connection for sending response frames.
     /// `None` in test mode (no client connection).
