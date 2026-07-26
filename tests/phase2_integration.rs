@@ -7,7 +7,9 @@
 
 use bytes::Bytes;
 use common::config::StreamManagerConfig;
-use common::types::{Epoch, ExtentId, ExtentPolicy, ExtentState, NodeMetrics, Offset, StorageClass};
+use common::types::{
+    Epoch, ExtentId, ExtentPolicy, ExtentState, NodeMetrics, Offset, StorageClass,
+};
 
 use serial_test::serial;
 
