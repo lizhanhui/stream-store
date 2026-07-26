@@ -20,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: shogo82148/actions-setup-mysql@v1
       with:
         mysql-version: "8.4"
@@ -41,7 +41,7 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
     - uses: shogo82148/actions-setup-mysql@v1
       with:
         mysql-version: "8.4"
