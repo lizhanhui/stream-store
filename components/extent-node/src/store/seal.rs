@@ -185,10 +185,17 @@ impl ExtentNodeStore {
                     .unwrap_or(end_offset);
                 let sealed_extent_id = active_id;
                 let _ = stream;
-                info!(
-                    "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={committed_end_offset} (local={end_offset})",
-                    sealed_extent_id, stream_id
-                );
+                if committed_end_offset < end_offset {
+                    info!(
+                        "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={committed_end_offset} (local={end_offset})",
+                        sealed_extent_id, stream_id
+                    );
+                } else {
+                    info!(
+                        "sealed extent {} for stream {}, start_offset={start_offset}, end_offset={committed_end_offset}",
+                        sealed_extent_id, stream_id
+                    );
+                }
                 // Primary seals finalize CRC32 — send checksum to secondaries inline.
                 self.send_forward_checksum(stream_id, sealed_extent_id);
 

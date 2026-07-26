@@ -221,6 +221,10 @@ impl AckQueueInner {
     }
 
     /// Compute the quorum offset for a specific extent.
+    ///
+    /// Like [`quorum_offset`](Self::quorum_offset) but filters secondary ACKs
+    /// to only those reported for `extent_id`. Returns `None` when quorum
+    /// cannot be met or `required_acks == 0` (RF=1).
     pub fn quorum_offset_for_extent(&self, extent_id: ExtentId) -> Option<u64> {
         self.quorum_offset_for(extent_id)
     }
