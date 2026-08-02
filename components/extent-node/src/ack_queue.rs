@@ -79,9 +79,10 @@ pub struct AckQueueInner {
     /// Populated by [`receive_pending`] which drains `rx`.
     pub(crate) pending: VecDeque<PendingAck>,
 
-    /// Extent and highest offset acknowledged by each secondary.
-    acked_extent: [Option<ExtentId>; MAX_SECONDARIES],
+    /// Extent being acknowledged by each secondary.
+    extents: [Option<ExtentId>; MAX_SECONDARIES],
 
+    // Highest offset acknowledged by each secondary.
     /// `u64::MAX` = never reported for the corresponding extent.
     acked: [u64; MAX_SECONDARIES],
 
@@ -105,7 +106,7 @@ impl AckQueue {
             inner: Mutex::new(AckQueueInner {
                 rx,
                 pending: VecDeque::new(),
-                acked_extent: [None; MAX_SECONDARIES],
+                extents: [None; MAX_SECONDARIES],
                 acked: [u64::MAX; MAX_SECONDARIES],
                 required_acks: required_secondary_acks,
                 replication_timeout,
@@ -151,7 +152,7 @@ impl AckQueue {
         self.active_epoch.store(u64::MAX, Ordering::Release);
         let mut inner = self.inner.lock().unwrap();
         inner.fail_all_pending("Primary assignment changed");
-        inner.acked_extent = [None; MAX_SECONDARIES];
+        inner.extents = [None; MAX_SECONDARIES];
         inner.acked = [u64::MAX; MAX_SECONDARIES];
         inner.required_acks = required_acks;
         self.active_epoch.store(epoch.0 as u64, Ordering::Release);
@@ -180,8 +181,7 @@ impl AckQueue {
         if !self.is_active_at(epoch) {
             return;
         }
-        inner.receive_pending();
-        inner.ack_from_secondary(secondary_index, extent_id, offset);
+        inner.update_watermark(secondary_index, extent_id, offset);
         inner.drain_quorum();
     }
 
@@ -212,7 +212,7 @@ impl AckQueueInner {
 
     /// Drain all available PendingAcks from the lock-free channel into
     /// the local `pending` VecDeque. Call this before `drain_quorum`.
-    pub fn receive_pending(&mut self) {
+    pub(crate) fn receive_pending(&mut self) {
         while let Ok(ack) = self.rx.try_recv() {
             self.pending.push_back(ack);
         }
@@ -222,11 +222,7 @@ impl AckQueueInner {
     /// `required_acks` secondaries have confirmed.
     ///
     /// Returns None if quorum cannot be met (not enough secondaries have reported).
-    pub fn quorum_offset(&self) -> Option<u64> {
-        self.quorum_offset_for(ExtentId(0))
-    }
-
-    fn quorum_offset_for(&self, extent_id: ExtentId) -> Option<u64> {
+    pub fn quorum_offset(&self, extent_id: ExtentId) -> Option<u64> {
         if self.required_acks == 0 {
             return None; // RF=1, no quorum needed
         }
@@ -236,7 +232,7 @@ impl AckQueueInner {
         let mut offsets = [0u64; MAX_SECONDARIES];
         let mut count = 0;
         for (index, &value) in self.acked.iter().enumerate() {
-            if self.acked_extent[index] == Some(extent_id) && value != u64::MAX {
+            if self.extents[index] == Some(extent_id) && value != u64::MAX {
                 offsets[count] = value;
                 count += 1;
             }
@@ -261,8 +257,10 @@ impl AckQueueInner {
     /// `secondary_index` is the secondary's ordinal (role - 1): secondary-1 → 0,
     /// secondary-2 → 1, etc. Callers resolve this once per (stream, connection)
     /// pair and cache it locally.
-    pub fn ack_from_secondary(&mut self, secondary_index: u8, extent_id: ExtentId, offset: u64) {
-        let idx = secondary_index as usize;
+    pub fn update_watermark(&mut self, secondary: u8, extent_id: ExtentId, offset: u64) {
+        self.receive_pending();
+
+        let idx = secondary as usize;
         debug_assert!(
             idx < MAX_SECONDARIES,
             "secondary_index {} exceeds MAX_SECONDARIES {}",
@@ -272,8 +270,8 @@ impl AckQueueInner {
         if idx >= MAX_SECONDARIES {
             return;
         }
-        if self.acked_extent[idx] != Some(extent_id) {
-            self.acked_extent[idx] = Some(extent_id);
+        if self.extents[idx] != Some(extent_id) {
+            self.extents[idx] = Some(extent_id);
             self.acked[idx] = offset;
             return;
         }
@@ -293,7 +291,7 @@ impl AckQueueInner {
     /// entries (older than the configured replication timeout) and sends error responses.
     pub fn drain_quorum(&mut self) {
         while let Some(front) = self.pending.front() {
-            let Some(quorum_offset) = self.quorum_offset_for(front.extent_id) else {
+            let Some(quorum_offset) = self.quorum_offset(front.extent_id) else {
                 break;
             };
             if front.assigned_offset > quorum_offset {
