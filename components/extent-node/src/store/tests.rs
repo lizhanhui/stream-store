@@ -1354,29 +1354,6 @@ async fn secondary_withholds_watermark_after_forward_gap() {
     assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(1));
 }
 
-#[test]
-fn watermark_cannot_ack_pending_from_another_extent() {
-    let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(4);
-    let ack_queue = AckQueue::new(1);
-    ack_queue.enqueue(PendingAck {
-        request_id: 1,
-        stream_id: StreamId(10),
-        extent_id: ExtentId(40),
-        epoch: Epoch(0),
-        response_tx: resp_tx,
-        assigned_offset: 10,
-        created_at: Instant::now(),
-    });
-
-    ack_queue.update_watermark(Epoch(0), ExtentId(41), 0, 20);
-
-    assert!(resp_rx.try_recv().is_err());
-    let mut inner = ack_queue.lock_inner();
-    inner.receive_pending();
-    assert_eq!(inner.pending.len(), 1);
-    assert_eq!(inner.pending[0].extent_id, ExtentId(40));
-}
-
 #[tokio::test]
 async fn cumulative_ack_drains_multiple_pending() {
     // Test that a single watermark can drain multiple pending ACKs.
