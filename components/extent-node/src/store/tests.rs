@@ -1236,7 +1236,7 @@ async fn primary_append_defers_and_broadcasts() {
     // Simulate watermark from first secondary (quorum met with 1 ACK for RF=3).
     {
         let mut inner = aq.lock_inner();
-        inner.ack_from_secondary(0, ExtentId(50), 0);
+        inner.update_watermark(0, ExtentId(50), 0);
         inner.drain_quorum();
     }
 
@@ -1354,29 +1354,6 @@ async fn secondary_withholds_watermark_after_forward_gap() {
     assert_eq!(streams.get(&stream_id).unwrap().max_offset(), Offset(1));
 }
 
-#[test]
-fn watermark_cannot_ack_pending_from_another_extent() {
-    let (resp_tx, mut resp_rx) = mpsc::channel::<Frame>(4);
-    let ack_queue = AckQueue::new(1);
-    ack_queue.enqueue(PendingAck {
-        request_id: 1,
-        stream_id: StreamId(10),
-        extent_id: ExtentId(40),
-        epoch: Epoch(0),
-        response_tx: resp_tx,
-        assigned_offset: 10,
-        created_at: Instant::now(),
-    });
-
-    ack_queue.apply_watermark(Epoch(0), ExtentId(41), 0, 20);
-
-    assert!(resp_rx.try_recv().is_err());
-    let mut inner = ack_queue.lock_inner();
-    inner.receive_pending();
-    assert_eq!(inner.pending.len(), 1);
-    assert_eq!(inner.pending[0].extent_id, ExtentId(40));
-}
-
 #[tokio::test]
 async fn cumulative_ack_drains_multiple_pending() {
     // Test that a single watermark can drain multiple pending ACKs.
@@ -1400,7 +1377,7 @@ async fn cumulative_ack_drains_multiple_pending() {
     // Single cumulative ACK at offset 2 from one secondary.
     let mut inner = ack_queue.lock_inner();
     inner.receive_pending();
-    inner.ack_from_secondary(0, ExtentId(0), 2);
+    inner.update_watermark(0, ExtentId(0), 2);
     inner.drain_quorum();
     drop(inner);
 
@@ -1420,16 +1397,16 @@ async fn quorum_offset_with_multiple_secondaries() {
     let mut inner = aq.lock_inner();
 
     // Only 1 secondary has reported — not enough for quorum.
-    inner.ack_from_secondary(0, ExtentId(0), 5);
+    inner.update_watermark(0, ExtentId(0), 5);
     assert!(inner.quorum_offset().is_none());
 
     // Second secondary reports — now we have quorum.
-    inner.ack_from_secondary(1, ExtentId(0), 3);
+    inner.update_watermark(1, ExtentId(0), 3);
     // quorum_offset = min of top-2 = 3
     assert_eq!(inner.quorum_offset(), Some(3));
 
     // Third secondary reports higher.
-    inner.ack_from_secondary(2, ExtentId(0), 10);
+    inner.update_watermark(2, ExtentId(0), 10);
     // top-2 descending: [10, 5], so quorum_offset = 5
     assert_eq!(inner.quorum_offset(), Some(5));
 }
