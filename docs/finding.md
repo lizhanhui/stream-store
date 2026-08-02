@@ -34,11 +34,11 @@ Consequently, locally appended records that have not reached quorum can be inclu
 
 **Documentation resolution:** `design.md` now distinguishes the Primary's local seal frontier from the quorum-confirmed client ACK frontier and documents the duplicate and hole trade-offs. No implementation change is required.
 
-### 5. Epoch CAS does not fence the epoch observed by the client request
+### 5. Epoch CAS does not fence the epoch observed by the client request — Resolved
 
-`handle_epoch_seal` reads and validates the requested epoch early (`components/stream-manager/src/store.rs:1488-1503`). Later, `bump_epoch` rereads the current database value and CASes that value instead of accepting the originally observed epoch (`components/stream-manager/src/metadata.rs:1133-1157`).
+Previously, `handle_epoch_seal` validated the requested epoch early, but `bump_epoch` later reread and CASed the current database value. Two requests that both passed the initial check could therefore perform consecutive bumps.
 
-Two requests that both passed the initial check can consequently perform consecutive bumps. The second request can advance the stream to an epoch for which no corresponding active extent or replica set exists.
+**Resolution:** `handle_epoch_seal` now requires the request epoch to equal both the persisted epoch and the active extent's epoch before contacting an Extent Node, so stale and future requests fail without sealing a successor extent. `bump_epoch` also requires that original request epoch and updates only while the persisted epoch still matches it. Of concurrent requests for the same epoch, exactly one can advance it; losers receive `EpochStale` with their rejected request epoch and must rediscover or retry. A MySQL-backed concurrency test verifies one successful bump, one stale result, and a single persisted increment. Epoch bump and successor allocation remain separate transactions as tracked by finding 6.
 
 ### 6. Epoch bump and successor allocation are separate transactions
 

@@ -272,6 +272,20 @@ impl StreamClient {
         })
     }
 
+    fn check_seal_error(
+        resp: &Frame,
+        stream_id: StreamId,
+        epoch: Epoch,
+    ) -> Result<(), StorageError> {
+        if resp.is_error_response()
+            && ErrorCode::from_u16(resp.error_code()) == Some(ErrorCode::EpochStale)
+        {
+            return Err(EpochStaleSnafu { stream_id, epoch }.build());
+        }
+
+        Self::check_error(resp)
+    }
+
     /// Create a new stream on the StreamManager.
     /// Variable header carries stream name, per-stream replication factor, storage class,
     /// and the stream's extent-sizing policy.
@@ -500,7 +514,7 @@ impl StreamClient {
             None,
         );
         let resp = self.send_request(req).await?;
-        Self::check_error(&resp)?;
+        Self::check_seal_error(&resp, stream_id, epoch)?;
         if resp.opcode() != Opcode::SealStreamManager {
             return Err(InternalSnafu {
                 message: format!("expected SealStreamManagerResp, got {:?}", resp.opcode()),
@@ -762,6 +776,29 @@ mod tests {
             StorageError::NotPrimary {
                 stream_id: StreamId(9),
                 epoch: Epoch(3),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn seal_epoch_stale_error_preserves_request_epoch() {
+        let stream_id = StreamId(9);
+        let request_epoch = Epoch(7);
+        let response = Frame::seal_stream_manager_resp_error(
+            1,
+            stream_id,
+            ErrorCode::EpochStale,
+            "seal request epoch does not match the current stream epoch",
+        );
+
+        let error =
+            StreamClient::check_seal_error(&response, stream_id, request_epoch).unwrap_err();
+        assert!(matches!(
+            error,
+            StorageError::EpochStale {
+                stream_id: StreamId(9),
+                epoch: Epoch(7),
                 ..
             }
         ));

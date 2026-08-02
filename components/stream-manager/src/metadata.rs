@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use common::errors::{DatabaseSnafu, InternalSnafu, MigrationSnafu, StorageError};
+use common::errors::{DatabaseSnafu, EpochStaleSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
     Epoch, ExtentId, ExtentInfo, ExtentPolicy, ExtentState, NodeMetrics, NodeState, ReplicaDetail,
     StorageClass, StreamId,
@@ -1183,17 +1183,19 @@ impl MetadataStore {
         Ok(Epoch(row.get::<i32, _>("epoch") as u32))
     }
 
-    /// Bump the epoch for a stream. Returns the new epoch.
+    /// Bump the epoch for a stream from `expected` to `expected + 1`.
     ///
-    /// Uses compare-and-swap: only increments if the current epoch matches
-    /// `expected`. Returns an error if a concurrent bump was detected.
-    pub async fn bump_epoch(&self, stream_id: StreamId) -> Result<Epoch, StorageError> {
-        let current = self.get_stream_epoch(stream_id).await?;
-
+    /// The expected epoch must come from the request being handled rather than
+    /// from a fresh database read. This fences stale concurrent seal requests.
+    pub async fn bump_epoch(
+        &self,
+        stream_id: StreamId,
+        expected: Epoch,
+    ) -> Result<Epoch, StorageError> {
         let result =
             sqlx::query("UPDATE stream SET epoch = epoch + 1 WHERE stream_id = ? AND epoch = ?")
                 .bind(stream_id.0)
-                .bind(current.0 as i32)
+                .bind(expected.0 as i32)
                 .execute(&self.pool)
                 .await
                 .context(DatabaseSnafu {
@@ -1201,13 +1203,14 @@ impl MetadataStore {
                 })?;
 
         if result.rows_affected() == 0 {
-            return InternalSnafu {
-                message: "epoch CAS failed: concurrent bump detected",
+            return EpochStaleSnafu {
+                stream_id,
+                epoch: expected,
             }
             .fail();
         }
 
-        Ok(Epoch(current.0 + 1))
+        Ok(Epoch(expected.0 + 1))
     }
 
     // ── Leadership lease operations ──
