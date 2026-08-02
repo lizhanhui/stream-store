@@ -26,13 +26,13 @@ This can restart or overlap logical offsets after an epoch change.
 
 **Resolution:** `RegisterExtent` (sent only to the **Primary**) now carries the SM-assigned authoritative `start_offset` (u64) in its variable header, encoded after `epoch`. The Stream Manager populates it from the values it persists: the allocation `start_offset` for initial extents and the sealed extent's `end_offset` for seal-and-new successors (`components/stream-manager/src/store.rs`). The Primary installs the extent at the wire value and propagates the same authoritative `start_offset` once to secondaries via in-band `ForwardInitExtent` (the sole secondary creation path; the SM no longer sends `RegisterExtent` to secondaries). ForwardInitExtent installs an epoch-qualified Secondary role and atomically creates the extent if absent; a newer init demotes a former Primary, while stale/conflicting init is ignored. Forward and ForwardChecksum validate the Secondary role plus stream/extent epoch before mutation. Initialization remains best-effort with no replay: lost init or a replication gap quarantines that Secondary for the rest of the epoch and withholds Watermarks; same-epoch successor extents cannot make it rejoin, while RF=3 may operate temporarily degraded until a later epoch. Watermark quorum accounting is extent-qualified so successor progress cannot acknowledge missing predecessor records. Primary registration is idempotent and uses the wire value instead of `stream.max_offset()`. Regression tests cover fresh/stale local state, role transition, Secondary append rejection, batch rejection without mutation, and init-before-Forward ordering.
 
-### 4. Primary seal reports the local append frontier rather than the quorum frontier
+### 4. Primary seal reports the local append frontier rather than the quorum frontier — Documentation only
 
-The design describes the Primary seal offset as the committed, quorum-confirmed end offset (`design.md:47-55`, `design.md:1183-1188`). Quorum progress is tracked in `AckQueue`, but sealing returns `start_offset + record_count` (`components/extent-node/src/extent.rs:663-691`).
+Primary sealing returns `start_offset + record_count`, while quorum progress is tracked separately in `AckQueue`. The implementation intentionally does not wait for the quorum frontier during sealing so autonomous extent transitions remain local and fast.
 
-If the Primary has locally appended records that have not reached quorum, those records can still be included in the sealed metadata range. Losing the Primary afterward can leave surviving replicas without data that metadata declares committed.
+Consequently, locally appended records that have not reached quorum can be included in the sealed metadata range. They may become visible despite the client not receiving an APPEND ACK, and losing the Primary before replication or S3 flush can leave holes that surviving replicas cannot serve. This failure mode is accepted for the target workload in exchange for non-blocking seals.
 
-The design itself is internally inconsistent: `design.md:1324-1326` calls final `record_count` definitive, conflicting with the earlier quorum definition.
+**Documentation resolution:** `design.md` now distinguishes the Primary's local seal frontier from the quorum-confirmed client ACK frontier and documents the duplicate and hole trade-offs. No implementation change is required.
 
 ### 5. Epoch CAS does not fence the epoch observed by the client request
 
