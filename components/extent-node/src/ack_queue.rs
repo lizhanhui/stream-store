@@ -9,6 +9,7 @@
 //! update per-secondary offsets, and send AppendAck frames back to clients.
 
 use std::collections::VecDeque;
+use std::fmt::{Debug, Formatter, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -52,6 +53,7 @@ pub struct PendingAck {
 ///
 /// - **Producer** ([`enqueue`]): pushes `PendingAck` via a lock-free
 ///   crossbeam channel. The append leader never acquires a Mutex.
+///
 /// - **Consumer** ([`lock_inner`]): watermark readers lock `inner` to
 ///   drain the channel, update `acked[]`, and send AppendAck frames.
 ///
@@ -60,8 +62,10 @@ pub struct PendingAck {
 pub struct AckQueue {
     /// Lock-free producer channel. Append leaders push PendingAcks here.
     tx: crossbeam_channel::Sender<PendingAck>,
+
     /// Epoch for which this queue is active; u64::MAX means inactive.
     active_epoch: AtomicU64,
+
     /// Consumer state, protected by Mutex. Only watermark readers touch this.
     inner: Mutex<AckQueueInner>,
 }
@@ -70,12 +74,14 @@ pub struct AckQueue {
 pub struct AckQueueInner {
     /// Receiver end of the lock-free channel.
     rx: Receiver<PendingAck>,
+
     /// Pending client ACKs, ordered by offset (front = lowest).
     /// Populated by [`receive_pending`] which drains `rx`.
     pub(crate) pending: VecDeque<PendingAck>,
 
     /// Extent and highest offset acknowledged by each secondary.
     acked_extent: [Option<ExtentId>; MAX_SECONDARIES],
+
     /// `u64::MAX` = never reported for the corresponding extent.
     acked: [u64; MAX_SECONDARIES],
 
@@ -160,7 +166,7 @@ impl AckQueue {
             .fail_all_pending("this extent node is not the stream primary");
     }
 
-    pub fn apply_watermark(
+    pub fn update_watermark(
         &self,
         epoch: Epoch,
         extent_id: ExtentId,
@@ -348,16 +354,16 @@ const _: () = {
     }
 };
 
-impl std::fmt::Debug for AckQueue {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AckQueue {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("AckQueue")
             .field("inner", &"<locked>")
             .finish()
     }
 }
 
-impl std::fmt::Debug for AckQueueInner {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl Debug for AckQueueInner {
+    fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("AckQueueInner")
             .field("pending_len", &self.pending.len())
             .field("acked", &self.acked)

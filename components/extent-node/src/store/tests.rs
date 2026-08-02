@@ -1368,7 +1368,7 @@ fn watermark_cannot_ack_pending_from_another_extent() {
         created_at: Instant::now(),
     });
 
-    ack_queue.apply_watermark(Epoch(0), ExtentId(41), 0, 20);
+    ack_queue.update_watermark(Epoch(0), ExtentId(41), 0, 20);
 
     assert!(resp_rx.try_recv().is_err());
     let mut inner = ack_queue.lock_inner();

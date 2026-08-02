@@ -16,12 +16,15 @@
 //! Each connection also spawns a reader task that processes Watermark ACKs
 //! inline, calling `ack_queue.drain_quorum()` directly on the store.
 
+use common::types::Epoch;
+use common::types::StreamId;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use socket2::{SockRef, TcpKeepalive};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::net::tcp::OwnedReadHalf;
 use tokio_util::codec::FramedRead;
 
 use tokio::net::TcpStream;
@@ -269,7 +272,7 @@ async fn downstream_writer_task(
 /// Exits gracefully when the shutdown signal is received or the connection closes.
 async fn downstream_reader_inline(
     addr: String,
-    read_half: tokio::net::tcp::OwnedReadHalf,
+    read_half: OwnedReadHalf,
     store: Arc<ExtentNodeStore>,
     mut shutdown_rx: broadcast::Receiver<()>,
 ) {
@@ -277,8 +280,7 @@ async fn downstream_reader_inline(
 
     // Cache: stream_id → (epoch, secondary index). Replica ordering is only
     // immutable within an epoch.
-    let mut index_cache: HashMap<common::types::StreamId, (common::types::Epoch, u8)> =
-        HashMap::new();
+    let mut index_cache: HashMap<StreamId, (Epoch, u8)> = HashMap::new();
 
     loop {
         let result = tokio::select! {
@@ -303,7 +305,7 @@ async fn downstream_reader_inline(
                     let _transition = store.role_transition.read().unwrap();
                     if store.primary_replica_at(stream_id, epoch).is_none() {
                         warn!(
-                            "ignoring stale watermark from {addr}: stream={stream_id}, epoch={epoch}",
+                            "ignoring stale watermark update from {addr}: stream={stream_id}, epoch={epoch}",
                         );
                         continue;
                     }
@@ -326,8 +328,13 @@ async fn downstream_reader_inline(
 
                     let streams_guard = store.streams.pin();
                     if let Some(stream) = streams_guard.get(&stream_id) {
-                        if let Some(aq) = stream.ack_queue() {
-                            aq.apply_watermark(epoch, extent_id, secondary_index, acked_offset);
+                        if let Some(ack_queue) = stream.ack_queue() {
+                            ack_queue.update_watermark(
+                                epoch,
+                                extent_id,
+                                secondary_index,
+                                acked_offset,
+                            );
                         } else {
                             warn!(
                                 "received watermark for stream {:?} but no ack_queue exists",
