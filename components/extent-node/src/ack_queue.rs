@@ -222,7 +222,7 @@ impl AckQueueInner {
     /// `required_acks` secondaries have confirmed.
     ///
     /// Returns None if quorum cannot be met (not enough secondaries have reported).
-    pub fn quorum_offset(&self, extent_id: ExtentId) -> Option<u64> {
+    pub fn quorum_offset(&self) -> Option<u64> {
         if self.required_acks == 0 {
             return None; // RF=1, no quorum needed
         }
@@ -231,8 +231,8 @@ impl AckQueueInner {
         // Collect offsets from secondaries that have reported (not u64::MAX).
         let mut offsets = [0u64; MAX_SECONDARIES];
         let mut count = 0;
-        for (index, &value) in self.acked.iter().enumerate() {
-            if self.extents[index] == Some(extent_id) && value != u64::MAX {
+        for (_, &value) in self.acked.iter().enumerate() {
+            if value != u64::MAX {
                 offsets[count] = value;
                 count += 1;
             }
@@ -291,7 +291,7 @@ impl AckQueueInner {
     /// entries (older than the configured replication timeout) and sends error responses.
     pub fn drain_quorum(&mut self) {
         while let Some(front) = self.pending.front() {
-            let Some(quorum_offset) = self.quorum_offset(front.extent_id) else {
+            let Some(quorum_offset) = self.quorum_offset() else {
                 break;
             };
             if front.assigned_offset > quorum_offset {

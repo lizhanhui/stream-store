@@ -1421,17 +1421,17 @@ async fn quorum_offset_with_multiple_secondaries() {
 
     // Only 1 secondary has reported — not enough for quorum.
     inner.update_watermark(0, ExtentId(0), 5);
-    assert!(inner.quorum_offset(ExtentId(0)).is_none());
+    assert!(inner.quorum_offset().is_none());
 
     // Second secondary reports — now we have quorum.
     inner.update_watermark(1, ExtentId(0), 3);
     // quorum_offset = min of top-2 = 3
-    assert_eq!(inner.quorum_offset(ExtentId(0)), Some(3));
+    assert_eq!(inner.quorum_offset(), Some(3));
 
     // Third secondary reports higher.
     inner.update_watermark(2, ExtentId(0), 10);
     // top-2 descending: [10, 5], so quorum_offset = 5
-    assert_eq!(inner.quorum_offset(ExtentId(0)), Some(5));
+    assert_eq!(inner.quorum_offset(), Some(5));
 }
 
 #[tokio::test]
