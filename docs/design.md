@@ -39,15 +39,15 @@ For **client timeout or failure recovery**: the `SEAL_STREAM_MANAGER` opcode (0x
 
 **Client Seal (`FLAG_OFFSET_PRESENT = 0`, legacy extent-based)** — uses the 2-phase Prepare/Commit protocol (`SEAL_EXTENT_NODE` 0x07):
 1. Client sends `Seal(stream_id, extent_id)` to Stream Manager.
-2. **Prepare**: Stream Manager sends `SealExtentNode` (flag=0x00) to **each Extent Node holding a replica** (Primary and all Secondaries). Each Extent Node seals its last mutable extent and responds with its local committed offset.
-3. Stream Manager determines the authoritative committed offset: if the Primary responded, its quorum offset is used (most accurate). Otherwise, SM computes the committed offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
-4. **Commit**: Stream Manager broadcasts `SealExtentNode` (flag=0x02) with the authoritative committed offset to all replicas so they correct their local seal point. Commit is fire-and-forget.
-5. Stream Manager updates extent metadata to SEALED with the committed end_offset.
+2. **Prepare**: Stream Manager sends `SealExtentNode` (flag=0x00) to **each Extent Node holding a replica** (Primary and all Secondaries). Each Extent Node seals its last mutable extent and responds with its local append frontier.
+3. Stream Manager determines the authoritative seal offset: if the Primary responded, its local append frontier is used. Otherwise, SM computes the recoverable offset from Secondary responses using quorum math (sorts offsets descending, takes the k-th value where `k = RF/2`).
+4. **Commit**: Stream Manager broadcasts `SealExtentNode` (flag=0x02) with the authoritative seal offset to all replicas so they correct their local seal point. Commit is fire-and-forget.
+5. Stream Manager updates extent metadata to SEALED with the authoritative `end_offset`.
 6. Stream Manager allocates a **new** active extent on (potentially different) healthy nodes, sends `RegisterExtent` to the new **Primary** and **waits for its `RegisterExtent` ack (flag=0x01)** before proceeding. Secondaries are created by the Primary via in-band `ForwardInitExtent` before the first `Forward` (see "Lazy Secondary Extent Creation" below), so the SM does not register secondaries directly.
 6. Stream Manager responds to client with the new extent info (Primary address). Writes resume immediately.
 
 **Extent-node Seal** (`FLAG_OFFSET_PRESENT = 1`):
-1. Primary ExtentNode proactively seals (e.g. arena full) and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` set to Stream Manager. The `offset` is the committed end_offset.
+1. Primary ExtentNode proactively seals (e.g. arena full) and sends `Seal(stream_id, extent_id, offset)` with `FLAG_OFFSET_PRESENT` set to Stream Manager. The `offset` is the Primary's local append frontier.
 2. Stream Manager trusts the reported offset and records it as the extent's `end_offset` in metadata.
 3. Stream Manager updates extent metadata to SEALED.
 4. Stream Manager **fire-and-forgets** Seal RPCs to secondary extent nodes only (`tokio::spawn` -- does not block the response), skipping the Primary (already sealed locally). This ensures secondaries learn about the seal asynchronously.
@@ -490,7 +490,9 @@ See [adaptive-capacity.md](adaptive-capacity.md) for the full scaling model, dec
 
 #### Seal
 
-Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (leader has finished draining), then reads the final `record_count`. Subsequent appends see the limit and return `ExtentSealed`. The `committed_seq` at seal time is the definitive record count reported to Stream Manager.
+Sealing sets `limit` atomically. The store layer waits for `in_flight == 0` (leader has finished draining), then reads the final `record_count`. Subsequent appends see the limit and return `ExtentSealed`. The resulting local append frontier is the definitive seal offset reported to Stream Manager; sealing does not wait for `AckQueue` to advance to that offset.
+
+This is an intentional latency trade-off. Extent transitions must remain local and non-blocking, so the Primary's seal offset can include records whose client APPEND has not reached quorum or received an ACK. Such records may later become visible, and a producer retry can therefore create duplicates. If the Primary fails before those records reach another replica or S3, metadata may retain their offsets while surviving replicas cannot serve them, leaving holes in the stream. This loss mode is accepted in exchange for keeping autonomous sealing fast. When the Primary is unavailable during recovery, the Stream Manager instead derives the recoverable seal offset from Secondary responses using quorum order statistics.
 
 #### Properties
 
