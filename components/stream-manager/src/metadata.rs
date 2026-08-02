@@ -59,16 +59,24 @@ pub struct StreamReplicaRow {
 }
 
 /// Result of a transactional seal-and-allocate operation.
+///
+/// Both variants carry the epoch the stream is left at, so callers never have to
+/// re-read it: `Sealed` advanced the stream, `AlreadySealed` left it untouched.
 #[derive(Debug, Clone)]
 pub enum SealResult {
-    /// The extent was active and has been sealed; a new extent was allocated.
-    Sealed { new_extent_id: ExtentId },
-    /// The extent was already sealed by another client. Returns the successor extent
-    /// that was already allocated (the next Active extent after the sealed one).
+    /// The extent was active and has been sealed; the stream epoch was advanced
+    /// and a new extent was allocated at that epoch.
+    Sealed {
+        new_extent_id: ExtentId,
+        new_epoch: Epoch,
+    },
+    /// The extent was already sealed and a successor exists at the current epoch
+    /// (an Extent Node created it autonomously). The epoch is left unchanged.
     AlreadySealed {
         new_extent_id: ExtentId,
         new_start_offset: u64,
         primary_addr: String,
+        epoch: Epoch,
     },
 }
 
@@ -478,18 +486,27 @@ impl MetadataStore {
         Ok(())
     }
 
-    /// Seal an extent and allocate a new one in a single MySQL transaction.
+    /// Seal an extent, advance the stream epoch, and allocate the successor
+    /// extent and its replica set in a single MySQL transaction.
     ///
-    /// Uses `SELECT ... FOR UPDATE` to ensure concurrent safety:
-    /// - If the extent is Active: seal it, allocate a new extent, return `Sealed`.
-    /// - If the extent is already Sealed: find the successor extent and return `AlreadySealed`.
+    /// `expected_epoch` is the epoch carried by the request being served. The
+    /// transaction locks the stream row and refuses to proceed unless the
+    /// persisted epoch still matches, so concurrent transitions cannot perform
+    /// consecutive bumps and a failed allocation can never leave the stream
+    /// epoch ahead of its active extent.
+    ///
+    /// - If the extent is Active: seal it, bump the epoch, allocate a new extent
+    ///   and replica rows at the new epoch, return `Sealed`.
+    /// - If the extent is already sealed and a successor exists: return
+    ///   `AlreadySealed` without touching the epoch, keeping the stream epoch and
+    ///   the active extent's epoch equal.
     pub async fn seal_and_allocate_transaction(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
         end_offset: u64,
         nodes: &[(String, u8)],
-        epoch: Epoch,
+        expected_epoch: Epoch,
     ) -> Result<SealResult, StorageError> {
         let mut conn = self.pool.acquire().await.context(DatabaseSnafu {
             message: "acquire connection",
@@ -497,6 +514,37 @@ impl MetadataStore {
         let mut tx = conn.begin().await.context(DatabaseSnafu {
             message: "begin transaction",
         })?;
+
+        // Step 0: Lock the stream row and fence the request epoch. Taking this
+        // lock first serializes epoch transitions for the stream, so a losing
+        // request observes the winner's epoch instead of racing past it.
+        let stream_row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
+            .bind(stream_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .context(DatabaseSnafu {
+                message: "lock stream",
+            })?;
+
+        let current_epoch = match stream_row {
+            Some(row) => Epoch(row.get::<i32, _>("epoch") as u32),
+            None => {
+                return InternalSnafu {
+                    message: format!("stream not found: {stream_id}"),
+                }
+                .fail();
+            }
+        };
+
+        if current_epoch != expected_epoch {
+            return EpochStaleSnafu {
+                stream_id,
+                epoch: expected_epoch,
+            }
+            .fail();
+        }
+
+        let new_epoch = Epoch(expected_epoch.0 + 1);
 
         // Step 1: Lock the target extent row and check state.
         let row = sqlx::query(
@@ -549,7 +597,7 @@ impl MetadataStore {
                      WHERE stream_id = ? AND epoch = ? AND role = 0",
                 )
                 .bind(stream_id.0)
-                .bind(epoch.0 as i32)
+                .bind(current_epoch.0 as i32)
                 .fetch_optional(&mut *tx)
                 .await
                 .context(DatabaseSnafu {
@@ -568,6 +616,7 @@ impl MetadataStore {
                     new_extent_id,
                     new_start_offset,
                     primary_addr,
+                    epoch: current_epoch,
                 });
             }
 
@@ -622,7 +671,7 @@ impl MetadataStore {
         .bind(new_start_offset as i64)
         .bind(new_start_offset as i64) // end_offset = start_offset for new active extent
         .bind(ExtentState::Active.as_u8())
-        .bind(epoch.0 as i32)
+        .bind(new_epoch.0 as i32)
         .execute(&mut *tx)
         .await
         .context(DatabaseSnafu { message: "insert extent" })?;
@@ -634,7 +683,7 @@ impl MetadataStore {
                 "INSERT IGNORE INTO stream_replica (stream_id, epoch, node_addr, role) VALUES (?, ?, ?, ?)",
             )
             .bind(stream_id.0)
-            .bind(epoch.0 as i32)
+            .bind(new_epoch.0 as i32)
             .bind(addr)
             .bind(*role)
             .execute(&mut *tx)
@@ -642,11 +691,26 @@ impl MetadataStore {
             .context(DatabaseSnafu { message: "insert stream_replica" })?;
         }
 
+        // Step 6: Advance the stream epoch. This commits with the seal, the
+        // successor extent, and the replica rows, so the stream epoch and its
+        // active extent's epoch can never diverge.
+        sqlx::query("UPDATE stream SET epoch = ? WHERE stream_id = ?")
+            .bind(new_epoch.0 as i32)
+            .bind(stream_id.0)
+            .execute(&mut *tx)
+            .await
+            .context(DatabaseSnafu {
+                message: "advance stream epoch",
+            })?;
+
         tx.commit()
             .await
             .context(DatabaseSnafu { message: "commit" })?;
 
-        Ok(SealResult::Sealed { new_extent_id })
+        Ok(SealResult::Sealed {
+            new_extent_id,
+            new_epoch,
+        })
     }
 
     /// Get the active extent for a stream (there should be at most one).
@@ -1183,35 +1247,11 @@ impl MetadataStore {
         Ok(Epoch(row.get::<i32, _>("epoch") as u32))
     }
 
-    /// Bump the epoch for a stream from `expected` to `expected + 1`.
-    ///
-    /// The expected epoch must come from the request being handled rather than
-    /// from a fresh database read. This fences stale concurrent seal requests.
-    pub async fn bump_epoch(
-        &self,
-        stream_id: StreamId,
-        expected: Epoch,
-    ) -> Result<Epoch, StorageError> {
-        let result =
-            sqlx::query("UPDATE stream SET epoch = epoch + 1 WHERE stream_id = ? AND epoch = ?")
-                .bind(stream_id.0)
-                .bind(expected.0 as i32)
-                .execute(&self.pool)
-                .await
-                .context(DatabaseSnafu {
-                    message: "bump_epoch",
-                })?;
-
-        if result.rows_affected() == 0 {
-            return EpochStaleSnafu {
-                stream_id,
-                epoch: expected,
-            }
-            .fail();
-        }
-
-        Ok(Epoch(expected.0 + 1))
-    }
+    // The stream epoch is advanced only by `seal_and_allocate_transaction`, which
+    // commits the bump together with the seal, the successor extent, and the new
+    // replica set. A standalone bump is deliberately not offered: committing it
+    // separately can leave the stream epoch ahead of its active extent, which no
+    // later request can repair.
 
     // ── Leadership lease operations ──
 
