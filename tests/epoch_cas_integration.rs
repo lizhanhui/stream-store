@@ -44,6 +44,26 @@ async fn connect() -> MetadataStore {
     store
 }
 
+/// A raw pool, for fixtures that must write states `MetadataStore` has no API for.
+async fn raw_pool() -> sqlx::MySqlPool {
+    MySqlPoolOptions::new()
+        .max_connections(1)
+        .connect(&StreamManagerConfig::default().mysql_url())
+        .await
+        .expect("connect for fixture")
+}
+
+async fn extent(store: &MetadataStore, stream_id: StreamId, extent_id: ExtentId) -> (u64, u64) {
+    let row = store
+        .get_extents(stream_id)
+        .await
+        .expect("read extents")
+        .into_iter()
+        .find(|e| e.extent_id == extent_id)
+        .expect("extent present");
+    (row.start_offset, row.end_offset)
+}
+
 #[tokio::test]
 #[serial]
 async fn concurrent_transitions_from_same_epoch_advance_once() {
@@ -113,6 +133,109 @@ async fn concurrent_transitions_from_same_epoch_advance_once() {
     );
 }
 
+/// A seal request can arrive late, after the Extent Node has already sealed the
+/// extent and started its successor, and report a further end offset. Honouring
+/// it verbatim would stretch the predecessor across the successor's start and
+/// make the same offsets readable from two extents.
+#[tokio::test]
+#[serial]
+async fn delayed_seal_cannot_extend_predecessor_past_its_successor() {
+    let store = connect().await;
+    let (stream_id, extent_id) = stream_with_active_extent(&store, "epoch-overlap").await;
+
+    let successor_id = ExtentId(extent_id.0 + 1);
+    store
+        .record_extent_sealed(stream_id, Epoch(0), extent_id, 10, successor_id)
+        .await
+        .expect("record autonomous seal");
+
+    // The delayed request claims the extent runs to 20, but the successor has
+    // owned everything from 10 onwards since the autonomous transition.
+    store
+        .seal_and_allocate_transaction(
+            stream_id,
+            extent_id,
+            20,
+            &[("127.0.0.1:2".to_string(), 0u8)],
+            Epoch(0),
+        )
+        .await
+        .expect("delayed seal must succeed");
+
+    let (_, predecessor_end) = extent(&store, stream_id, extent_id).await;
+    let (successor_start, _) = extent(&store, stream_id, successor_id).await;
+    assert_eq!(
+        predecessor_end, successor_start,
+        "the predecessor must end exactly where its successor begins",
+    );
+    assert_eq!(predecessor_end, 10);
+}
+
+/// The successor can be persisted past the sealed extent's end offset when a
+/// sealed chain already reached further. `Sealed` must report the offset that
+/// was persisted, because the caller registers the extent on the Extent Node
+/// with it — recomputing it there would have MySQL and the Extent Node describe
+/// the same extent differently.
+#[tokio::test]
+#[serial]
+async fn sealed_reports_the_start_offset_it_persisted() {
+    let store = connect().await;
+    let (stream_id, first) = stream_with_active_extent(&store, "epoch-startoff").await;
+
+    // Build a sealed chain reaching to 30, then seal its tail so no active
+    // successor remains and the transaction has to allocate one.
+    let second = ExtentId(first.0 + 1);
+    let third = ExtentId(first.0 + 2);
+    store
+        .record_extent_sealed(stream_id, Epoch(0), first, 10, second)
+        .await
+        .expect("seal first");
+    store
+        .record_extent_sealed(stream_id, Epoch(0), second, 30, third)
+        .await
+        .expect("seal second");
+    sqlx::query(
+        "UPDATE extent SET state = ?, end_offset = 30 WHERE stream_id = ? AND extent_id = ?",
+    )
+    .bind(ExtentState::Sealed.as_u8())
+    .bind(stream_id.0)
+    .bind(third.0 as i64)
+    .execute(&raw_pool().await)
+    .await
+    .expect("seal the tail of the chain");
+
+    // Reported end offset is 10, but the chain already reaches 30.
+    let result = store
+        .seal_and_allocate_transaction(
+            stream_id,
+            first,
+            10,
+            &[("127.0.0.1:2".to_string(), 0u8)],
+            Epoch(0),
+        )
+        .await
+        .expect("seal must succeed");
+
+    let (new_extent_id, new_start_offset) = match result {
+        SealResult::Sealed {
+            new_extent_id,
+            new_start_offset,
+            ..
+        } => (new_extent_id, new_start_offset),
+        other => panic!("expected Sealed, got {other:?}"),
+    };
+
+    assert_eq!(
+        new_start_offset, 30,
+        "the successor must start past the sealed chain, not at the reported end offset",
+    );
+    let (persisted_start, _) = extent(&store, stream_id, new_extent_id).await;
+    assert_eq!(
+        new_start_offset, persisted_start,
+        "the reported start offset must be the one persisted",
+    );
+}
+
 /// An Extent Node can seal an extent autonomously, create the successor, and
 /// flush the sealed extent to S3 before the Stream Manager's seal request lands.
 /// The request must recognise the flushed predecessor as already sealed and
@@ -136,11 +259,13 @@ async fn flushed_predecessor_is_already_sealed_and_allocates_nothing() {
         .await
         .expect("record flush");
 
+    // Report a further end offset than was uploaded. A flushed extent's bytes
+    // are already in S3, so its boundary must not move.
     let result = store
         .seal_and_allocate_transaction(
             stream_id,
             extent_id,
-            10,
+            20,
             &[("127.0.0.1:2".to_string(), 0u8)],
             Epoch(0),
         )
@@ -176,6 +301,12 @@ async fn flushed_predecessor_is_already_sealed_and_allocates_nothing() {
         "the stream must keep exactly one active extent, found {active:?}",
     );
     assert_eq!(active[0].extent_id, successor_id);
+
+    let (_, flushed_end) = extent(&store, stream_id, extent_id).await;
+    assert_eq!(
+        flushed_end, 10,
+        "a flushed extent must not advertise bytes beyond what reached S3",
+    );
 }
 
 #[tokio::test]

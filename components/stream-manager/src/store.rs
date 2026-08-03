@@ -1192,6 +1192,7 @@ impl StreamManagerStore {
         let (new_extent_id, primary_addr, epoch) = match seal_result {
             SealResult::Sealed {
                 new_extent_id,
+                new_start_offset,
                 new_epoch,
             } => {
                 let primary_addr = new_replicas[0].0.clone();
@@ -1220,13 +1221,15 @@ impl StreamManagerStore {
 
                 // Register new extent: best-effort. If Primary is dead/slow,
                 // client will discover on first append and trigger another seal-and-new.
-                // The new extent's start_offset is the sealed extent's end_offset,
-                // matching what seal_and_allocate_transaction persisted.
+                // Register at the offset the transaction persisted, not at
+                // `end_offset`: the two differ when the successor had to start
+                // past a sealed chain, and disagreeing here would leave MySQL and
+                // the Extent Node describing the same extent differently.
                 if let Err(e) = self
                     .register_primary(
                         config,
                         new_extent_id,
-                        end_offset,
+                        new_start_offset,
                         &primary_addr,
                         &secondary_addrs,
                     )
