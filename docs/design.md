@@ -34,8 +34,10 @@ For **client timeout or failure recovery**: the `SEAL_STREAM_MANAGER` opcode (0x
 1. Client sends `Seal(stream_id, epoch)` to Stream Manager (client seals by epoch, not extent_id).
 2. Stream Manager looks up the Primary for that epoch and forwards the Seal.
 3. Primary seals its current active extent and responds with `(extent_id, end_offset)`.
-4. Stream Manager reconciles metadata, bumps epoch, allocates a new replica set.
+4. Stream Manager reconciles metadata, then bumps the epoch and allocates the successor extent and its replica set in a single transaction.
 5. Stream Manager responds to client with the new extent info and new epoch.
+
+**Epoch transitions are atomic and fenced.** The seal-and-allocate transaction locks the stream row, verifies the persisted epoch still equals the epoch the client sealed against, and only then seals the extent, writes the successor extent and replica rows at `epoch + 1`, and advances `stream.epoch`. Concurrent seals of the same epoch therefore produce exactly one transition; the loser receives `EpochStale` and rediscovers. Because the bump commits with the allocation, a failure never leaves `stream.epoch` ahead of the active extent's epoch — these two values are always equal.
 
 **Client Seal (`FLAG_OFFSET_PRESENT = 0`, legacy extent-based)** — uses the 2-phase Prepare/Commit protocol (`SEAL_EXTENT_NODE` 0x07):
 1. Client sends `Seal(stream_id, extent_id)` to Stream Manager.

@@ -9,7 +9,7 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
     DEFAULT_MIN_EXTENT_CAPACITY,
 };
-use common::errors::{InternalSnafu, StorageError};
+use common::errors::{EpochStaleSnafu, InternalSnafu, StorageError};
 use common::types::{
     Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
 };
@@ -797,13 +797,16 @@ impl StreamManagerStore {
     ///
     /// **Phase 2 — Seal all replicas (fire-and-forget).**
     /// After `seal_allocate_register`, all replicas are sealed. This is idempotent.
+    ///
+    /// `expected_epoch` is the epoch the request was issued against; the resulting
+    /// epoch is returned alongside the new extent.
     async fn seal_extent(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
         committed_offset: Option<u64>,
-        epoch: Epoch,
-    ) -> Result<(ExtentId, String), StorageError> {
+        expected_epoch: Epoch,
+    ) -> Result<(ExtentId, String, Epoch), StorageError> {
         // Get extent metadata early — needed for start_offset in seal RPCs.
         let extent_row = self
             .store
@@ -818,6 +821,20 @@ impl StreamManagerStore {
                 }
                 .build()
             })?;
+
+        // Fence before touching an ExtentNode. `resolve_committed_offset` below
+        // physically seals the extent on every replica, so a request that has
+        // already lost an epoch transition must stop here — otherwise it seals
+        // the winner's freshly allocated extent and only then learns, from the
+        // transaction, that its epoch was stale.
+        if extent_row.epoch != expected_epoch {
+            return EpochStaleSnafu {
+                stream_id,
+                epoch: expected_epoch,
+            }
+            .fail();
+        }
+
         let extent_start_offset = extent_row.start_offset;
 
         let end_offset = match committed_offset {
@@ -843,7 +860,7 @@ impl StreamManagerStore {
 
         // Seal + allocate + notify new replica set.
         let result = self
-            .seal_allocate_register(stream_id, extent_id, end_offset, epoch)
+            .seal_allocate_register(stream_id, extent_id, end_offset, expected_epoch)
             .await?;
 
         // Look up replicas once for both phase 2 commit and DR flush.
@@ -1120,14 +1137,19 @@ impl StreamManagerStore {
     }
 
     /// Shared logic for both seal paths: pick new nodes, seal-and-allocate in DB,
-    /// register new replica set, and return (new_extent_id, primary_addr).
+    /// register new replica set, and return (new_extent_id, primary_addr, epoch).
+    ///
+    /// `expected_epoch` is the epoch the request was issued against. The epoch is
+    /// advanced inside the seal-and-allocate transaction, so the returned epoch is
+    /// authoritative: the bumped epoch when this call performed the transition, or
+    /// the unchanged epoch when a successor already existed.
     pub async fn seal_allocate_register(
         &self,
         stream_id: StreamId,
         extent_id: ExtentId,
         end_offset: u64,
-        epoch: Epoch,
-    ) -> Result<(ExtentId, String), StorageError> {
+        expected_epoch: Epoch,
+    ) -> Result<(ExtentId, String, Epoch), StorageError> {
         // Pick nodes for new extent replica set using per-stream replication factor.
         let replication_factor =
             self.store.get_stream_replication_factor(stream_id).await? as usize;
@@ -1153,14 +1175,26 @@ impl StreamManagerStore {
             .map(|(i, n)| (n.addr.clone(), i as u8))
             .collect();
 
-        // Transactional seal + allocate (idempotent for already-sealed extents).
+        // Transactional epoch bump + seal + allocate (idempotent for already-sealed
+        // extents). Nothing above this point has mutated metadata, so a failure
+        // here leaves the stream entirely at `expected_epoch`.
         let seal_result = self
             .store
-            .seal_and_allocate_transaction(stream_id, extent_id, end_offset, &new_replicas, epoch)
+            .seal_and_allocate_transaction(
+                stream_id,
+                extent_id,
+                end_offset,
+                &new_replicas,
+                expected_epoch,
+            )
             .await?;
 
-        let (new_extent_id, primary_addr) = match seal_result {
-            SealResult::Sealed { new_extent_id } => {
+        let (new_extent_id, primary_addr, epoch) = match seal_result {
+            SealResult::Sealed {
+                new_extent_id,
+                new_start_offset,
+                new_epoch,
+            } => {
                 let primary_addr = new_replicas[0].0.clone();
                 let node_addrs: Vec<String> = new_replicas.iter().map(|(a, _)| a.clone()).collect();
                 let secondary_addrs: Vec<&str> =
@@ -1170,7 +1204,7 @@ impl StreamManagerStore {
                 let config = StreamConfig {
                     stream_id,
                     replication_factor: node_addrs.len() as u8,
-                    epoch,
+                    epoch: new_epoch,
                     storage_class,
                     policy: ExtentPolicy {
                         cache: cache_extents,
@@ -1181,19 +1215,21 @@ impl StreamManagerStore {
                 };
 
                 info!(
-                    "new extent {} allocated for stream {}, primary={primary_addr}",
+                    "new extent {} allocated for stream {} at epoch {new_epoch}, primary={primary_addr}",
                     new_extent_id, stream_id
                 );
 
                 // Register new extent: best-effort. If Primary is dead/slow,
                 // client will discover on first append and trigger another seal-and-new.
-                // The new extent's start_offset is the sealed extent's end_offset,
-                // matching what seal_and_allocate_transaction persisted.
+                // Register at the offset the transaction persisted, not at
+                // `end_offset`: the two differ when the successor had to start
+                // past a sealed chain, and disagreeing here would leave MySQL and
+                // the Extent Node describing the same extent differently.
                 if let Err(e) = self
                     .register_primary(
                         config,
                         new_extent_id,
-                        end_offset,
+                        new_start_offset,
                         &primary_addr,
                         &secondary_addrs,
                     )
@@ -1205,22 +1241,23 @@ impl StreamManagerStore {
                     );
                 }
 
-                (new_extent_id, primary_addr)
+                (new_extent_id, primary_addr, new_epoch)
             }
             SealResult::AlreadySealed {
                 new_extent_id,
                 new_start_offset: _,
                 primary_addr,
+                epoch,
             } => {
                 info!(
-                    "extent {} already sealed for stream {}; returning successor {}",
+                    "extent {} already sealed for stream {}; returning successor {} at epoch {epoch}",
                     extent_id, stream_id, new_extent_id
                 );
-                (new_extent_id, primary_addr)
+                (new_extent_id, primary_addr, epoch)
             }
         };
 
-        Ok((new_extent_id, primary_addr))
+        Ok((new_extent_id, primary_addr, epoch))
     }
 
     /// QueryOffset on StreamManager: return the total logical end offset for a stream.
@@ -1415,9 +1452,8 @@ impl StreamManagerStore {
     async fn handle_epoch_seal(&self, request_id: u32, stream_id: StreamId, epoch: Epoch) -> Frame {
         info!("Epoch-based seal: stream={}, epoch={}", stream_id, epoch);
 
-        // Check if the client's epoch is stale. If the stream has already advanced
-        // past the requested epoch, return the current epoch's primary info directly
-        // — no seal needed.
+        // Fence the request before contacting an Extent Node. Both stale and future
+        // epochs must fail without mutating the active extent.
         let current_epoch = match self.store.get_stream_epoch(stream_id).await {
             Ok(e) => e,
             Err(e) => {
@@ -1429,37 +1465,16 @@ impl StreamManagerStore {
                 );
             }
         };
-        if epoch.0 < current_epoch.0 {
+        if epoch != current_epoch {
             info!(
-                "Epoch seal: client epoch {} is stale (current={}), returning current state",
+                "Epoch seal rejected: request epoch {} does not match current epoch {}",
                 epoch, current_epoch
             );
-            // Return the current epoch's primary and let the client reconnect.
-            let replicas = match self.store.get_replicas(stream_id, current_epoch).await {
-                Ok(r) => r,
-                Err(e) => {
-                    return Frame::seal_stream_manager_resp_error(
-                        request_id,
-                        stream_id,
-                        ErrorCode::InternalError,
-                        &format!("get_replicas for current epoch: {e}"),
-                    );
-                }
-            };
-            let primary_addr = replicas
-                .iter()
-                .find(|r| r.role == 0)
-                .map(|r| r.node_addr.clone())
-                .unwrap_or_default();
-            return Frame::new(
-                VariableHeader::SealStreamManagerResp {
-                    request_id,
-                    stream_id,
-                    offset: Offset(0),
-                    new_epoch: current_epoch,
-                    primary_addr: Bytes::copy_from_slice(primary_addr.as_bytes()),
-                },
-                None,
+            return Frame::seal_stream_manager_resp_error(
+                request_id,
+                stream_id,
+                ErrorCode::EpochStale,
+                "seal request epoch does not match the current stream epoch",
             );
         }
 
@@ -1483,6 +1498,18 @@ impl StreamManagerStore {
                 );
             }
         };
+        if active.epoch != epoch {
+            info!(
+                "Epoch seal rejected: active extent epoch {} does not match request epoch {}",
+                active.epoch, epoch
+            );
+            return Frame::seal_stream_manager_resp_error(
+                request_id,
+                stream_id,
+                ErrorCode::EpochStale,
+                "active extent advanced beyond the seal request epoch",
+            );
+        }
 
         let replicas = match self.store.get_replicas(stream_id, active.epoch).await {
             Ok(r) => r,
@@ -1548,7 +1575,10 @@ impl StreamManagerStore {
                     "Epoch seal: primary unreachable at {primary_addr}, falling back to quorum seal: {e}"
                 );
 
-                // Re-read the active extent — it may have changed after reconciliation.
+                // Re-read the active extent — it may have changed after
+                // reconciliation. It may also belong to a newer epoch if a
+                // concurrent transition won; `seal_extent` fences on the request
+                // epoch before it seals anything on an ExtentNode.
                 let active = match self.store.get_active_extent(stream_id).await {
                     Ok(Some(ext)) => ext,
                     Ok(None) => {
@@ -1569,27 +1599,17 @@ impl StreamManagerStore {
                     }
                 };
 
-                // Step 3: Bump epoch and seal the (possibly new) active extent.
-                let new_epoch = match self.store.bump_epoch(stream_id).await {
-                    Ok(e) => e,
-                    Err(e) => {
-                        return Frame::seal_stream_manager_resp_error(
-                            request_id,
-                            stream_id,
-                            ErrorCode::InternalError,
-                            &format!("epoch seal fallback: bump_epoch failed: {e}"),
-                        );
-                    }
-                };
+                // Step 3: Seal the (possibly new) active extent. The epoch is
+                // advanced inside the seal-and-allocate transaction.
                 info!(
-                    "Epoch seal: reconciled, sealing extent {} at new epoch {} for stream {}",
-                    active.extent_id, new_epoch, stream_id
+                    "Epoch seal: reconciled, sealing extent {} at epoch {} for stream {}",
+                    active.extent_id, epoch, stream_id
                 );
                 match self
-                    .seal_extent(stream_id, active.extent_id, None, new_epoch)
+                    .seal_extent(stream_id, active.extent_id, None, epoch)
                     .await
                 {
-                    Ok((_new_extent_id, new_primary_addr)) => {
+                    Ok((_new_extent_id, new_primary_addr, new_epoch)) => {
                         return Frame::new(
                             VariableHeader::SealStreamManagerResp {
                                 request_id,
@@ -1599,6 +1619,14 @@ impl StreamManagerStore {
                                 primary_addr: Bytes::copy_from_slice(new_primary_addr.as_bytes()),
                             },
                             None,
+                        );
+                    }
+                    Err(StorageError::EpochStale { .. }) => {
+                        return Frame::seal_stream_manager_resp_error(
+                            request_id,
+                            stream_id,
+                            ErrorCode::EpochStale,
+                            "epoch seal lost a concurrent epoch transition",
                         );
                     }
                     Err(e2) => {
@@ -1619,14 +1647,10 @@ impl StreamManagerStore {
         // use the sealed extent from the SealExtentNodeResp.
         let sealed_extent_id = match self.store.get_active_extent(stream_id).await {
             Ok(Some(ext)) => ext.extent_id,
-            Ok(None) => {
-                // Primary already sealed the last extent. Ensure it's sealed in DB too.
-                let _ = self
-                    .store
-                    .seal_extent(stream_id, active.extent_id, end_offset)
-                    .await;
-                active.extent_id
-            }
+            // The primary already sealed the last extent. The transaction below
+            // records the boundary under the epoch fence; writing it here would
+            // mutate metadata outside the atomic transition.
+            Ok(None) => active.extent_id,
             Err(e) => {
                 return Frame::seal_stream_manager_resp_error(
                     request_id,
@@ -1637,27 +1661,15 @@ impl StreamManagerStore {
             }
         };
 
-        // Bump epoch BEFORE seal+allocate so the new extent is created at the new epoch.
-        let new_epoch = match self.store.bump_epoch(stream_id).await {
-            Ok(e) => e,
-            Err(e) => {
-                error!("epoch seal: bump_epoch failed: {e}");
-                return Frame::seal_stream_manager_resp_error(
-                    request_id,
-                    stream_id,
-                    ErrorCode::InternalError,
-                    &format!("epoch seal: bump_epoch: {e}"),
-                );
-            }
-        };
-
-        // Allocate new extent. The sealed extent is already sealed on the EN (and in DB
-        // after reconciliation). We just need to allocate the successor.
+        // Bump the epoch and allocate the successor. The sealed extent is already
+        // sealed on the EN (and in DB after reconciliation); the transaction below
+        // commits the epoch bump with the successor extent and its replica set, so
+        // a failure here leaves the stream fully at the requested epoch.
         match self
-            .seal_allocate_register(stream_id, sealed_extent_id, end_offset, new_epoch)
+            .seal_allocate_register(stream_id, sealed_extent_id, end_offset, epoch)
             .await
         {
-            Ok((_new_extent_id, new_primary_addr)) => Frame::new(
+            Ok((_new_extent_id, new_primary_addr, new_epoch)) => Frame::new(
                 VariableHeader::SealStreamManagerResp {
                     request_id,
                     stream_id,
@@ -1666,6 +1678,12 @@ impl StreamManagerStore {
                     primary_addr: Bytes::copy_from_slice(new_primary_addr.as_bytes()),
                 },
                 None,
+            ),
+            Err(StorageError::EpochStale { .. }) => Frame::seal_stream_manager_resp_error(
+                request_id,
+                stream_id,
+                ErrorCode::EpochStale,
+                "epoch seal lost a concurrent epoch transition",
             ),
             Err(e) => {
                 error!("epoch seal metadata update failed: {e}");

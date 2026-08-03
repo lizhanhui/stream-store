@@ -61,7 +61,7 @@ async fn clean_database(mysql_url: &str) {
     }
     pool.close().await;
 
-    let store = MetadataStore::connect(mysql_url)
+    let store = MetadataStore::connect_with_max_connections(mysql_url, 3)
         .await
         .expect("connect for migration");
     store.migrate().await.expect("migration failed");
@@ -84,6 +84,7 @@ fn sm_config_fast() -> StreamManagerConfig {
         heartbeat_check_interval_ms: 500,
         leadership_lease_duration_secs: 3,
         flush_staleness_threshold_ms: 5000, // 5s for fast test
+        mysql_max_connections: 3,
         ..StreamManagerConfig::default()
     }
 }
@@ -171,7 +172,7 @@ async fn setup_cluster_with_s3(
     let mysql_url = sm_cfg.mysql_url();
     clean_database(&mysql_url).await;
 
-    let store = MetadataStore::connect(&mysql_url)
+    let store = MetadataStore::connect_with_max_connections(&mysql_url, 3)
         .await
         .expect("metadata connect");
     let sm = StreamManager::start(sm_cfg).await;

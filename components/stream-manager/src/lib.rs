@@ -45,9 +45,12 @@ impl StreamManager {
         let mut task_handles = Vec::new();
 
         // 1. Connect to MySQL metadata store.
-        let store = MetadataStore::connect(&config.mysql_url())
-            .await
-            .expect("failed to connect to MySQL");
+        let store = MetadataStore::connect_with_max_connections(
+            &config.mysql_url(),
+            config.mysql_max_connections,
+        )
+        .await
+        .expect("failed to connect to MySQL");
         store.migrate().await.expect("failed to run migrations");
         info!("StreamManager connected to MySQL: {}", config.mysql_url());
 

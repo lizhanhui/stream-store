@@ -56,7 +56,7 @@ async fn start_stream_manager_server() -> String {
     pool.close().await;
 
     // Connect and migrate.
-    let store = MetadataStore::connect(&config.mysql_url())
+    let store = MetadataStore::connect_with_max_connections(&config.mysql_url(), 3)
         .await
         .expect("failed to connect to MySQL");
     store.migrate().await.expect("failed to migrate");
