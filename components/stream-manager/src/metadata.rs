@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use common::errors::{DatabaseSnafu, EpochStaleSnafu, InternalSnafu, MigrationSnafu, StorageError};
 use common::types::{
@@ -97,9 +98,33 @@ pub struct MetadataStore {
     url: String,
 }
 
+/// Pool size for a Stream Manager process.
+const DEFAULT_MAX_CONNECTIONS: u32 = 10;
+
+/// How long an unused connection is kept before it is closed. Pools that only
+/// see occasional traffic shrink back instead of pinning a server slot for the
+/// life of the process.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Hard cap on connection age. Bounds how long a connection can hold
+/// server-side state (locks from an abandoned transaction, for instance) when
+/// the peer goes away without a clean close.
+const POOL_MAX_LIFETIME: Duration = Duration::from_secs(600);
+
 impl MetadataStore {
     /// Connect to MySQL and return a MetadataStore.
     pub async fn connect(url: &str) -> Result<Self, StorageError> {
+        Self::connect_with_max_connections(url, DEFAULT_MAX_CONNECTIONS).await
+    }
+
+    /// Connect with an explicit pool size.
+    ///
+    /// Tests run many stores against one shared MySQL, where the default pool
+    /// size per store can exhaust `max_connections` on the server.
+    pub async fn connect_with_max_connections(
+        url: &str,
+        max_connections: u32,
+    ) -> Result<Self, StorageError> {
         // MySQL servers with binary collation (e.g. utf8mb4_0900_bin) return
         // VARCHAR columns as VARBINARY, which sqlx cannot decode into Rust
         // String. Append charset to URL and set on options for belt-and-suspenders.
@@ -117,7 +142,9 @@ impl MetadataStore {
         let options = options.charset("utf8mb4");
 
         let pool = MySqlPoolOptions::new()
-            .max_connections(10)
+            .max_connections(max_connections)
+            .idle_timeout(POOL_IDLE_TIMEOUT)
+            .max_lifetime(POOL_MAX_LIFETIME)
             .connect_with(options)
             .await
             .context(DatabaseSnafu {
@@ -463,29 +490,6 @@ impl MetadataStore {
         Ok(extent_id)
     }
 
-    /// Seal an extent: update state to SEALED and record end_offset.
-    pub async fn seal_extent(
-        &self,
-        stream_id: StreamId,
-        extent_id: ExtentId,
-        end_offset: u64,
-    ) -> Result<(), StorageError> {
-        sqlx::query(
-            "UPDATE extent SET state = ?, end_offset = ?, sealed_at = NOW() \
-             WHERE stream_id = ? AND extent_id = ?",
-        )
-        .bind(ExtentState::Sealed.as_u8())
-        .bind(end_offset as i64)
-        .bind(stream_id.0)
-        .bind(extent_id.0 as i64)
-        .execute(&self.pool)
-        .await
-        .context(DatabaseSnafu {
-            message: "seal_extent",
-        })?;
-        Ok(())
-    }
-
     /// Seal an extent, advance the stream epoch, and allocate the successor
     /// extent and its replica set in a single MySQL transaction.
     ///
@@ -497,9 +501,9 @@ impl MetadataStore {
     ///
     /// - If the extent is Active: seal it, bump the epoch, allocate a new extent
     ///   and replica rows at the new epoch, return `Sealed`.
-    /// - If the extent is already sealed and a successor exists: return
-    ///   `AlreadySealed` without touching the epoch, keeping the stream epoch and
-    ///   the active extent's epoch equal.
+    /// - If the extent is no longer Active (sealed or already flushed) and an
+    ///   active successor exists: return `AlreadySealed` without touching the
+    ///   epoch, keeping the stream epoch and the active extent's epoch equal.
     pub async fn seal_and_allocate_transaction(
         &self,
         stream_id: StreamId,
@@ -572,15 +576,48 @@ impl MetadataStore {
         let state_val = row.get::<i8, _>("state") as u8;
         let state = ExtentState::from_u8(state_val).unwrap_or(ExtentState::Unspecified);
 
-        if state == ExtentState::Sealed {
-            // Already sealed — find the successor (next extent with higher extent_id).
+        // Offset the successor extent must start at. Normally this is the end of
+        // the extent being sealed, but an already-sealed extent may sit in front
+        // of a sealed successor chain that reaches further.
+        let mut start_floor = end_offset;
+
+        // Anything that is not Active has already been sealed — by an autonomous
+        // Extent Node transition, by reconciliation, or by an earlier attempt of
+        // this same request. `Flushed` counts: it is a sealed extent that has
+        // since reached S3. Treating only `Sealed` as sealed would let a flushed
+        // predecessor fall through to allocation and produce a second active
+        // extent alongside the successor the Extent Node already created.
+        if state != ExtentState::Active {
+            // Advance the recorded end offset if this request learned a further
+            // one, without regressing the state of an extent that has already
+            // been flushed. This repair used to run as a separate statement
+            // outside the transaction, where it could overwrite a committed
+            // boundary without holding the epoch fence.
+            sqlx::query(
+                "UPDATE extent SET end_offset = ?, sealed_at = COALESCE(sealed_at, NOW()) \
+                 WHERE stream_id = ? AND extent_id = ? AND end_offset < ?",
+            )
+            .bind(end_offset as i64)
+            .bind(stream_id.0)
+            .bind(extent_id.0 as i64)
+            .bind(end_offset as i64)
+            .execute(&mut *tx)
+            .await
+            .context(DatabaseSnafu {
+                message: "advance sealed end_offset",
+            })?;
+
+            // The caller wants the extent that is now taking writes, which is the
+            // *active* successor. A sealed successor is not a usable answer: the
+            // caller would hand it to a client as the new append target.
             let successor = sqlx::query(
-                "SELECT extent_id, start_offset FROM extent \
-                 WHERE stream_id = ? AND extent_id > ? \
+                "SELECT extent_id, start_offset, epoch FROM extent \
+                 WHERE stream_id = ? AND extent_id > ? AND state = ? \
                  ORDER BY extent_id ASC LIMIT 1",
             )
             .bind(stream_id.0)
             .bind(extent_id.0 as i64)
+            .bind(ExtentState::Active.as_u8())
             .fetch_optional(&mut *tx)
             .await
             .context(DatabaseSnafu {
@@ -590,6 +627,11 @@ impl MetadataStore {
             if let Some(successor) = successor {
                 let new_extent_id = ExtentId(successor.get::<i64, _>("extent_id") as u32);
                 let new_start_offset = successor.get::<i64, _>("start_offset") as u64;
+                // The successor carries its own epoch, which is what the caller
+                // must append under. It matches the stream epoch under the fence
+                // above, but reading it from the extent keeps the two from
+                // drifting if an out-of-order EN notification installed the row.
+                let successor_epoch = Epoch(successor.get::<i32, _>("epoch") as u32);
 
                 // Get primary replica address from the stream-level replica set.
                 let replica = sqlx::query(
@@ -597,7 +639,7 @@ impl MetadataStore {
                      WHERE stream_id = ? AND epoch = ? AND role = 0",
                 )
                 .bind(stream_id.0)
-                .bind(current_epoch.0 as i32)
+                .bind(successor_epoch.0 as i32)
                 .fetch_optional(&mut *tx)
                 .await
                 .context(DatabaseSnafu {
@@ -616,12 +658,22 @@ impl MetadataStore {
                     new_extent_id,
                     new_start_offset,
                     primary_addr,
-                    epoch: current_epoch,
+                    epoch: successor_epoch,
                 });
             }
 
-            // No successor — fall through to allocate a new extent.
-            // Use the sealed extent's end_offset as the new start_offset.
+            // No successor is taking writes — fall through and allocate one,
+            // starting past the furthest sealed boundary so the new extent
+            // cannot overlap a sealed successor.
+            let max_end: Option<i64> =
+                sqlx::query_scalar("SELECT MAX(end_offset) FROM extent WHERE stream_id = ?")
+                    .bind(stream_id.0)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .context(DatabaseSnafu {
+                        message: "read max end_offset",
+                    })?;
+            start_floor = start_floor.max(max_end.unwrap_or(0) as u64);
         }
 
         // Step 2: Seal the active extent (idempotent if already sealed).
@@ -660,7 +712,7 @@ impl MetadataStore {
             })?;
 
         let new_extent_id = ExtentId(seq_row.get::<i64, _>("next_extent_id") as u32);
-        let new_start_offset = end_offset;
+        let new_start_offset = start_floor;
 
         // Step 4: Insert new extent row.
         sqlx::query(
@@ -1756,6 +1808,11 @@ impl MetadataStore {
     ///
     /// For each extent in the report, insert it if missing and update stream_sequence.
     /// Extents that are reported as sealed get their end_offset set.
+    ///
+    /// Fenced on `epoch`: the reported extents describe the stream as of that
+    /// epoch, so writing them after a concurrent transition has advanced the
+    /// stream would install rows for an epoch the stream has already left.
+    /// Callers that lost the race get `EpochStale` and no rows are written.
     pub async fn reconcile_extents(
         &self,
         stream_id: StreamId,
@@ -1768,6 +1825,28 @@ impl MetadataStore {
         let mut tx = conn.begin().await.context(DatabaseSnafu {
             message: "begin transaction",
         })?;
+
+        let stream_row = sqlx::query("SELECT epoch FROM stream WHERE stream_id = ? FOR UPDATE")
+            .bind(stream_id.0)
+            .fetch_optional(&mut *tx)
+            .await
+            .context(DatabaseSnafu {
+                message: "lock stream for reconcile",
+            })?;
+
+        let current_epoch = match stream_row {
+            Some(row) => Epoch(row.get::<i32, _>("epoch") as u32),
+            None => {
+                return InternalSnafu {
+                    message: format!("stream not found: {stream_id}"),
+                }
+                .fail();
+            }
+        };
+
+        if current_epoch != epoch {
+            return EpochStaleSnafu { stream_id, epoch }.fail();
+        }
 
         let mut max_extent_id: u32 = 0;
 

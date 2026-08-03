@@ -198,6 +198,11 @@ pub struct StreamManagerConfig {
     pub mysql_password: String,
     /// MySQL database name.
     pub mysql_database: String,
+    /// Upper bound on pooled MySQL connections. Lower this where many Stream
+    /// Managers share one server, so a single process cannot exhaust its
+    /// `max_connections`.
+    #[serde(default = "default_mysql_max_connections")]
+    pub mysql_max_connections: u32,
     /// How often the heartbeat checker polls for expired nodes, in milliseconds.
     pub heartbeat_check_interval_ms: u32,
     /// Timeout (ms) for establishing an RPC TCP connection to ExtentNodes. Defaults to 500ms.
@@ -224,6 +229,7 @@ impl Default for StreamManagerConfig {
             mysql_username: "root".to_string(),
             mysql_password: "password".to_string(),
             mysql_database: "stream_store".to_string(),
+            mysql_max_connections: default_mysql_max_connections(),
             heartbeat_check_interval_ms: 3000,
             connect_timeout_ms: DEFAULT_CONNECT_TIMEOUT_MS,
             request_timeout_ms: DEFAULT_SM_REQUEST_TIMEOUT_MS,
@@ -266,6 +272,10 @@ impl StreamManagerConfig {
 
 fn default_flush_staleness_threshold_ms() -> u32 {
     300_000
+}
+
+fn default_mysql_max_connections() -> u32 {
+    10
 }
 
 /// Load a config from a TOML file, falling back to defaults for missing fields.

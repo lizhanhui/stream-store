@@ -52,7 +52,7 @@ async fn clean_database(mysql_url: &str) {
     }
     pool.close().await;
 
-    let store = MetadataStore::connect(mysql_url)
+    let store = MetadataStore::connect_with_max_connections(mysql_url, 3)
         .await
         .expect("connect for migration");
     store.migrate().await.expect("migration failed");
@@ -70,6 +70,9 @@ fn sm_config() -> StreamManagerConfig {
         port: 0,
         heartbeat_check_interval_ms: 1000,
         leadership_lease_duration_secs: 3,
+        // Several Stream Managers share one MySQL here; keep each pool small
+        // so the suite cannot exhaust the server's connection limit.
+        mysql_max_connections: 3,
         ..StreamManagerConfig::default()
     }
 }
@@ -125,7 +128,7 @@ async fn multi_sm_leadership_failover() {
     clean_database(&mysql_url).await;
 
     // Open an independent MetadataStore connection for assertions.
-    let meta = MetadataStore::connect(&mysql_url)
+    let meta = MetadataStore::connect_with_max_connections(&mysql_url, 3)
         .await
         .expect("connect metadata for assertions");
 

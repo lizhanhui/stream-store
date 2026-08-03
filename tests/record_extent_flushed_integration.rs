@@ -42,7 +42,7 @@ async fn fresh_store() -> MetadataStore {
     }
     pool.close().await;
 
-    let store = MetadataStore::connect(&url)
+    let store = MetadataStore::connect_with_max_connections(&url, 3)
         .await
         .expect("metadata connect");
     store.migrate().await.expect("migrate");

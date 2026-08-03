@@ -9,7 +9,7 @@ use common::config::{
     DEFAULT_CACHE_EXTENTS, DEFAULT_EXTENT_GROWTH_FACTOR, DEFAULT_MAX_EXTENT_CAPACITY,
     DEFAULT_MIN_EXTENT_CAPACITY,
 };
-use common::errors::{InternalSnafu, StorageError};
+use common::errors::{EpochStaleSnafu, InternalSnafu, StorageError};
 use common::types::{
     Epoch, ErrorCode, ExtentId, ExtentPolicy, Offset, Opcode, StorageClass, StreamConfig, StreamId,
 };
@@ -821,6 +821,20 @@ impl StreamManagerStore {
                 }
                 .build()
             })?;
+
+        // Fence before touching an ExtentNode. `resolve_committed_offset` below
+        // physically seals the extent on every replica, so a request that has
+        // already lost an epoch transition must stop here — otherwise it seals
+        // the winner's freshly allocated extent and only then learns, from the
+        // transaction, that its epoch was stale.
+        if extent_row.epoch != expected_epoch {
+            return EpochStaleSnafu {
+                stream_id,
+                epoch: expected_epoch,
+            }
+            .fail();
+        }
+
         let extent_start_offset = extent_row.start_offset;
 
         let end_offset = match committed_offset {
@@ -1558,7 +1572,10 @@ impl StreamManagerStore {
                     "Epoch seal: primary unreachable at {primary_addr}, falling back to quorum seal: {e}"
                 );
 
-                // Re-read the active extent — it may have changed after reconciliation.
+                // Re-read the active extent — it may have changed after
+                // reconciliation. It may also belong to a newer epoch if a
+                // concurrent transition won; `seal_extent` fences on the request
+                // epoch before it seals anything on an ExtentNode.
                 let active = match self.store.get_active_extent(stream_id).await {
                     Ok(Some(ext)) => ext,
                     Ok(None) => {
@@ -1627,14 +1644,10 @@ impl StreamManagerStore {
         // use the sealed extent from the SealExtentNodeResp.
         let sealed_extent_id = match self.store.get_active_extent(stream_id).await {
             Ok(Some(ext)) => ext.extent_id,
-            Ok(None) => {
-                // Primary already sealed the last extent. Ensure it's sealed in DB too.
-                let _ = self
-                    .store
-                    .seal_extent(stream_id, active.extent_id, end_offset)
-                    .await;
-                active.extent_id
-            }
+            // The primary already sealed the last extent. The transaction below
+            // records the boundary under the epoch fence; writing it here would
+            // mutate metadata outside the atomic transition.
+            Ok(None) => active.extent_id,
             Err(e) => {
                 return Frame::seal_stream_manager_resp_error(
                     request_id,
